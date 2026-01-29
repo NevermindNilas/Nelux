@@ -1,6 +1,6 @@
 
 name: "Bug Report"
-description: "Report an issue or unexpected behavior in CeLux"
+description: "Report an issue or unexpected behavior in NeLux"
 title: "[Bug] "
 labels: bug
 
@@ -15,8 +15,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: "CeLux Version"
-      description: "Which version of CeLux are you using?"
+      label: "NeLux Version"
+      description: "Which version of NeLux are you using?"
       placeholder: "e.g., 0.4.1"
 
   - type: textarea

@@ -1,6 +1,6 @@
-# CeLux Usage Guide
+# NeLux Usage Guide
 
-This comprehensive guide covers all CeLux APIs for high-performance video processing.
+This comprehensive guide covers all NeLux APIs for high-performance video processing.
 
 ## Table of Contents
 
@@ -26,11 +26,11 @@ This comprehensive guide covers all CeLux APIs for high-performance video proces
 ## Installation
 
 ```bash
-# Install from PyPI (published as 'nelux', imports as 'celux')
+# Install from PyPI (published as 'nelux', imports as 'nelux')
 pip install nelux
 
 # Or install from wheel (Linux)
-pip install ./celux-*.whl
+pip install ./nelux-*.whl
 ```
 
 **Requirements:**
@@ -43,7 +43,7 @@ pip install ./celux-*.whl
 ## Quick Start
 
 ```python
-from celux import VideoReader, VideoEncoder
+from nelux import VideoReader, VideoEncoder
 
 # Basic video reading
 reader = VideoReader("input.mp4")
@@ -88,7 +88,7 @@ VideoReader(
 **Example:**
 
 ```python
-from celux import VideoReader
+from nelux import VideoReader
 
 # CPU decoding with PyTorch tensors (default)
 reader = VideoReader("video.mp4")
@@ -353,7 +353,7 @@ for frame in reader:
 Decode video on NVIDIA GPU using NVDEC hardware decoder.
 
 ```python
-from celux import VideoReader
+from nelux import VideoReader
 
 # Enable NVDEC decoding
 reader = VideoReader(
@@ -388,7 +388,7 @@ for frame in reader:
 **Requirements:**
 - NVIDIA GPU with NVDEC support
 - CUDA toolkit installed
-- CeLux wheel built with CUDA support (`celux.__cuda_support__ == True`)
+- NeLux wheel built with CUDA support (`nelux.__cuda_support__ == True`)
 
 ---
 
@@ -454,7 +454,7 @@ VideoEncoder(
 ### Basic Usage
 
 ```python
-from celux import VideoEncoder
+from nelux import VideoEncoder
 import torch
 
 # Create encoder manually
@@ -521,11 +521,11 @@ with VideoEncoder("output.mp4", audio_sample_rate=44100, audio_channels=2) as en
 
 ## Logging
 
-Control CeLux's logging verbosity.
+Control NeLux's logging verbosity.
 
 ```python
-import celux
-from celux import LogLevel
+import nelux
+from nelux import LogLevel
 
 # Available log levels
 LogLevel.trace     # Most verbose
@@ -537,8 +537,8 @@ LogLevel.critical  # Critical errors only
 LogLevel.off       # Disable logging
 
 # Set log level
-celux.set_log_level(LogLevel.debug)  # Enable debug output
-celux.set_log_level(LogLevel.off)    # Silence all output
+nelux.set_log_level(LogLevel.debug)  # Enable debug output
+nelux.set_log_level(LogLevel.off)    # Silence all output
 ```
 
 ---
@@ -546,10 +546,10 @@ celux.set_log_level(LogLevel.off)    # Silence all output
 ## Module Attributes
 
 ```python
-import celux
+import nelux
 
-celux.__version__       # str: Library version (e.g., "0.8.5")
-celux.__cuda_support__  # bool: True if CUDA/NVDEC support is compiled in
+nelux.__version__       # str: Library version (e.g., "0.8.5")
+nelux.__cuda_support__  # bool: True if CUDA/NVDEC support is compiled in
 ```
 
 ---
@@ -557,7 +557,7 @@ celux.__cuda_support__  # bool: True if CUDA/NVDEC support is compiled in
 ## Complete Example: ML Inference Pipeline
 
 ```python
-from celux import VideoReader, VideoEncoder
+from nelux import VideoReader, VideoEncoder
 import torch
 
 def process_video(input_path: str, output_path: str, model):
@@ -618,7 +618,7 @@ def batch_process(video_paths: list, model):
 Ensure FFmpeg shared libraries are in your system PATH.
 
 ### CUDA Not Available
-- Check `celux.__cuda_support__` is `True`
+- Check `nelux.__cuda_support__` is `True`
 - Verify CUDA drivers are installed
 - Ensure you installed the CUDA-enabled wheel
 

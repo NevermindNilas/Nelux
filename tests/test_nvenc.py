@@ -99,7 +99,7 @@ def test_nvenc_encoding(codec_name, device, width=1920, height=1080, frames=60):
 
 
 def main():
-    print(f"CeLux Version: {nelux.__version__}")
+    print(f"NeLux Version: {nelux.__version__}")
     if hasattr(nelux, "__cuda_support__"):
         print(f"CUDA Support: {nelux.__cuda_support__}")
 

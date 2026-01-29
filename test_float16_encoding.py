@@ -8,7 +8,7 @@ import tempfile
 import torch
 
 # Add FFmpeg DLLs
-ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
+ffmpeg_bin = r"D:\NeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
@@ -21,7 +21,7 @@ def test_float16_encoding():
     print("Testing Float16 / RGB48 Encoding Capabilities")
     print("=" * 60)
 
-    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"\nNeLux version: {nelux.__version__}")
     print(f"CUDA support: {nelux.__cuda_support__}")
 
     width, height = 1920, 1080

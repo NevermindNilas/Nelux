@@ -26,7 +26,7 @@ import torch.cuda as cuda
 import nelux
 
 # Configuration
-VIDEO_PATH = r"F:/CeLux/tests/data/default/demo_output.mp4"
+VIDEO_PATH = r"F:/NeLux/tests/data/default/demo_output.mp4"
 NUM_FRAMES_TO_PROCESS = 200
 QUEUE_MAX_SIZE = 8  # Limit queue size to control memory usage
 

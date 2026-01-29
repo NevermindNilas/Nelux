@@ -8,13 +8,13 @@ import time
 import torch
 
 # Add FFmpeg DLLs
-ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
+ffmpeg_bin = r"D:\NeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
 import nelux
 
-INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
+INPUT_VIDEO = r"D:\NeLux\benchmark_source.mp4"
 
 
 def test_hevc_nvenc():
@@ -23,7 +23,7 @@ def test_hevc_nvenc():
     print("Testing HEVC NVENC (hevc_nvenc) Encoding")
     print("=" * 60)
 
-    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"\nNeLux version: {nelux.__version__}")
     print(f"CUDA support: {nelux.__cuda_support__}")
 
     # List available encoders

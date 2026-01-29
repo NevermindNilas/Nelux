@@ -24,7 +24,7 @@ try:
 except ImportError:
     HAS_TORCHMETRICS = False
 
-INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
+INPUT_VIDEO = r"D:\NeLux\benchmark_source.mp4"
 NUM_FRAMES_TO_COMPARE = 100  # Compare first N frames
 
 
@@ -162,10 +162,10 @@ def compare_videos(original_path: str, encoded_path: str, name: str):
 
 def main():
     print("=" * 60)
-    print("CeLux Encoding Quality Comparison")
+    print("NeLux Encoding Quality Comparison")
     print("=" * 60)
 
-    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"\nNeLux version: {nelux.__version__}")
     print(f"Input video: {INPUT_VIDEO}")
 
     results = []

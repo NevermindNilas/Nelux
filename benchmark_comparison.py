@@ -5,8 +5,8 @@ import os
 import sys
 import numpy as np
 
-# Add FFmpeg DLLs for CeLux
-ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
+# Add FFmpeg DLLs for NeLux
+ffmpeg_bin = r"D:\NeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
     # Add to PATH for subprocess
@@ -14,14 +14,14 @@ if os.path.exists(ffmpeg_bin):
 
 import nelux
 
-INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
+INPUT_VIDEO = r"D:\NeLux\benchmark_source.mp4"
 FRAMES_TO_TEST = 500
 WIDTH = 1920
 HEIGHT = 1080
 BITRATE = "8M"
 
 
-def benchmark_celux_internal(decode_accel, encode_codec, desc):
+def benchmark_nelux_internal(decode_accel, encode_codec, desc):
     print(f"\n--- Benchmarking: {desc} ---")
 
     # Setup Reader
@@ -114,8 +114,8 @@ def benchmark_ffmpeg_pipe(decode_accel, encode_codec, desc):
         "-b:v",
         BITRATE,
         "-preset",
-        "fast",  # Match default roughly or use medium? CeLux defaults are usually 'medium' for cpu, or 'p4' for nvenc.
-        # We'll stick to defaults or 'fast' to ensure we aren't bottlenecked by slow presets if CeLux uses faster settings.
+        "fast",  # Match default roughly or use medium? NeLux defaults are usually 'medium' for cpu, or 'p4' for nvenc.
+        # We'll stick to defaults or 'fast' to ensure we aren't bottlenecked by slow presets if NeLux uses faster settings.
     ]
 
     # NVENC specific tweaks if needed
@@ -196,7 +196,7 @@ def benchmark_ffmpeg_pipe(decode_accel, encode_codec, desc):
 
 def main():
     print("============================================================")
-    print("CeLux vs FFmpeg Pipe Benchmark")
+    print("NeLux vs FFmpeg Pipe Benchmark")
     print("============================================================")
     print(f"Frames: {FRAMES_TO_TEST}")
     print(f"Resolution: {WIDTH}x{HEIGHT}")
@@ -206,12 +206,12 @@ def main():
     for i, (func, args, name) in enumerate(
         [
             (
-                benchmark_celux_internal,
+                benchmark_nelux_internal,
                 ("cpu", "libx264", "NELUX CPU -> NELUX CPU (Internal)"),
                 "NELUX CPU -> NELUX CPU",
             ),
             (
-                benchmark_celux_internal,
+                benchmark_nelux_internal,
                 ("nvdec", "h264_nvenc", "NELUX GPU -> NELUX GPU (Internal)"),
                 "NELUX GPU -> NELUX GPU",
             ),

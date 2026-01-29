@@ -1,5 +1,5 @@
 # download_ffmpeg.ps1
-# Downloads and extracts pre-built FFmpeg shared libraries for CeLux
+# Downloads and extracts pre-built FFmpeg shared libraries for NeLux
 
 param(
     [string]$OutputDir = "$PSScriptRoot\..\external\ffmpeg",

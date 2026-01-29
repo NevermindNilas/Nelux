@@ -6,15 +6,15 @@ Tests that decoder reuse via reconfigure() is faster than creating new readers.
 import sys
 import os
 
-# Add CeLux to path for development testing
+# Add NeLux to path for development testing
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import time
 import nelux
 
 # Test videos - use existing test data
-VIDEO1 = r"D:\CeLux\tests\data\sample_h264.mp4"
-VIDEO2 = r"D:\CeLux\tests\data\ForBiggerBlazes.mp4"
+VIDEO1 = r"D:\NeLux\tests\data\sample_h264.mp4"
+VIDEO2 = r"D:\NeLux\tests\data\ForBiggerBlazes.mp4"
 
 
 def test_reconfigure_basic():
@@ -125,7 +125,7 @@ def test_reconfigure_state_reset():
 
 
 def main():
-    print(f"CeLux version: {nelux.__version__}")
+    print(f"NeLux version: {nelux.__version__}")
     print("Testing decoder reconfiguration API...")
 
     # Verify test videos exist

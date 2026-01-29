@@ -3,18 +3,18 @@
 
 #### **Lazy Loading for Faster Imports**
 - **Improved:** Heavy dependencies (torch, C extensions, DLLs) are now loaded lazily.
-  - `import celux` no longer triggers immediate loading of torch or C extensions.
+  - `import nelux` no longer triggers immediate loading of torch or C extensions.
   - DLL path setup on Windows only occurs when VideoReader or other classes are actually instantiated.
   - Significantly faster import times for scripts that only need to check version or metadata.
   
   ```python
-  import celux  # Fast! No heavy imports yet
+  import nelux  # Fast! No heavy imports yet
   
   # Checking metadata is still fast
-  print(celux.__version__)  # Only loads version info
+  print(nelux.__version__)  # Only loads version info
   
   # Heavy imports happen here
-  vr = celux.VideoReader("video.mp4")  # Loads torch, DLLs, C extension
+  vr = nelux.VideoReader("video.mp4")  # Loads torch, DLLs, C extension
   ```
 
 #### **Improved DLL Error Messages**
@@ -26,18 +26,20 @@
   
   ```python
   # Before: Generic "DLL load failed" error
-  # ImportError: DLL load failed while importing _celux: The specified module could not be found.
+  # ImportError: DLL load failed while importing _nelux: The specified module could not be found.
   
   # After: Specific error with exact DLL and component:
-  # ImportError: Failed to load CeLux: 'avcodec-60.dll' is missing
+  # ImportError: Failed to load nelux: 'avcodec-60.dll' is missing
   # Component: FFmpeg
   # Description: FFmpeg video/audio processing library
   # FFmpeg DLLs can be located in:
   #   - System PATH environment variable
   #   - A shared library directory (e.g., nelux.libs)
-  #   - The CeLux package directory
+  #   - The nelux package directory
   # Make sure FFmpeg shared libraries are installed and accessible.
   ```
+
+- Reverted back to pytorch 2.9.1 due to issues with pytorch 2.10.0
 
 ### **Version 0.8.6 (2026-01-28)**
 
@@ -163,9 +165,9 @@
 ### **Version 0.8.1 (2025-12-04)**
 
 #### **Build System & CI Fixes**
-- **Fixed:** PyPI wheel was not being built with CUDA support due to `CELUX_ENABLE_CUDA` not being properly passed to CMake via scikit-build-core
-- **Added:** `CELUX_ENABLE_CUDA` env var support in `pyproject.toml` via `[tool.scikit-build.cmake.define]` section
-- **Added:** `celux.__cuda_support__` attribute to check at runtime if the wheel was built with CUDA/NVDEC support
+- **Fixed:** PyPI wheel was not being built with CUDA support due to `nelux_ENABLE_CUDA` not being properly passed to CMake via scikit-build-core
+- **Added:** `nelux_ENABLE_CUDA` env var support in `pyproject.toml` via `[tool.scikit-build.cmake.define]` section
+- **Added:** `nelux.__cuda_support__` attribute to check at runtime if the wheel was built with CUDA/NVDEC support
 - **Enhanced:** CI smoke test now verifies `__cuda_support__ == True` and fails the build if CUDA wasn't compiled in
 - **Updated:** PyTorch installation in CI now uses `cu130` index (CUDA 13.0 wheels now available)
 
@@ -248,20 +250,20 @@
 - **Enhanced:** Better logging during pixel format negotiation to aid debugging.
 
 ### **Version 0.7.6 (2025-11-27)**
-- **Changed:** Package renamed to `nelux` on PyPI for independent publishing. Import remains `import celux`.
+- **Changed:** Package renamed to `nelux` on PyPI for independent publishing. Import remains `import nelux`.
 - **Fixed:** Internal version now correctly reports `0.7.6`.
-- **Maintenance:** Updated repository URLs to point to NevermindNilas/CeLux.
+- **Maintenance:** Updated repository URLs to point to NevermindNilas/nelux.
 
 ### **Version 0.7.5 (2025-11-27)**
 - **Changed:** Initial PyPI release under new package name `nelux`.
 
 ### **Version 0.7.4 (2025-08-20)**
-- **Added:** Improved AV1 decoding that prefers `libdav1d` when available, with safe fallbacks to other software decoders. Installer/CMake now packages FFmpeg runtime DLLs (including `dav1d.dll`) into the Windows wheel so `import celux` works out-of-the-box. Added `vcpkg` recipe guidance and updated `setup_dev.ps1` to include `ffmpeg[dav1d]` for developer environments. Tests: added/updated manual AV1 test files (`tests/data/sample_av1.mp4`) and improved logging for diagnostics.
+- **Added:** Improved AV1 decoding that prefers `libdav1d` when available, with safe fallbacks to other software decoders. Installer/CMake now packages FFmpeg runtime DLLs (including `dav1d.dll`) into the Windows wheel so `import nelux` works out-of-the-box. Added `vcpkg` recipe guidance and updated `setup_dev.ps1` to include `ffmpeg[dav1d]` for developer environments. Tests: added/updated manual AV1 test files (`tests/data/sample_av1.mp4`) and improved logging for diagnostics.
 - **Changed:** Decoder negotiation now prefers software-friendly pixel formats to avoid selecting unsupported hardware formats that could cause "Function not implemented" errors. `__getitem__` was adjusted to choose the appropriate decoder dynamically, improving pipeline interoperability.
 - **Enhanced:** Robust 10-bit YUV (I010) → RGB conversion via `libyuv`, with a compatibility fallback pipeline (`I010` → `I420` → `RGB`).
 - **Libyuv Integration:** When enabled, `libyuv` is prioritized for color conversions and automatically normalizes outputs to 8-bit (`uint8`) for consistent downstream behavior.
 - **Fixed:** Resolved build issues related to missing `libyuv` symbols and other packaging/runtime problems affecting Windows imports.
-- **Notes:** If `libdav1d` is not present, CeLux will attempt other AV1 decoders (e.g., `libaom-av1`), but `libdav1d` is recommended for best performance and compatibility.
+- **Notes:** If `libdav1d` is not present, nelux will attempt other AV1 decoders (e.g., `libaom-av1`), but `libdav1d` is recommended for best performance and compatibility.
 
 
 ### **Version 0.7.3 (2025-08-17)**
@@ -276,7 +278,7 @@
 
 ### Example
 ```python
-from celux import VideoReader
+from nelux import VideoReader
 
 vr = VideoReader("input.mp4")
 
@@ -466,12 +468,12 @@ print(audio.channels)  # Number of channels
 ### Version 0.5.0 (2024-11-03)
   - Some Major Refactoring and changes made.
     - Parsed and created `Filter` classes for every (video) Ffmpeg filter.
-      - Filters defined within `Celux.pyi`
+      - Filters defined within `nelux.pyi`
         - Not all are tested. For Full documentation of arguments and usage, see: [ffmpeg-filter-docs](https://ffmpeg.org/ffmpeg-filters.html)
         - Please create a new issue if any problems occur!
     - Fixed an issue with Filter initialization and unwanted output messages. 
     ```py
-    from celux import VideoReader, Scale #, CreateFilter, FilterType
+    from nelux import VideoReader, Scale #, CreateFilter, FilterType
 
 
     scale_filter = Scale(width = "1920", height = "1080")
@@ -618,8 +620,8 @@ print(audio.channels)  # Number of channels
 - **Pre-Release Update:**
   - Added logging utility for debugging purposes.
     ```py
-    import celux
-    celux.set_log_level(celux.LogLevel.debug)
+    import nelux
+    nelux.set_log_level(nelux.LogLevel.debug)
     ```
 
 ### Version 0.3.3 (2024-10-19)
@@ -639,7 +641,7 @@ print(audio.channels)  # Number of channels
 ### Version 0.3.0 (2024-10-17)
 
 - **Pre-Release Update:**
-  - Renamed from `ffmpy` to `CeLux`.
+  - Renamed from `ffmpy` to `nelux`.
   - Created official `pypi` release.
   - Refactored to split `cpu` and `cuda` backends.
 

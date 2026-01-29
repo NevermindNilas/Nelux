@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install scikit-build-core pybind11 numpy ninja
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+          python -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu130
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -147,7 +147,7 @@ jobs:
         env:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
-          CELUX_ENABLE_CUDA: "ON"
+          NELUX_ENABLE_CUDA: "ON"
         run: |
           # Convert backslashes to forward slashes to avoid CMake escaping issues on Windows
           TEMP_FWD=$(echo "$RUNNER_TEMP" | tr '\\' '/')
@@ -161,18 +161,18 @@ jobs:
           export VCPKG_TARGET_TRIPLET=x64-windows-release
           export CMAKE_PREFIX_PATH="${VCPKG_ROOT}/installed/x64-windows-release"
 
-          # Construct CMAKE_ARGS with sanitized paths AND FORCE CELUX_ENABLE_CUDA=ON
-          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DCELUX_ENABLE_CUDA=ON"
+          # Construct CMAKE_ARGS with sanitized paths AND FORCE NELUX_ENABLE_CUDA=ON
+          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
           # Use --no-build-isolation so we usage the pre-installed CUDA-enabled Torch
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 
-      - name: Debug - List celux folder and wheel contents
+      - name: Debug - List nelux folder and wheel contents
         shell: powershell
         run: |
-          Write-Host "=== Contents of celux/ folder (post-build) ==="
-          Get-ChildItem -Path celux -Recurse | ForEach-Object { 
+          Write-Host "=== Contents of nelux/ folder (post-build) ==="
+          Get-ChildItem -Path nelux -Recurse | ForEach-Object { 
             Write-Host "$($_.Length) bytes - $($_.FullName)" 
           }
           Write-Host "=== Contents of dist/ folder ==="
@@ -232,7 +232,7 @@ jobs:
       - name: List wheel contents
         run: |
           echo "=== Wheel contents (CUDA DLLs bundled via delvewheel, FFmpeg NOT bundled) ==="
-          unzip -l dist/*.whl | grep celux/
+          unzip -l dist/*.whl | grep nelux/
 
       - name: Test wheel import and API
         shell: powershell
@@ -247,7 +247,7 @@ jobs:
           $env:FFMPEG_BIN = $FFmpegBin
 
           # Check torch and basic import with explicit DLL path adding for FFmpeg
-          python -c "import os, sys, torch; os.add_dll_directory(os.environ['FFMPEG_BIN']) if os.path.exists(os.environ.get('FFMPEG_BIN', '')) else None; import celux; print(f'torch {torch.__version__}, celux {celux.__version__}')"
+          python -c "import os, sys, torch; os.add_dll_directory(os.environ['FFMPEG_BIN']) if os.path.exists(os.environ.get('FFMPEG_BIN', '')) else None; import nelux; print(f'torch {torch.__version__}, nelux {nelux.__version__}')"
 
           # Verify 0.8.3 API features are present
           Write-Host "--- Verifying 0.8.3 API Features ---"
@@ -261,8 +261,8 @@ jobs:
               print(f"Adding DLL directory: {ffmpeg_bin}")
               os.add_dll_directory(ffmpeg_bin)
 
-          import celux
-          vr = celux.VideoReader
+          import nelux
+          vr = nelux.VideoReader
 
           # Prefetch API
           assert hasattr(vr, 'start_prefetch'), 'MISSING: start_prefetch'

@@ -1,12 +1,12 @@
 """
-Test script for CeLux prefetch API
+Test script for NeLux prefetch API
 """
 
 import sys
 import time
 
-# Add celux to path
-sys.path.insert(0, r"D:\CeLux")
+# Add nelux to path
+sys.path.insert(0, r"D:\NeLux")
 
 try:
     from nelux import VideoReader
@@ -17,7 +17,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Test with a video file
-test_video = r"D:\CeLux\benchmark_source.mp4"
+test_video = r"D:\NeLux\benchmark_source.mp4"
 
 print(f"\nOpening video: {test_video}")
 reader = VideoReader(test_video)

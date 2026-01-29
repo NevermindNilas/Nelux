@@ -62,7 +62,7 @@ def pipeline_ff_ff():
     return output
 
 
-def pipeline_celux_ff():
+def pipeline_nelux_ff():
     """Pipeline 2: NELUX Decode -> FFMPEG Encode"""
     output = os.path.join(OUT_DIR, "nelux_ff.mp4")
     print(f"Running Nelux -> FF to {output}...")
@@ -205,7 +205,7 @@ def pipeline_cv_cv():
     return output
 
 
-def pipeline_celux_celux():
+def pipeline_nelux_nelux():
     """Pipeline 5: NELUX Decode -> NELUX Encode"""
     output = os.path.join(OUT_DIR, "nelux_nelux.mp4")
     print(f"Running Nelux -> Nelux to {output}...")
@@ -413,10 +413,10 @@ def main():
     p1 = pipeline_ff_ff()
     p1a = pipeline_ff_raw_rgb_ff()
     p1b = pipeline_ff_raw_yuv_ff()
-    p2 = pipeline_celux_ff()
+    p2 = pipeline_nelux_ff()
     p3 = pipeline_cv_ff()
     p4 = pipeline_cv_cv()
-    p5 = pipeline_celux_celux()
+    p5 = pipeline_nelux_nelux()
 
     # 2. Read Frames for Comparison
     source_frames = read_frames(SOURCE_FILE)

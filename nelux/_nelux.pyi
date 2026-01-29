@@ -19,7 +19,7 @@ class LogLevel(Enum):
 
 def set_log_level(level: LogLevel) -> None:
     """
-    Set the logging level for CeLux.
+    Set the logging level for NeLux.
 
     Args:
         level (LogLevel): The logging level to set.

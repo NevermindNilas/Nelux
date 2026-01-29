@@ -161,7 +161,7 @@ def main():
     print("=" * 70)
     print("Test: Decode with Dedup Processing")
     print("=" * 70)
-    print(f"CeLux: {nelux.__version__}, PyTorch: {torch.__version__}")
+    print(f"NeLux: {nelux.__version__}, PyTorch: {torch.__version__}")
     print()
 
     videos = find_videos(INPUT_DIR, NUM_VIDEOS)

@@ -15,7 +15,7 @@ def get_generated_files():
 @pytest.mark.parametrize("video_path", get_generated_files())
 def test_pixel_format(video_path):
     """
-    Tests if CeLux can open and read frames from the video file.
+    Tests if NeLux can open and read frames from the video file.
     """
     print(f"Testing {video_path}")
     try:

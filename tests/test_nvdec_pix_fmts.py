@@ -16,9 +16,9 @@ os.add_dll_directory(r"C:\Users\nilas\AppData\Roaming\TheAnimeScripter\ffmpeg_sh
 try:
     import nelux
 
-    HAS_CELUX = True
+    HAS_NELUX = True
 except ImportError as e:
-    HAS_CELUX = False
+    HAS_NELUX = False
     print(f"Warning: nelux not available: {e}")
     import traceback
 
@@ -114,8 +114,8 @@ def generate_test_video(ffmpeg_path, output_path, pix_fmt, duration=1.0):
 
     # Try generic libx264 first, but it supports limited pixel formats.
     # Try libx265 for 10/12 bit.
-    # If those fail, we might need raw video (rawvideo) but CeLux might not support raw video containers well?
-    # Actually CeLux likely uses FFmpeg demuxer, so any container FFmpeg supports is fine.
+    # If those fail, we might need raw video (rawvideo) but NeLux might not support raw video containers well?
+    # Actually NeLux likely uses FFmpeg demuxer, so any container FFmpeg supports is fine.
     # Let's try to put everything in .mp4 or .mkv or .nut. .nut is very flexible.
 
     # We'll try to use 'rawvideo' codec in 'nut' container if we want to be sure to support obscure pixel formats,
@@ -130,8 +130,8 @@ def generate_test_video(ffmpeg_path, output_path, pix_fmt, duration=1.0):
     # Does the user want to test:
     # A) Which pixel formats *can be decoded by NVDEC hardware*?
     #    -> In this case, we MUST encode using H264/HEVC. If the pixel format isn't supported by H264/HEVC, NVDEC can't decode it anyway.
-    # B) Which pixel formats *can be handled by CeLux's NVDEC pipeline* (e.g. including sw-fallback or format conversion)?
-    #    -> If CeLux is strict "NVDEC only", then (A).
+    # B) Which pixel formats *can be handled by NeLux's NVDEC pipeline* (e.g. including sw-fallback or format conversion)?
+    #    -> If NeLux is strict "NVDEC only", then (A).
     #
     # Given the prompt "testscript for nvdec decode ... that tests all possible pix_fmts and see what is and what isn't supported",
     # it implies finding the boundary of NVDEC support.
@@ -214,9 +214,9 @@ def compare_frames(frame_a, frame_b, threshold=5.0):
 
 
 def test_format(video_path, format_name):
-    """Tests decoding the video file using CeLux NVDEC and compares with CPU."""
-    if not HAS_CELUX:
-        return "Skipped (No CeLux)"
+    """Tests decoding the video file using NeLux NVDEC and compares with CPU."""
+    if not HAS_NELUX:
+        return "Skipped (No NeLux)"
 
     try:
         # 1. Decode with NVDEC

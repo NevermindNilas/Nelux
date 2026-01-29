@@ -3,14 +3,14 @@ import sys
 import torch
 import nelux
 
-print(f"CeLux version: {nelux.__version__}")
+print(f"NeLux version: {nelux.__version__}")
 print(f"CUDA support: {nelux.__cuda_support__}")
 
 if not nelux.__cuda_support__:
-    print("ERROR: CeLux installed but reports NO CUDA support!")
+    print("ERROR: NeLux installed but reports NO CUDA support!")
     sys.exit(1)
 
-video_path = r"f:/CeLux/benchmark_source.mp4"
+video_path = r"f:/NeLux/benchmark_source.mp4"
 if not os.path.exists(video_path):
     print(f"Warning: Test video not found at {video_path}, checking current dir...")
     video_path = "benchmark_source.mp4"

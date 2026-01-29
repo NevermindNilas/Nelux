@@ -1,15 +1,15 @@
-[![Release and Benchmark Tests](https://github.com/NevermindNilas/CeLux/actions/workflows/createRelease.yaml/badge.svg)](https://github.com/NevermindNilas/CeLux/actions/workflows/createRelease.yaml)
-[![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](https://github.com/NevermindNilas/CeLux/blob/master/LICENSE)
+[![Release and Benchmark Tests](https://github.com/NevermindNilas/NeLux/actions/workflows/createRelease.yaml/badge.svg)](https://github.com/NevermindNilas/NeLux/actions/workflows/createRelease.yaml)
+[![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](https://github.com/NevermindNilas/NeLux/blob/master/LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/nelux)](https://pypi.org/project/nelux/)
 [![PyPI - Downloads](https://img.shields.io/pypi/dm/nelux)](https://pypi.org/project/nelux/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/nelux)](https://pypi.org/project/nelux/)
 [![Discord](https://img.shields.io/discord/1041502781808328704.svg?label=Join%20Us%20on%20Discord&logo=discord&colorB=7289da)](https://discord.gg/hFSHjGyp4p)
 
-# CeLux
+# NeLux
 
-**CeLux** is a high-performance Python library for video processing, leveraging the power of FFmpeg with hardware acceleration (NVDEC/NVENC). It delivers some of the fastest decode times globally, enabling efficient video decoding directly into ML-ready PyTorch tensors.
+**NeLux** is a high-performance Python library for video processing, leveraging the power of FFmpeg with hardware acceleration (NVDEC/NVENC). It delivers some of the fastest decode times globally, enabling efficient video decoding directly into ML-ready PyTorch tensors.
 
-The name **CeLux** comes from the Latin words _celer_ (speed) and _lux_ (light), reflecting its commitment to speed and efficiency.
+The name **NeLux** comes from the Latin words _celer_ (speed) and _lux_ (light), reflecting its commitment to speed and efficiency.
 
 ---
 
@@ -19,7 +19,7 @@ The name **CeLux** comes from the Latin words _celer_ (speed) and _lux_ (light),
 pip install nelux
 ```
 
-**Note**: The package is named `nelux` on PyPI (not `celux`).
+**Note**: The package is named `nelux` on PyPI (not `nelux`).
 
 **For Linux**: Download the most recent release (.whl) and install manually:
 ```bash
@@ -154,8 +154,8 @@ VideoReader(
 
 ## Documentation
 
-- [Full Usage Guide](https://github.com/NevermindNilas/CeLux/blob/master/docs/usage.md) - Complete API reference
-- [Changelog](https://github.com/NevermindNilas/CeLux/blob/master/docs/CHANGELOG.md) - Version history
+- [Full Usage Guide](https://github.com/NevermindNilas/NeLux/blob/master/docs/usage.md) - Complete API reference
+- [Changelog](https://github.com/NevermindNilas/NeLux/blob/master/docs/CHANGELOG.md) - Version history
 - [Benchmarks](https://github.com/NevermindNilas/python-decoders-benchmarks) - Performance comparisons
 
 ---
@@ -172,8 +172,8 @@ VideoReader(
 ## Building from Source
 
 ```bash
-git clone https://github.com/NevermindNilas/CeLux.git
-cd CeLux
+git clone https://github.com/NevermindNilas/NeLux.git
+cd NeLux
 
 # Install dependencies
 pip install -r requirements.txt
@@ -194,8 +194,8 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 
 ## Acknowledgments
 
-- **[FFmpeg](https://ffmpeg.org/)**: The backbone of video processing in CeLux
+- **[FFmpeg](https://ffmpeg.org/)**: The backbone of video processing in NeLux
 - **[PyTorch](https://pytorch.org/)**: For tensor operations and CUDA integration
 - **[libyuv](https://chromium.googlesource.com/libyuv/libyuv/)**: For fast CPU color conversion
-- **Contributors**: Thanks to everyone who has contributed to CeLux!
+- **Contributors**: Thanks to everyone who has contributed to NeLux!
 

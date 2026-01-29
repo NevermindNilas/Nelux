@@ -7,13 +7,13 @@ import torch
 import numpy as np
 
 # Add FFmpeg DLLs
-ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
+ffmpeg_bin = r"D:\NeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
 import nelux
 
-INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
+INPUT_VIDEO = r"D:\NeLux\benchmark_source.mp4"
 
 
 def inspect_frames():

@@ -270,18 +270,18 @@ file(GLOB_RECURSE NELUX_SOURCES
 # Add CUDA sources if CUDA is enabled  
 if(NELUX_ENABLE_CUDA)
   # Add only the CUDA cpp files to main sources, but NOT the .cu files
-  file(GLOB CELUX_CUDA_CPP_SOURCES
+  file(GLOB NELUX_CUDA_CPP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cpp
   )
-  list(APPEND NELUX_SOURCES ${CELUX_CUDA_CPP_SOURCES})
+  list(APPEND NELUX_SOURCES ${NELUX_CUDA_CPP_SOURCES})
   
   # Create a separate CUDA library for .cu files
-  file(GLOB CELUX_CUDA_CU_SOURCES
+  file(GLOB NELUX_CUDA_CU_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cu
   )
   
-  if(CELUX_CUDA_CU_SOURCES)
-    add_library(NeluxCuda STATIC ${CELUX_CUDA_CU_SOURCES})
+  if(NELUX_CUDA_CU_SOURCES)
+    add_library(NeluxCuda STATIC ${NELUX_CUDA_CU_SOURCES})
     set_target_properties(NeluxCuda PROPERTIES
       CUDA_SEPARABLE_COMPILATION OFF
       POSITION_INDEPENDENT_CODE ON
@@ -298,10 +298,10 @@ if(NELUX_ENABLE_CUDA)
     )
     target_compile_definitions(NeluxCuda PUBLIC NELUX_ENABLE_CUDA)
     # Do NOT link CUDA::cudart here - let the runtime be resolved at link time
-    message(STATUS "CUDA .cu sources: ${CELUX_CUDA_CU_SOURCES}")
+    message(STATUS "CUDA .cu sources: ${NELUX_CUDA_CU_SOURCES}")
   endif()
   
-  message(STATUS "CUDA .cpp sources: ${CELUX_CUDA_CPP_SOURCES}")
+  message(STATUS "CUDA .cpp sources: ${NELUX_CUDA_CPP_SOURCES}")
 endif()
 
 add_library(NeluxLib STATIC ${NELUX_SOURCES})
@@ -503,15 +503,15 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
         message(WARNING "[CUDA DEBUG] NO DLLs found in ${CUDA_BIN_DIR}!")
       endif()
 
-      file(GLOB CELUX_CUDA_DLLS
+      file(GLOB NELUX_CUDA_DLLS
         "${CUDA_BIN_DIR}/cudart64_*.dll"
         "${CUDA_BIN_DIR}/nvrtc64_*.dll"
       )
       
-      list(LENGTH CELUX_CUDA_DLLS _cuda_dlls_found)
+      list(LENGTH NELUX_CUDA_DLLS _cuda_dlls_found)
       if(_cuda_dlls_found GREATER 0)
-        list(APPEND NELUX_DLLS ${CELUX_CUDA_DLLS})
-        message(STATUS "[CUDA DEBUG] Found ${_cuda_dlls_found} CUDA DLLs to bundle: ${CELUX_CUDA_DLLS}")
+        list(APPEND NELUX_DLLS ${NELUX_CUDA_DLLS})
+        message(STATUS "[CUDA DEBUG] Found ${_cuda_dlls_found} CUDA DLLs to bundle: ${NELUX_CUDA_DLLS}")
       else()
         message(WARNING "[CUDA DEBUG] GLOB found NO cudart64_*.dll or nvrtc64_*.dll in ${CUDA_BIN_DIR}!")
       endif()

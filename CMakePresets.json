@@ -1,4 +1,4 @@
-﻿{
+{
   "version": 3,
   "cmakeMinimumRequired": {
     "major": 3,
@@ -28,7 +28,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CELUX_ENABLE_CUDA": "OFF"
+        "NELUX_ENABLE_CUDA": "OFF"
       }
     },
     {
@@ -37,7 +37,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CELUX_ENABLE_CUDA": "OFF"
+        "NELUX_ENABLE_CUDA": "OFF"
       }
     },
     {
@@ -46,8 +46,8 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CELUX_ENABLE_CUDA": "OFF",
-        "CELUX_ENABLE_AVX2": "OFF"
+        "NELUX_ENABLE_CUDA": "OFF",
+        "NELUX_ENABLE_AVX2": "OFF"
       }
     },
     {
@@ -56,7 +56,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CELUX_ENABLE_CUDA": "ON"
+        "NELUX_ENABLE_CUDA": "ON"
       }
     },
     {
@@ -65,7 +65,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CELUX_ENABLE_CUDA": "ON"
+        "NELUX_ENABLE_CUDA": "ON"
       }
     }
   ],

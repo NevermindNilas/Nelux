@@ -1,5 +1,5 @@
 """
-CeLux Decode/Encode Pipeline Benchmark
+NeLux Decode/Encode Pipeline Benchmark
 Tests 4 pipeline configurations:
 1. CPU → CPU: CPU decode (libx264) → CPU encode (libx264)
 2. CPU → GPU: CPU decode → GPU encode (h264_nvenc)
@@ -14,14 +14,14 @@ import tempfile
 import torch
 
 # Add FFmpeg DLLs
-ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
+ffmpeg_bin = r"D:\NeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
 import nelux
 
 # Configuration
-INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
+INPUT_VIDEO = r"D:\NeLux\benchmark_source.mp4"
 NUM_WARMUP_FRAMES = 10
 NUM_BENCHMARK_FRAMES = 200  # Benchmark this many frames
 
@@ -130,10 +130,10 @@ def benchmark_pipeline(name: str, decode_accel: str, encode_codec: str) -> dict:
 
 def main():
     print("=" * 60)
-    print("CeLux Decode/Encode Pipeline Benchmark")
+    print("NeLux Decode/Encode Pipeline Benchmark")
     print("=" * 60)
 
-    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"\nNeLux version: {nelux.__version__}")
     print(f"CUDA support: {nelux.__cuda_support__}")
     print(f"PyTorch CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():

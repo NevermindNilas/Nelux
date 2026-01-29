@@ -56,7 +56,7 @@ jobs:
       run: |
         echo "${{ runner.temp }}/vcpkg/installed/x64-windows/tools/ffmpeg" >> $GITHUB_PATH
 
-    - name: Install Celux (Build from Source)
+    - name: Install Nelux (Build from Source)
       shell: bash
       env:
         SKBUILD_GENERATOR: Ninja

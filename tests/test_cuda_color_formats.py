@@ -33,9 +33,9 @@ except ImportError:
 try:
     import nelux
 
-    HAS_CELUX = True
+    HAS_NELUX = True
 except ImportError:
-    HAS_CELUX = False
+    HAS_NELUX = False
     print("Warning: nelux not available")
 
 try:
@@ -182,15 +182,15 @@ def generate_test_video(
         return False
 
 
-def test_decode_with_celux(
+def test_decode_with_nelux(
     video_path: str, use_cuda: bool = True, num_frames: int = 60
 ):
     """
-    Test decoding a video with CeLux and measure performance.
+    Test decoding a video with NeLux and measure performance.
 
     Returns dict with results or None on failure.
     """
-    if not HAS_CELUX:
+    if not HAS_NELUX:
         return None
 
     results = {
@@ -260,7 +260,7 @@ def test_color_accuracy(video_path: str, expected_color_space: str):
     This is a basic sanity check - a proper test would compare against
     a reference implementation.
     """
-    if not HAS_CELUX or not HAS_NUMPY:
+    if not HAS_NELUX or not HAS_NUMPY:
         return None
 
     try:
@@ -355,7 +355,7 @@ def run_format_tests(formats_to_test, temp_dir: str, use_cuda: bool = True):
             # Test CUDA decoding (with protected call)
             print(f"  Testing {'CUDA/NVDEC' if use_cuda else 'CPU'} decoding...")
             try:
-                decode_results = test_decode_with_celux(
+                decode_results = test_decode_with_nelux(
                     video_path, use_cuda=use_cuda, num_frames=90
                 )
             except KeyboardInterrupt:
@@ -379,7 +379,7 @@ def run_format_tests(formats_to_test, temp_dir: str, use_cuda: bool = True):
                     f"  ❌ Decoding failed: {decode_results.get('error', 'unknown error')}"
                 )
             else:
-                print(f"  ⚠ Decoding test skipped (CeLux not available)")
+                print(f"  ⚠ Decoding test skipped (NeLux not available)")
 
             # Test color accuracy (with protected call)
             if decode_results and decode_results.get("success"):
@@ -463,7 +463,7 @@ def compare_cpu_vs_cuda(temp_dir: str):
         # Test CPU decoding
         print("\nCPU Decoding:")
         try:
-            cpu_results = test_decode_with_celux(
+            cpu_results = test_decode_with_nelux(
                 video_path, use_cuda=False, num_frames=150
             )
             if cpu_results and cpu_results["success"]:
@@ -481,7 +481,7 @@ def compare_cpu_vs_cuda(temp_dir: str):
         # Test CUDA decoding
         print("\nCUDA/NVDEC Decoding:")
         try:
-            cuda_results = test_decode_with_celux(
+            cuda_results = test_decode_with_nelux(
                 video_path, use_cuda=True, num_frames=150
             )
             if cuda_results and cuda_results["success"]:
@@ -551,7 +551,7 @@ The CUDA color conversion kernel expects NV12 from NVDEC.
 
         print("\nDecoding YUV420P source with NVDEC:")
         try:
-            yuv420p_results = test_decode_with_celux(
+            yuv420p_results = test_decode_with_nelux(
                 yuv420p_path, use_cuda=True, num_frames=60
             )
             if yuv420p_results and yuv420p_results.get("success"):
@@ -611,7 +611,7 @@ def main():
     print("\nDependency Check:")
     print(f"  PyTorch: {'✓' if HAS_TORCH else '❌'}")
     print(f"  NumPy: {'✓' if HAS_NUMPY else '❌'}")
-    print(f"  CeLux: {'✓' if HAS_CELUX else '❌'}")
+    print(f"  NeLux: {'✓' if HAS_NELUX else '❌'}")
     print(f"  FFmpeg: {'✓' if check_ffmpeg() else '❌'}")
 
     if HAS_TORCH and torch.cuda.is_available():
@@ -623,8 +623,8 @@ def main():
         print("\nError: FFmpeg is required to generate test videos")
         return 1
 
-    if not HAS_CELUX:
-        print("\nError: CeLux is required for decoding tests")
+    if not HAS_NELUX:
+        print("\nError: NeLux is required for decoding tests")
         return 1
 
     # Parse arguments

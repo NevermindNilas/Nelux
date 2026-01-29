@@ -75,24 +75,24 @@ def ffmpeg_rgb24_pipe(path):
 
 def compare_with_ffmpeg(path):
     """
-    Compare every frame from Celux vs. an ffmpeg RGB24 pipe.
+    Compare every frame from Nelux vs. an ffmpeg RGB24 pipe.
     Displays side-by-side in OpenCV and logs a sample pixel + MAD.
     """
     ce_reader = VideoReader(path)
     ff_pipe = ffmpeg_rgb24_pipe(path)
 
-    for idx, celux_frame in enumerate(ce_reader):
+    for idx, nelux_frame in enumerate(ce_reader):
         # --- read & prep raw arrays ---
-        arr_celux = celux_frame.numpy()
+        arr_nelux = nelux_frame.numpy()
 
         # Handle Float32 output (likely 0.0-1.0 range)
-        if arr_celux.dtype == np.float32:
+        if arr_nelux.dtype == np.float32:
             # Simple heuristic: if max <= 1.0, assume 0-1 range and scale up
-            # (Or just always scale if we know CeLux now outputs 0-1 float)
+            # (Or just always scale if we know NeLux now outputs 0-1 float)
             # We'll assume 0-1 for float32 as per standard ffmpeg/swscale behavior for float formats.
-            arr_celux = (arr_celux * 255.0).clip(0, 255).astype(np.uint8)
+            arr_nelux = (arr_nelux * 255.0).clip(0, 255).astype(np.uint8)
         else:
-            arr_celux = arr_celux.astype(np.uint8)
+            arr_nelux = arr_nelux.astype(np.uint8)
 
         try:
             arr_ff = next(ff_pipe)  # RGB
@@ -101,30 +101,30 @@ def compare_with_ffmpeg(path):
             break
 
         # shape check
-        if arr_ff.shape != arr_celux.shape:
+        if arr_ff.shape != arr_nelux.shape:
             raise RuntimeError(
-                f"Shape mismatch on frame {idx}: {arr_celux.shape} vs {arr_ff.shape}"
+                f"Shape mismatch on frame {idx}: {arr_nelux.shape} vs {arr_ff.shape}"
             )
 
         # compute Mean Absolute Difference
-        diff = np.abs(arr_celux.astype(int) - arr_ff.astype(int))
+        diff = np.abs(arr_nelux.astype(int) - arr_ff.astype(int))
         mad = diff.mean()
 
         # --- logging ---
-        h0, w0, _ = arr_celux.shape
+        h0, w0, _ = arr_nelux.shape
         # pick center pixel for a quick sanity check
         yc, xc = h0 // 2, w0 // 2
         print(
             f"[Frame {idx:03d}] "
-            f"Sample@({xc},{yc}) CeLux={arr_celux[yc, xc]} "
+            f"Sample@({xc},{yc}) NeLux={arr_nelux[yc, xc]} "
             f"FFmpeg={arr_ff[yc, xc]}  MAD={mad:.2f}"
         )
 
         # --- prepare for display (OpenCV wants BGR) ---
-        arr_celux_bgr = cv2.cvtColor(arr_celux, cv2.COLOR_RGB2BGR)
+        arr_nelux_bgr = cv2.cvtColor(arr_nelux, cv2.COLOR_RGB2BGR)
         arr_ff_bgr = cv2.cvtColor(arr_ff, cv2.COLOR_RGB2BGR)
 
-        combined = np.hstack((arr_celux_bgr, arr_ff_bgr))
+        combined = np.hstack((arr_nelux_bgr, arr_ff_bgr))
 
         # scale down if too large
         h, w = combined.shape[:2]
@@ -144,7 +144,7 @@ def compare_with_ffmpeg(path):
         )
 
         # show & handle keys
-        cv2.imshow("CeLux (L) | FFmpeg (R)", display)
+        cv2.imshow("NeLux (L) | FFmpeg (R)", display)
         key = cv2.waitKey(0) & 0xFF
         if key == ord("q"):
             break
