@@ -29,7 +29,8 @@ Issues = "https://github.com/NevermindNilas/Nelux/issues"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-ninja.make-fallback = true
+cmake.verbose = true
+ninja.make-fallback = false
 
 [tool.scikit-build.cmake.define]
 NELUX_ENABLE_CUDA = {env="NELUX_ENABLE_CUDA", default="OFF"}

@@ -462,18 +462,34 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     set(_vcpkg_triplet "x64-windows")
   endif()
   
+  # vcpkg can put DLLs in different locations depending on mode:
+  # - Classic mode: vcpkg/installed/<triplet>/bin/
+  # - Manifest mode: vcpkg/packages/<package>_<triplet>/bin/
   if(DEFINED ENV{VCPKG_ROOT})
     file(TO_CMAKE_PATH "$ENV{VCPKG_ROOT}" _vcpkg_root_cmake)
-    set(VCPKG_BIN "${_vcpkg_root_cmake}/installed/${_vcpkg_triplet}/bin")
+    set(VCPKG_INSTALLED_BIN "${_vcpkg_root_cmake}/installed/${_vcpkg_triplet}/bin")
+    set(VCPKG_PACKAGES_DIR "${_vcpkg_root_cmake}/packages")
   else()
-    set(VCPKG_BIN "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_vcpkg_triplet}/bin")
+    set(VCPKG_INSTALLED_BIN "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_vcpkg_triplet}/bin")
+    set(VCPKG_PACKAGES_DIR "${CMAKE_SOURCE_DIR}/vcpkg/packages")
   endif()
   
+  # Try installed directory first (classic mode)
   file(GLOB NELUX_DLLS
-    "${VCPKG_BIN}/libyuv*.dll"
-    "${VCPKG_BIN}/spdlog*.dll"
-    "${VCPKG_BIN}/fmt*.dll"
+    "${VCPKG_INSTALLED_BIN}/libyuv*.dll"
+    "${VCPKG_INSTALLED_BIN}/spdlog*.dll"
+    "${VCPKG_INSTALLED_BIN}/fmt*.dll"
   )
+  
+  # If not found, try packages directory (manifest mode)
+  if(NOT NELUX_DLLS)
+    message(STATUS "DLLs not found in installed directory, checking packages directory...")
+    file(GLOB NELUX_DLLS
+      "${VCPKG_PACKAGES_DIR}/libyuv_${_vcpkg_triplet}/bin/libyuv*.dll"
+      "${VCPKG_PACKAGES_DIR}/spdlog_${_vcpkg_triplet}/bin/spdlog*.dll"
+      "${VCPKG_PACKAGES_DIR}/fmt_${_vcpkg_triplet}/bin/fmt*.dll"
+    )
+  endif()
 
   if(NELUX_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -503,9 +519,15 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
         message(WARNING "[CUDA DEBUG] NO DLLs found in ${CUDA_BIN_DIR}!")
       endif()
 
+      # CUDA 13+ stores DLLs in bin/x64 subdirectory
       file(GLOB NELUX_CUDA_DLLS
+        "${CUDA_BIN_DIR}/x64/cudart64_*.dll"
+        "${CUDA_BIN_DIR}/x64/nvrtc64_*.dll"
+        "${CUDA_BIN_DIR}/x64/nvrtc-builtins64_*.dll"
+        # Also try root bin directory for older CUDA versions
         "${CUDA_BIN_DIR}/cudart64_*.dll"
         "${CUDA_BIN_DIR}/nvrtc64_*.dll"
+        "${CUDA_BIN_DIR}/nvrtc-builtins64_*.dll"
       )
       
       list(LENGTH NELUX_CUDA_DLLS _cuda_dlls_found)

@@ -4,6 +4,25 @@ ffmpy.egg-info/*
 build/*
 celux/*.dll
 celux/_celux.pyd
+nelux/*.dll
+nelux/_nelux.pyd
+nelux/*.so
+
+# Build scripts (generated)
+scripts/
+
+# Documentation build artifacts
+docs/BUILD.md
+
+# vcpkg build artifacts
+vcpkg_installed/
+vcpkg.json
+
+# VS Code settings
+.vscode/
+
+# Misc build artifacts
+nul
 
 # For me 
 setup_dev.ps1
