@@ -3,6 +3,8 @@
 
 #ifdef NELUX_ENABLE_CUDA
 
+#include <cuda_fp16.h>
+
 #include <Logger.hpp>
 #include <error/CxException.hpp>
 #include <stdexcept>
