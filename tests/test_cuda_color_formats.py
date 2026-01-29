@@ -31,12 +31,12 @@ except ImportError:
     print("Warning: PyTorch not available, some tests will be skipped")
 
 try:
-    import celux
+    import nelux
 
     HAS_CELUX = True
 except ImportError:
     HAS_CELUX = False
-    print("Warning: CeLux not available")
+    print("Warning: nelux not available")
 
 try:
     import numpy as np
@@ -206,7 +206,7 @@ def test_decode_with_celux(
     try:
         # Create reader with specified backend
         accelerator = "nvdec" if use_cuda else "cpu"
-        reader = celux.VideoReader(
+        reader = nelux.VideoReader(
             video_path,
             num_threads=4,
             decode_accelerator=accelerator,
@@ -264,7 +264,7 @@ def test_color_accuracy(video_path: str, expected_color_space: str):
         return None
 
     try:
-        reader = celux.VideoReader(
+        reader = nelux.VideoReader(
             video_path,
             num_threads=4,
             decode_accelerator="nvdec",
@@ -604,7 +604,7 @@ def print_summary(results):
 
 def main():
     print("=" * 60)
-    print("CeLux CUDA Color Format Test Suite")
+    print("nelux CUDA Color Format Test Suite")
     print("=" * 60)
 
     # Check dependencies
@@ -651,7 +651,7 @@ def main():
         os.makedirs(temp_dir, exist_ok=True)
         cleanup = False
     else:
-        temp_dir = tempfile.mkdtemp(prefix="celux_test_")
+        temp_dir = tempfile.mkdtemp(prefix="nelux_test_")
         cleanup = not args.keep_videos
 
     print(f"\nTest videos directory: {temp_dir}")

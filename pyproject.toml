@@ -21,16 +21,16 @@ classifiers = [
 keywords = ["ffmpeg", "video", "ml", "pytorch", "decode", "tensors", "inference"]
 
 [project.urls]
-Homepage = "https://github.com/NevermindNilas/CeLux"
-Repository = "https://github.com/NevermindNilas/CeLux"
-Documentation = "https://github.com/NevermindNilas/CeLux/blob/master/README.md"
-Changelog = "https://github.com/NevermindNilas/CeLux/blob/master/docs/CHANGELOG.md"
-Issues = "https://github.com/NevermindNilas/CeLux/issues"
+Homepage = "https://github.com/NevermindNilas/Nelux"
+Repository = "https://github.com/NevermindNilas/Nelux"
+Documentation = "https://github.com/NevermindNilas/Nelux/blob/master/README.md"
+Changelog = "https://github.com/NevermindNilas/Nelux/blob/master/docs/CHANGELOG.md"
+Issues = "https://github.com/NevermindNilas/Nelux/issues"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
 ninja.make-fallback = true
 
 [tool.scikit-build.cmake.define]
-CELUX_ENABLE_CUDA = {env="CELUX_ENABLE_CUDA", default="OFF"}
+NELUX_ENABLE_CUDA = {env="NELUX_ENABLE_CUDA", default="OFF"}
 

@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 import torch
 
-from celux import VideoReader
+from nelux import VideoReader
 from utils.video_downloader import (
     get_video,
 )  # utility to download open source test clips

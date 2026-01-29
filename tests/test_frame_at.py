@@ -5,7 +5,7 @@ import cv2
 import torch
 import sys
 
-from celux import VideoReader
+from nelux import VideoReader
 from tests.utils.video_downloader import (
     get_video,
 )  # utility to download open source test clips

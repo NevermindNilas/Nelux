@@ -10,7 +10,7 @@ if os.name == "nt":
     except Exception:
         pass
 
-import celux
+import nelux
 import torch
 import time
 
@@ -24,7 +24,7 @@ def test_nvenc_encoding(codec_name, device, width=1920, height=1080, frames=60):
 
     try:
         # Initialize encoder
-        encoder = celux.VideoEncoder(
+        encoder = nelux.VideoEncoder(
             output_file,
             codec=codec_name,
             width=width,
@@ -99,21 +99,21 @@ def test_nvenc_encoding(codec_name, device, width=1920, height=1080, frames=60):
 
 
 def main():
-    print(f"CeLux Version: {celux.__version__}")
-    if hasattr(celux, "__cuda_support__"):
-        print(f"CUDA Support: {celux.__cuda_support__}")
+    print(f"CeLux Version: {nelux.__version__}")
+    if hasattr(nelux, "__cuda_support__"):
+        print(f"CUDA Support: {nelux.__cuda_support__}")
 
     # 1. Discover NVENC encoders
     print("\nScanning for NVENC encoders...")
 
-    # Fallback to _celux if get_available_encoders not exported in __init__
-    if hasattr(celux, "get_available_encoders"):
-        encoders = celux.get_available_encoders()
-    elif hasattr(celux, "_celux") and hasattr(celux._celux, "get_available_encoders"):
-        print("NOTE: Using celux._celux.get_available_encoders (missing export)")
-        encoders = celux._celux.get_available_encoders()
+    # Fallback to _nelux if get_available_encoders not exported in __init__
+    if hasattr(nelux, "get_available_encoders"):
+        encoders = nelux.get_available_encoders()
+    elif hasattr(nelux, "_nelux") and hasattr(nelux._nelux, "get_available_encoders"):
+        print("NOTE: Using nelux._nelux.get_available_encoders (missing export)")
+        encoders = nelux._nelux.get_available_encoders()
     else:
-        print("ERROR: get_available_encoders not found in celux or celux._celux")
+        print("ERROR: get_available_encoders not found in nelux or nelux._nelux")
         # Try to continue with hardcoded NVENC codecs just in case
         print("Assuming NVENC codecs exist...")
         encoders = [

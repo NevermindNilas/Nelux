@@ -14,7 +14,7 @@ ffmpeg_bin = r"C:\Users\nilas\AppData\Roaming\TheAnimeScripter\ffmpeg_shared"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
-import celux
+import nelux
 
 # Try to import torchmetrics for SSIM, fall back to manual calculation
 try:
@@ -65,11 +65,11 @@ def calculate_ssim_simple(original: torch.Tensor, encoded: torch.Tensor) -> floa
 
 def encode_test_video(decode_accel: str, encode_codec: str, output_path: str):
     """Encode a test video with specific settings."""
-    reader = celux.VideoReader(
+    reader = nelux.VideoReader(
         INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
     )
 
-    encoder = celux.VideoEncoder(
+    encoder = nelux.VideoEncoder(
         output_path=output_path,
         codec=encode_codec,
         width=reader.width,
@@ -96,10 +96,10 @@ def compare_videos(original_path: str, encoded_path: str, name: str):
     print(f"{'=' * 60}")
 
     # Open both videos
-    orig_reader = celux.VideoReader(
+    orig_reader = nelux.VideoReader(
         original_path, decode_accelerator="cpu", backend="pytorch"
     )
-    enc_reader = celux.VideoReader(
+    enc_reader = nelux.VideoReader(
         encoded_path, decode_accelerator="cpu", backend="pytorch"
     )
 
@@ -165,7 +165,7 @@ def main():
     print("CeLux Encoding Quality Comparison")
     print("=" * 60)
 
-    print(f"\nCeLux version: {celux.__version__}")
+    print(f"\nCeLux version: {nelux.__version__}")
     print(f"Input video: {INPUT_VIDEO}")
 
     results = []
@@ -181,7 +181,7 @@ def main():
 
     for name, decode_accel, encode_codec in configs:
         output_path = os.path.join(
-            temp_dir, f"celux_quality_{encode_codec}_{decode_accel}.mp4"
+            temp_dir, f"nelux_quality_{encode_codec}_{decode_accel}.mp4"
         )
 
         try:

@@ -1,4 +1,44 @@
 
+### **Version 0.8.7 (2026-01-29)**
+
+#### **Lazy Loading for Faster Imports**
+- **Improved:** Heavy dependencies (torch, C extensions, DLLs) are now loaded lazily.
+  - `import celux` no longer triggers immediate loading of torch or C extensions.
+  - DLL path setup on Windows only occurs when VideoReader or other classes are actually instantiated.
+  - Significantly faster import times for scripts that only need to check version or metadata.
+  
+  ```python
+  import celux  # Fast! No heavy imports yet
+  
+  # Checking metadata is still fast
+  print(celux.__version__)  # Only loads version info
+  
+  # Heavy imports happen here
+  vr = celux.VideoReader("video.mp4")  # Loads torch, DLLs, C extension
+  ```
+
+#### **Improved DLL Error Messages**
+- **Added:** Specific DLL error detection with exact file names and components.
+  - Errors now pinpoint the exact missing DLL (e.g., `'avcodec-60.dll'`).
+  - Identifies the component: FFmpeg, libyuv, CUDA Runtime, or NVIDIA drivers.
+  - Provides specific solutions based on which DLL is missing.
+  - Shows package directory location for troubleshooting.
+  
+  ```python
+  # Before: Generic "DLL load failed" error
+  # ImportError: DLL load failed while importing _celux: The specified module could not be found.
+  
+  # After: Specific error with exact DLL and component:
+  # ImportError: Failed to load CeLux: 'avcodec-60.dll' is missing
+  # Component: FFmpeg
+  # Description: FFmpeg video/audio processing library
+  # FFmpeg DLLs can be located in:
+  #   - System PATH environment variable
+  #   - A shared library directory (e.g., nelux.libs)
+  #   - The CeLux package directory
+  # Make sure FFmpeg shared libraries are installed and accessible.
+  ```
+
 ### **Version 0.8.6 (2026-01-28)**
 
 #### **Major: High-Performance Encoding Pipeline (GPU & CPU)**

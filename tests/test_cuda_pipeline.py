@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 import torch
 import torch.cuda as cuda
-import celux
+import nelux
 
 # Configuration
 VIDEO_PATH = r"F:/CeLux/tests/data/default/demo_output.mp4"
@@ -97,7 +97,7 @@ class ConsumerThread(threading.Thread):
             print(f"[Consumer] Starting decoder on CUDA:{self.device_index}")
 
             # Open video with NVDEC acceleration
-            reader = celux.VideoReader(
+            reader = nelux.VideoReader(
                 self.video_path,
                 decode_accelerator="nvdec",
                 cuda_device_index=self.device_index,

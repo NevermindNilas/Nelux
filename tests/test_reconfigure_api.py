@@ -10,7 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import time
-import celux
+import nelux
 
 # Test videos - use existing test data
 VIDEO1 = r"D:\CeLux\tests\data\sample_h264.mp4"
@@ -22,7 +22,7 @@ def test_reconfigure_basic():
     print("\n=== Basic Reconfigure Test ===")
 
     # Create reader with first video
-    reader = celux.VideoReader(VIDEO1)
+    reader = nelux.VideoReader(VIDEO1)
     print(f"Initial file: {reader.file_path}")
     print(f"Initial properties: {reader.width}x{reader.height} @ {reader.fps:.2f} FPS")
 
@@ -58,7 +58,7 @@ def test_reconfigure_performance():
     # Method 1: Create new reader each time
     start = time.perf_counter()
     for _ in range(iterations):
-        reader = celux.VideoReader(VIDEO1)
+    reader = nelux.VideoReader(VIDEO1)
         # Read one frame to ensure decoder is initialized
         for frame in reader:
             break
@@ -69,7 +69,7 @@ def test_reconfigure_performance():
     )
 
     # Method 2: Reuse reader with reconfigure()
-    reader = celux.VideoReader(VIDEO1)
+    reader = nelux.VideoReader(VIDEO1)
     # Warm up - read one frame
     for frame in reader:
         break
@@ -98,7 +98,7 @@ def test_reconfigure_state_reset():
     """Test that reconfigure properly resets iteration state."""
     print("\n=== State Reset Test ===")
 
-    reader = celux.VideoReader(VIDEO1)
+    reader = nelux.VideoReader(VIDEO1)
 
     # Read several frames to advance the iterator
     frames_read_first = 0
@@ -125,7 +125,7 @@ def test_reconfigure_state_reset():
 
 
 def main():
-    print(f"CeLux version: {celux.__version__}")
+    print(f"CeLux version: {nelux.__version__}")
     print("Testing decoder reconfiguration API...")
 
     # Verify test videos exist

@@ -12,7 +12,7 @@ ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
-import celux
+import nelux
 
 INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
 
@@ -23,14 +23,14 @@ def test_hevc_nvenc():
     print("Testing HEVC NVENC (hevc_nvenc) Encoding")
     print("=" * 60)
 
-    print(f"\nCeLux version: {celux.__version__}")
-    print(f"CUDA support: {celux.__cuda_support__}")
+    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"CUDA support: {nelux.__cuda_support__}")
 
     # List available encoders
-    encoders = celux.get_available_encoders()
+    encoders = nelux.get_available_encoders()
     print(f"\nAvailable encoders: {encoders}")
 
-    nvenc_encoders = celux.get_nvenc_encoders()
+    nvenc_encoders = nelux.get_nvenc_encoders()
     nvenc_names = [e["name"] for e in nvenc_encoders]
     print(f"NVENC encoders: {nvenc_names}")
 
@@ -52,13 +52,13 @@ def test_hevc_nvenc():
 
         try:
             # Open reader
-            reader = celux.VideoReader(
+            reader = nelux.VideoReader(
                 INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
             )
             print(f"  Input: {reader.width}x{reader.height} @ {reader.fps:.2f} fps")
 
             # Create encoder
-            encoder = celux.VideoEncoder(
+            encoder = nelux.VideoEncoder(
                 output_path=output_path,
                 codec=codec,
                 width=reader.width,
@@ -89,7 +89,7 @@ def test_hevc_nvenc():
                 )
 
                 # Verify we can decode the HEVC output
-                verify_reader = celux.VideoReader(
+                verify_reader = nelux.VideoReader(
                     output_path, decode_accelerator="cpu", backend="pytorch"
                 )
                 verify_frame = verify_reader.read_frame()

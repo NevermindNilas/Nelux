@@ -18,7 +18,7 @@ ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
-import celux
+import nelux
 
 # Configuration
 INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
@@ -37,12 +37,12 @@ def benchmark_pipeline(name: str, decode_accel: str, encode_codec: str) -> dict:
 
     # Create temp output file
     output_path = os.path.join(
-        tempfile.gettempdir(), f"celux_bench_{name.replace(' ', '_')}.mp4"
+        tempfile.gettempdir(), f"nelux_bench_{name.replace(' ', '_')}.mp4"
     )
 
     try:
         # Open reader
-        reader = celux.VideoReader(
+        reader = nelux.VideoReader(
             INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
         )
 
@@ -51,7 +51,7 @@ def benchmark_pipeline(name: str, decode_accel: str, encode_codec: str) -> dict:
         )
 
         # Open encoder
-        encoder = celux.VideoEncoder(
+        encoder = nelux.VideoEncoder(
             output_path=output_path,
             codec=encode_codec,
             width=reader.width,
@@ -133,8 +133,8 @@ def main():
     print("CeLux Decode/Encode Pipeline Benchmark")
     print("=" * 60)
 
-    print(f"\nCeLux version: {celux.__version__}")
-    print(f"CUDA support: {celux.__cuda_support__}")
+    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"CUDA support: {nelux.__cuda_support__}")
     print(f"PyTorch CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
@@ -143,7 +143,7 @@ def main():
 
     # Check available encoders
     try:
-        nvenc_encoders = celux.get_nvenc_encoders()
+        nvenc_encoders = nelux.get_nvenc_encoders()
         has_nvenc = len(nvenc_encoders) > 0
     except AttributeError:
         # Fallback: try to detect NVENC by attempting to use it
@@ -178,7 +178,7 @@ def main():
         print("\nSkipping CPU→GPU: NVENC not available")
 
     # 3. GPU → CPU
-    if celux.__cuda_support__:
+    if nelux.__cuda_support__:
         results.append(
             benchmark_pipeline(
                 name="GPU to CPU",
@@ -190,7 +190,7 @@ def main():
         print("\nSkipping GPU→CPU: CUDA not supported in build")
 
     # 4. GPU → GPU
-    if celux.__cuda_support__ and has_nvenc:
+    if nelux.__cuda_support__ and has_nvenc:
         results.append(
             benchmark_pipeline(
                 name="GPU to GPU",

@@ -11,7 +11,7 @@ ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
-import celux
+import nelux
 
 INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
 
@@ -20,7 +20,7 @@ def inspect_frames():
     """Compare pixel values between original and re-encoded video."""
 
     # Read original
-    orig_reader = celux.VideoReader(
+    orig_reader = nelux.VideoReader(
         INPUT_VIDEO, decode_accelerator="cpu", backend="pytorch"
     )
     print(f"Original video: {orig_reader.width}x{orig_reader.height}")
@@ -42,9 +42,9 @@ def inspect_frames():
     # Encode a few frames
     import tempfile
 
-    output_path = os.path.join(tempfile.gettempdir(), "celux_debug_quality.mp4")
+    output_path = os.path.join(tempfile.gettempdir(), "nelux_debug_quality.mp4")
 
-    encoder = celux.VideoEncoder(
+    encoder = nelux.VideoEncoder(
         output_path=output_path,
         codec="libx264",
         width=orig_reader.width,
@@ -61,7 +61,7 @@ def inspect_frames():
     encoder.close()
 
     # Read back encoded
-    enc_reader = celux.VideoReader(
+    enc_reader = nelux.VideoReader(
         output_path, decode_accelerator="cpu", backend="pytorch"
     )
     enc_frame = enc_reader.read_frame()

@@ -3,7 +3,7 @@ import sys
 import time
 import numpy as np
 import torch
-import celux
+import nelux
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from tests.utils.video_downloader import get_video
@@ -12,7 +12,7 @@ VIDEO_PATH = get_video("lite")
 
 
 def run_benchmark(backend: str, max_frames: int = 200, convert_to_numpy: bool = False):
-    reader = celux.VideoReader(VIDEO_PATH, backend=backend)
+    reader = nelux.VideoReader(VIDEO_PATH, backend=backend)
 
     start = time.time()
     count = 0

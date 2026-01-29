@@ -12,7 +12,7 @@ if os.path.exists(ffmpeg_bin):
     # Add to PATH for subprocess
     os.environ["PATH"] += os.pathsep + ffmpeg_bin
 
-import celux
+import nelux
 
 INPUT_VIDEO = r"D:\CeLux\benchmark_source.mp4"
 FRAMES_TO_TEST = 500
@@ -25,21 +25,21 @@ def benchmark_celux_internal(decode_accel, encode_codec, desc):
     print(f"\n--- Benchmarking: {desc} ---")
 
     # Setup Reader
-    reader = celux.VideoReader(
+    reader = nelux.VideoReader(
         INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
     )
 
     # Setup Encoder
     output_path = os.devnull  # Write to null to test throughput (or temp file if strictly needed, but null avoids disk I/O bottleneck)
-    # CeLux VideoEncoder requires a real path or we can use a temp file.
+    # nelux VideoEncoder requires a real path or we can use a temp file.
     # Let's use a temp file to be realistic about file writing overhead, same as FFmpeg pipe usually outputs to file.
     import tempfile
 
     output_path = os.path.join(
-        tempfile.gettempdir(), f"celux_internal_{decode_accel}_{encode_codec}.mp4"
+        tempfile.gettempdir(), f"nelux_internal_{decode_accel}_{encode_codec}.mp4"
     )
 
-    encoder = celux.VideoEncoder(
+    encoder = nelux.VideoEncoder(
         output_path=output_path,
         codec=encode_codec,
         width=WIDTH,
@@ -56,7 +56,7 @@ def benchmark_celux_internal(decode_accel, encode_codec, desc):
 
     # Benchmark
     # Re-create reader since seek is not supported
-    reader = celux.VideoReader(
+    reader = nelux.VideoReader(
         INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
     )
     start_time = time.time()
@@ -85,7 +85,7 @@ def benchmark_ffmpeg_pipe(decode_accel, encode_codec, desc):
     print(f"\n--- Benchmarking: {desc} ---")
 
     # Setup Reader
-    reader = celux.VideoReader(
+    reader = nelux.VideoReader(
         INPUT_VIDEO, decode_accelerator=decode_accel, backend="pytorch"
     )
 
@@ -125,7 +125,7 @@ def benchmark_ffmpeg_pipe(decode_accel, encode_codec, desc):
     import tempfile
 
     output_path = os.path.join(
-        tempfile.gettempdir(), f"celux_pipe_{decode_accel}_{encode_codec}.mp4"
+        tempfile.gettempdir(), f"nelux_pipe_{decode_accel}_{encode_codec}.mp4"
     )
     ffmpeg_cmd.append(output_path)
 
@@ -207,23 +207,23 @@ def main():
         [
             (
                 benchmark_celux_internal,
-                ("cpu", "libx264", "CELUX CPU -> CELUX CPU (Internal)"),
-                "CELUX CPU -> CELUX CPU",
+                ("cpu", "libx264", "NELUX CPU -> NELUX CPU (Internal)"),
+                "NELUX CPU -> NELUX CPU",
             ),
             (
                 benchmark_celux_internal,
-                ("nvdec", "h264_nvenc", "CELUX GPU -> CELUX GPU (Internal)"),
-                "CELUX GPU -> CELUX GPU",
+                ("nvdec", "h264_nvenc", "NELUX GPU -> NELUX GPU (Internal)"),
+                "NELUX GPU -> NELUX GPU",
             ),
             (
                 benchmark_ffmpeg_pipe,
-                ("cpu", "libx264", "CELUX CPU -> FFMPEG PIPE (libx264)"),
-                "CELUX CPU -> FFPIPE CPU",
+                ("cpu", "libx264", "NELUX CPU -> FFMPEG PIPE (libx264)"),
+                "NELUX CPU -> FFPIPE CPU",
             ),
             (
                 benchmark_ffmpeg_pipe,
-                ("nvdec", "h264_nvenc", "CELUX GPU -> FFMPEG PIPE (h264_nvenc)"),
-                "CELUX GPU -> FFPIPE GPU",
+                ("nvdec", "h264_nvenc", "NELUX GPU -> FFMPEG PIPE (h264_nvenc)"),
+                "NELUX GPU -> FFPIPE GPU",
             ),
         ]
     ):

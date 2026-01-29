@@ -3,12 +3,14 @@ import numpy as np
 import cv2
 import torch
 import sys
+
 sys.path.append(".")
 
-from celux import VideoReader
+from nelux import VideoReader
 from utils.video_downloader import get_video
 
 VIDEO_PATH = get_video("lite")  # short clip for quick manual runs
+
 
 def tensor_to_bgr_uint8(frame: torch.Tensor, bit_depth: int) -> np.ndarray | None:
     """Convert HxWxC tensor (uint8/uint16/float/uint32) to uint8 BGR for imshow."""
@@ -31,6 +33,7 @@ def tensor_to_bgr_uint8(frame: torch.Tensor, bit_depth: int) -> np.ndarray | Non
         else:
             rgb8 = np.zeros_like(arr, dtype=np.uint8)
     return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
+
 
 def main():
     vr = VideoReader(VIDEO_PATH)
@@ -59,8 +62,16 @@ def main():
             if img is None:
                 print("Bad frame")
                 break
-            cv2.putText(img, f"Sequential frame {i}/{total_frames}", (15, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                img,
+                f"Sequential frame {i}/{total_frames}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
             cv2.imshow("Sequential", img)
             i += 1
 
@@ -71,8 +82,16 @@ def main():
                     rnd = vr.frame_at(t)  # explicit random-access path
                     rnd_img = tensor_to_bgr_uint8(rnd, bit_depth)
                     if rnd_img is not None:
-                        cv2.putText(rnd_img, f"Random @ {t:.3f}s (frame_at)", (15, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+                        cv2.putText(
+                            rnd_img,
+                            f"Random @ {t:.3f}s (frame_at)",
+                            (15, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (0, 200, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
                         cv2.imshow("RandomAccess", rnd_img)
                     last_random_show = i
                 except Exception as e:
@@ -84,30 +103,47 @@ def main():
                 smart = vr[near_ts]
                 smart_img = tensor_to_bgr_uint8(smart, bit_depth)
                 if smart_img is not None:
-                    cv2.putText(smart_img, f"Smart __getitem__ ~{near_ts:.3f}s", (15, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2, cv2.LINE_AA)
+                    cv2.putText(
+                        smart_img,
+                        f"Smart __getitem__ ~{near_ts:.3f}s",
+                        (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 200, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
                     cv2.imshow("SmartGetItem", smart_img)
             except Exception as e:
                 print(f"Smart __getitem__ failed: {e}")
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if key == ord("q"):
             break
-        elif key == ord(' '):
+        elif key == ord(" "):
             paused = not paused
-        elif key == ord('r'):
+        elif key == ord("r"):
             t = random.uniform(0.0, max(0.0, duration - 0.001))
             try:
                 rnd = vr.frame_at(t)
                 rnd_img = tensor_to_bgr_uint8(rnd, bit_depth)
                 if rnd_img is not None:
-                    cv2.putText(rnd_img, f"Random @ {t:.3f}s (manual)", (15, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+                    cv2.putText(
+                        rnd_img,
+                        f"Random @ {t:.3f}s (manual)",
+                        (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 200, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
                     cv2.imshow("RandomAccess", rnd_img)
             except Exception as e:
                 print(f"Random access failed: {e}")
 
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

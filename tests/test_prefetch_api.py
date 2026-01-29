@@ -9,9 +9,9 @@ import time
 sys.path.insert(0, r"D:\CeLux")
 
 try:
-    from celux import VideoReader
+    from nelux import VideoReader
 
-    print("✓ Successfully imported celux.VideoReader")
+    print("✓ Successfully imported nelux.VideoReader")
 except ImportError as e:
     print(f"✗ Failed to import: {e}")
     sys.exit(1)

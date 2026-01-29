@@ -1,8 +1,9 @@
 import time
 import os
-import celux
-from celux import VideoReader
+import nelux
+from nelux import VideoReader
 import torch
+
 
 def bench_sequential(path):
     print(f"--- Sequential Read ---")
@@ -13,7 +14,10 @@ def bench_sequential(path):
         _ = frame
         count += 1
     end = time.time()
-    print(f"Processed {count} frames in {end-start:.4f}s. FPS: {count/(end-start):.2f}")
+    print(
+        f"Processed {count} frames in {end - start:.4f}s. FPS: {count / (end - start):.2f}"
+    )
+
 
 def bench_skip_index(path, step=1):
     print(f"--- Index Read (step={step}) ---")
@@ -22,11 +26,13 @@ def bench_skip_index(path, step=1):
     count = 0
     start = time.time()
     for i in range(0, length, step):
-
         _ = vr[i]
         count += 1
     end = time.time()
-    print(f"Processed {count} frames (sampled from {length}) in {end-start:.4f}s. FPS (display): {count/(end-start):.2f}")
+    print(
+        f"Processed {count} frames (sampled from {length}) in {end - start:.4f}s. FPS (display): {count / (end - start):.2f}"
+    )
+
 
 def bench_set_range(path, chunk_size=100):
     print(f"--- Set Range (chunk={chunk_size}) ---")
@@ -34,7 +40,7 @@ def bench_set_range(path, chunk_size=100):
     length = len(vr)
     count = 0
     start_total = time.time()
-    
+
     num_chunks = length // chunk_size
     for i in range(num_chunks):
         start = i * chunk_size
@@ -43,9 +49,11 @@ def bench_set_range(path, chunk_size=100):
         for f in vr:
             _ = f
             count += 1
-            
+
     end_total = time.time()
-    print(f"Processed {count} frames in {end_total-start_total:.4f}s. FPS: {count/(end_total-start_total):.2f}")
+    print(
+        f"Processed {count} frames in {end_total - start_total:.4f}s. FPS: {count / (end_total - start_total):.2f}"
+    )
 
 
 def main():
@@ -61,7 +69,6 @@ def main():
     except Exception as e:
         print(f"Error initializing VideoReader: {e}")
         return
-
 
     bench_sequential(path)
     try:
@@ -79,12 +86,11 @@ def main():
     except Exception as e:
         print(f"FAILED step=10: {e}")
 
-
     try:
         bench_set_range(path)
     except Exception as e:
         print(f"FAILED set_range: {e}")
 
+
 if __name__ == "__main__":
     main()
-

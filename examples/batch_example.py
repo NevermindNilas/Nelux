@@ -1,8 +1,8 @@
-"""Example demonstrating batch frame reading in CeLux."""
+"""Example demonstrating batch frame reading in Nelux."""
 
 import sys
 import torch
-from celux import VideoReader
+from nelux import VideoReader
 
 def main():
     # Replace with your video file path

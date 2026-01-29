@@ -12,7 +12,7 @@ ffmpeg_bin = r"D:\CeLux\external\ffmpeg\bin"
 if os.path.exists(ffmpeg_bin):
     os.add_dll_directory(ffmpeg_bin)
 
-import celux
+import nelux
 
 
 def test_float16_encoding():
@@ -21,8 +21,8 @@ def test_float16_encoding():
     print("Testing Float16 / RGB48 Encoding Capabilities")
     print("=" * 60)
 
-    print(f"\nCeLux version: {celux.__version__}")
-    print(f"CUDA support: {celux.__cuda_support__}")
+    print(f"\nCeLux version: {nelux.__version__}")
+    print(f"CUDA support: {nelux.__cuda_support__}")
 
     width, height = 1920, 1080
     fps = 30.0
@@ -56,7 +56,7 @@ def test_float16_encoding():
 
         try:
             # Create encoder
-            encoder = celux.VideoEncoder(
+            encoder = nelux.VideoEncoder(
                 output_path=output_path,
                 codec=codec,
                 width=width,

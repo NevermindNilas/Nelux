@@ -1,5 +1,5 @@
 import time
-import celux
+import nelux
 import subprocess
 import os
 
@@ -34,7 +34,7 @@ def generate_source():
 
 
 def benchmark():
-    reader = celux.VideoReader(SOURCE_FILE)
+    reader = nelux.VideoReader(SOURCE_FILE)
 
     start = time.time()
     count = 0
@@ -44,9 +44,7 @@ def benchmark():
 
     duration = end - start
     fps = count / duration
-    print(
-        f"decoded: {count} frames in {duration:.4f}s ({fps:.2f} fps)"
-    )
+    print(f"decoded: {count} frames in {duration:.4f}s ({fps:.2f} fps)")
 
 
 if __name__ == "__main__":

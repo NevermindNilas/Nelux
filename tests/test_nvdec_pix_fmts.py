@@ -14,12 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 os.add_dll_directory(r"C:\Users\nilas\AppData\Roaming\TheAnimeScripter\ffmpeg_shared")
 try:
-    import celux
+    import nelux
 
     HAS_CELUX = True
 except ImportError as e:
     HAS_CELUX = False
-    print(f"Warning: CeLux not available: {e}")
+    print(f"Warning: nelux not available: {e}")
     import traceback
 
     traceback.print_exc()
@@ -220,14 +220,14 @@ def test_format(video_path, format_name):
 
     try:
         # 1. Decode with NVDEC
-        reader_nvdec = celux.VideoReader(video_path, decode_accelerator="nvdec")
+        reader_nvdec = nelux.VideoReader(video_path, decode_accelerator="nvdec")
         frame_nvdec = next(iter(reader_nvdec))
 
         if frame_nvdec is None:
             return "NVDEC Failed to read frame"
 
         # 2. Decode with CPU
-        reader_cpu = celux.VideoReader(video_path, decode_accelerator="cpu")
+        reader_cpu = nelux.VideoReader(video_path, decode_accelerator="cpu")
         frame_cpu = next(iter(reader_cpu))
 
         if frame_cpu is None:
@@ -250,7 +250,7 @@ def test_format(video_path, format_name):
 
 def main():
     print("=" * 60)
-    print("CeLux NVDEC Pixel Format Support Test")
+    print("nelux NVDEC Pixel Format Support Test")
     print("=" * 60)
 
     ffmpeg_path = get_ffmpeg_path()
@@ -272,7 +272,7 @@ def main():
     # filtering is risky if we miss one.
 
     # Let's create a temp directory
-    temp_dir = tempfile.mkdtemp(prefix="celux_pixfmt_test_")
+    temp_dir = tempfile.mkdtemp(prefix="nelux_pixfmt_test_")
     print(f"Working directory: {temp_dir}")
 
     results = []

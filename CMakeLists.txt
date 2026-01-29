@@ -20,7 +20,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   endif()
 endif()
 
-project(CeLux VERSION 0.8.6 LANGUAGES CXX)
+project(Nelux VERSION 0.8.6 LANGUAGES CXX)
 
 # ─── Compiler options ─── 
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.
@@ -45,17 +45,17 @@ set(CMAKE_CXX_STANDARD        17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(CELUX_ENABLE_CUDA   "Enable CUDA support in CeLux" OFF)
-option(CELUX_BUILD_PYTHON "Build Python bindings"     ON)
+option(NELUX_ENABLE_CUDA   "Enable CUDA support in Nelux" OFF)
+option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)
 
 # Host-side performance options (C++ only)
 # - AVX2: targets modern x86_64 CPUs; can be disabled for broader compatibility.
 # - LTO: enables interprocedural optimization (IPO/LTO) in Release when supported.
-option(CELUX_ENABLE_AVX2 "Enable AVX2 for host (C++) code" ON)
-option(CELUX_ENABLE_LTO  "Enable IPO/LTO for Release builds" ON)
+option(NELUX_ENABLE_AVX2 "Enable AVX2 for host (C++) code" ON)
+option(NELUX_ENABLE_LTO  "Enable IPO/LTO for Release builds" ON)
 
 # --- Enable CUDA language if requested ---
-if(CELUX_ENABLE_CUDA)
+if(NELUX_ENABLE_CUDA)
   # Try to help CMake find CUDA if not already set
   if(NOT CMAKE_CUDA_COMPILER)
     # Check CUDA_PATH environment variable (set by NVIDIA installer)
@@ -113,10 +113,10 @@ if(CELUX_ENABLE_CUDA)
     endif()
   else()
     message(FATAL_ERROR 
-      "CELUX_ENABLE_CUDA is ON but no CUDA compiler found!\n"
+      "NELUX_ENABLE_CUDA is ON but no CUDA compiler found!\n"
       "The build cannot continue without CUDA when explicitly requested.\n"
       "Ensure CUDA Toolkit is installed and CUDA_PATH is set correctly.\n"
-      "If you want a CPU-only build, set -DCELUX_ENABLE_CUDA=OFF"
+      "If you want a CPU-only build, set -DNELUX_ENABLE_CUDA=OFF"
     )
   endif()
 endif()
@@ -127,7 +127,7 @@ if(CCACHE_PROGRAM)
   message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
   set(CMAKE_C_COMPILER_LAUNCHER   ${CCACHE_PROGRAM})
   set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
-  if(CELUX_ENABLE_CUDA)
+  if(NELUX_ENABLE_CUDA)
     set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
   endif()
 endif()
@@ -149,23 +149,23 @@ endif()
 # --- FFmpeg ---
 # Uses pre-built FFmpeg from external/ffmpeg directory
 # Run: .\tools\download_ffmpeg.ps1 to download FFmpeg before building
-set(CELUX_FFMPEG_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg")
+set(NELUX_FFMPEG_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg")
 
-if(NOT EXISTS "${CELUX_FFMPEG_DIR}/include/libavcodec/avcodec.h")
+if(NOT EXISTS "${NELUX_FFMPEG_DIR}/include/libavcodec/avcodec.h")
   message(FATAL_ERROR 
-    "FFmpeg not found at ${CELUX_FFMPEG_DIR}\n"
+    "FFmpeg not found at ${NELUX_FFMPEG_DIR}\n"
     "Run: .\\tools\\download_ffmpeg.ps1 to download pre-built FFmpeg")
 endif()
 
-message(STATUS "Using external FFmpeg from: ${CELUX_FFMPEG_DIR}")
+message(STATUS "Using external FFmpeg from: ${NELUX_FFMPEG_DIR}")
 
 # Set include directories
-set(CELUX_FFMPEG_INCS "${CELUX_FFMPEG_DIR}/include")
+set(NELUX_FFMPEG_INCS "${NELUX_FFMPEG_DIR}/include")
 
 # Find import libraries
 if(WIN32)
-  set(_ffmpeg_lib_dir "${CELUX_FFMPEG_DIR}/lib")
-  set(CELUX_FFMPEG_LIBS
+  set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
+  set(NELUX_FFMPEG_LIBS
     "${_ffmpeg_lib_dir}/avcodec.lib"
     "${_ffmpeg_lib_dir}/avformat.lib"
     "${_ffmpeg_lib_dir}/avutil.lib"
@@ -175,8 +175,8 @@ if(WIN32)
     "${_ffmpeg_lib_dir}/avdevice.lib"
   )
 else()
-  set(_ffmpeg_lib_dir "${CELUX_FFMPEG_DIR}/lib")
-  set(CELUX_FFMPEG_LIBS
+  set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
+  set(NELUX_FFMPEG_LIBS
     "${_ffmpeg_lib_dir}/libavcodec.so"
     "${_ffmpeg_lib_dir}/libavformat.so"
     "${_ffmpeg_lib_dir}/libavutil.so"
@@ -188,16 +188,16 @@ else()
 endif()
 
 # Verify libraries exist
-foreach(_lib ${CELUX_FFMPEG_LIBS})
+foreach(_lib ${NELUX_FFMPEG_LIBS})
   if(NOT EXISTS "${_lib}")
     message(FATAL_ERROR "FFmpeg library not found: ${_lib}")
   endif()
 endforeach()
 
-message(STATUS "FFmpeg includes: ${CELUX_FFMPEG_INCS}")
-message(STATUS "FFmpeg libraries: ${CELUX_FFMPEG_LIBS}")
+message(STATUS "FFmpeg includes: ${NELUX_FFMPEG_INCS}")
+message(STATUS "FFmpeg libraries: ${NELUX_FFMPEG_LIBS}")
 
-if(CELUX_BUILD_PYTHON)
+if(NELUX_BUILD_PYTHON)
   find_package(Python3 3.13 REQUIRED COMPONENTS Interpreter Development.Module)
   message(STATUS "Python3: ${Python3_EXECUTABLE}")
   message(STATUS "Python3 includes: ${Python3_INCLUDE_DIRS}")
@@ -215,20 +215,20 @@ if(CELUX_BUILD_PYTHON)
   find_package(pybind11 CONFIG)
   if(pybind11_FOUND)
     message(STATUS "pybind11 (CMake): ${pybind11_VERSION}")
-    set(CELUX_PYBIND11_INCS ${pybind11_INCLUDE_DIRS})
-    set(CELUX_PYBIND11_LIBS pybind11::module)
+    set(NELUX_PYBIND11_INCS ${pybind11_INCLUDE_DIRS})
+    set(NELUX_PYBIND11_LIBS pybind11::module)
   else()
     message(STATUS "pybind11 not found via CMake; falling back to pip headers")
     
     if(WIN32)
-      set(CELUX_PYBIND11_INCS
+      set(NELUX_PYBIND11_INCS
           "${Python3_SITE_PACKAGES}/Lib/site-packages/pybind11/include")
     else()
-      set(CELUX_PYBIND11_INCS
+      set(NELUX_PYBIND11_INCS
           "${Python3_SITE_PACKAGES}/pybind11/include")
     endif()
-    set(CELUX_PYBIND11_LIBS "")
-    if(NOT EXISTS "${CELUX_PYBIND11_INCS}/pybind11/pybind11.h")
+    set(NELUX_PYBIND11_LIBS "")
+    if(NOT EXISTS "${NELUX_PYBIND11_INCS}/pybind11/pybind11.h")
       message(FATAL_ERROR "pybind11 headers missing; run: pip install pybind11")
     endif()
   endif()
@@ -243,60 +243,60 @@ if(CELUX_BUILD_PYTHON)
   )
   
   if(_torch_result EQUAL 0 AND EXISTS "${TORCH_PACKAGE_DIR}")
-    set(CELUX_PYTORCH_LIBDIR "${TORCH_PACKAGE_DIR}/lib")
-    set(CELUX_PYTORCH_INCLUDEDIR "${TORCH_PACKAGE_DIR}/include")
+    set(NELUX_PYTORCH_LIBDIR "${TORCH_PACKAGE_DIR}/lib")
+    set(NELUX_PYTORCH_INCLUDEDIR "${TORCH_PACKAGE_DIR}/include")
     
     # Main headers: torch/include and torch/include/torch/csrc/api/include
     include_directories(
-      ${CELUX_PYTORCH_INCLUDEDIR}
-      ${CELUX_PYTORCH_INCLUDEDIR}/torch/csrc/api/include
+      ${NELUX_PYTORCH_INCLUDEDIR}
+      ${NELUX_PYTORCH_INCLUDEDIR}/torch/csrc/api/include
     )
     # Add the lib directory to the linker
-    link_directories(${CELUX_PYTORCH_LIBDIR})
+    link_directories(${NELUX_PYTORCH_LIBDIR})
     
-    message(STATUS "Using torch headers: ${CELUX_PYTORCH_INCLUDEDIR}")
-    message(STATUS "Using torch libs:    ${CELUX_PYTORCH_LIBDIR}")
+    message(STATUS "Using torch headers: ${NELUX_PYTORCH_INCLUDEDIR}")
+    message(STATUS "Using torch libs:    ${NELUX_PYTORCH_LIBDIR}")
   else()
     message(FATAL_ERROR "PyTorch not found. Run: pip install torch")
   endif()
 endif()
 
-file(GLOB_RECURSE CELUX_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/CeLux/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/CeLux/conversion/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/CeLux/backends/*.cpp
+file(GLOB_RECURSE NELUX_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/conversion/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/*.cpp
 )
 
 # Add CUDA sources if CUDA is enabled  
-if(CELUX_ENABLE_CUDA)
+if(NELUX_ENABLE_CUDA)
   # Add only the CUDA cpp files to main sources, but NOT the .cu files
   file(GLOB CELUX_CUDA_CPP_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/CeLux/backends/cuda/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cpp
   )
-  list(APPEND CELUX_SOURCES ${CELUX_CUDA_CPP_SOURCES})
+  list(APPEND NELUX_SOURCES ${CELUX_CUDA_CPP_SOURCES})
   
   # Create a separate CUDA library for .cu files
   file(GLOB CELUX_CUDA_CU_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/CeLux/backends/cuda/*.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cu
   )
   
   if(CELUX_CUDA_CU_SOURCES)
-    add_library(CeLuxCuda STATIC ${CELUX_CUDA_CU_SOURCES})
-    set_target_properties(CeLuxCuda PROPERTIES
+    add_library(NeluxCuda STATIC ${CELUX_CUDA_CU_SOURCES})
+    set_target_properties(NeluxCuda PROPERTIES
       CUDA_SEPARABLE_COMPILATION OFF
       POSITION_INDEPENDENT_CODE ON
       CUDA_STANDARD 17
       CUDA_RUNTIME_LIBRARY Shared
     )
-    target_include_directories(CeLuxCuda PUBLIC
+    target_include_directories(NeluxCuda PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux
-      ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/backends
-      ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/backends/cuda
-      ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/conversion
-      ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/conversion/gpu
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/backends
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/backends/cuda
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/gpu
     )
-    target_compile_definitions(CeLuxCuda PUBLIC CELUX_ENABLE_CUDA)
+    target_compile_definitions(NeluxCuda PUBLIC NELUX_ENABLE_CUDA)
     # Do NOT link CUDA::cudart here - let the runtime be resolved at link time
     message(STATUS "CUDA .cu sources: ${CELUX_CUDA_CU_SOURCES}")
   endif()
@@ -304,156 +304,156 @@ if(CELUX_ENABLE_CUDA)
   message(STATUS "CUDA .cpp sources: ${CELUX_CUDA_CPP_SOURCES}")
 endif()
 
-add_library(CeLuxLib STATIC ${CELUX_SOURCES})
+add_library(NeluxLib STATIC ${NELUX_SOURCES})
 
 # --- Host ISA / AVX2 ---
-if(CELUX_ENABLE_AVX2)
+if(NELUX_ENABLE_AVX2)
   if(MSVC)
-    target_compile_options(CeLuxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+    target_compile_options(NeluxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
   else()
-    target_compile_options(CeLuxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
+    target_compile_options(NeluxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
   endif()
 endif()
 
 # --- IPO / LTO (Release) ---
-if(CELUX_ENABLE_LTO)
+if(NELUX_ENABLE_LTO)
   include(CheckIPOSupported)
-  check_ipo_supported(RESULT _celux_ipo_supported OUTPUT _celux_ipo_error)
-  if(_celux_ipo_supported)
-    set_property(TARGET CeLuxLib PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+  check_ipo_supported(RESULT _nelux_ipo_supported OUTPUT _nelux_ipo_error)
+  if(_nelux_ipo_supported)
+    set_property(TARGET NeluxLib PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
   else()
-    message(WARNING "IPO/LTO requested but not supported: ${_celux_ipo_error}")
+    message(WARNING "IPO/LTO requested but not supported: ${_nelux_ipo_error}")
   endif()
 endif()
 
 # Link CUDA library if enabled
-if(CELUX_ENABLE_CUDA)
-  target_compile_definitions(CeLuxLib PUBLIC CELUX_ENABLE_CUDA)
-  if(TARGET CeLuxCuda)
-    target_link_libraries(CeLuxLib PUBLIC CeLuxCuda)
+if(NELUX_ENABLE_CUDA)
+  target_compile_definitions(NeluxLib PUBLIC NELUX_ENABLE_CUDA)
+  if(TARGET NeluxCuda)
+    target_link_libraries(NeluxLib PUBLIC NeluxCuda)
   endif()
 endif()
 
-target_include_directories(CeLuxLib
+target_include_directories(NeluxLib
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/backends>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/backends/cuda>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/python>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/conversion>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/conversion/cpu>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/conversion/gpu>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/backends>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/backends/cuda>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/python>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/cpu>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/gpu>
     $<INSTALL_INTERFACE:include>
-    ${CELUX_FFMPEG_INCS}
-    $<$<BOOL:${CELUX_BUILD_PYTHON}>:${Python3_INCLUDE_DIRS}>
-    $<$<BOOL:${CELUX_ENABLE_CUDA}>:${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}>
+    ${NELUX_FFMPEG_INCS}
+    $<$<BOOL:${NELUX_BUILD_PYTHON}>:${Python3_INCLUDE_DIRS}>
+    $<$<BOOL:${NELUX_ENABLE_CUDA}>:${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}>
 )
 
-target_link_libraries(CeLuxLib PUBLIC
-  ${CELUX_FFMPEG_LIBS}
+target_link_libraries(NeluxLib PUBLIC
+  ${NELUX_FFMPEG_LIBS}
   spdlog::spdlog_header_only
   ${FMT_HO_TARGET}
   yuv
-  $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch_cpu>
-  $<$<BOOL:${CELUX_BUILD_PYTHON}>:c10>
-  $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch>
-  $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch_python>
-  $<$<AND:$<BOOL:${CELUX_BUILD_PYTHON}>,$<BOOL:${CELUX_ENABLE_CUDA}>>:torch_cuda>
-  $<$<AND:$<BOOL:${CELUX_BUILD_PYTHON}>,$<BOOL:${CELUX_ENABLE_CUDA}>>:c10_cuda>
+  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
+  $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
+  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
+  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
 )
 if(WIN32)
-  target_link_libraries(CeLuxLib PUBLIC ws2_32 bcrypt)
+  target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
 endif()
 # If you want to add Linux-specific libs:
 #if(UNIX AND NOT APPLE)
-#  target_link_libraries(CeLuxLib PUBLIC pthread dl rt)
+#  target_link_libraries(NeluxLib PUBLIC pthread dl rt)
 #endif()
 
-if(CELUX_BUILD_PYTHON)
-  add_library(celux MODULE src/CeLux/python/Bindings.cpp)
+if(NELUX_BUILD_PYTHON)
+  add_library(nelux MODULE src/Nelux/python/Bindings.cpp)
 
   # Match host performance flags on the Python extension module
-  if(CELUX_ENABLE_AVX2)
+  if(NELUX_ENABLE_AVX2)
     if(MSVC)
-      target_compile_options(celux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+      target_compile_options(nelux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
     else()
-      target_compile_options(celux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
+      target_compile_options(nelux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
     endif()
   endif()
 
-  if(CELUX_ENABLE_LTO)
+  if(NELUX_ENABLE_LTO)
     include(CheckIPOSupported)
-    check_ipo_supported(RESULT _celux_ipo_supported_py OUTPUT _celux_ipo_error_py)
-    if(_celux_ipo_supported_py)
-      set_property(TARGET celux PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    check_ipo_supported(RESULT _nelux_ipo_supported_py OUTPUT _nelux_ipo_error_py)
+    if(_nelux_ipo_supported_py)
+      set_property(TARGET nelux PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     else()
-      message(WARNING "IPO/LTO requested but not supported for celux module: ${_celux_ipo_error_py}")
+      message(WARNING "IPO/LTO requested but not supported for nelux module: ${_nelux_ipo_error_py}")
     endif()
   endif()
 
-  target_include_directories(celux PRIVATE
-    ${CELUX_PYBIND11_INCS}
+  target_include_directories(nelux PRIVATE
+    ${NELUX_PYBIND11_INCS}
     ${Python3_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/CeLux/python
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/python
   )
 
-  target_link_libraries(celux PRIVATE
-    CeLuxLib
+  target_link_libraries(nelux PRIVATE
+    NeluxLib
     Python3::Module
-    ${CELUX_PYBIND11_LIBS}
-    $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch_cpu>
-    $<$<BOOL:${CELUX_BUILD_PYTHON}>:c10>
-    $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch>
-    $<$<BOOL:${CELUX_BUILD_PYTHON}>:torch_python>
-    $<$<AND:$<BOOL:${CELUX_BUILD_PYTHON}>,$<BOOL:${CELUX_ENABLE_CUDA}>>:torch_cuda>
-    $<$<AND:$<BOOL:${CELUX_BUILD_PYTHON}>,$<BOOL:${CELUX_ENABLE_CUDA}>>:c10_cuda>
+    ${NELUX_PYBIND11_LIBS}
+    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
+    $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
+    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
+    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
+    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
+    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
   )
 
-  if(CELUX_ENABLE_CUDA)
-    target_compile_definitions(celux PRIVATE CELUX_ENABLE_CUDA)
+  if(NELUX_ENABLE_CUDA)
+    target_compile_definitions(nelux PRIVATE NELUX_ENABLE_CUDA)
 
-    if(MSVC AND TARGET CeLuxCuda)
-      target_link_options(celux PRIVATE
-        "/WHOLEARCHIVE:$<TARGET_FILE:CeLuxCuda>"
+    if(MSVC AND TARGET NeluxCuda)
+      target_link_options(nelux PRIVATE
+        "/WHOLEARCHIVE:$<TARGET_FILE:NeluxCuda>"
       )
-      message(STATUS "MSVC: Using /WHOLEARCHIVE for CeLuxCuda to include all CUDA kernels in celux")
+      message(STATUS "MSVC: Using /WHOLEARCHIVE for NeluxCuda to include all CUDA kernels in nelux")
     endif()
   endif()
 
-  set_target_properties(celux PROPERTIES
+  set_target_properties(nelux PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "_celux"
+    OUTPUT_NAME "_nelux"
 
     # single-config fallback
-    LIBRARY_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/celux
-    RUNTIME_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/celux
+    LIBRARY_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    RUNTIME_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/nelux
 
     # multi-config overrides:
-    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/celux
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/celux
-    LIBRARY_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/celux
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/celux
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/nelux
   )
   if(WIN32)
-    set_target_properties(celux PROPERTIES SUFFIX ".pyd")
+    set_target_properties(nelux PROPERTIES SUFFIX ".pyd")
   else()
-    set_target_properties(celux PROPERTIES SUFFIX ".so")
+    set_target_properties(nelux PROPERTIES SUFFIX ".so")
   endif()
 
   # RPATH for Linux (optional, to run .so without LD_LIBRARY_PATH)
   if(UNIX AND NOT APPLE)
-    set_target_properties(celux PROPERTIES
+    set_target_properties(nelux PROPERTIES
       INSTALL_RPATH "$ORIGIN"
       BUILD_WITH_INSTALL_RPATH TRUE
     )
   endif()
 endif()
 
-if(WIN32 AND CELUX_BUILD_PYTHON)
+if(WIN32 AND NELUX_BUILD_PYTHON)
   # DLL copy logic for Windows only
   # NOTE: FFmpeg DLLs are NOT bundled - user must have FFmpeg in their PATH
-  set(CELUX_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/celux")
+  set(NELUX_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
   
   # vcpkg provides spdlog, fmt, libyuv
   if(DEFINED ENV{VCPKG_TARGET_TRIPLET})
@@ -469,13 +469,13 @@ if(WIN32 AND CELUX_BUILD_PYTHON)
     set(VCPKG_BIN "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_vcpkg_triplet}/bin")
   endif()
   
-  file(GLOB CELUX_DLLS
+  file(GLOB NELUX_DLLS
     "${VCPKG_BIN}/libyuv*.dll"
     "${VCPKG_BIN}/spdlog*.dll"
     "${VCPKG_BIN}/fmt*.dll"
   )
 
-  if(CELUX_ENABLE_CUDA)
+  if(NELUX_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "[CUDA DEBUG] CUDAToolkit_FOUND: ${CUDAToolkit_FOUND}")
     message(STATUS "[CUDA DEBUG] CUDAToolkit_BIN_DIR: ${CUDAToolkit_BIN_DIR}")
@@ -510,7 +510,7 @@ if(WIN32 AND CELUX_BUILD_PYTHON)
       
       list(LENGTH CELUX_CUDA_DLLS _cuda_dlls_found)
       if(_cuda_dlls_found GREATER 0)
-        list(APPEND CELUX_DLLS ${CELUX_CUDA_DLLS})
+        list(APPEND NELUX_DLLS ${CELUX_CUDA_DLLS})
         message(STATUS "[CUDA DEBUG] Found ${_cuda_dlls_found} CUDA DLLs to bundle: ${CELUX_CUDA_DLLS}")
       else()
         message(WARNING "[CUDA DEBUG] GLOB found NO cudart64_*.dll or nvrtc64_*.dll in ${CUDA_BIN_DIR}!")
@@ -520,22 +520,22 @@ if(WIN32 AND CELUX_BUILD_PYTHON)
     endif()
   endif()
 
-  message(STATUS "Found ${CMAKE_CURRENT_LIST_DIR} DLLs to bundle: ${CELUX_DLLS}")
+  message(STATUS "Found ${CMAKE_CURRENT_LIST_DIR} DLLs to bundle: ${NELUX_DLLS}")
 
-  foreach(dll ${CELUX_DLLS})
-    add_custom_command(TARGET celux POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${CELUX_DLL_DIR}"
-      COMMENT "Copying dependency DLL: ${dll} → ${CELUX_DLL_DIR}"
+  foreach(dll ${NELUX_DLLS})
+    add_custom_command(TARGET nelux POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${NELUX_DLL_DIR}"
+      COMMENT "Copying dependency DLL: ${dll} → ${NELUX_DLL_DIR}"
     )
   endforeach()
 
-    # <-- install those same DLLs into the celux package!
-  install(FILES ${CELUX_DLLS}
-          DESTINATION celux
+    # <-- install those same DLLs into the nelux package!
+  install(FILES ${NELUX_DLLS}
+          DESTINATION nelux
           OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
 endif()
 
-if(UNIX AND CELUX_BUILD_PYTHON)
+if(UNIX AND NELUX_BUILD_PYTHON)
   # -- where vcpkg puts its .so’s for x64-linux-dynamic
   # NOTE: FFmpeg .so files are NOT bundled - user must have FFmpeg installed
   if(DEFINED ENV{VCPKG_ROOT})
@@ -545,36 +545,36 @@ if(UNIX AND CELUX_BUILD_PYTHON)
     set(VCPKG_LIB "${CMAKE_SOURCE_DIR}/vcpkg/installed/x64-linux-dynamic/lib")
   endif()
 
-  set(CELUX_SO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/celux")
+  set(NELUX_SO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
 
   # Only bundle vcpkg-provided libs (spdlog, fmt, libyuv) - NOT FFmpeg
-  file(GLOB CELUX_SOS
+  file(GLOB NELUX_SOS
     "${VCPKG_LIB}/libspdlog.so*"
     "${VCPKG_LIB}/libyuv.so*"
     "${VCPKG_LIB}/libfmt.so*"
   )
 
-  foreach(sofile ${CELUX_SOS})
-    add_custom_command(TARGET celux POST_BUILD
+  foreach(sofile ${NELUX_SOS})
+    add_custom_command(TARGET nelux POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${sofile}"
-        "${CELUX_SO_DIR}"
-      COMMENT "Copying dependency .so: ${sofile} → ${CELUX_SO_DIR}"
+        "${NELUX_SO_DIR}"
+      COMMENT "Copying dependency .so: ${sofile} → ${NELUX_SO_DIR}"
     )
   endforeach()
 endif()
 
-install(TARGETS celux
-  LIBRARY   DESTINATION celux   # for .so on Linux
-  RUNTIME   DESTINATION celux   # for .pyd on Windows
+install(TARGETS nelux
+  LIBRARY   DESTINATION nelux   # for .so on Linux
+  RUNTIME   DESTINATION nelux   # for .pyd on Windows
 )
 
 install(FILES
-  ${CMAKE_CURRENT_SOURCE_DIR}/celux/__init__.py
-  ${CMAKE_CURRENT_SOURCE_DIR}/celux/batch.py
-  ${CMAKE_CURRENT_SOURCE_DIR}/celux/py.typed
-  ${CMAKE_CURRENT_SOURCE_DIR}/celux/_celux.pyi
-  DESTINATION celux
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/__init__.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/batch.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/py.typed
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/_nelux.pyi
+  DESTINATION nelux
 )
 
 # debug dump of the variables we care about

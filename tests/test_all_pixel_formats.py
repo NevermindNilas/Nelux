@@ -1,14 +1,16 @@
 import pytest
 import os
 import glob
-from celux import VideoReader
+from nelux import VideoReader
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated_formats")
+
 
 def get_generated_files():
     if not os.path.exists(GENERATED_DIR):
         return []
     return glob.glob(os.path.join(GENERATED_DIR, "*.nut"))
+
 
 @pytest.mark.parametrize("video_path", get_generated_files())
 def test_pixel_format(video_path):
@@ -24,7 +26,7 @@ def test_pixel_format(video_path):
             # Check if we got a tensor
             assert hasattr(frame, "shape")
             count += 1
-            if count >= 3: # Read a few frames
+            if count >= 3:  # Read a few frames
                 break
         assert count > 0, "No frames read"
     except Exception as e:
