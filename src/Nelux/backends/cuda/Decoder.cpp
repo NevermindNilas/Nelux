@@ -5,6 +5,7 @@
 
 #include <cuda_fp16.h>
 
+#include <BatchDecoder.hpp>
 #include <Logger.hpp>
 #include <error/CxException.hpp>
 #include <stdexcept>
