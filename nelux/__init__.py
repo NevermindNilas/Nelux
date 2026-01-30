@@ -179,7 +179,7 @@ def _import_core():
 
                 if missing_dll:
                     # Build a specific error message
-                if component == "FFmpeg":
+                    if component == "FFmpeg":
                     solution = (
                         "FFmpeg DLLs can be located in:\n"
                         "  - System PATH environment variable\n"
