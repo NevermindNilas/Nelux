@@ -255,18 +255,35 @@ jobs:
               os.add_dll_directory(ffmpeg_bin)
 
           import nelux
-          vr = nelux.VideoReader
+
+          # Force lazy loader to create the actual class by instantiating
+          # The methods are defined in C++ and only available on instances
+          class DummyVideoReader(nelux.VideoReader):
+              def __init__(self):
+                  # Don't call super().__init__ to avoid needing a real file
+                  pass
+
+          # Get the actual implementation class from an instance attempt
+          # The lazy loader creates _real_class when __new__ is called
+          try:
+              # Create a dummy instance to trigger lazy loading
+              dummy = object.__new__(nelux.VideoReader)
+              actual_class = type(dummy)
+          except:
+              # Fallback: check that the module exports these
+              actual_class = nelux.VideoReader
 
           # Prefetch API
-          assert hasattr(vr, 'start_prefetch'), 'MISSING: start_prefetch'
-          assert hasattr(vr, 'stop_prefetch'), 'MISSING: stop_prefetch'
-          assert hasattr(vr, 'prefetch_buffered'), 'MISSING: prefetch_buffered'
-          assert hasattr(vr, 'is_prefetching'), 'MISSING: is_prefetching'
-          assert hasattr(vr, 'prefetch_size'), 'MISSING: prefetch_size'
+          assert hasattr(actual_class, 'start_prefetch'), 'MISSING: start_prefetch'
+          assert hasattr(actual_class, 'stop_prefetch'), 'MISSING: stop_prefetch'
+          # These are properties, check both property and the getter would exist
+          assert 'prefetch_buffered' in dir(actual_class) or hasattr(actual_class, 'prefetch_buffered'), 'MISSING: prefetch_buffered'
+          assert 'is_prefetching' in dir(actual_class) or hasattr(actual_class, 'is_prefetching'), 'MISSING: is_prefetching'
+          assert 'prefetch_size' in dir(actual_class) or hasattr(actual_class, 'prefetch_size'), 'MISSING: prefetch_size'
 
           # Reconfigure API
-          assert hasattr(vr, 'reconfigure'), 'MISSING: reconfigure'
-          assert hasattr(vr, 'file_path'), 'MISSING: file_path'
+          assert hasattr(actual_class, 'reconfigure'), 'MISSING: reconfigure'
+          assert 'file_path' in dir(actual_class) or hasattr(actual_class, 'file_path'), 'MISSING: file_path'
 
           print('All 0.8.3 API features verified!')
           '@
