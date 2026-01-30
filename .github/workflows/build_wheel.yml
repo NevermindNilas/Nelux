@@ -254,16 +254,18 @@ jobs:
               print(f"Adding FFmpeg DLL directory: {ffmpeg_bin}")
               os.add_dll_directory(ffmpeg_bin)
 
-          # Import nelux - this loads the C extension
+          # Import nelux and trigger C extension loading
           import nelux
+          # Access __version__ to trigger _import_core() which loads the C extension
+          _ = nelux.__version__
           
           # Access the C extension module that was loaded by nelux
           # The _nelux module is imported inside nelux/__init__.py
           import sys
           _nelux = sys.modules.get('nelux._nelux')
           if _nelux is None:
-              # Try direct import - should work now that nelux is loaded
-              from nelux import _nelux
+              # C extension wasn't loaded - this shouldn't happen if __version__ worked
+              raise ImportError("C extension (_nelux) was not loaded after accessing nelux.__version__")
           
           # Get the actual VideoReader class from C++ extension
           vr_class = _nelux.VideoReader
