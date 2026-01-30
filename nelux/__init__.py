@@ -180,13 +180,13 @@ def _import_core():
                 if missing_dll:
                     # Build a specific error message
                     if component == "FFmpeg":
-                    solution = (
-                        "FFmpeg DLLs can be located in:\n"
-                        "  - System PATH environment variable\n"
-                        "  - A shared library directory (e.g., nelux.libs)\n"
-                        "  - The Nelux package directory\n"
-                        "Make sure FFmpeg shared libraries are installed and accessible."
-                    )
+                        solution = (
+                            "FFmpeg DLLs can be located in:\n"
+                            "  - System PATH environment variable\n"
+                            "  - A shared library directory (e.g., nelux.libs)\n"
+                            "  - The Nelux package directory\n"
+                            "Make sure FFmpeg shared libraries are installed and accessible."
+                        )
                     elif component == "libyuv":
                         solution = (
                             f"libyuv.dll should be in: {package_dir}\n"
