@@ -261,21 +261,60 @@ jobs:
               print(f"Adding DLL directory: {ffmpeg_bin}")
               os.add_dll_directory(ffmpeg_bin)
 
-          import nelux
+          import sys
+          import glob
           
-          # Set up DLL paths for the C extension before importing it directly
-          # The C extension needs FFmpeg and other bundled DLLs
-          nelux_dir = os.path.dirname(nelux.__file__)
+          # Find nelux package directory without importing it
+          import site
+          nelux_dir = None
+          for site_dir in site.getsitepackages():
+              candidate = os.path.join(site_dir, 'nelux')
+              if os.path.exists(candidate):
+                  nelux_dir = candidate
+                  break
+          
+          if not nelux_dir:
+              # Try user site packages
+              import site
+              user_site = site.getusersitepackages()
+              if user_site:
+                  candidate = os.path.join(user_site, 'nelux')
+                  if os.path.exists(candidate):
+                      nelux_dir = candidate
+          
+          if not nelux_dir:
+              raise ImportError("Could not find nelux package directory")
+          
+          print(f"Found nelux at: {nelux_dir}")
+          
+          # Set up all DLL paths BEFORE importing any C extension
+          ffmpeg_bin = os.environ.get('FFMPEG_BIN', '')
+          if os.path.exists(ffmpeg_bin) and hasattr(os, 'add_dll_directory'):
+              print(f"Adding FFmpeg DLL directory: {ffmpeg_bin}")
+              os.add_dll_directory(ffmpeg_bin)
+          
           if hasattr(os, 'add_dll_directory'):
-              # Add nelux package directory for bundled DLLs (libyuv, etc.)
+              # Add nelux package directory
               os.add_dll_directory(nelux_dir)
-              # Also check for nelux.libs subdirectory (where delvewheel puts DLLs)
+              # Add nelux.libs subdirectory (where delvewheel puts DLLs)
               libs_dir = os.path.join(nelux_dir, 'nelux.libs')
               if os.path.exists(libs_dir):
+                  print(f"Adding nelux.libs DLL directory: {libs_dir}")
                   os.add_dll_directory(libs_dir)
           
-          # Import the C extension module directly to check API without instantiating
-          from nelux import _nelux
+          # Add nelux to path and import the C extension directly
+          sys.path.insert(0, os.path.dirname(nelux_dir))
+          
+          # Find the C extension module file
+          pyd_files = glob.glob(os.path.join(nelux_dir, '_nelux*.pyd'))
+          if not pyd_files:
+              raise ImportError(f"Could not find _nelux C extension in {nelux_dir}")
+          
+          # Import using importlib to avoid going through nelux/__init__.py
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("_nelux", pyd_files[0])
+          _nelux = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(_nelux)
           
           # Get the actual VideoReader class from C++ extension
           vr_class = _nelux.VideoReader
