@@ -188,7 +188,6 @@ jobs:
 
           Write-Host "=== Setting up DLL search paths ==="
           $VcpkgBin = Join-Path $env:RUNNER_TEMP "vcpkg\installed\x64-windows-release\bin"
-          $CudaBin = Join-Path $env:CUDA_PATH "bin"
 
           # Locating Torch DLLs (needed so delvewheel finds them, but we EXCLUDE them from bundling)
           $TorchSite = python -c "import torch, os; print(os.path.dirname(torch.__file__))"
@@ -202,7 +201,6 @@ jobs:
           $FFmpegExclude = $FFmpegDlls -join ";"
 
           Write-Host "VCPKG bin: $VcpkgBin"
-          Write-Host "CUDA bin: $CudaBin"
           Write-Host "Torch lib: $TorchLib"
           Write-Host "FFmpeg bin: $FFmpegBin"
           Write-Host "Excluding FFmpeg DLLs: $FFmpegExclude"
@@ -214,12 +212,12 @@ jobs:
           New-Item -ItemType Directory -Path dist_repaired -Force | Out-Null
 
           # Run delvewheel repair
+          # Note: We don't add CUDA bin path - CUDA DLLs come from PyTorch installation
           delvewheel repair $WheelFile.FullName `
             --add-path "$VcpkgBin" `
-            --add-path "$CudaBin" `
             --add-path "$TorchLib" `
             --add-path "$FFmpegBin" `
-            --exclude "torch_cpu.dll;c10.dll;torch_python.dll;torch.dll;torch_cuda.dll;$FFmpegExclude" `
+            --exclude "torch_cpu.dll;c10.dll;torch_python.dll;torch.dll;torch_cuda.dll;cudart64*.dll;nvrtc64*.dll;nvrtc-builtins64*.dll;cufft64*.dll;curand64*.dll;cusolver64*.dll;cusparse64*.dll;cudnn64*.dll;nvToolsExt64*.dll;$FFmpegExclude" `
             --wheel-dir dist_repaired `
             -v
 

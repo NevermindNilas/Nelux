@@ -21,8 +21,17 @@ def _setup_dll_paths():
         package_dir = os.path.dirname(os.path.abspath(__file__))
         if hasattr(os, "add_dll_directory"):
             os.add_dll_directory(package_dir)
+            # Also add nelux.libs directory where delvewheel puts bundled DLLs
+            libs_dir = os.path.join(package_dir, "nelux.libs")
+            if os.path.exists(libs_dir):
+                os.add_dll_directory(libs_dir)
         else:
-            os.environ["PATH"] = package_dir + ";" + os.environ["PATH"]
+            # Fallback for older Python versions
+            path_entries = [package_dir]
+            libs_dir = os.path.join(package_dir, "nelux.libs")
+            if os.path.exists(libs_dir):
+                path_entries.append(libs_dir)
+            os.environ["PATH"] = ";".join(path_entries) + ";" + os.environ["PATH"]
 
 
 def _check_dll_availability():

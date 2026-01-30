@@ -542,19 +542,26 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endif()
   endif()
 
-  message(STATUS "Found ${CMAKE_CURRENT_LIST_DIR} DLLs to bundle: ${NELUX_DLLS}")
+  message(STATUS "Found ${CMAKE_CURRENT_LIST_DIR} DLLs for delvewheel: ${NELUX_DLLS}")
 
-  foreach(dll ${NELUX_DLLS})
-    add_custom_command(TARGET nelux POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${NELUX_DLL_DIR}"
-      COMMENT "Copying dependency DLL: ${dll} → ${NELUX_DLL_DIR}"
-    )
-  endforeach()
+  # NOTE: We no longer copy DLLs to the build directory or install them.
+  # Delvewheel handles all DLL bundling into nelux.libs/ with proper name mangling.
+  # This prevents duplicate DLLs in both nelux/ and nelux.libs/ folders.
+  
+  # Only for local development: copy to build directory for testing
+  if(DEFINED ENV{NELUX_COPY_DLLS_FOR_DEV})
+    foreach(dll ${NELUX_DLLS})
+      add_custom_command(TARGET nelux POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${NELUX_DLL_DIR}"
+        COMMENT "Copying dependency DLL for dev: ${dll} → ${NELUX_DLL_DIR}"
+      )
+    endforeach()
+  endif()
 
-    # <-- install those same DLLs into the nelux package!
-  install(FILES ${NELUX_DLLS}
-          DESTINATION nelux
-          OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
+  # Don't install DLLs - delvewheel will bundle them properly
+  # install(FILES ${NELUX_DLLS}
+  #         DESTINATION nelux
+  #         OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
 endif()
 
 if(UNIX AND NELUX_BUILD_PYTHON)
