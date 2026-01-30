@@ -256,6 +256,17 @@ jobs:
 
           import nelux
           
+          # Set up DLL paths for the C extension before importing it directly
+          # The C extension needs FFmpeg and other bundled DLLs
+          nelux_dir = os.path.dirname(nelux.__file__)
+          if hasattr(os, 'add_dll_directory'):
+              # Add nelux package directory for bundled DLLs (libyuv, etc.)
+              os.add_dll_directory(nelux_dir)
+              # Also check for nelux.libs subdirectory (where delvewheel puts DLLs)
+              libs_dir = os.path.join(nelux_dir, 'nelux.libs')
+              if os.path.exists(libs_dir):
+                  os.add_dll_directory(libs_dir)
+          
           # Import the C extension module directly to check API without instantiating
           from nelux import _nelux
           
