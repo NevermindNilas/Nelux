@@ -39,6 +39,7 @@ def _check_dll_availability():
         return {}
 
     import glob
+
     package_dir = os.path.dirname(os.path.abspath(__file__))
     libs_dir = os.path.join(package_dir, "nelux.libs")
 
@@ -69,14 +70,14 @@ def _check_dll_availability():
         # Check direct file in package dir
         if os.path.exists(os.path.join(package_dir, dll_name)):
             return True
-        
+
         # Check for mangled version in nelux.libs (pattern: name-<hash>.dll)
         if os.path.exists(libs_dir):
-            base_name = dll_name.replace('.dll', '')
+            base_name = dll_name.replace(".dll", "")
             pattern = os.path.join(libs_dir, f"{base_name}-*.dll")
             if glob.glob(pattern):
                 return True
-        
+
         return False
 
     missing = {}
@@ -228,41 +229,41 @@ def _import_core():
                         f"{solution}\n"
                         f"Original error: {e}"
                     ) from e
-                    else:
-                        # Check which DLLs are actually missing from disk
-                        missing_dlls = _check_dll_availability()
+                else:
+                    # Check which DLLs are actually missing from disk
+                    missing_dlls = _check_dll_availability()
 
-                        if missing_dlls:
-                            details = []
-                            for comp, dlls in missing_dlls.items():
-                                details.append(f"  - {comp}: {', '.join(dlls)}")
-                            
-                            # Check if FFmpeg is among the missing
-                            if "FFmpeg" in missing_dlls:
-                                ffmpeg_note = (
-                                    "\n\nNote: FFmpeg DLLs are not bundled. Add them to PATH or use:\n"
-                                    "  os.add_dll_directory(r'C:\\path\\to\\ffmpeg\\bin')\n"
-                                    "before importing nelux."
-                                )
-                            else:
-                                ffmpeg_note = ""
+                    if missing_dlls:
+                        details = []
+                        for comp, dlls in missing_dlls.items():
+                            details.append(f"  - {comp}: {', '.join(dlls)}")
 
-                            raise ImportError(
-                                f"Failed to load Nelux: Required DLLs are missing.\n"
-                                f"Missing DLLs:\n" + "\n".join(details) + "\n"
-                                f"Package location: {package_dir}"
-                                f"{ffmpeg_note}\n"
-                                f"Try reinstalling: pip install nelux --force-reinstall\n"
-                                f"Original error: {e}"
-                            ) from e
+                        # Check if FFmpeg is among the missing
+                        if "FFmpeg" in missing_dlls:
+                            ffmpeg_note = (
+                                "\n\nNote: FFmpeg DLLs are not bundled. Add them to PATH or use:\n"
+                                "  os.add_dll_directory(r'C:\\path\\to\\ffmpeg\\bin')\n"
+                                "before importing nelux."
+                            )
                         else:
-                            raise ImportError(
-                                f"Failed to load Nelux C extension (_nelux).\n"
-                                f"All expected DLLs are present but import still failed.\n"
-                                f"This may be due to DLL version mismatches or architecture incompatibility.\n"
-                                f"Package location: {package_dir}\n"
-                                f"Original error: {e}"
-                            ) from e
+                            ffmpeg_note = ""
+
+                        raise ImportError(
+                            f"Failed to load Nelux: Required DLLs are missing.\n"
+                            f"Missing DLLs:\n" + "\n".join(details) + "\n"
+                            f"Package location: {package_dir}"
+                            f"{ffmpeg_note}\n"
+                            f"Try reinstalling: pip install nelux --force-reinstall\n"
+                            f"Original error: {e}"
+                        ) from e
+                    else:
+                        raise ImportError(
+                            f"Failed to load Nelux C extension (_nelux).\n"
+                            f"All expected DLLs are present but import still failed.\n"
+                            f"This may be due to DLL version mismatches or architecture incompatibility.\n"
+                            f"Package location: {package_dir}\n"
+                            f"Original error: {e}"
+                        ) from e
             else:
                 raise ImportError(
                     f"Failed to import Nelux C extension (_nelux). Original error: {e}"
