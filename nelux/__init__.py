@@ -44,22 +44,16 @@ def _check_dll_availability():
     libs_dir = os.path.join(package_dir, "nelux.libs")
 
     # Define expected DLLs by component
+    # FFmpeg 8.x uses version numbers like avcodec-62.dll
     dll_groups = {
         "FFmpeg": [
-            "avcodec-60.dll",
-            "avcodec-61.dll",
-            "avformat-60.dll",
-            "avformat-61.dll",
-            "avutil-58.dll",
-            "avutil-59.dll",
-            "swscale-7.dll",
-            "swscale-8.dll",
-            "swresample-4.dll",
-            "swresample-5.dll",
-            "avfilter-9.dll",
-            "avfilter-10.dll",
-            "avdevice-60.dll",
-            "avdevice-61.dll",
+            "avcodec-62.dll",
+            "avformat-62.dll",
+            "avutil-60.dll",
+            "swscale-9.dll",
+            "swresample-6.dll",
+            "avfilter-11.dll",
+            "avdevice-62.dll",
         ],
         "libyuv": ["libyuv.dll"],
         "Nelux Core": ["_nelux.pyd"],
