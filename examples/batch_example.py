@@ -1,7 +1,23 @@
 """Example demonstrating batch frame reading in Nelux."""
 
+import os
 import sys
 import torch
+
+def _add_ffmpeg_dll_dir() -> None:
+    if os.name != "nt":
+        return
+    ffmpeg_dir = os.environ.get("NELUX_FFMPEG_DLL_DIR") or os.environ.get("FFMPEG_DLL_DIR")
+    if not ffmpeg_dir:
+        return
+    try:
+        os.add_dll_directory(ffmpeg_dir)
+    except Exception:
+        pass
+
+
+_add_ffmpeg_dll_dir()
+
 from nelux import VideoReader
 
 def main():
