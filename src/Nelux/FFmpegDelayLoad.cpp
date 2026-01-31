@@ -5,6 +5,8 @@
 #ifdef _WIN32
 
 #include <windows.h>
+// Allow writable delay-load hook variables on MSVC
+#define DELAYIMP_INSECURE_WRITABLE_HOOKS
 #include <delayimp.h>
 #include <string>
 
@@ -56,7 +58,7 @@ static const char** GetVersionList(const char* dllName) {
 
 // Delay-load notification hook
 // Called when delay-load helper is about to load a DLL
-FARPROC WINAPI __delayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
     if (dliNotify == dliNotePreLoadLibrary) {
         // pdli->szDll contains the DLL name we're trying to load
         const char** versions = GetVersionList(pdli->szDll);
@@ -78,18 +80,7 @@ FARPROC WINAPI __delayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli) {
     return nullptr;
 }
 
-// Delay-load failure hook  
-// Called when delay-load helper fails to get a procedure address
-FARPROC WINAPI __delayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli) {
-    // We could try to handle missing functions here if needed
-    // For now, let it fail naturally
-    return nullptr;
-}
-
-// Export the hooks so the delay-load helper uses them
-extern "C" {
-    PfnDliHook __pfnDliNotifyHook2 = __delayLoadNotifyHook;
-    PfnDliHook __pfnDliFailureHook2 = __delayLoadFailureHook;
-}
+ExternC PfnDliHook __pfnDliNotifyHook2 = FFmpegDelayLoadHook;
+ExternC PfnDliHook __pfnDliFailureHook2 = FFmpegDelayLoadHook;
 
 #endif // _WIN32
