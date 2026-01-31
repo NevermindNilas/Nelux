@@ -304,6 +304,11 @@ if(NELUX_ENABLE_CUDA)
   message(STATUS "CUDA .cpp sources: ${NELUX_CUDA_CPP_SOURCES}")
 endif()
 
+# Add delay-load hook for FFmpeg on Windows
+if(WIN32)
+  list(APPEND NELUX_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/FFmpegDelayLoad.cpp)
+endif()
+
 add_library(NeluxLib STATIC ${NELUX_SOURCES})
 
 # --- Host ISA / AVX2 ---
@@ -409,6 +414,24 @@ if(NELUX_BUILD_PYTHON)
     $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
     $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
   )
+
+  # Delay-load FFmpeg DLLs on Windows for version flexibility
+  if(WIN32 AND MSVC)
+    # Link delayimp.lib for delay-load support
+    target_link_libraries(nelux PRIVATE delayimp)
+    
+    # Delay-load FFmpeg DLLs - they will be resolved at runtime via our hook
+    target_link_options(nelux PRIVATE
+      "/DELAYLOAD:avcodec-62.dll"
+      "/DELAYLOAD:avformat-62.dll"
+      "/DELAYLOAD:avutil-60.dll"
+      "/DELAYLOAD:swscale-9.dll"
+      "/DELAYLOAD:swresample-6.dll"
+      "/DELAYLOAD:avfilter-11.dll"
+      "/DELAYLOAD:avdevice-62.dll"
+    )
+    message(STATUS "MSVC: FFmpeg DLLs will be delay-loaded for version flexibility")
+  endif()
 
   if(NELUX_ENABLE_CUDA)
     target_compile_definitions(nelux PRIVATE NELUX_ENABLE_CUDA)

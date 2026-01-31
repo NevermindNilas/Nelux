@@ -74,20 +74,19 @@ jobs:
         run: |
           "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt libyuv --triplet x64-windows-release --recurse
 
-      - name: Download FFmpeg 8.x for build (headers/libs only)
+      - name: Download FFmpeg 7.1 for build (headers/libs only)
         shell: powershell
         run: |
-          # FFmpeg 8.x is needed for headers/import libs at build time
-          # The DLLs are NOT bundled - users must have FFmpeg 8.x in their PATH
-          # FFmpeg 8.x uses DLLs with version numbers like avcodec-62.dll
-          $FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.0-full_build-shared.7z"
+          # Latest FFmpeg is needed for headers/import libs at build time
+          # The DLLs are NOT bundled - users must have FFmpeg in their PATH
+          $FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"
           $OutputDir = "${{ github.workspace }}/external/ffmpeg"
           $TempDir = "${{ runner.temp }}/ffmpeg_download"
 
           New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
           New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-          Write-Host "Downloading FFmpeg 8.x (for build-time headers/libs only)..."
+          Write-Host "Downloading latest FFmpeg (for build-time headers/libs only)..."
           Start-BitsTransfer -Source $FFmpegUrl -Destination "$TempDir/ffmpeg.7z"
 
           Write-Host "Extracting FFmpeg..."
@@ -99,15 +98,15 @@ jobs:
           Copy-Item -Path "$($FFmpegDir.FullName)/lib" -Destination $OutputDir -Recurse -Force
           Copy-Item -Path "$($FFmpegDir.FullName)/include" -Destination $OutputDir -Recurse -Force
 
-          # Verify FFmpeg 8.x DLLs
-          Write-Host "=== Verifying FFmpeg 8.x DLLs ==="
+          # Verify FFmpeg DLLs
+          Write-Host "=== Verifying FFmpeg DLLs ==="
           $DllPattern = "$OutputDir/bin/avcodec-*.dll"
           $DllFiles = Get-ChildItem -Path $DllPattern
           if ($DllFiles) {
               Write-Host "Found: $($DllFiles.Name)"
           }
 
-          Write-Host "=== FFmpeg 8.x installed (headers/libs for build, bin for testing) ==="
+          Write-Host "=== FFmpeg installed (headers/libs for build, bin for testing) ==="
 
       - name: Setup CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.30

@@ -3,16 +3,15 @@
 
 param(
     [string]$OutputDir = "$PSScriptRoot\..\external\ffmpeg",
-    [string]$FFmpegVersion = "8.0",
+    [string]$FFmpegVersion = "latest",
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
 
-# FFmpeg 8.x shared build from gyan.dev (GPL, includes x264/x265)
-# Version 8.x uses DLLs with version numbers like avcodec-62.dll
-$FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.0-full_build-shared.7z"
-$ArchiveName = "ffmpeg-8.0-full_build-shared.7z"
+# Latest FFmpeg shared build from gyan.dev (GPL, includes x264/x265)
+$FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"
+$ArchiveName = "ffmpeg-release-full-shared.7z"
 
 Write-Host "=== FFmpeg Download Script ===" -ForegroundColor Cyan
 Write-Host "Output directory: $OutputDir" -ForegroundColor Gray
