@@ -1,45 +1,61 @@
 
-### **Version 0.8.7 (2026-01-29)**
+### **Version 0.8.7 (2026-02-01)**
 
-#### **Lazy Loading for Faster Imports**
-- **Improved:** Heavy dependencies (torch, C extensions, DLLs) are now loaded lazily.
-  - `import nelux` no longer triggers immediate loading of torch or C extensions.
-  - DLL path setup on Windows only occurs when VideoReader or other classes are actually instantiated.
-  - Significantly faster import times for scripts that only need to check version or metadata.
+#### **Breaking Change: PyTorch Import Order**
+- **Changed:** PyTorch must now be imported **before** Nelux.
+  - This ensures proper DLL initialization on Windows.
+  - Clear error message if import order is wrong.
   
   ```python
-  import nelux  # Fast! No heavy imports yet
+  # Correct:
+  import torch
+  import nelux
   
-  # Checking metadata is still fast
-  print(nelux.__version__)  # Only loads version info
-  
-  # Heavy imports happen here
-  vr = nelux.VideoReader("video.mp4")  # Loads torch, DLLs, C extension
+  # Wrong - will raise ImportError:
+  import nelux  # ImportError: PyTorch must be imported before Nelux
   ```
 
-#### **Improved DLL Error Messages**
-- **Added:** Specific DLL error detection with exact file names and components.
-  - Errors now pinpoint the exact missing DLL (e.g., `'avcodec-60.dll'`).
-  - Identifies the component: FFmpeg, libyuv, CUDA Runtime, or NVIDIA drivers.
-  - Provides specific solutions based on which DLL is missing.
-  - Shows package directory location for troubleshooting.
+#### **FFmpeg Version Flexibility (Windows)**
+- **Added:** Delay-load hooks for FFmpeg DLLs on Windows.
+  - Nelux now works with FFmpeg 6.x, 7.x, or 8.x automatically.
+  - No need to match exact FFmpeg versions anymore.
+  - The binary tries multiple FFmpeg versions at runtime (avcodec-62, -61, -60, etc.).
   
   ```python
-  # Before: Generic "DLL load failed" error
-  # ImportError: DLL load failed while importing _nelux: The specified module could not be found.
-  
-  # After: Specific error with exact DLL and component:
-  # ImportError: Failed to load nelux: 'avcodec-60.dll' is missing
-  # Component: FFmpeg
-  # Description: FFmpeg video/audio processing library
-  # FFmpeg DLLs can be located in:
-  #   - System PATH environment variable
-  #   - A shared library directory (e.g., nelux.libs)
-  #   - The nelux package directory
-  # Make sure FFmpeg shared libraries are installed and accessible.
+  import os
+  # Add any FFmpeg 6.x-8.x to path
+  os.add_dll_directory(r'C:\path\to\ffmpeg\bin')
+  import torch
+  import nelux  # Works with any FFmpeg version!
   ```
 
-- Reverted back to pytorch 2.9.1 due to issues with pytorch 2.10.0
+#### **Simplified Import System**
+- **Removed:** Complex lazy loading mechanism.
+  - Imports are now immediate and straightforward.
+  - No more lazy-loading wrappers or deferred initialization.
+  - All classes available immediately after import.
+  
+  ```python
+  import torch
+  import nelux
+  
+  # Everything available immediately:
+  print(nelux.__version__)  # Works right away
+  vr = nelux.VideoReader("video.mp4")  # No lazy loading delay
+  ```
+
+#### **Build System Improvements**
+- **Fixed:** Duplicate DLL bundling issue.
+  - FFmpeg DLLs are no longer bundled in the wheel (user provides them).
+  - CUDA DLLs are properly excluded from bundling.
+  - Only essential DLLs (libyuv, fmt, spdlog) are bundled via delvewheel.
+- **Fixed:** Syntax error in `__init__.py` that broke delvewheel patching.
+
+#### **Improved Error Messages**
+- **Added:** Clear error messages for missing dependencies.
+  - FFmpeg missing: Shows instructions to use `os.add_dll_directory()`.
+  - PyTorch missing: Reminds user to import torch first.
+  - All error messages now include actionable solutions.
 
 ### **Version 0.8.6 (2026-01-28)**
 
