@@ -260,21 +260,14 @@ jobs:
               print(f"Adding FFmpeg DLL directory: {ffmpeg_bin}")
               os.add_dll_directory(ffmpeg_bin)
 
-          # Import nelux and trigger C extension loading
+          # Import torch FIRST (required before nelux)
+          import torch
+
+          # Import nelux (now loads immediately, not lazily)
           import nelux
-          # Access __version__ to trigger _import_core() which loads the C extension
-          _ = nelux.__version__
           
-          # Access the C extension module that was loaded by nelux
-          # The _nelux module is imported inside nelux/__init__.py
-          import sys
-          _nelux = sys.modules.get('nelux._nelux')
-          if _nelux is None:
-              # C extension wasn't loaded - this shouldn't happen if __version__ worked
-              raise ImportError("C extension (_nelux) was not loaded after accessing nelux.__version__")
-          
-          # Get the actual VideoReader class from C++ extension
-          vr_class = _nelux.VideoReader
+          # Get the VideoReader class directly
+          vr_class = nelux.VideoReader
           
           # Prefetch API
           assert hasattr(vr_class, 'start_prefetch'), 'MISSING: start_prefetch'
