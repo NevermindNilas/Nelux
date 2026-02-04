@@ -265,38 +265,67 @@ torch::Tensor VideoReader::decodeFrame()
 
     double frame_timestamp = 0.0;
     bool success = false;
+    
     try
     {
-        // Always use ML-optimized decode path for CUDA decoder (BCHW format)
+#ifdef NELUX_ENABLE_CUDA
+        // NVDEC path: use ML-optimized decode (BCHW output directly from GPU kernel)
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         {
             auto* cudaDecoder = dynamic_cast<nelux::backends::cuda::Decoder*>(decoder.get());
-            if (cudaDecoder && cudaDecoder->isMLOutputMode())
+            if (cudaDecoder)
             {
+                if (!cudaDecoder->isMLOutputMode())
+                {
+                    // Enable ML mode with default normalization (0-1 range)
+                    cudaDecoder->setMLOutputMode(true, nullptr, nullptr);
+                    cudaDecoder->setMLUseFP16(tensor.dtype() == torch::kFloat16);
+                }
                 success = cudaDecoder->decodeNextFrameML(tensor.data_ptr(), &frame_timestamp);
-            }
-            else if (cudaDecoder)
-            {
-                // CUDA decoder but ML mode not enabled - enable it now
-                cudaDecoder->setMLOutputMode(true, nullptr, nullptr);
-                cudaDecoder->setMLUseFP16(tensor.dtype() == torch::kFloat16);
-                success = cudaDecoder->decodeNextFrameML(tensor.data_ptr(), &frame_timestamp);
+                
+                // Synchronize to ensure data is ready
+                if (success)
+                {
+                    cudaDecoder->waitForDecodeComplete(0);
+                }
             }
             else
             {
-                // Fallback to standard decode
-                success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+                // Shouldn't happen, but fallback to standard decode
+                throw std::runtime_error("NVDEC decoder not available");
             }
         }
         else
+#endif
         {
-            // CPU decoder - use standard decode path
-            success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+            // CPU decoder path: decode to HWC uint8, then convert to BCHW float
+            // Create temporary HWC buffer for CPU decode
+            torch::Tensor hwcBuffer = torch::empty(
+                {properties.height, properties.width, 3},
+                torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+            
+            success = decoder->decodeNextFrame(hwcBuffer.data_ptr(), &frame_timestamp);
+            
+            if (success)
+            {
+                // Convert HWC uint8 -> BCHW float with normalization to [0, 1]
+                // hwcBuffer: [H, W, 3] uint8
+                // tensor: [1, 3, H, W] float16/float32
+                
+                // Step 1: permute HWC -> CHW
+                torch::Tensor chw = hwcBuffer.permute({2, 0, 1}); // [3, H, W]
+                
+                // Step 2: convert to float and normalize to [0, 1]
+                torch::Tensor normalized = chw.to(tensor.dtype()).div_(255.0f);
+                
+                // Step 3: add batch dimension and copy to output tensor
+                tensor.copy_(normalized.unsqueeze(0));
+            }
         }
     }
     catch (const std::exception& ex)
     {
-        // If NVDEC fails mid-iteration (e.g., unsupported codec), fall back to CPU.
+        // If NVDEC fails mid-iteration, fall back to CPU.
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         {
             NELUX_WARN("decodeFrame(): NVDEC failed: {}. Falling back to CPU decoder.",
@@ -313,33 +342,15 @@ torch::Tensor VideoReader::decodeFrame()
                 {1, 3, properties.height, properties.width},
                 torch::TensorOptions().dtype(torchDataType).device(torch::kCPU));
 
-            // Seek back to the last known timestamp and decode forward
-            if (current_timestamp > 0.0)
-            {
-                decoder->seekToNearestKeyframe(current_timestamp);
-            }
-
-            double ts = 0.0;
-            const double half = 0.5 * ((properties.fps > 0) ? 1.0 / properties.fps : 0.0);
-            while (true)
-            {
-                success = decoder->decodeNextFrame(tensor.data_ptr(), &ts);
-                if (!success)
-                {
-                    break;
-                }
-                if (ts + 1e-9 >= current_timestamp - half)
-                {
-                    frame_timestamp = ts;
-                    break;
-                }
-            }
+            // Retry decode with CPU path (recursive call will use correct path)
+            return decodeFrame();
         }
         else
         {
             throw;
         }
     }
+    
     if (!success)
     {
         NELUX_WARN("Decoding failed or no more frames available");
@@ -1198,6 +1209,7 @@ void VideoReader::reconfigure(const std::string& newFilePath)
 
 bool VideoReader::setMLOutputMode(bool enable, const std::vector<float>& mean, const std::vector<float>& std, bool useFP16)
 {
+#ifdef NELUX_ENABLE_CUDA
     // ML mode only works with CUDA/NVDEC decoder
     if (enable && decodeAccelerator != nelux::DecodeAccelerator::NVDEC)
     {
@@ -1268,4 +1280,13 @@ bool VideoReader::setMLOutputMode(bool enable, const std::vector<float>& mean, c
     }
     
     return true;
+#else
+    // CUDA not enabled - ML mode not available
+    (void)enable;
+    (void)mean;
+    (void)std;
+    (void)useFP16;
+    NELUX_WARN("ML output mode requires CUDA support, which is not enabled in this build.");
+    return false;
+#endif
 }
