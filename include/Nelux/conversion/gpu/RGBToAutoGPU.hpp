@@ -44,15 +44,17 @@ private:
     int colorSpace = nelux::backends::cuda::ColorSpaceEncode_BT709;
     int colorRange = nelux::backends::cuda::ColorRangeEncode_Limited;
     
-    // CUDA buffers for NV12/YUV output
-    uint8_t* cudaNv12Buffer = nullptr;  // For NV12/P010/NV16
-    uint8_t* cudaYBuffer = nullptr;     // For YUV444P (Y plane)
-    uint8_t* cudaUBuffer = nullptr;     // For YUV444P (U plane)
-    uint8_t* cudaVBuffer = nullptr;     // For YUV444P (V plane)
+    // CUDA buffers for various output formats
+    uint8_t* cudaNv12Buffer = nullptr;  // For NV12/P010/NV16/P210/P216
+    uint8_t* cudaYBuffer = nullptr;     // For planar YUV (Y plane)
+    uint8_t* cudaUBuffer = nullptr;     // For planar YUV (U plane)
+    uint8_t* cudaVBuffer = nullptr;     // For planar YUV (V plane)
+    uint8_t* cudaRgbBuffer = nullptr;   // For packed RGB/BGR (BGR0, RGBA, etc.)
     
     size_t bufferSize = 0;
     int nv12Pitch = 0;
     int surfaceHeight = 0;
+    int rgbPitch = 0;  // For RGB packed formats
 
 public:
     RGBToAutoGPUConverter(int w, int h, AVPixelFormat format, cudaStream_t cudaStream = nullptr)
@@ -60,18 +62,55 @@ public:
     {
         // Validate supported formats and allocate buffers
         switch (format) {
+            // 4:2:0 formats
             case AV_PIX_FMT_NV12:
                 allocateNv12Buffer();
                 break;
             case AV_PIX_FMT_P010LE:
                 allocateP010Buffer();
                 break;
-            case AV_PIX_FMT_YUV444P:
-                allocateYuv444Buffer();
+            case AV_PIX_FMT_YUV420P:
+                allocateYuv420pBuffer();
                 break;
+            
+            // 4:2:2 formats
             case AV_PIX_FMT_NV16:
                 allocateNv16Buffer();
                 break;
+            case AV_PIX_FMT_P210LE:
+                allocateP210Buffer();
+                break;
+            case AV_PIX_FMT_P216LE:
+                allocateP216Buffer();
+                break;
+            
+            // 4:4:4 formats
+            case AV_PIX_FMT_YUV444P:
+                allocateYuv444Buffer();
+                break;
+            case AV_PIX_FMT_YUV444P10LE:
+                allocateYuv444P10Buffer();
+                break;
+            case AV_PIX_FMT_YUV444P16LE:
+                allocateYuv444P16Buffer();
+                break;
+            
+            // Packed RGB/BGR formats (no conversion needed, just channel swap)
+            case AV_PIX_FMT_BGR0:
+            case AV_PIX_FMT_BGRA:
+            case AV_PIX_FMT_RGB0:
+            case AV_PIX_FMT_RGBA:
+                allocatePackedRgbBuffer(format);
+                break;
+            
+            // Planar RGB formats (GBR)
+            case AV_PIX_FMT_GBRP:
+                allocateGbrpBuffer();
+                break;
+            case AV_PIX_FMT_GBRP16LE:
+                allocateGbrp16Buffer();
+                break;
+            
             default:
                 throw std::runtime_error("RGBToAutoGPUConverter: Unsupported pixel format");
         }
@@ -151,6 +190,15 @@ public:
                     colorSpace, colorRange, stream);
                 break;
                 
+            case AV_PIX_FMT_YUV420P:
+                nelux::backends::cuda::Rgb24ToYuv420p(
+                    gpuRgb, rgbPitch,
+                    cudaYBuffer, cudaUBuffer, cudaVBuffer,
+                    width,  // Y pitch = width for 8-bit
+                    width, height,
+                    colorSpace, colorRange, stream);
+                break;
+                
             default:
                 throw std::runtime_error("RGBToAutoGPUConverter: Unsupported format");
         }
@@ -188,6 +236,9 @@ public:
             case AV_PIX_FMT_NV16:
                 copyNv16ToCpuFrame(frame);
                 break;
+            case AV_PIX_FMT_YUV420P:
+                copyYuv420pToCpuFrame(frame);
+                break;
             default:
                 break;
         }
@@ -217,6 +268,9 @@ public:
                 break;
             case AV_PIX_FMT_NV16:
                 copyNv16ToCudaFrame(frame);
+                break;
+            case AV_PIX_FMT_YUV420P:
+                copyYuv420pToCudaFrame(frame);
                 break;
             default:
                 break;
@@ -286,12 +340,128 @@ private:
         }
     }
     
+    void allocateYuv420pBuffer()
+    {
+        // YUV420P: Y plane (width * height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
+        size_t ySize = static_cast<size_t>(width) * height;
+        size_t uvSize = ySize / 4;  // Quarter size for U and V
+        
+        cudaError_t err = cudaMalloc(&cudaYBuffer, ySize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate Y buffer");
+        
+        err = cudaMalloc(&cudaUBuffer, uvSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate U buffer");
+        
+        err = cudaMalloc(&cudaVBuffer, uvSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate V buffer");
+    }
+    
+    void allocateP210Buffer()
+    {
+        // P210: 16-bit per component, 4:2:2 (UV same height as Y)
+        nv12Pitch = width * 2;  // 2 bytes per Y sample
+        surfaceHeight = height;
+        bufferSize = static_cast<size_t>(nv12Pitch) * height * 2;  // 4:2:2 = 2x luma
+        
+        cudaError_t err = cudaMalloc(&cudaNv12Buffer, bufferSize);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate CUDA P210 buffer");
+        }
+    }
+    
+    void allocateP216Buffer()
+    {
+        // P216: 16-bit per component, 4:2:2
+        nv12Pitch = width * 2;
+        surfaceHeight = height;
+        bufferSize = static_cast<size_t>(nv12Pitch) * height * 2;
+        
+        cudaError_t err = cudaMalloc(&cudaNv12Buffer, bufferSize);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate CUDA P216 buffer");
+        }
+    }
+    
+    void allocateYuv444P10Buffer()
+    {
+        // YUV444P10: 16-bit planes with 10-bit data
+        size_t planeSize = static_cast<size_t>(width) * height * 2;  // 2 bytes per sample
+        
+        cudaError_t err = cudaMalloc(&cudaYBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate Y buffer");
+        
+        err = cudaMalloc(&cudaUBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate U buffer");
+        
+        err = cudaMalloc(&cudaVBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate V buffer");
+    }
+    
+    void allocateYuv444P16Buffer()
+    {
+        // YUV444P16: 16-bit planes
+        size_t planeSize = static_cast<size_t>(width) * height * 2;
+        
+        cudaError_t err = cudaMalloc(&cudaYBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate Y buffer");
+        
+        err = cudaMalloc(&cudaUBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate U buffer");
+        
+        err = cudaMalloc(&cudaVBuffer, planeSize);
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate V buffer");
+    }
+    
+    void allocatePackedRgbBuffer(AVPixelFormat format)
+    {
+        // BGR0, BGRA, RGB0, RGBA - packed formats
+        int bytesPerPixel = (format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_RGBA) ? 4 : 3;
+        rgbPitch = width * bytesPerPixel;
+        bufferSize = static_cast<size_t>(rgbPitch) * height;
+        
+        cudaError_t err = cudaMalloc(&cudaRgbBuffer, bufferSize);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate CUDA RGB packed buffer");
+        }
+    }
+    
+    void allocateGbrpBuffer()
+    {
+        // GBRP: 3 separate 8-bit planes (G, B, R order for FFmpeg)
+        size_t planeSize = static_cast<size_t>(width) * height;
+        
+        cudaError_t err = cudaMalloc(&cudaYBuffer, planeSize);  // G
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate G buffer");
+        
+        err = cudaMalloc(&cudaUBuffer, planeSize);  // B
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate B buffer");
+        
+        err = cudaMalloc(&cudaVBuffer, planeSize);  // R
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate R buffer");
+    }
+    
+    void allocateGbrp16Buffer()
+    {
+        // GBRP16: 3 separate 16-bit planes
+        size_t planeSize = static_cast<size_t>(width) * height * 2;
+        
+        cudaError_t err = cudaMalloc(&cudaYBuffer, planeSize);  // G
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate G16 buffer");
+        
+        err = cudaMalloc(&cudaUBuffer, planeSize);  // B
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate B16 buffer");
+        
+        err = cudaMalloc(&cudaVBuffer, planeSize);  // R
+        if (err != cudaSuccess) throw std::runtime_error("Failed to allocate R16 buffer");
+    }
+    
     void freeBuffers()
     {
         if (cudaNv12Buffer) { cudaFree(cudaNv12Buffer); cudaNv12Buffer = nullptr; }
         if (cudaYBuffer) { cudaFree(cudaYBuffer); cudaYBuffer = nullptr; }
         if (cudaUBuffer) { cudaFree(cudaUBuffer); cudaUBuffer = nullptr; }
         if (cudaVBuffer) { cudaFree(cudaVBuffer); cudaVBuffer = nullptr; }
+        if (cudaRgbBuffer) { cudaFree(cudaRgbBuffer); cudaRgbBuffer = nullptr; }
     }
     
     void copyNv12ToCpuFrame(AVFrame* frame)
@@ -417,6 +587,54 @@ private:
             cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
             width, height,
             cudaMemcpyDeviceToHost);
+    }
+    
+    void copyYuv420pToCpuFrame(AVFrame* frame)
+    {
+        // Copy Y plane (full resolution)
+        cudaMemcpy2D(
+            frame->data[0], frame->linesize[0],
+            cudaYBuffer, width,
+            width, height,
+            cudaMemcpyDeviceToHost);
+        
+        // Copy U plane (quarter resolution)
+        cudaMemcpy2D(
+            frame->data[1], frame->linesize[1],
+            cudaUBuffer, width / 2,
+            width / 2, height / 2,
+            cudaMemcpyDeviceToHost);
+        
+        // Copy V plane (quarter resolution)
+        cudaMemcpy2D(
+            frame->data[2], frame->linesize[2],
+            cudaVBuffer, width / 2,
+            width / 2, height / 2,
+            cudaMemcpyDeviceToHost);
+    }
+    
+    void copyYuv420pToCudaFrame(AVFrame* frame)
+    {
+        // Copy Y plane (full resolution)
+        cudaMemcpy2D(
+            frame->data[0], frame->linesize[0],
+            cudaYBuffer, width,
+            width, height,
+            cudaMemcpyDeviceToDevice);
+        
+        // Copy U plane (quarter resolution)
+        cudaMemcpy2D(
+            frame->data[1], frame->linesize[1],
+            cudaUBuffer, width / 2,
+            width / 2, height / 2,
+            cudaMemcpyDeviceToDevice);
+        
+        // Copy V plane (quarter resolution)
+        cudaMemcpy2D(
+            frame->data[2], frame->linesize[2],
+            cudaVBuffer, width / 2,
+            width / 2, height / 2,
+            cudaMemcpyDeviceToDevice);
     }
 };
 

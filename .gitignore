@@ -17,7 +17,7 @@ vcpkg.json
 
 .vscode/
 
-nul
+llms.txt
 
 # For me 
 setup_dev.ps1

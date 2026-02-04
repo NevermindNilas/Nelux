@@ -1,5 +1,9 @@
 ﻿#include "Encoder.hpp"
 
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
+
 namespace fs = std::filesystem;
 
 namespace nelux
@@ -147,9 +151,28 @@ void Encoder::initVideoStream()
         
         if (hwDeviceCtx)
         {
-            // NVENC prefers NV12 or P010 for 10-bit
-            // For software input, we'll use NV12 which NVENC can accept directly
-            properties.pixelFormat = AV_PIX_FMT_NV12;
+            // NVENC supports NV12, P010, YUV420P, YUV444P, etc.
+            // Validate the requested pixel format - default to NV12 if not supported
+            AVPixelFormat requestedFormat = properties.pixelFormat;
+            AVPixelFormat hwSwFormat = AV_PIX_FMT_NV12;  // Default software format
+            
+            switch (requestedFormat) {
+                case AV_PIX_FMT_NV12:
+                case AV_PIX_FMT_YUV420P:
+                    hwSwFormat = requestedFormat;
+                    break;
+                case AV_PIX_FMT_P010LE:
+                case AV_PIX_FMT_YUV444P:
+                    hwSwFormat = requestedFormat;
+                    break;
+                default:
+                    // Fall back to NV12 for unsupported formats
+                    NELUX_WARN("Pixel format {} not directly supported for NVENC, using NV12", 
+                               av_get_pix_fmt_name(requestedFormat));
+                    properties.pixelFormat = AV_PIX_FMT_NV12;
+                    hwSwFormat = AV_PIX_FMT_NV12;
+                    break;
+            }
             
             // Set up hardware frames context
             hwFramesCtx = av_hwframe_ctx_alloc(hwDeviceCtx);
@@ -157,7 +180,7 @@ void Encoder::initVideoStream()
             {
                 AVHWFramesContext* frames_ctx = (AVHWFramesContext*)hwFramesCtx->data;
                 frames_ctx->format = AV_PIX_FMT_CUDA;  // Hardware pixel format
-                frames_ctx->sw_format = AV_PIX_FMT_NV12;  // Software format for upload
+                frames_ctx->sw_format = hwSwFormat;    // Software format for upload (NV12, YUV420P, etc.)
                 frames_ctx->width = properties.width;
                 frames_ctx->height = properties.height;
                 frames_ctx->initial_pool_size = 20;  // Pre-allocate frames
@@ -172,8 +195,9 @@ void Encoder::initVideoStream()
                 else
                 {
                     videoCodecCtx->hw_frames_ctx = av_buffer_ref(hwFramesCtx);
-                    NELUX_INFO("NVENC: Hardware frames context initialized ({}x{})", 
-                               properties.width, properties.height);
+                    NELUX_INFO("NVENC: Hardware frames context initialized ({}x{}, format={})", 
+                               properties.width, properties.height,
+                               av_get_pix_fmt_name(hwSwFormat));
                 }
             }
         }

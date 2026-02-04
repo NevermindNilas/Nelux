@@ -394,6 +394,153 @@ __global__ void Rgb24ToNv16Kernel(
 }
 
 //==============================================================================
+// RGB24 TO YUV420P KERNEL (8-bit 4:2:0 planar)
+// Planar YUV format with separate U and V planes
+//==============================================================================
+
+/**
+ * @brief RGB24 to YUV420P (I420) kernel
+ * 
+ * YUV420P layout (planar 4:2:0):
+ *   Y plane: W x H bytes (one Y per pixel)
+ *   U plane: W/2 x H/2 bytes (one U per 2x2 block)
+ *   V plane: W/2 x H/2 bytes (one V per 2x2 block)
+ * 
+ * Each thread processes a 2x2 block of RGB pixels and produces:
+ *   - 4 Y values (one per pixel)
+ *   - 1 U value (average of 4 pixels)
+ *   - 1 V value (average of 4 pixels)
+ */
+__global__ void Rgb24ToYuv420pKernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pY,
+    uint8_t* __restrict__ pU,
+    uint8_t* __restrict__ pV,
+    int nYPitch,
+    int nWidth,
+    int nHeight)
+{
+    // Each thread handles a 2x2 block
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        return;
+    }
+    
+    // Read 4 RGB pixels (2x2 block)
+    const uint8_t* pSrc00 = pRgb + y * nRgbPitch + x * 3;
+    const uint8_t* pSrc01 = pSrc00 + 3;
+    const uint8_t* pSrc10 = pRgb + (y + 1) * nRgbPitch + x * 3;
+    const uint8_t* pSrc11 = pSrc10 + 3;
+    
+    // Convert each pixel to YUV
+    float y00, u00, v00, y01, u01, v01;
+    float y10, u10, v10, y11, u11, v11;
+    
+    RgbToYuv(pSrc00[0], pSrc00[1], pSrc00[2], y00, u00, v00);
+    RgbToYuv(pSrc01[0], pSrc01[1], pSrc01[2], y01, u01, v01);
+    RgbToYuv(pSrc10[0], pSrc10[1], pSrc10[2], y10, u10, v10);
+    RgbToYuv(pSrc11[0], pSrc11[1], pSrc11[2], y11, u11, v11);
+    
+    // Write Y plane (4 values)
+    uint8_t* pDstY0 = pY + y * nYPitch + x;
+    uint8_t* pDstY1 = pY + (y + 1) * nYPitch + x;
+    
+    pDstY0[0] = static_cast<uint8_t>(Clamp(y00 + 0.5f, 0.0f, 255.0f));
+    pDstY0[1] = static_cast<uint8_t>(Clamp(y01 + 0.5f, 0.0f, 255.0f));
+    pDstY1[0] = static_cast<uint8_t>(Clamp(y10 + 0.5f, 0.0f, 255.0f));
+    pDstY1[1] = static_cast<uint8_t>(Clamp(y11 + 0.5f, 0.0f, 255.0f));
+    
+    // Average UV for 2x2 block and write to separate U and V planes
+    float uAvg = (u00 + u01 + u10 + u11) * 0.25f;
+    float vAvg = (v00 + v01 + v10 + v11) * 0.25f;
+    
+    // U and V planes are half resolution
+    int uvX = x / 2;
+    int uvY = y / 2;
+    int uvPitch = nYPitch / 2;  // U/V planes have half the width
+    
+    pU[uvY * uvPitch + uvX] = static_cast<uint8_t>(Clamp(uAvg + 0.5f, 0.0f, 255.0f));
+    pV[uvY * uvPitch + uvX] = static_cast<uint8_t>(Clamp(vAvg + 0.5f, 0.0f, 255.0f));
+}
+
+//==============================================================================
+// RGB24 TO P016/YUV420P16 KERNEL (16-bit 4:2:0 planar)
+// 16-bit planar YUV format for high bit depth encoding
+//==============================================================================
+
+/**
+ * @brief RGB24 to P016/YUV420P16 (16-bit planar 4:2:0) kernel
+ * 
+ * Output layout (16-bit per component):
+ *   Y plane: W x H uint16 (MSB aligned)
+ *   U plane: W/2 x H/2 uint16
+ *   V plane: W/2 x H/2 uint16
+ */
+__global__ void Rgb24ToYuv420p16Kernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pY,
+    uint8_t* __restrict__ pU,
+    uint8_t* __restrict__ pV,
+    int nYPitch,
+    int nWidth,
+    int nHeight)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        return;
+    }
+    
+    // Read 4 RGB pixels
+    const uint8_t* pSrc00 = pRgb + y * nRgbPitch + x * 3;
+    const uint8_t* pSrc01 = pSrc00 + 3;
+    const uint8_t* pSrc10 = pRgb + (y + 1) * nRgbPitch + x * 3;
+    const uint8_t* pSrc11 = pSrc10 + 3;
+    
+    float y00, u00, v00, y01, u01, v01;
+    float y10, u10, v10, y11, u11, v11;
+    
+    RgbToYuv(pSrc00[0], pSrc00[1], pSrc00[2], y00, u00, v00);
+    RgbToYuv(pSrc01[0], pSrc01[1], pSrc01[2], y01, u01, v01);
+    RgbToYuv(pSrc10[0], pSrc10[1], pSrc10[2], y10, u10, v10);
+    RgbToYuv(pSrc11[0], pSrc11[1], pSrc11[2], y11, u11, v11);
+    
+    // Convert 8-bit YUV to 16-bit (left-shifted by 8 for MSB alignment)
+    auto toP016 = [](float val) -> uint16_t {
+        int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
+        return static_cast<uint16_t>(v << 8);
+    };
+    
+    // Write Y plane (16-bit values)
+    uint16_t* pDstY0 = reinterpret_cast<uint16_t*>(pY + y * nYPitch) + x;
+    uint16_t* pDstY1 = reinterpret_cast<uint16_t*>(pY + (y + 1) * nYPitch) + x;
+    
+    pDstY0[0] = toP016(y00);
+    pDstY0[1] = toP016(y01);
+    pDstY1[0] = toP016(y10);
+    pDstY1[1] = toP016(y11);
+    
+    // Average UV and write to separate planes
+    float uAvg = (u00 + u01 + u10 + u11) * 0.25f;
+    float vAvg = (v00 + v01 + v10 + v11) * 0.25f;
+    
+    int uvX = x / 2;
+    int uvY = y / 2;
+    int uvPitch = nYPitch / 2;
+    
+    uint16_t* pDstU = reinterpret_cast<uint16_t*>(pU + uvY * uvPitch) + uvX;
+    uint16_t* pDstV = reinterpret_cast<uint16_t*>(pV + uvY * uvPitch) + uvX;
+    
+    pDstU[0] = toP016(uAvg);
+    pDstV[0] = toP016(vAvg);
+}
+
+//==============================================================================
 // HOST WRAPPER FUNCTIONS
 //==============================================================================
 
@@ -476,6 +623,58 @@ void Rgb24ToYuv444(
 }
 
 /**
+ * @brief Convert RGB24 to YUV420P (I420) on GPU
+ */
+void Rgb24ToYuv420p(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pY,
+    uint8_t* pU,
+    uint8_t* pV,
+    int nYPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(16, 16);
+    dim3 gridSize((nWidth / 2 + blockSize.x - 1) / blockSize.x,
+                  (nHeight / 2 + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToYuv420pKernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pY, pU, pV, nYPitch, nWidth, nHeight);
+}
+
+/**
+ * @brief Convert RGB24 to YUV420P16 (P016 planar) on GPU
+ */
+void Rgb24ToYuv420p16(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pY,
+    uint8_t* pU,
+    uint8_t* pV,
+    int nYPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(16, 16);
+    dim3 gridSize((nWidth / 2 + blockSize.x - 1) / blockSize.x,
+                  (nHeight / 2 + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToYuv420p16Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pY, pU, pV, nYPitch, nWidth, nHeight);
+}
+
+/**
  * @brief Convert RGB24 to NV16 on GPU
  */
 void Rgb24ToNv16(
@@ -498,6 +697,559 @@ void Rgb24ToNv16(
     
     Rgb24ToNv16Kernel<<<gridSize, blockSize, 0, stream>>>(
         pRgb, nRgbPitch, pNv16, nNv16Pitch, nWidth, nHeight, nSurfaceHeight);
+}
+
+//==============================================================================
+// RGB24 TO PACKED RGB/BGR KERNELS (for NVENC RGB input)
+// NVENC supports BGR0/BGRA/RGB0/RGBA directly without YUV conversion
+//==============================================================================
+
+/**
+ * @brief RGB24 to BGR0/BGRA kernel (swaps R and B channels)
+ * 
+ * BGR0 layout: B G R (3 bytes per pixel, no alpha)
+ * BGRA layout: B G R A (4 bytes per pixel)
+ */
+__global__ void Rgb24ToBgrKernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pBgr,
+    int nBgrPitch,
+    int nWidth,
+    int nHeight,
+    bool addAlpha)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB pixel
+    const uint8_t* pSrc = pRgb + y * nRgbPitch + x * 3;
+    uint8_t r = pSrc[0];
+    uint8_t g = pSrc[1];
+    uint8_t b = pSrc[2];
+    
+    // Write BGR (swapped)
+    uint8_t* pDst = pBgr + y * nBgrPitch + x * (addAlpha ? 4 : 3);
+    pDst[0] = b;  // B
+    pDst[1] = g;  // G
+    pDst[2] = r;  // R
+    
+    if (addAlpha) {
+        pDst[3] = 255;  // A (opaque)
+    }
+}
+
+/**
+ * @brief RGB24 to RGB0/RGBA kernel (packed, no channel swap)
+ */
+__global__ void Rgb24ToRgbPackedKernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pDst,
+    int nDstPitch,
+    int nWidth,
+    int nHeight,
+    bool addAlpha)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB pixel
+    const uint8_t* pSrc = pRgb + y * nRgbPitch + x * 3;
+    
+    // Write RGB (same order, optionally with alpha)
+    uint8_t* pDstPixel = pDst + y * nDstPitch + x * (addAlpha ? 4 : 3);
+    pDstPixel[0] = pSrc[0];  // R
+    pDstPixel[1] = pSrc[1];  // G
+    pDstPixel[2] = pSrc[2];  // B
+    
+    if (addAlpha) {
+        pDstPixel[3] = 255;  // A (opaque)
+    }
+}
+
+//==============================================================================
+// RGB24 TO GBRP KERNEL (planar RGB for NVENC)
+// GBRP layout: G plane, B plane, R plane (FFmpeg convention)
+//==============================================================================
+
+/**
+ * @brief RGB24 to GBRP (planar GBR) kernel
+ * 
+ * Output layout (planar):
+ *   G plane: W x H
+ *   B plane: W x H  
+ *   R plane: W x H
+ */
+__global__ void Rgb24ToGbrpKernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pG,
+    uint8_t* __restrict__ pB,
+    uint8_t* __restrict__ pR,
+    int nPitch,
+    int nWidth,
+    int nHeight)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB pixel
+    const uint8_t* pSrc = pRgb + y * nRgbPitch + x * 3;
+    uint8_t r = pSrc[0];
+    uint8_t g = pSrc[1];
+    uint8_t b = pSrc[2];
+    
+    // Write to separate planes (FFmpeg GBRP order: G, B, R)
+    int idx = y * nPitch + x;
+    pG[idx] = g;
+    pB[idx] = b;
+    pR[idx] = r;
+}
+
+//==============================================================================
+// RGB48 (16-bit RGB) TO GBRP16LE KERNEL
+//==============================================================================
+
+/**
+ * @brief RGB48 (16-bit per channel) to GBRP16LE kernel
+ * 
+ * Input: Packed RGB48 (R16 G16 B16 = 6 bytes per pixel)
+ * Output: Planar GBR 16-bit (G plane, B plane, R plane)
+ */
+__global__ void Rgb48ToGbrp16Kernel(
+    const uint8_t* __restrict__ pRgb48,
+    int nRgbPitch,
+    uint8_t* __restrict__ pG,
+    uint8_t* __restrict__ pB,
+    uint8_t* __restrict__ pR,
+    int nPitch,
+    int nWidth,
+    int nHeight)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB48 pixel (16-bit per channel, little-endian)
+    const uint16_t* pSrc = reinterpret_cast<const uint16_t*>(pRgb48 + y * nRgbPitch + x * 6);
+    uint16_t r = pSrc[0];
+    uint16_t g = pSrc[1];
+    uint16_t b = pSrc[2];
+    
+    // Write to separate 16-bit planes (FFmpeg GBRP16LE order: G, B, R)
+    uint16_t* pG16 = reinterpret_cast<uint16_t*>(pG + y * nPitch) + x;
+    uint16_t* pB16 = reinterpret_cast<uint16_t*>(pB + y * nPitch) + x;
+    uint16_t* pR16 = reinterpret_cast<uint16_t*>(pR + y * nPitch) + x;
+    
+    *pG16 = g;
+    *pB16 = b;
+    *pR16 = r;
+}
+
+//==============================================================================
+// P210/P216 KERNELS (10/16-bit 4:2:2 for NVENC)
+//==============================================================================
+
+/**
+ * @brief RGB24 to P210 (10-bit 4:2:2) kernel
+ * 
+ * P210 layout (similar to P010 but 4:2:2):
+ *   Y plane: W x H uint16 (10-bit in upper bits)
+ *   UV plane: W x H uint16 (interleaved, 10-bit)
+ */
+__global__ void Rgb24ToP210Kernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pP210,
+    int nP210Pitch,
+    int nWidth,
+    int nHeight,
+    int nSurfaceHeight)
+{
+    // Each thread processes 2 horizontal pixels (4:2:2 chroma subsampling)
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x + 1 >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read 2 RGB pixels
+    const uint8_t* pSrc0 = pRgb + y * nRgbPitch + x * 3;
+    const uint8_t* pSrc1 = pSrc0 + 3;
+    
+    float y0, u0, v0, y1, u1, v1;
+    RgbToYuv(pSrc0[0], pSrc0[1], pSrc0[2], y0, u0, v0);
+    RgbToYuv(pSrc1[0], pSrc1[1], pSrc1[2], y1, u1, v1);
+    
+    // Convert to 10-bit (left-shifted by 6 for MSB alignment in 16-bit)
+    auto toP210 = [](float val) -> uint16_t {
+        int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
+        return static_cast<uint16_t>(v << 6);  // 8-bit to 10-bit MSB aligned
+    };
+    
+    // Write Y plane (16-bit values)
+    uint16_t* pDstY = reinterpret_cast<uint16_t*>(pP210 + y * nP210Pitch) + x;
+    pDstY[0] = toP210(y0);
+    pDstY[1] = toP210(y1);
+    
+    // Average UV for 2 horizontal pixels (4:2:2 subsampling)
+    float uAvg = (u0 + u1) * 0.5f;
+    float vAvg = (v0 + v1) * 0.5f;
+    
+    // UV plane (same height as Y for 4:2:2)
+    uint16_t* pDstUV = reinterpret_cast<uint16_t*>(pP210 + nSurfaceHeight * nP210Pitch + y * nP210Pitch) + x;
+    pDstUV[0] = toP210(uAvg);
+    pDstUV[1] = toP210(vAvg);
+}
+
+/**
+ * @brief RGB24 to P216 (16-bit 4:2:2) kernel
+ * 
+ * P216 layout:
+ *   Y plane: W x H uint16 (MSB aligned)
+ *   UV plane: W x H uint16 (interleaved, MSB aligned)
+ */
+__global__ void Rgb24ToP216Kernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pP216,
+    int nP216Pitch,
+    int nWidth,
+    int nHeight,
+    int nSurfaceHeight)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x + 1 >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read 2 RGB pixels
+    const uint8_t* pSrc0 = pRgb + y * nRgbPitch + x * 3;
+    const uint8_t* pSrc1 = pSrc0 + 3;
+    
+    float y0, u0, v0, y1, u1, v1;
+    RgbToYuv(pSrc0[0], pSrc0[1], pSrc0[2], y0, u0, v0);
+    RgbToYuv(pSrc1[0], pSrc1[1], pSrc1[2], y1, u1, v1);
+    
+    // Convert to 16-bit (left-shifted by 8 for MSB alignment)
+    auto toP216 = [](float val) -> uint16_t {
+        int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
+        return static_cast<uint16_t>(v << 8);
+    };
+    
+    // Write Y plane
+    uint16_t* pDstY = reinterpret_cast<uint16_t*>(pP216 + y * nP216Pitch) + x;
+    pDstY[0] = toP216(y0);
+    pDstY[1] = toP216(y1);
+    
+    // Average UV
+    float uAvg = (u0 + u1) * 0.5f;
+    float vAvg = (v0 + v1) * 0.5f;
+    
+    // UV plane
+    uint16_t* pDstUV = reinterpret_cast<uint16_t*>(pP216 + nSurfaceHeight * nP216Pitch + y * nP216Pitch) + x;
+    pDstUV[0] = toP216(uAvg);
+    pDstUV[1] = toP216(vAvg);
+}
+
+//==============================================================================
+// YUV444 10/16-bit ENCODE KERNELS
+//==============================================================================
+
+/**
+ * @brief RGB24 to YUV444P10LE (10-bit planar 4:4:4) kernel
+ */
+__global__ void Rgb24ToYuv444P10Kernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pY,
+    uint8_t* __restrict__ pU,
+    uint8_t* __restrict__ pV,
+    int nYuvPitch,
+    int nWidth,
+    int nHeight)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB pixel
+    const uint8_t* pSrc = pRgb + y * nRgbPitch + x * 3;
+    
+    float yf, uf, vf;
+    RgbToYuv(pSrc[0], pSrc[1], pSrc[2], yf, uf, vf);
+    
+    // Convert to 10-bit
+    auto to10bit = [](float val) -> uint16_t {
+        int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
+        return static_cast<uint16_t>(v << 2);  // 8-bit to 10-bit
+    };
+    
+    // Write to 16-bit planes
+    uint16_t* pDstY = reinterpret_cast<uint16_t*>(pY + y * nYuvPitch) + x;
+    uint16_t* pDstU = reinterpret_cast<uint16_t*>(pU + y * nYuvPitch) + x;
+    uint16_t* pDstV = reinterpret_cast<uint16_t*>(pV + y * nYuvPitch) + x;
+    
+    *pDstY = to10bit(yf);
+    *pDstU = to10bit(uf);
+    *pDstV = to10bit(vf);
+}
+
+/**
+ * @brief RGB24 to YUV444P16LE (16-bit planar 4:4:4) kernel
+ */
+__global__ void Rgb24ToYuv444P16Kernel(
+    const uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    uint8_t* __restrict__ pY,
+    uint8_t* __restrict__ pU,
+    uint8_t* __restrict__ pV,
+    int nYuvPitch,
+    int nWidth,
+    int nHeight)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    
+    // Read RGB pixel
+    const uint8_t* pSrc = pRgb + y * nRgbPitch + x * 3;
+    
+    float yf, uf, vf;
+    RgbToYuv(pSrc[0], pSrc[1], pSrc[2], yf, uf, vf);
+    
+    // Convert to 16-bit
+    auto to16bit = [](float val) -> uint16_t {
+        int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
+        return static_cast<uint16_t>(v << 8);  // 8-bit to 16-bit MSB aligned
+    };
+    
+    // Write to 16-bit planes
+    uint16_t* pDstY = reinterpret_cast<uint16_t*>(pY + y * nYuvPitch) + x;
+    uint16_t* pDstU = reinterpret_cast<uint16_t*>(pU + y * nYuvPitch) + x;
+    uint16_t* pDstV = reinterpret_cast<uint16_t*>(pV + y * nYuvPitch) + x;
+    
+    *pDstY = to16bit(yf);
+    *pDstU = to16bit(uf);
+    *pDstV = to16bit(vf);
+}
+
+//==============================================================================
+// HOST WRAPPER FUNCTIONS FOR NEW FORMATS
+//==============================================================================
+
+/**
+ * @brief Convert RGB24 to BGR0/BGRA (packed BGR for NVENC)
+ */
+void Rgb24ToBgr(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pBgr,
+    int nBgrPitch,
+    int nWidth,
+    int nHeight,
+    bool addAlpha,
+    cudaStream_t stream)
+{
+    // No color matrix needed for channel swap
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToBgrKernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pBgr, nBgrPitch, nWidth, nHeight, addAlpha);
+}
+
+/**
+ * @brief Convert RGB24 to RGB0/RGBA (packed RGB for NVENC)
+ */
+void Rgb24ToRgbPacked(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pDst,
+    int nDstPitch,
+    int nWidth,
+    int nHeight,
+    bool addAlpha,
+    cudaStream_t stream)
+{
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToRgbPackedKernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pDst, nDstPitch, nWidth, nHeight, addAlpha);
+}
+
+/**
+ * @brief Convert RGB24 to GBRP (planar GBR for NVENC)
+ */
+void Rgb24ToGbrp(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pG,
+    uint8_t* pB,
+    uint8_t* pR,
+    int nPitch,
+    int nWidth,
+    int nHeight,
+    cudaStream_t stream)
+{
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToGbrpKernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pG, pB, pR, nPitch, nWidth, nHeight);
+}
+
+/**
+ * @brief Convert RGB48 to GBRP16LE (planar 16-bit GBR)
+ */
+void Rgb48ToGbrp16(
+    const uint8_t* pRgb48,
+    int nRgbPitch,
+    uint8_t* pG,
+    uint8_t* pB,
+    uint8_t* pR,
+    int nPitch,
+    int nWidth,
+    int nHeight,
+    cudaStream_t stream)
+{
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb48ToGbrp16Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb48, nRgbPitch, pG, pB, pR, nPitch, nWidth, nHeight);
+}
+
+/**
+ * @brief Convert RGB24 to P210 (10-bit 4:2:2)
+ */
+void Rgb24ToP210(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pP210,
+    int nP210Pitch,
+    int nWidth,
+    int nHeight,
+    int nSurfaceHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(16, 16);
+    dim3 gridSize((nWidth / 2 + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToP210Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pP210, nP210Pitch, nWidth, nHeight, nSurfaceHeight);
+}
+
+/**
+ * @brief Convert RGB24 to P216 (16-bit 4:2:2)
+ */
+void Rgb24ToP216(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pP216,
+    int nP216Pitch,
+    int nWidth,
+    int nHeight,
+    int nSurfaceHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(16, 16);
+    dim3 gridSize((nWidth / 2 + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToP216Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pP216, nP216Pitch, nWidth, nHeight, nSurfaceHeight);
+}
+
+/**
+ * @brief Convert RGB24 to YUV444P10LE (10-bit planar 4:4:4)
+ */
+void Rgb24ToYuv444P10(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pY,
+    uint8_t* pU,
+    uint8_t* pV,
+    int nYuvPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToYuv444P10Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pY, pU, pV, nYuvPitch, nWidth, nHeight);
+}
+
+/**
+ * @brief Convert RGB24 to YUV444P16LE (16-bit planar 4:4:4)
+ */
+void Rgb24ToYuv444P16(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    uint8_t* pY,
+    uint8_t* pU,
+    uint8_t* pV,
+    int nYuvPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatRgb2Yuv(colorSpace, colorRange, stream);
+    
+    dim3 blockSize(32, 8);
+    dim3 gridSize((nWidth + blockSize.x - 1) / blockSize.x,
+                  (nHeight + blockSize.y - 1) / blockSize.y);
+    
+    Rgb24ToYuv444P16Kernel<<<gridSize, blockSize, 0, stream>>>(
+        pRgb, nRgbPitch, pY, pU, pV, nYuvPitch, nWidth, nHeight);
 }
 
 } // namespace nelux::backends::cuda

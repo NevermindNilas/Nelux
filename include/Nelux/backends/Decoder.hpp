@@ -116,7 +116,7 @@ class Decoder
 
     // Batch decoding support
     int64_t get_frame_count();
-    torch::Tensor decode_batch(const std::vector<int64_t>& indices);
+    virtual torch::Tensor decode_batch(const std::vector<int64_t>& indices);
 
   protected:
     void initialize(const std::string& filePath);

@@ -1108,6 +1108,129 @@ void Decoder::reconfigure(const std::string& filePath)
     NELUX_INFO("CUDA DECODER: Reconfigured successfully for: {}", filePath);
 }
 
+torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
+{
+    NELUX_DEBUG("CUDA DECODER: decode_batch called with {} indices", indices.size());
+    
+    if (indices.empty()) {
+        return torch::empty({0, properties.height, properties.width, 3},
+                           torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, cudaDeviceIndex_));
+    }
+
+    // Sort and group indices
+    int64_t total_frames = 0;
+    // Get frame count (cached or calculated)
+    if (formatCtx->streams[videoStreamIndex]->nb_frames > 0) {
+        total_frames = formatCtx->streams[videoStreamIndex]->nb_frames;
+    } else {
+         double fps = av_q2d(formatCtx->streams[videoStreamIndex]->avg_frame_rate);
+         total_frames = static_cast<int64_t>(properties.duration * fps);
+    }
+
+    // Validate indices and build map
+    std::map<int64_t, std::vector<size_t>> position_map;
+    for (size_t i = 0; i < indices.size(); i++) {
+        position_map[indices[i]].push_back(i);
+    }
+
+    // Get sorted unique frames
+    std::vector<int64_t> sorted_frames;
+    sorted_frames.reserve(position_map.size());
+    for (const auto& pair : position_map) {
+        sorted_frames.push_back(pair.first);
+    }
+
+    // Determine output properties
+    torch::ScalarType dtype = torch::kUInt8;
+    int elemSize = 1;
+    if (!force_8bit && properties.bitDepth > 8) {
+        dtype = torch::kUInt16;
+        elemSize = 2;
+    }
+
+    // Allocate output tensor on GPU
+    auto options = torch::TensorOptions().dtype(dtype).device(torch::kCUDA, cudaDeviceIndex_);
+    torch::Tensor output = torch::empty({static_cast<int64_t>(indices.size()), 
+                                         properties.height, properties.width, 3}, options);
+
+    // Temp GPU buffer for a single frame
+    size_t frame_size_bytes = static_cast<size_t>(properties.width) * 
+                              static_cast<size_t>(properties.height) * 3 * elemSize;
+    
+    void* d_frame_buffer = nullptr;
+    cudaError_t err = cudaMalloc(&d_frame_buffer, frame_size_bytes);
+    if (err != cudaSuccess) {
+        throw CxException("Failed to allocate temp buffer for batch decoding");
+    }
+
+    // RAII for cudaFree
+    struct CudaFreer {
+        void* ptr;
+        ~CudaFreer() { if (ptr) cudaFree(ptr); }
+    } freer{d_frame_buffer};
+
+    // Decoding loop
+    int64_t current_frame = -1;
+    bool need_seek = true;
+    double fps = av_q2d(formatCtx->streams[videoStreamIndex]->avg_frame_rate);
+    const int64_t SEQUENTIAL_THRESHOLD = 30;
+
+    try {
+        for (int64_t target_frame : sorted_frames) {
+            // Check if we need to seek
+            bool seek_required = need_seek || target_frame < current_frame || 
+                                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD;
+            
+            if (seek_required) {
+                double target_ts = static_cast<double>(target_frame) / fps;
+                if (!seek(target_ts)) {
+                    NELUX_WARN("Batch seek failed for frame {}", target_frame);
+                    // Try to continue, maybe next seek works
+                    continue; 
+                }
+                current_frame = -1; // Reset estimation
+            }
+
+            // Decode until target
+            while (true) {
+                double frame_ts = 0.0;
+                // Decode into temp buffer
+                bool ok = decodeNextFrame(d_frame_buffer, &frame_ts);
+                if (!ok) {
+                    NELUX_WARN("Failed to decode frame while seeking target {}", target_frame);
+                    break; 
+                }
+                
+                // Estimate frame index from timestamp
+                int64_t decoded_idx = static_cast<int64_t>(frame_ts * fps + 0.5);
+                current_frame = decoded_idx;
+
+                if (current_frame >= target_frame) {
+                    // Match found (or passed closely)
+                    const auto& positions = position_map[target_frame];
+                    
+                    // Create tensor wrapper for device-to-device copy
+                    auto frame_tensor = torch::from_blob(d_frame_buffer, 
+                                        {properties.height, properties.width, 3}, 
+                                        options); 
+
+                    for (size_t pos : positions) {
+                        output[pos].copy_(frame_tensor);
+                    }
+                    
+                    need_seek = false;
+                    break;
+                }
+            }
+        }
+    } catch (...) {
+        throw;
+    }
+    
+    // d_frame_buffer freed by RAII
+    return output;
+}
+
 } // namespace nelux::backends::cuda
 
 #endif // NELUX_ENABLE_CUDA
