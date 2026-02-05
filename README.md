@@ -9,7 +9,7 @@
 
 **NeLux** is a high-performance Python library for video processing, leveraging the power of FFmpeg with hardware acceleration (NVDEC/NVENC). It delivers some of the fastest decode times globally, enabling efficient video decoding directly into ML-ready PyTorch tensors.
 
-The name **NeLux** comes from the Latin words _celer_ (speed) and _lux_ (light), reflecting its commitment to speed and efficiency.
+Originall created by [Trentonom0r3](https://github.com/Trentonom0r3)
 
 ---
 
