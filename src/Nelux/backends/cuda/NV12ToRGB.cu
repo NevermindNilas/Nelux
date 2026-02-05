@@ -14,6 +14,7 @@
  * - Packed RGB24 and planar RGBP output formats
  * 
  * SPDX-License-Identifier: MIT
+ * Build: 2026-02-06 - Force recompile to fix RGB24x2 padding bug
  */
 
 #ifdef NELUX_ENABLE_CUDA
