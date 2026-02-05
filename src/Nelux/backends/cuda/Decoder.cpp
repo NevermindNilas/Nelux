@@ -970,6 +970,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         
         // Step 3: Convert RGB24 -> BCHW with normalization
         int rgbPitch = frame.get()->width * 3;
+        
         if (mlUseFP16_)
         {
             launchRgb24ToBchwFP16(

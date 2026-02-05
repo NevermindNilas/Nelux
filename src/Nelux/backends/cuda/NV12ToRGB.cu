@@ -375,12 +375,17 @@ __global__ void Nv12ToRgb24Kernel(
     RGB24 rgb10 = YuvToRgbForPixel<uint8_t>(y1.x, uv.x, uv.y, fullRange);
     RGB24 rgb11 = YuvToRgbForPixel<uint8_t>(y1.y, uv.x, uv.y, fullRange);
     
-    // Vectorized RGB writes - write 2 pixels per row at once
-    RGB24x2* pDst0 = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    RGB24x2* pDst1 = reinterpret_cast<RGB24x2*>(pRgb + (y + 1) * nRgbPitch + x * 3);
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst0 = pRgb + y * nRgbPitch + x * 3;
+    uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
-    *pDst0 = RGB24x2{rgb00.v, rgb01.v};
-    *pDst1 = RGB24x2{rgb10.v, rgb11.v};
+    // Row 0: pixels (x, y) and (x+1, y)
+    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
+    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    
+    // Row 1: pixels (x, y+1) and (x+1, y+1)
+    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
+    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
 }
 
 /**
@@ -473,12 +478,18 @@ __global__ void Nv12SeparateToRgb24Kernel(
     RGB24 rgb10 = YuvToRgbForPixel<uint8_t>(y1.x, uv.x, uv.y, fullRange);
     RGB24 rgb11 = YuvToRgbForPixel<uint8_t>(y1.y, uv.x, uv.y, fullRange);
     
-    // Vectorized writes
-    RGB24x2* pDst0 = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    RGB24x2* pDst1 = reinterpret_cast<RGB24x2*>(pRgb + (y + 1) * nRgbPitch + x * 3);
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    // uchar3 is 4 bytes in CUDA due to alignment, so we can't use RGB24x2 struct
+    uint8_t* pDst0 = pRgb + y * nRgbPitch + x * 3;
+    uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
-    *pDst0 = RGB24x2{rgb00.v, rgb01.v};
-    *pDst1 = RGB24x2{rgb10.v, rgb11.v};
+    // Row 0: pixels (x, y) and (x+1, y)
+    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
+    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    
+    // Row 1: pixels (x, y+1) and (x+1, y+1)
+    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
+    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
 }
 
 //==============================================================================
@@ -521,12 +532,17 @@ __global__ void P016ToRgb24Kernel(
     RGB24 rgb10 = YuvToRgbForPixel<uint16_t>(y1.x, uv.x, uv.y, fullRange);
     RGB24 rgb11 = YuvToRgbForPixel<uint16_t>(y1.y, uv.x, uv.y, fullRange);
     
-    // Vectorized writes
-    RGB24x2* pDst0 = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    RGB24x2* pDst1 = reinterpret_cast<RGB24x2*>(pRgb + (y + 1) * nRgbPitch + x * 3);
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst0 = pRgb + y * nRgbPitch + x * 3;
+    uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
-    *pDst0 = RGB24x2{rgb00.v, rgb01.v};
-    *pDst1 = RGB24x2{rgb10.v, rgb11.v};
+    // Row 0: pixels (x, y) and (x+1, y)
+    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
+    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    
+    // Row 1: pixels (x, y+1) and (x+1, y+1)
+    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
+    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
 }
 
 /**
