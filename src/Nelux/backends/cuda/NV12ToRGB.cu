@@ -632,9 +632,10 @@ __global__ void Nv16ToRgb24Kernel(
     RGB24 rgb0 = YuvToRgbForPixel<uint8_t>(yy.x, uv.x, uv.y, fullRange);
     RGB24 rgb1 = YuvToRgbForPixel<uint8_t>(yy.y, uv.x, uv.y, fullRange);
     
-    // Vectorized write
-    RGB24x2* pDst = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    *pDst = RGB24x2{rgb0.v, rgb1.v};
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
+    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
 }
 
 /**
@@ -709,9 +710,10 @@ __global__ void P216ToRgb24Kernel(
     RGB24 rgb0 = YuvToRgbForPixel<uint16_t>(yy.x, uv.x, uv.y, fullRange);
     RGB24 rgb1 = YuvToRgbForPixel<uint16_t>(yy.y, uv.x, uv.y, fullRange);
     
-    // Vectorized write
-    RGB24x2* pDst = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    *pDst = RGB24x2{rgb0.v, rgb1.v};
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
+    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
 }
 
 //==============================================================================
@@ -754,9 +756,10 @@ __global__ void Yuv444ToRgb24Kernel(
     RGB24 rgb0 = YuvToRgbForPixel<uint8_t>(yy.x, uu.x, vv.x, fullRange);
     RGB24 rgb1 = YuvToRgbForPixel<uint8_t>(yy.y, uu.y, vv.y, fullRange);
     
-    // Vectorized write
-    RGB24x2* pDst = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    *pDst = RGB24x2{rgb0.v, rgb1.v};
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
+    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
 }
 
 /**
@@ -836,9 +839,10 @@ __global__ void Yuv444P16ToRgb24Kernel(
     RGB24 rgb0 = YuvToRgbForPixel<uint16_t>(yy.x, uu.x, vv.x, fullRange);
     RGB24 rgb1 = YuvToRgbForPixel<uint16_t>(yy.y, uu.y, vv.y, fullRange);
     
-    // Vectorized write
-    RGB24x2* pDst = reinterpret_cast<RGB24x2*>(pRgb + y * nRgbPitch + x * 3);
-    *pDst = RGB24x2{rgb0.v, rgb1.v};
+    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
+    uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
+    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
 }
 
 //==============================================================================
