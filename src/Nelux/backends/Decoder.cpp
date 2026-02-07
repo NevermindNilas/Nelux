@@ -1329,6 +1329,7 @@ void Decoder::clearQueue()
 void Decoder::decodingLoop()
 {
     Frame localFrame;
+    bool packetPending = false;
     
     while (!stopDecoding)
     {
@@ -1344,6 +1345,7 @@ void Decoder::decodingLoop()
 
         if (stopDecoding) break;
 
+        // Try to receive a decoded frame
         int ret = avcodec_receive_frame(codecCtx.get(), localFrame.get());
         
         if (ret == 0)
@@ -1389,7 +1391,7 @@ void Decoder::decodingLoop()
             }
 
             av_frame_unref(localFrame.get());
-            continue;
+            continue; // Successfully got a frame, try to get another one before sending more input
         }
         
         if (ret == AVERROR_EOF)
@@ -1406,19 +1408,63 @@ void Decoder::decodingLoop()
             break; 
         }
 
+        // --- Packet Sending Logic ---
+
+        // If we have a pending packet from a previous EAGAIN, try to send it now
+        if (packetPending)
+        {
+            int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
+            if (sendRet == AVERROR(EAGAIN))
+            {
+                // Still failed, loop back to receive_frame (maybe we need to drain more)
+                // Do NOT unref packet, keep it pending
+                continue;
+            }
+            else if (sendRet < 0)
+            {
+                NELUX_WARN("Error sending pending packet: {}", sendRet);
+                packetPending = false;
+                av_packet_unref(pkt.get());
+            }
+            else
+            {
+                // Success
+                packetPending = false;
+                av_packet_unref(pkt.get());
+            }
+            continue;
+        }
+
+        // Read a new packet from file
         if (av_read_frame(formatCtx.get(), pkt.get()) >= 0)
         {
             if (pkt->stream_index == videoStreamIndex)
             {
-                if (avcodec_send_packet(codecCtx.get(), pkt.get()) < 0)
+                int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
+                if (sendRet == AVERROR(EAGAIN))
                 {
-                    NELUX_WARN("Error sending packet to decoder");
+                    // Input buffer full. Keep packet pending and loop back to receive_frame
+                    packetPending = true;
+                }
+                else
+                {
+                    if (sendRet < 0)
+                    {
+                        NELUX_WARN("Error sending packet to decoder: {}", sendRet);
+                    }
+                    // Success or fatal error: consume packet
+                    av_packet_unref(pkt.get());
                 }
             }
-            av_packet_unref(pkt.get());
+            else
+            {
+                // Ignore non-video packets
+                av_packet_unref(pkt.get());
+            }
         }
         else
         {
+            // EOF handling: flush decoder
             avcodec_send_packet(codecCtx.get(), nullptr);
         }
     }

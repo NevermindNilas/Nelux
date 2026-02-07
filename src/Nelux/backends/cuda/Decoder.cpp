@@ -543,6 +543,12 @@ void Decoder::initCodecContextWithHwAccel()
     codecCtx->thread_count = numThreads;
     codecCtx->thread_type = FF_THREAD_FRAME;
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
+    codecCtx->pkt_timebase = formatCtx->streams[videoStreamIndex]->time_base;
+    codecCtx->framerate = (formatCtx->streams[videoStreamIndex]->avg_frame_rate.num > 0)
+                             ? formatCtx->streams[videoStreamIndex]->avg_frame_rate
+                             : av_guess_frame_rate(formatCtx.get(),
+                                                   formatCtx->streams[videoStreamIndex],
+                                                   nullptr);
     
     // Open the codec
     int ret = avcodec_open2(codecCtx.get(), codec, nullptr);

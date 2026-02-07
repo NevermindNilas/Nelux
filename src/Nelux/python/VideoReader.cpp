@@ -272,15 +272,11 @@ torch::Tensor VideoReader::decodeFrame()
 #ifdef NELUX_ENABLE_CUDA
         // NVDEC path: use ML-optimized decode (BCHW output directly from GPU kernel)
         
-        fprintf(stderr, "VideoReader PROBE: decodeAccelerator=%d (NVDEC=%d)\n", (int)decodeAccelerator, (int)nelux::DecodeAccelerator::NVDEC);
-
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         {
-            fprintf(stderr, "VideoReader PROBE: Inside NVDEC block\n");
             auto* cudaDecoder = dynamic_cast<nelux::backends::cuda::Decoder*>(decoder.get());
             if (cudaDecoder)
             {
-                fprintf(stderr, "VideoReader PROBE: cudaDecoder valid\n");
                 if (!cudaDecoder->isMLOutputMode())
                 {
                     // Enable ML mode with default normalization (0-1 range)
@@ -297,7 +293,6 @@ torch::Tensor VideoReader::decodeFrame()
             }
             else
             {
-                fprintf(stderr, "VideoReader PROBE: cudaDecoder NULL (Dynamic Cast Failed)\n");
                 // Shouldn't happen, but fallback to standard decode
                 throw std::runtime_error("NVDEC decoder not available");
             }
@@ -305,7 +300,6 @@ torch::Tensor VideoReader::decodeFrame()
         else
 #endif
         {
-            fprintf(stderr, "VideoReader PROBE: Inside CPU block\n");
             // CPU decoder path: decode to HWC uint8, then convert to BCHW float
             // Create temporary HWC buffer for CPU decode
             torch::Tensor hwcBuffer = torch::empty(
