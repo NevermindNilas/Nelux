@@ -172,7 +172,7 @@ protected:
      * @param hwFrame Hardware frame from NVDEC
      * @param outputBuffer Output RGB buffer (device pointer)
      */
-    void transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer);
+    void transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch = 0);
     
     // Static callback for FFmpeg hardware pixel format selection
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);

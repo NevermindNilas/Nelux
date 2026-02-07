@@ -132,6 +132,24 @@ void launchNv12ToRgb24Separate(
     int colorRange,
     cudaStream_t stream);
 
+/**
+ * @brief Convert NV12 to RGBA32 (4 bytes/pixel) with separate Y and UV plane pointers
+ * Use this when AVFrame provides separate data[0] (Y) and data[1] (UV)
+ */
+void launchNv12ToRgba32Separate(
+    const uint8_t* pY,
+    const uint8_t* pUV,
+    int nYPitch,
+    int nUVPitch,
+    uint8_t* pRgba,
+    int nRgbaPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream);
+
+
 //------------------------------------------------------------------------------
 // P016 (4:2:0, 10/16-bit) Functions - HDR Content
 //------------------------------------------------------------------------------
@@ -307,6 +325,30 @@ void launchNV12ToRGBKernelWithUV(
     int uvPitch,
     int rgbPitch,
     cudaStream_t stream);
+
+/**
+ * @brief Convert RGBA32 to BCHW float32 with normalization
+ */
+void launchRgba32ToBchw(
+    const uint8_t* pRgba,
+    int nRgbaPitch,
+    float* pOutput,
+    int nWidth,
+    int nHeight,
+    float3 mean,
+    float3 invStd,
+    cudaStream_t stream);
+
+void launchRgb24ToBchw(
+    const uint8_t* pRgb,
+    int nRgbPitch,
+    float* pOutput,
+    int nWidth,
+    int nHeight,
+    float3 mean,
+    float3 invStd,
+    cudaStream_t stream);
+
 
 } // namespace nelux::backends::cuda
 

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <thread>
+#include <iostream>
 
 extern "C" {
 #include <libavutil/opt.h>
@@ -181,6 +182,30 @@ extern void launchRgb24ToBchwFP16(
     float3 invStd,
     cudaStream_t stream);
 
+// RGBA32 conversion (4 bytes/pixel for alignment safety)
+extern void launchNv12ToRgba32Separate(
+    const uint8_t* pY,
+    const uint8_t* pUV,
+    int nYPitch,
+    int nUVPitch,
+    uint8_t* pRgba,
+    int nRgbaPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream);
+
+extern void launchRgba32ToBchw(
+    const uint8_t* pRgba,
+    int nRgbaPitch,
+    float* pOutput,
+    int nWidth,
+    int nHeight,
+    float3 mean,
+    float3 invStd,
+    cudaStream_t stream);
+
 // Batch BCHW output with normalization
 extern void launchNv12BatchToBchw(
     const uint8_t* pY[],
@@ -247,6 +272,7 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
     , mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
     NELUX_DEBUG("CUDA DECODER: Constructing with device index {}", cudaDeviceIndex);
+    NELUX_INFO("CUDA DECODER BUILD: 2026-02-06T22:49:00 RGB24-BYTE-BY-BYTE-FIX-ACTIVE");
     
     // Suppress noisy FFmpeg/NVDEC warnings (e.g., "Invalid pkt_timebase")
     av_log_set_callback(ffmpegLogCallback);
@@ -530,7 +556,7 @@ void Decoder::initCodecContextWithHwAccel()
     NELUX_DEBUG("CUDA DECODER: Codec opened with hardware acceleration");
 }
 
-void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer)
+void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch)
 {
     // Input validation
     if (!hwFrame)
@@ -560,8 +586,8 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer)
     int width = hwFrame->width;
     int height = hwFrame->height;
     
-    // Output RGB buffer pitch (3 channels, contiguous)
-    int rgbPitch = width * 3;
+    // Output RGB buffer pitch (3 channels, contiguous or aligned)
+    int rgbPitch = (outputPitch > 0) ? outputPitch : (width * 3);
     
     // Determine color space and range from frame metadata
     int colorSpace = mapColorSpace(hwFrame->colorspace, width, height);
@@ -592,6 +618,9 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer)
                 static_cast<uint8_t*>(outputBuffer), rgbPitch,
                 width, height, colorSpace, colorRange, cudaStream_
             );
+            std::cerr << "NV12 DEBUG !!!!!!: width=" << width << " height=" << height 
+                      << " yPitch=" << yPitch << " uvPitch=" << uvPitch 
+                      << " rgbPitch=" << rgbPitch << std::endl;
             break;
         }
         
@@ -700,7 +729,28 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     // For hardware frames, we use our GPU-side conversion
     if (frame.get()->format == AV_PIX_FMT_CUDA)
     {
-        transferAndConvertFrame(frame.get(), buffer);
+        // Use intermediate aligned buffer to ensure kernel works correctly
+        // and to support writing to unaligned host memory (CPU tensor)
+        int width = frame.get()->width;
+        int height = frame.get()->height;
+        int alignedPitch = (width * 3 + 255) & ~255;
+        size_t alignedSize = alignedPitch * height;
+        
+        if (!rgb24Buffer_ || rgb24BufferSize_ < alignedSize)
+        {
+            if (rgb24Buffer_) cudaFree(rgb24Buffer_);
+            cudaError_t err = cudaMalloc(&rgb24Buffer_, alignedSize);
+            if (err != cudaSuccess) throw CxException("CUDA DECODER: Alloc failed");
+            rgb24BufferSize_ = alignedSize;
+        }
+        
+        // 1. Convert to aligned GPU buffer
+        transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
+        
+        // 2. Copy to output buffer (removing padding if any)
+        // buffer is likely Host memory if calling decodeNextFrame with NVDEC frame
+        cudaMemcpy2D(buffer, width * 3, rgb24Buffer_, alignedPitch, 
+                     width * 3, height, cudaMemcpyDeviceToHost);
     }
     else
     {
@@ -951,45 +1001,96 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         // - Consistent behavior across all codecs
         // - Negligible performance cost (~20 microseconds vs direct path)
         
-        // Step 1: Allocate/ensure RGB24 buffer exists
-        size_t rgb24Size = frame.get()->width * frame.get()->height * 3;
-        if (!rgb24Buffer_ || rgb24BufferSize_ < rgb24Size)
+        // Step 1: Check format and choose path
+        AVHWFramesContext* hwFramesCtx = (AVHWFramesContext*)frame.get()->hw_frames_ctx->data;
+        AVPixelFormat swFormat = hwFramesCtx->sw_format;
+        
+        // RGBA32 Path for NV12 (Fixes alignment stripes)
+        if (swFormat == AV_PIX_FMT_NV12)
         {
-            if (rgb24Buffer_) cudaFree(rgb24Buffer_);
-            cudaError_t err = cudaMalloc(&rgb24Buffer_, rgb24Size);
-            if (err != cudaSuccess)
+            int width = frame.get()->width;
+            int height = frame.get()->height;
+            int rgbaPitch = width * 4; // Always 256-byte aligned for 1920 (7680)
+            size_t rgbaSize = rgbaPitch * height;
+            
+            if (!rgb24Buffer_ || rgb24BufferSize_ < rgbaSize)
             {
-                throw CxException(std::string("CUDA DECODER: Failed to allocate RGB24 buffer: ") +
-                                 cudaGetErrorString(err));
+                if (rgb24Buffer_) cudaFree(rgb24Buffer_);
+                cudaError_t err = cudaMalloc(&rgb24Buffer_, rgbaSize);
+                if (err != cudaSuccess) throw CxException("CUDA DECODER: RGBA Alloc failed");
+                rgb24BufferSize_ = rgbaSize;
             }
-            rgb24BufferSize_ = rgb24Size;
-        }
-        
-        // Step 2: Convert source format to RGB24 using existing kernel
-        transferAndConvertFrame(frame.get(), rgb24Buffer_);
-        
-        // Step 3: Convert RGB24 -> BCHW with normalization
-        int rgbPitch = frame.get()->width * 3;
-        
-        if (mlUseFP16_)
-        {
-            launchRgb24ToBchwFP16(
-                static_cast<uint8_t*>(rgb24Buffer_), rgbPitch,
-                static_cast<half*>(buffer),
-                frame.get()->width, frame.get()->height,
+            
+            // NV12 -> RGBA32
+            const uint8_t* yPlane = frame.get()->data[0];
+            const uint8_t* uvPlane = frame.get()->data[1];
+            int yPitch = frame.get()->linesize[0];
+            int uvPitch = frame.get()->linesize[1];
+            
+            int colorSpace = mapColorSpace(frame.get()->colorspace, width, height);
+            int colorRange = mapColorRange(frame.get()->color_range);
+            
+            launchNv12ToRgba32Separate(
+                yPlane, uvPlane, yPitch, uvPitch,
+                static_cast<uint8_t*>(rgb24Buffer_), rgbaPitch,
+                width, height, colorSpace, colorRange, cudaStream_
+            );
+            
+            // RGBA32 -> BCHW Float32
+            // Note: We ignore mlUseFP16_ here and always use FP32 as verified safer
+            launchRgba32ToBchw(
+                static_cast<uint8_t*>(rgb24Buffer_), rgbaPitch,
+                static_cast<float*>(buffer),
+                width, height,
                 mlMean_, mlInvStd_,
                 cudaStream_
             );
+            
+            // Synchronize and check for errors
+            cudaError_t err = cudaStreamSynchronize(cudaStream_);
+            if (err != cudaSuccess) {
+                // Log error but try to continue
+                // fprintf(stderr, "CUDA ERROR after kernel: %s\n", cudaGetErrorString(err));
+            }
         }
         else
         {
-            launchRgb24ToBchw(
-                static_cast<uint8_t*>(rgb24Buffer_), rgbPitch,
-                static_cast<float*>(buffer),
-                frame.get()->width, frame.get()->height,
-                mlMean_, mlInvStd_,
-                cudaStream_
-            );
+            // Legacy/Fallback Path for P010, P016 etc.
+            int width = frame.get()->width;
+            int height = frame.get()->height;
+            int rgbPitch = (width * 3 + 255) & ~255;
+            size_t rgb24Size = rgbPitch * height;
+            
+            if (!rgb24Buffer_ || rgb24BufferSize_ < rgb24Size)
+            {
+                if (rgb24Buffer_) cudaFree(rgb24Buffer_);
+                cudaError_t err = cudaMalloc(&rgb24Buffer_, rgb24Size);
+                if (err != cudaSuccess) throw CxException("CUDA DECODER: RGB Alloc failed");
+                rgb24BufferSize_ = rgb24Size;
+            }
+            
+            transferAndConvertFrame(frame.get(), rgb24Buffer_, rgbPitch);
+            
+            if (mlUseFP16_)
+            {
+                 launchRgb24ToBchwFP16(
+                    static_cast<uint8_t*>(rgb24Buffer_), rgbPitch,
+                    static_cast<half*>(buffer),
+                    width, height,
+                    mlMean_, mlInvStd_,
+                    cudaStream_
+                );
+            }
+            else
+            {
+                launchRgb24ToBchw(
+                    static_cast<uint8_t*>(rgb24Buffer_), rgbPitch,
+                    static_cast<float*>(buffer),
+                    width, height,
+                    mlMean_, mlInvStd_,
+                    cudaStream_
+                );
+            }
         }
     }
     else

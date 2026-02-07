@@ -1,6 +1,7 @@
 // Python/VideoReader.cpp
 #include "python/VideoReader.hpp"
 #include <cstring> // For std::memcpy
+#include <iostream>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -270,11 +271,16 @@ torch::Tensor VideoReader::decodeFrame()
     {
 #ifdef NELUX_ENABLE_CUDA
         // NVDEC path: use ML-optimized decode (BCHW output directly from GPU kernel)
+        
+        fprintf(stderr, "VideoReader PROBE: decodeAccelerator=%d (NVDEC=%d)\n", (int)decodeAccelerator, (int)nelux::DecodeAccelerator::NVDEC);
+
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         {
+            fprintf(stderr, "VideoReader PROBE: Inside NVDEC block\n");
             auto* cudaDecoder = dynamic_cast<nelux::backends::cuda::Decoder*>(decoder.get());
             if (cudaDecoder)
             {
+                fprintf(stderr, "VideoReader PROBE: cudaDecoder valid\n");
                 if (!cudaDecoder->isMLOutputMode())
                 {
                     // Enable ML mode with default normalization (0-1 range)
@@ -291,6 +297,7 @@ torch::Tensor VideoReader::decodeFrame()
             }
             else
             {
+                fprintf(stderr, "VideoReader PROBE: cudaDecoder NULL (Dynamic Cast Failed)\n");
                 // Shouldn't happen, but fallback to standard decode
                 throw std::runtime_error("NVDEC decoder not available");
             }
@@ -298,6 +305,7 @@ torch::Tensor VideoReader::decodeFrame()
         else
 #endif
         {
+            fprintf(stderr, "VideoReader PROBE: Inside CPU block\n");
             // CPU decoder path: decode to HWC uint8, then convert to BCHW float
             // Create temporary HWC buffer for CPU decode
             torch::Tensor hwcBuffer = torch::empty(
@@ -321,10 +329,14 @@ torch::Tensor VideoReader::decodeFrame()
                 // Step 3: add batch dimension and copy to output tensor
                 tensor.copy_(normalized.unsqueeze(0));
             }
+            else {
+                 std::cerr << "VideoReader: CPU decode failed" << std::endl;
+            }
         }
     }
     catch (const std::exception& ex)
     {
+        std::cerr << "VideoReader: Exception caught: " << ex.what() << std::endl;
         // If NVDEC fails mid-iteration, fall back to CPU.
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         {
@@ -1046,8 +1058,8 @@ torch::ScalarType VideoReader::findMLTypeFromBitDepth()
     
     if (force_8bit || bit_depth <= 8)
     {
-        NELUX_DEBUG("Using FP16 for 8-bit video (optimal for ML inference)");
-        return torch::kFloat16;
+        NELUX_DEBUG("Using FP32 for 8-bit video (FP16 path disabled due to artifacts)");
+        return torch::kFloat32;
     }
     else
     {

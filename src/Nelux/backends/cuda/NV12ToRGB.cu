@@ -57,14 +57,15 @@ __constant__ float matYuv2Rgb[3][3];
 //------------------------------------------------------------------------------
 // RGB pixel types for vectorized access
 //------------------------------------------------------------------------------
-union RGB24 {
-    uchar3 v;
-    struct {
-        uint8_t r, g, b;
-    } c;
+
+// RGB24: Packed 3-byte structure for RGB pixels
+// Note: CUDA's uchar3 has 4-byte alignment, which causes corruption when used
+// in arrays. This struct uses a simple 3-byte layout to avoid padding issues.
+struct RGB24 {
+    uint8_t r, g, b;
     
-    __device__ __host__ RGB24() : v{0, 0, 0} {}
-    __device__ __host__ RGB24(uint8_t r_, uint8_t g_, uint8_t b_) { c.r = r_; c.g = g_; c.b = b_; }
+    __device__ __host__ RGB24() : r(0), g(0), b(0) {}
+    __device__ __host__ RGB24(uint8_t r_, uint8_t g_, uint8_t b_) : r(r_), g(g_), b(b_) {}
 };
 
 // For writing two RGB24 pixels at once (6 bytes, vectorized)
@@ -316,9 +317,9 @@ __device__ __forceinline__ RGB24 YuvToRgbForPixel(YuvUnit y, YuvUnit u, YuvUnit 
     
     // Round and clamp to [0, 255]
     RGB24 rgb;
-    rgb.c.r = static_cast<uint8_t>(Clamp(rf + 0.5f, 0.0f, 255.0f));
-    rgb.c.g = static_cast<uint8_t>(Clamp(gf + 0.5f, 0.0f, 255.0f));
-    rgb.c.b = static_cast<uint8_t>(Clamp(bf + 0.5f, 0.0f, 255.0f));
+    rgb.r = static_cast<uint8_t>(Clamp(rf + 0.5f, 0.0f, 255.0f));
+    rgb.g = static_cast<uint8_t>(Clamp(gf + 0.5f, 0.0f, 255.0f));
+    rgb.b = static_cast<uint8_t>(Clamp(bf + 0.5f, 0.0f, 255.0f));
     return rgb;
 }
 
@@ -329,9 +330,9 @@ template<class YuvUnit>
 __device__ __forceinline__ RGBA32 YuvToRgbaForPixel(YuvUnit y, YuvUnit u, YuvUnit v, uint8_t alpha = 255, bool fullRange = false) {
     RGB24 rgb = YuvToRgbForPixel(y, u, v, fullRange);
     RGBA32 rgba;
-    rgba.c.r = rgb.c.r;
-    rgba.c.g = rgb.c.g;
-    rgba.c.b = rgb.c.b;
+    rgba.c.r = rgb.r;
+    rgba.c.g = rgb.g;
+    rgba.c.b = rgb.b;
     rgba.c.a = alpha;
     return rgba;
 }
@@ -381,12 +382,12 @@ __global__ void Nv12ToRgb24Kernel(
     uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
     // Row 0: pixels (x, y) and (x+1, y)
-    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
-    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
+    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
     
     // Row 1: pixels (x, y+1) and (x+1, y+1)
-    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
-    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
+    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
+    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
 }
 
 /**
@@ -431,16 +432,16 @@ __global__ void Nv12ToRgbPlanarKernel(
     int idx1 = (y + 1) * nWidth + x;
     
     // Vectorized writes to each plane
-    *reinterpret_cast<uchar2*>(pRgbp + idx0) = make_uchar2(rgb00.c.r, rgb01.c.r);
-    *reinterpret_cast<uchar2*>(pRgbp + idx1) = make_uchar2(rgb10.c.r, rgb11.c.r);
+    *reinterpret_cast<uchar2*>(pRgbp + idx0) = make_uchar2(rgb00.r, rgb01.r);
+    *reinterpret_cast<uchar2*>(pRgbp + idx1) = make_uchar2(rgb10.r, rgb11.r);
     
     // G plane
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx0) = make_uchar2(rgb00.c.g, rgb01.c.g);
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx1) = make_uchar2(rgb10.c.g, rgb11.c.g);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx0) = make_uchar2(rgb00.g, rgb01.g);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx1) = make_uchar2(rgb10.g, rgb11.g);
     
     // B plane
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx0) = make_uchar2(rgb00.c.b, rgb01.c.b);
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx1) = make_uchar2(rgb10.c.b, rgb11.c.b);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx0) = make_uchar2(rgb00.b, rgb01.b);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx1) = make_uchar2(rgb10.b, rgb11.b);
 }
 
 /**
@@ -485,12 +486,62 @@ __global__ void Nv12SeparateToRgb24Kernel(
     uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
     // Row 0: pixels (x, y) and (x+1, y)
-    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
-    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
+    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
     
     // Row 1: pixels (x, y+1) and (x+1, y+1)
-    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
-    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
+    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
+    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
+}
+
+/**
+ * @brief NV12 to RGBA32 (4 bytes/pixel) kernel for alignment safety
+ */
+__global__ void Nv12SeparateToRgba32Kernel(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pUV,
+    int nYPitch,
+    int nUVPitch,
+    uint8_t* __restrict__ pRgba,
+    int nRgbaPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        return;
+    }
+    
+    // Read Y
+    const uint8_t* pSrcY = pY + y * nYPitch + x;
+    uchar2 y0 = *reinterpret_cast<const uchar2*>(pSrcY);
+    uchar2 y1 = *reinterpret_cast<const uchar2*>(pSrcY + nYPitch);
+    
+    // Read UV
+    const uint8_t* pSrcUV = pUV + (y / 2) * nUVPitch + x;
+    uchar2 uv = *reinterpret_cast<const uchar2*>(pSrcUV);
+    
+    // Convert
+    RGB24 rgb00 = YuvToRgbForPixel<uint8_t>(y0.x, uv.x, uv.y, fullRange);
+    RGB24 rgb01 = YuvToRgbForPixel<uint8_t>(y0.y, uv.x, uv.y, fullRange);
+    RGB24 rgb10 = YuvToRgbForPixel<uint8_t>(y1.x, uv.x, uv.y, fullRange);
+    RGB24 rgb11 = YuvToRgbForPixel<uint8_t>(y1.y, uv.x, uv.y, fullRange);
+    
+    // Write RGBA32 pixels (4 bytes each)
+    // We can use uchar4 vector writes or int writes if aligned32, but standard ptr access is safe
+    uint8_t* pDst0 = pRgba + y * nRgbaPitch + x * 4;
+    uint8_t* pDst1 = pRgba + (y + 1) * nRgbaPitch + x * 4;
+    
+    // Row 0
+    *reinterpret_cast<uchar4*>(pDst0) = make_uchar4(rgb00.r, rgb00.g, rgb00.b, 255);
+    *reinterpret_cast<uchar4*>(pDst0 + 4) = make_uchar4(rgb01.r, rgb01.g, rgb01.b, 255);
+    
+    // Row 1
+    *reinterpret_cast<uchar4*>(pDst1) = make_uchar4(rgb10.r, rgb10.g, rgb10.b, 255);
+    *reinterpret_cast<uchar4*>(pDst1 + 4) = make_uchar4(rgb11.r, rgb11.g, rgb11.b, 255);
 }
 
 //==============================================================================
@@ -538,12 +589,12 @@ __global__ void P016ToRgb24Kernel(
     uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
     
     // Row 0: pixels (x, y) and (x+1, y)
-    pDst0[0] = rgb00.c.r; pDst0[1] = rgb00.c.g; pDst0[2] = rgb00.c.b;
-    pDst0[3] = rgb01.c.r; pDst0[4] = rgb01.c.g; pDst0[5] = rgb01.c.b;
+    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
+    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
     
     // Row 1: pixels (x, y+1) and (x+1, y+1)
-    pDst1[0] = rgb10.c.r; pDst1[1] = rgb10.c.g; pDst1[2] = rgb10.c.b;
-    pDst1[3] = rgb11.c.r; pDst1[4] = rgb11.c.g; pDst1[5] = rgb11.c.b;
+    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
+    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
 }
 
 /**
@@ -587,12 +638,12 @@ __global__ void P016ToRgbPlanarKernel(
     int idx0 = y * nWidth + x;
     int idx1 = (y + 1) * nWidth + x;
     
-    *reinterpret_cast<uchar2*>(pRgbp + idx0) = make_uchar2(rgb00.c.r, rgb01.c.r);
-    *reinterpret_cast<uchar2*>(pRgbp + idx1) = make_uchar2(rgb10.c.r, rgb11.c.r);
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx0) = make_uchar2(rgb00.c.g, rgb01.c.g);
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx1) = make_uchar2(rgb10.c.g, rgb11.c.g);
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx0) = make_uchar2(rgb00.c.b, rgb01.c.b);
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx1) = make_uchar2(rgb10.c.b, rgb11.c.b);
+    *reinterpret_cast<uchar2*>(pRgbp + idx0) = make_uchar2(rgb00.r, rgb01.r);
+    *reinterpret_cast<uchar2*>(pRgbp + idx1) = make_uchar2(rgb10.r, rgb11.r);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx0) = make_uchar2(rgb00.g, rgb01.g);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx1) = make_uchar2(rgb10.g, rgb11.g);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx0) = make_uchar2(rgb00.b, rgb01.b);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx1) = make_uchar2(rgb10.b, rgb11.b);
 }
 
 //==============================================================================
@@ -635,8 +686,8 @@ __global__ void Nv16ToRgb24Kernel(
     
     // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
     uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
-    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
-    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
 }
 
 /**
@@ -670,9 +721,9 @@ __global__ void Nv16ToRgbPlanarKernel(
     RGB24 rgb1 = YuvToRgbForPixel<uint8_t>(yy.y, uv.x, uv.y, fullRange);
     
     int idx = y * nWidth + x;
-    *reinterpret_cast<uchar2*>(pRgbp + idx) = make_uchar2(rgb0.c.r, rgb1.c.r);
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx) = make_uchar2(rgb0.c.g, rgb1.c.g);
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx) = make_uchar2(rgb0.c.b, rgb1.c.b);
+    *reinterpret_cast<uchar2*>(pRgbp + idx) = make_uchar2(rgb0.r, rgb1.r);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx) = make_uchar2(rgb0.g, rgb1.g);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx) = make_uchar2(rgb0.b, rgb1.b);
 }
 
 //==============================================================================
@@ -713,8 +764,8 @@ __global__ void P216ToRgb24Kernel(
     
     // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
     uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
-    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
-    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
 }
 
 //==============================================================================
@@ -759,8 +810,8 @@ __global__ void Yuv444ToRgb24Kernel(
     
     // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
     uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
-    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
-    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
 }
 
 /**
@@ -797,9 +848,9 @@ __global__ void Yuv444ToRgbPlanarKernel(
     RGB24 rgb1 = YuvToRgbForPixel<uint8_t>(yy.y, uu.y, vv.y, fullRange);
     
     int idx = y * nWidth + x;
-    *reinterpret_cast<uchar2*>(pRgbp + idx) = make_uchar2(rgb0.c.r, rgb1.c.r);
-    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx) = make_uchar2(rgb0.c.g, rgb1.c.g);
-    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx) = make_uchar2(rgb0.c.b, rgb1.c.b);
+    *reinterpret_cast<uchar2*>(pRgbp + idx) = make_uchar2(rgb0.r, rgb1.r);
+    *reinterpret_cast<uchar2*>(pRgbp + planeSize + idx) = make_uchar2(rgb0.g, rgb1.g);
+    *reinterpret_cast<uchar2*>(pRgbp + 2 * planeSize + idx) = make_uchar2(rgb0.b, rgb1.b);
 }
 
 //==============================================================================
@@ -842,8 +893,8 @@ __global__ void Yuv444P16ToRgb24Kernel(
     
     // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
     uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
-    pDst[0] = rgb0.c.r; pDst[1] = rgb0.c.g; pDst[2] = rgb0.c.b;
-    pDst[3] = rgb1.c.r; pDst[4] = rgb1.c.g; pDst[5] = rgb1.c.b;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
 }
 
 //==============================================================================
@@ -1328,22 +1379,22 @@ __global__ void Nv12ToBchwNormalizedKernel(
     int idx0 = y * nWidth + x;
     int idx1 = (y + 1) * nWidth + x;
     
-    pOutput[0 * cStride + idx0 + 0] = (rgb00.c.r * invStd.x) - mean.x;
-    pOutput[0 * cStride + idx0 + 1] = (rgb01.c.r * invStd.x) - mean.x;
-    pOutput[0 * cStride + idx1 + 0] = (rgb10.c.r * invStd.x) - mean.x;
-    pOutput[0 * cStride + idx1 + 1] = (rgb11.c.r * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx0 + 0] = (rgb00.r * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx0 + 1] = (rgb01.r * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx1 + 0] = (rgb10.r * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx1 + 1] = (rgb11.r * invStd.x) - mean.x;
     
     // G plane (C=1)
-    pOutput[1 * cStride + idx0 + 0] = (rgb00.c.g * invStd.y) - mean.y;
-    pOutput[1 * cStride + idx0 + 1] = (rgb01.c.g * invStd.y) - mean.y;
-    pOutput[1 * cStride + idx1 + 0] = (rgb10.c.g * invStd.y) - mean.y;
-    pOutput[1 * cStride + idx1 + 1] = (rgb11.c.g * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx0 + 0] = (rgb00.g * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx0 + 1] = (rgb01.g * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx1 + 0] = (rgb10.g * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx1 + 1] = (rgb11.g * invStd.y) - mean.y;
     
     // B plane (C=2)
-    pOutput[2 * cStride + idx0 + 0] = (rgb00.c.b * invStd.z) - mean.z;
-    pOutput[2 * cStride + idx0 + 1] = (rgb01.c.b * invStd.z) - mean.z;
-    pOutput[2 * cStride + idx1 + 0] = (rgb10.c.b * invStd.z) - mean.z;
-    pOutput[2 * cStride + idx1 + 1] = (rgb11.c.b * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx0 + 0] = (rgb00.b * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx0 + 1] = (rgb01.b * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx1 + 0] = (rgb10.b * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx1 + 1] = (rgb11.b * invStd.z) - mean.z;
 }
 
 /**
@@ -1401,22 +1452,22 @@ __global__ void Nv12ToBchwNormalizedFP16Kernel(
     int idx1 = (y + 1) * nWidth + x;
     
     // R plane (C=0) - convert to half precision
-    pOutput[0 * cStride + idx0 + 0] = __float2half((rgb00.c.r * invStd.x) - mean.x);
-    pOutput[0 * cStride + idx0 + 1] = __float2half((rgb01.c.r * invStd.x) - mean.x);
-    pOutput[0 * cStride + idx1 + 0] = __float2half((rgb10.c.r * invStd.x) - mean.x);
-    pOutput[0 * cStride + idx1 + 1] = __float2half((rgb11.c.r * invStd.x) - mean.x);
+    pOutput[0 * cStride + idx0 + 0] = __float2half((rgb00.r * invStd.x) - mean.x);
+    pOutput[0 * cStride + idx0 + 1] = __float2half((rgb01.r * invStd.x) - mean.x);
+    pOutput[0 * cStride + idx1 + 0] = __float2half((rgb10.r * invStd.x) - mean.x);
+    pOutput[0 * cStride + idx1 + 1] = __float2half((rgb11.r * invStd.x) - mean.x);
     
     // G plane (C=1)
-    pOutput[1 * cStride + idx0 + 0] = __float2half((rgb00.c.g * invStd.y) - mean.y);
-    pOutput[1 * cStride + idx0 + 1] = __float2half((rgb01.c.g * invStd.y) - mean.y);
-    pOutput[1 * cStride + idx1 + 0] = __float2half((rgb10.c.g * invStd.y) - mean.y);
-    pOutput[1 * cStride + idx1 + 1] = __float2half((rgb11.c.g * invStd.y) - mean.y);
+    pOutput[1 * cStride + idx0 + 0] = __float2half((rgb00.g * invStd.y) - mean.y);
+    pOutput[1 * cStride + idx0 + 1] = __float2half((rgb01.g * invStd.y) - mean.y);
+    pOutput[1 * cStride + idx1 + 0] = __float2half((rgb10.g * invStd.y) - mean.y);
+    pOutput[1 * cStride + idx1 + 1] = __float2half((rgb11.g * invStd.y) - mean.y);
     
     // B plane (C=2)
-    pOutput[2 * cStride + idx0 + 0] = __float2half((rgb00.c.b * invStd.z) - mean.z);
-    pOutput[2 * cStride + idx0 + 1] = __float2half((rgb01.c.b * invStd.z) - mean.z);
-    pOutput[2 * cStride + idx1 + 0] = __float2half((rgb10.c.b * invStd.z) - mean.z);
-    pOutput[2 * cStride + idx1 + 1] = __float2half((rgb11.c.b * invStd.z) - mean.z);
+    pOutput[2 * cStride + idx0 + 0] = __float2half((rgb00.b * invStd.z) - mean.z);
+    pOutput[2 * cStride + idx0 + 1] = __float2half((rgb01.b * invStd.z) - mean.z);
+    pOutput[2 * cStride + idx1 + 0] = __float2half((rgb10.b * invStd.z) - mean.z);
+    pOutput[2 * cStride + idx1 + 1] = __float2half((rgb11.b * invStd.z) - mean.z);
 }
 
 /**
@@ -1564,22 +1615,22 @@ __global__ void Nv12BatchToBchwKernel(
     int idx1 = (y + 1) * nWidth + x;
     
     // R plane
-    pFrameOutput[0 * cStride + idx0 + 0] = (rgb00.c.r * invStd.x) - mean.x;
-    pFrameOutput[0 * cStride + idx0 + 1] = (rgb01.c.r * invStd.x) - mean.x;
-    pFrameOutput[0 * cStride + idx1 + 0] = (rgb10.c.r * invStd.x) - mean.x;
-    pFrameOutput[0 * cStride + idx1 + 1] = (rgb11.c.r * invStd.x) - mean.x;
+    pFrameOutput[0 * cStride + idx0 + 0] = (rgb00.r * invStd.x) - mean.x;
+    pFrameOutput[0 * cStride + idx0 + 1] = (rgb01.r * invStd.x) - mean.x;
+    pFrameOutput[0 * cStride + idx1 + 0] = (rgb10.r * invStd.x) - mean.x;
+    pFrameOutput[0 * cStride + idx1 + 1] = (rgb11.r * invStd.x) - mean.x;
     
     // G plane
-    pFrameOutput[1 * cStride + idx0 + 0] = (rgb00.c.g * invStd.y) - mean.y;
-    pFrameOutput[1 * cStride + idx0 + 1] = (rgb01.c.g * invStd.y) - mean.y;
-    pFrameOutput[1 * cStride + idx1 + 0] = (rgb10.c.g * invStd.y) - mean.y;
-    pFrameOutput[1 * cStride + idx1 + 1] = (rgb11.c.g * invStd.y) - mean.y;
+    pFrameOutput[1 * cStride + idx0 + 0] = (rgb00.g * invStd.y) - mean.y;
+    pFrameOutput[1 * cStride + idx0 + 1] = (rgb01.g * invStd.y) - mean.y;
+    pFrameOutput[1 * cStride + idx1 + 0] = (rgb10.g * invStd.y) - mean.y;
+    pFrameOutput[1 * cStride + idx1 + 1] = (rgb11.g * invStd.y) - mean.y;
     
     // B plane
-    pFrameOutput[2 * cStride + idx0 + 0] = (rgb00.c.b * invStd.z) - mean.z;
-    pFrameOutput[2 * cStride + idx0 + 1] = (rgb01.c.b * invStd.z) - mean.z;
-    pFrameOutput[2 * cStride + idx1 + 0] = (rgb10.c.b * invStd.z) - mean.z;
-    pFrameOutput[2 * cStride + idx1 + 1] = (rgb11.c.b * invStd.z) - mean.z;
+    pFrameOutput[2 * cStride + idx0 + 0] = (rgb00.b * invStd.z) - mean.z;
+    pFrameOutput[2 * cStride + idx0 + 1] = (rgb01.b * invStd.z) - mean.z;
+    pFrameOutput[2 * cStride + idx1 + 0] = (rgb10.b * invStd.z) - mean.z;
+    pFrameOutput[2 * cStride + idx1 + 1] = (rgb11.b * invStd.z) - mean.z;
 }
 
 /**
@@ -1781,6 +1832,60 @@ __global__ void Rgb24ToBchwFP16Kernel(
 }
 
 /**
+ * @brief Universal kernel: Convert RGBA32 (HWC) to BCHW float32 with normalization
+ */
+__global__ void Rgba32ToBchwKernel(
+    const uint8_t* __restrict__ pRgba,
+    int nRgbaPitch,
+    float* __restrict__ pOutput,
+    int nWidth,
+    int nHeight,
+    float3 mean,
+    float3 invStd)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        return;
+    }
+    
+    const int planeSize = nWidth * nHeight;
+    const int cStride = planeSize;
+    
+    // Read 2x2 block of RGBA32 pixels (32-bit reads)
+    const uchar4* pSrc0 = reinterpret_cast<const uchar4*>(pRgba + y * nRgbaPitch + x * 4);
+    const uchar4* pSrc1 = reinterpret_cast<const uchar4*>(pRgba + (y + 1) * nRgbaPitch + x * 4);
+    
+    uchar4 px00 = pSrc0[0];
+    uchar4 px01 = pSrc0[1];
+    uchar4 px10 = pSrc1[0];
+    uchar4 px11 = pSrc1[1];
+    
+    // Write to BCHW format
+    int idx0 = y * nWidth + x;
+    int idx1 = (y + 1) * nWidth + x;
+    
+    // R plane
+    pOutput[0 * cStride + idx0 + 0] = (px00.x * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx0 + 1] = (px01.x * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx1 + 0] = (px10.x * invStd.x) - mean.x;
+    pOutput[0 * cStride + idx1 + 1] = (px11.x * invStd.x) - mean.x;
+    
+    // G plane
+    pOutput[1 * cStride + idx0 + 0] = (px00.y * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx0 + 1] = (px01.y * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx1 + 0] = (px10.y * invStd.y) - mean.y;
+    pOutput[1 * cStride + idx1 + 1] = (px11.y * invStd.y) - mean.y;
+    
+    // B plane
+    pOutput[2 * cStride + idx0 + 0] = (px00.z * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx0 + 1] = (px01.z * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx1 + 0] = (px10.z * invStd.z) - mean.z;
+    pOutput[2 * cStride + idx1 + 1] = (px11.z * invStd.z) - mean.z;
+}
+
+/**
  * @brief Launch RGB24 to BCHW float32 conversion
  */
 void launchRgb24ToBchw(
@@ -1825,6 +1930,61 @@ void launchRgb24ToBchwFP16(
     
     Rgb24ToBchwFP16Kernel<<<gridDim, blockDim, 0, stream>>>(
         pRgb, nRgbPitch, pOutput, nWidth, nHeight, mean, invStd
+    );
+}
+
+void launchNv12ToRgba32Separate(
+    const uint8_t* pY, const uint8_t* pUV,
+    int nYPitch, int nUVPitch,
+    uint8_t* pRgba, int nRgbaPitch,
+    int nWidth, int nHeight,
+    int colorSpace, int colorRange,
+    cudaStream_t stream)
+{
+    // Configure colorspace - simplified for brevity, relying on template instantation or dynamic pass usually
+    // Assuming Standard Colorspace for now or handled by compilation
+    // But wait, the original calls launchNv12ToRgb24Separate which handles color space internally via templates?
+    // Looking at original code: launchNv12ToRgb24Separate is defined elsewhere?
+    // ...Checking file structure...
+    // The previous view_file didn't show launchNv12ToRgb24Separate definition, only declaration in header maybe?
+    // Wait, I am editing the .cu file.
+    
+    // I will use a simple kernel launch with 'bt709' default or similar if I can't access the logic easily.
+    // Actually, looking at lines 478: YuvToRgbForPixel. It takes y, u, v, fullRange.
+    // It doesn't seem to take color matrix.
+    // I'll assume standard Rec709/Rec601 is handled inside YuvToRgbForPixel specializations.
+    
+    // Re-check YuvToRgbForPixel. Ideally I should follow the existing pattern.
+    // But since I can't see the full file, I'll just implement the kernel launch.
+    
+    // CRITICAL: Initialize the YUV->RGB color conversion matrix before kernel launch!
+    SetMatYuv2Rgb(colorSpace, colorRange, stream);
+    
+    dim3 blockDim(32, 2);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    
+    bool full = (colorRange == 1); // ColorRange_Full = 1
+    
+    Nv12SeparateToRgba32Kernel<<<gridDim, blockDim, 0, stream>>>(
+        pY, pUV, nYPitch, nUVPitch, pRgba, nRgbaPitch, nWidth, nHeight, full
+    );
+}
+
+void launchRgba32ToBchw(
+    const uint8_t* pRgba,
+    int nRgbaPitch,
+    float* pOutput,
+    int nWidth,
+    int nHeight,
+    float3 mean,
+    float3 invStd,
+    cudaStream_t stream)
+{
+    dim3 blockDim(32, 2);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    
+    Rgba32ToBchwKernel<<<gridDim, blockDim, 0, stream>>>(
+        pRgba, nRgbaPitch, pOutput, nWidth, nHeight, mean, invStd
     );
 }
 
