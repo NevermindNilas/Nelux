@@ -18,12 +18,6 @@ Originall created by [Trentonom0r3](https://github.com/Trentonom0r3)
 ```bash
 pip install nelux
 ```
-
-**For Linux**: Download the most recent release (.whl) and install manually:
-```bash
-pip install ./*.whl
-```
-
 ---
 
 ## Quick Start
