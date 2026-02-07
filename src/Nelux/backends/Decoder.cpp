@@ -470,6 +470,7 @@ bool Decoder::seek(double timestamp)
 {
     stopDecodingThread();
     clearQueue();
+    resetTimestampState();
 
     NELUX_TRACE("Seeking to timestamp: {}", timestamp);
     if (timestamp < 0 || timestamp > properties.duration)
@@ -600,6 +601,7 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
 {
     stopDecodingThread();
     clearQueue();
+    resetTimestampState();
 
     NELUX_TRACE("Seeking to the nearest keyframe for timestamp: {}", timestamp);
     if (timestamp < 0 || timestamp > properties.duration)
@@ -638,28 +640,14 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
         return -1.0;
     }
 
-    AVRational time_base = formatCtx->streams[videoStreamIndex]->time_base;
-    // For hardware frames (e.g., NVDEC), prefer stream time base to avoid hwaccel time base skew.
-    if (frame->format != AV_PIX_FMT_CUDA)
-    {
-        // Prefer a frame-provided time base if available; otherwise fall back to codec pkt time base.
-        if (frame->time_base.num > 0 && frame->time_base.den > 0)
-        {
-            time_base = frame->time_base;
-        }
-        else if (codecCtx && codecCtx->pkt_timebase.num > 0 && codecCtx->pkt_timebase.den > 0)
-        {
-            time_base = codecCtx->pkt_timebase;
-        }
-    }
-
     // Define a lambda to convert AV_TIME_BASE to seconds
-    auto convert_to_seconds = [&](int64_t timestamp, AVRational tb) -> double
-    { return static_cast<double>(timestamp) * av_q2d(tb); };
+    auto convert_to_seconds = [&](int64_t timestamp, AVRational time_base) -> double
+    { return static_cast<double>(timestamp) * av_q2d(time_base); };
 
     // Attempt to retrieve the best_effort_timestamp first
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
     {
+        AVRational time_base = formatCtx->streams[videoStreamIndex]->time_base;
         double timestamp = convert_to_seconds(frame->best_effort_timestamp, time_base);
         NELUX_DEBUG("Using best_effort_timestamp: {}", timestamp);
         return timestamp;
@@ -668,6 +656,7 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     // Fallback to frame->pts
     if (frame->pts != AV_NOPTS_VALUE)
     {
+        AVRational time_base = formatCtx->streams[videoStreamIndex]->time_base;
         double timestamp = convert_to_seconds(frame->pts, time_base);
         NELUX_DEBUG("Using frame->pts: {}", timestamp);
         return timestamp;
@@ -676,6 +665,7 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     // Fallback to frame->pkt_dts if available
     if (frame->pkt_dts != AV_NOPTS_VALUE)
     {
+        AVRational time_base = formatCtx->streams[videoStreamIndex]->time_base;
         double timestamp = convert_to_seconds(frame->pkt_dts, time_base);
         NELUX_DEBUG("Using frame->pkt_dts: {}", timestamp);
         return timestamp;
@@ -1243,6 +1233,7 @@ void Decoder::reconfigure(const std::string& filePath)
     // Stop any running prefetch thread first
     stopDecodingThread();
     clearQueue();
+    resetTimestampState();
     
     // Close audio if it was initialized
     closeAudio();
@@ -1336,6 +1327,14 @@ void Decoder::clearQueue()
     std::queue<ConvertedFrame> emptyConverted;
     std::swap(convertedQueue, emptyConverted);
     isFinished = false;
+}
+
+void Decoder::resetTimestampState()
+{
+    lastFrameTimestamp_ = -1.0;
+    lastTimestampValid_ = false;
+    timestampOffset_ = 0.0;
+    timestampOffsetInitialized_ = false;
 }
 
 void Decoder::decodingLoop()

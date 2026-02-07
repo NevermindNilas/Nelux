@@ -2,6 +2,7 @@
 #include "python/VideoReader.hpp"
 #include <cstring> // For std::memcpy
 #include <iostream>
+#include <cmath>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -22,7 +23,9 @@ namespace py = pybind11;
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
                          int cuda_device_index)
-    : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
+        : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
+            nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
+            rangeFrameLimit_(-1), rangeFramesEmitted_(0),
       start_frame(0), end_frame(-1), start_time(-1.0), end_time(-1.0),
       filePath(filePath), numThreads(numThreads), force_8bit(force_8bit),
       backend(backend),
@@ -89,17 +92,18 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
 
         properties = decoder->getVideoProperties();
 
-        // Always use BCHW format with automatic dtype selection:
-        // - FP16 for 8-bit videos (sufficient precision, 2x memory savings)
-        // - FP32 for 10-bit+ videos (needed for precision)
-        torch::Dtype torchDataType = findMLTypeFromBitDepth();
+        // Always use HWC format with native dtype (uint8/int16):
+        // - No BCHW conversion
+        // - No floating point conversion
+        // - Native bit depth preserved
+        torch::Dtype torchDataType = findTypeFromBitDepth();
         tensor = torch::empty(
-            {1, 3, properties.height, properties.width},
+            {properties.height, properties.width, 3},
             torch::TensorOptions().dtype(torchDataType).device(torchDevice));
         CHECK_TENSOR(tensor);
         
-        NELUX_INFO("VideoReader initialized with BCHW format, dtype={}", 
-                   torchDataType == torch::kFloat16 ? "FP16" : "FP32");
+        NELUX_INFO("VideoReader initialized with HWC format, dtype={}", 
+                   torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
     }
     catch (const std::exception& ex)
     {
@@ -269,64 +273,9 @@ torch::Tensor VideoReader::decodeFrame()
     
     try
     {
-#ifdef NELUX_ENABLE_CUDA
-        // NVDEC path: use ML-optimized decode (BCHW output directly from GPU kernel)
-        
-        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-        {
-            auto* cudaDecoder = dynamic_cast<nelux::backends::cuda::Decoder*>(decoder.get());
-            if (cudaDecoder)
-            {
-                if (!cudaDecoder->isMLOutputMode())
-                {
-                    // Enable ML mode with default normalization (0-1 range)
-                    cudaDecoder->setMLOutputMode(true, nullptr, nullptr);
-                    cudaDecoder->setMLUseFP16(tensor.dtype() == torch::kFloat16);
-                }
-                success = cudaDecoder->decodeNextFrameML(tensor.data_ptr(), &frame_timestamp);
-                
-                // Synchronize to ensure data is ready
-                if (success)
-                {
-                    cudaDecoder->waitForDecodeComplete(0);
-                }
-            }
-            else
-            {
-                // Shouldn't happen, but fallback to standard decode
-                throw std::runtime_error("NVDEC decoder not available");
-            }
-        }
-        else
-#endif
-        {
-            // CPU decoder path: decode to HWC uint8, then convert to BCHW float
-            // Create temporary HWC buffer for CPU decode
-            torch::Tensor hwcBuffer = torch::empty(
-                {properties.height, properties.width, 3},
-                torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
-            
-            success = decoder->decodeNextFrame(hwcBuffer.data_ptr(), &frame_timestamp);
-            
-            if (success)
-            {
-                // Convert HWC uint8 -> BCHW float with normalization to [0, 1]
-                // hwcBuffer: [H, W, 3] uint8
-                // tensor: [1, 3, H, W] float16/float32
-                
-                // Step 1: permute HWC -> CHW
-                torch::Tensor chw = hwcBuffer.permute({2, 0, 1}); // [3, H, W]
-                
-                // Step 2: convert to float and normalize to [0, 1]
-                torch::Tensor normalized = chw.to(tensor.dtype()).div_(255.0f);
-                
-                // Step 3: add batch dimension and copy to output tensor
-                tensor.copy_(normalized.unsqueeze(0));
-            }
-            else {
-                 std::cerr << "VideoReader: CPU decode failed" << std::endl;
-            }
-        }
+        // Simple HWC decode - no conversions, no BCHW, no floating point
+        // Output is always HWC with native bit depth (uint8/int16)
+        success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
     }
     catch (const std::exception& ex)
     {
@@ -342,10 +291,10 @@ torch::Tensor VideoReader::decodeFrame()
                                                     numThreads, decodeAccelerator, 0);
             decoder->setForce8Bit(force_8bit);
 
-            // Recreate output tensor on CPU with BCHW format
-            torch::Dtype torchDataType = findMLTypeFromBitDepth();
+            // Recreate output tensor on CPU with HWC format
+            torch::Dtype torchDataType = findTypeFromBitDepth();
             tensor = torch::empty(
-                {1, 3, properties.height, properties.width},
+                {properties.height, properties.width, 3},
                 torch::TensorOptions().dtype(torchDataType).device(torch::kCPU));
 
             // Retry decode with CPU path (recursive call will use correct path)
@@ -680,6 +629,10 @@ void VideoReader::reset()
     }
     currentIndex = 0;
     current_timestamp = 0.0;
+    nvdecTimestampOffset_ = 0.0;
+    nvdecTimestampOffsetInitialized_ = false;
+    rangeFrameLimit_ = -1;
+    rangeFramesEmitted_ = 0;
     hasBufferedFrame = false;
     // Reset range if needed, or keep it? Usually reset() implies full reset,
     // but here we just reset iteration state.
@@ -859,11 +812,31 @@ VideoReader& VideoReader::iter()
         NELUX_INFO("Using timestamp range for iteration: start_time={}, end_time={}",
                    start_time, end_time);
 
-        bool success = seek(start_time);
-        if (!success)
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && properties.fps > 0.0)
         {
-            NELUX_ERROR("Failed to seek to start_time: {}", start_time);
-            throw std::runtime_error("Failed to seek to start_time.");
+            double span = std::max(0.0, end_time - start_time);
+            rangeFrameLimit_ = static_cast<int>(std::ceil(span * properties.fps)) + 1;
+            rangeFramesEmitted_ = 0;
+        }
+        else
+        {
+            rangeFrameLimit_ = -1;
+            rangeFramesEmitted_ = 0;
+        }
+
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_time <= 0.0)
+        {
+            // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
+            decoder->reconfigure(filePath);
+        }
+        else
+        {
+            bool success = seek(start_time);
+            if (!success)
+            {
+                NELUX_ERROR("Failed to seek to start_time: {}", start_time);
+                throw std::runtime_error("Failed to seek to start_time.");
+            }
         }
 
         // -------------------------------------------------------
@@ -904,19 +877,33 @@ VideoReader& VideoReader::iter()
         // Using frame range
         NELUX_INFO("Using frame range for iteration: start_frame={}, end_frame={}",
                    start_frame, end_frame);
-        bool success = seekToFrame(start_frame);
-        if (!success)
+        rangeFrameLimit_ = -1;
+        rangeFramesEmitted_ = 0;
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_frame <= 0)
         {
-            NELUX_ERROR("Failed to seek to start_frame: {}", start_frame);
-            throw std::runtime_error("Failed to seek to start_frame.");
+            // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
+            decoder->reconfigure(filePath);
+            currentIndex = 0;
+            current_timestamp = 0.0;
         }
-        currentIndex = start_frame;
-        current_timestamp = static_cast<double>(currentIndex) / properties.fps;
+        else
+        {
+            bool success = seekToFrame(start_frame);
+            if (!success)
+            {
+                NELUX_ERROR("Failed to seek to start_frame: {}", start_frame);
+                throw std::runtime_error("Failed to seek to start_frame.");
+            }
+            currentIndex = start_frame;
+            current_timestamp = static_cast<double>(currentIndex) / properties.fps;
+        }
     }
     else
     {
         // No range set; start from the beginning
         NELUX_INFO("No range set; starting from the beginning");
+        rangeFrameLimit_ = -1;
+        rangeFramesEmitted_ = 0;
         bool success = seek(0.0);
         if (!success)
         {
@@ -933,6 +920,11 @@ VideoReader& VideoReader::iter()
 py::object VideoReader::next()
 {
     NELUX_TRACE("next() called: Retrieving next frame");
+
+    if (rangeFrameLimit_ > 0 && rangeFramesEmitted_ >= rangeFrameLimit_)
+    {
+        throw py::stop_iteration();
+    }
 
     // If we have a buffered frame from the discard loop, consume it first.
     torch::Tensor frame;
@@ -977,6 +969,10 @@ py::object VideoReader::next()
 
     NELUX_TRACE("next() returning frame index={}, timestamp={}", currentIndex - 1,
                 current_timestamp);
+    if (rangeFrameLimit_ > 0)
+    {
+        rangeFramesEmitted_++;
+    }
     return tensorToOutput(frame);
 }
 
@@ -1188,6 +1184,10 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     // Reset iteration state
     currentIndex = 0;
     current_timestamp = 0.0;
+    nvdecTimestampOffset_ = 0.0;
+    nvdecTimestampOffsetInitialized_ = false;
+    rangeFrameLimit_ = -1;
+    rangeFramesEmitted_ = 0;
     
     // Clear any set ranges
     start_frame = 0;

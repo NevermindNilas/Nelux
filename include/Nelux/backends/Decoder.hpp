@@ -164,10 +164,18 @@ class Decoder
     std::atomic<bool> preconvertEnabled{false};
     size_t convertedFrameBytes = 0;
 
+    double lastFrameTimestamp_ = -1.0;
+    bool lastTimestampValid_ = false;
+    double timestampOffset_ = 0.0;
+    bool timestampOffsetInitialized_ = false;
+    int timestampDebugCount_ = 0;
+
     void decodingLoop();
     void startDecodingThread();
     void stopDecodingThread();
     void clearQueue();
+
+    void resetTimestampState();
 
     // Batch decoder instance (lazy initialized)
     std::unique_ptr<BatchDecoder> batch_decoder_;

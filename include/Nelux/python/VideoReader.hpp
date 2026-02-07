@@ -487,6 +487,10 @@ class VideoReader
     // Iterator state
     int currentIndex;
     double current_timestamp; // Add this line
+    double nvdecTimestampOffset_ = 0.0;
+    bool nvdecTimestampOffsetInitialized_ = false;
+    int rangeFrameLimit_ = -1;
+    int rangeFramesEmitted_ = 0;
     // List of filters to be added before initialization
     torch::Tensor bufferedFrame; // The "first valid" frame, if we found it early
     bool hasBufferedFrame = false;

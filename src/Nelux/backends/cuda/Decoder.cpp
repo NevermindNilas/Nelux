@@ -543,12 +543,6 @@ void Decoder::initCodecContextWithHwAccel()
     codecCtx->thread_count = numThreads;
     codecCtx->thread_type = FF_THREAD_FRAME;
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
-    codecCtx->pkt_timebase = formatCtx->streams[videoStreamIndex]->time_base;
-    codecCtx->framerate = (formatCtx->streams[videoStreamIndex]->avg_frame_rate.num > 0)
-                             ? formatCtx->streams[videoStreamIndex]->avg_frame_rate
-                             : av_guess_frame_rate(formatCtx.get(),
-                                                   formatCtx->streams[videoStreamIndex],
-                                                   nullptr);
     
     // Open the codec
     int ret = avcodec_open2(codecCtx.get(), codec, nullptr);
@@ -624,9 +618,6 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int 
                 static_cast<uint8_t*>(outputBuffer), rgbPitch,
                 width, height, colorSpace, colorRange, cudaStream_
             );
-            std::cerr << "NV12 DEBUG !!!!!!: width=" << width << " height=" << height 
-                      << " yPitch=" << yPitch << " uvPitch=" << uvPitch 
-                      << " rgbPitch=" << rgbPitch << std::endl;
             break;
         }
         
@@ -704,41 +695,70 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         return false;
     }
     
-    // Note: buffer must be a CUDA device pointer!
-    // The torch::Tensor for CUDA backend should be allocated with device='cuda'
+    // Synchronous decode for NVDEC - hardware frames share buffer pools,
+    // so we cannot queue them. Decode and convert immediately.
+    Frame localFrame;
+    bool frameDecoded = false;
     
-    // Use the base class decoding thread infrastructure, but with our conversion
-    if (!decodingThread.joinable())
+    while (!frameDecoded)
     {
-        startDecodingThread();
+        // Try to receive a decoded frame
+        int ret = avcodec_receive_frame(codecCtx.get(), localFrame.get());
+        
+        if (ret == 0)
+        {
+            // Successfully got a frame
+            frameDecoded = true;
+            break;
+        }
+        else if (ret == AVERROR_EOF)
+        {
+            // End of file
+            return false;
+        }
+        else if (ret != AVERROR(EAGAIN))
+        {
+            // Error
+            NELUX_WARN("Error receiving frame: {}", ret);
+            return false;
+        }
+        
+        // Need more input - read and send a packet
+        if (av_read_frame(formatCtx.get(), pkt.get()) >= 0)
+        {
+            if (pkt->stream_index == videoStreamIndex)
+            {
+                int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
+                if (sendRet < 0 && sendRet != AVERROR(EAGAIN))
+                {
+                    NELUX_WARN("Error sending packet to decoder: {}", sendRet);
+                }
+            }
+            av_packet_unref(pkt.get());
+        }
+        else
+        {
+            // EOF - flush decoder
+            avcodec_send_packet(codecCtx.get(), nullptr);
+        }
     }
-
-    std::unique_lock<std::mutex> lock(queueMutex);
-    queueCond.wait(lock, [this] { return !frameQueue.empty() || isFinished || stopDecoding; });
-
-    if (frameQueue.empty())
+    
+    if (!frameDecoded)
     {
         return false;
     }
 
-    Frame frame = std::move(frameQueue.front());
-    frameQueue.pop();
-    producerCond.notify_one();
-    lock.unlock();
-
     if (frame_timestamp)
     {
-        *frame_timestamp = getFrameTimestamp(frame.get());
+        *frame_timestamp = getFrameTimestamp(localFrame.get());
     }
 
-    // Convert and transfer the frame
-    // For hardware frames, we use our GPU-side conversion
-    if (frame.get()->format == AV_PIX_FMT_CUDA)
+    // Convert and transfer the frame immediately (don't queue hardware frames)
+    if (localFrame.get()->format == AV_PIX_FMT_CUDA)
     {
         // Use intermediate aligned buffer to ensure kernel works correctly
-        // and to support writing to unaligned host memory (CPU tensor)
-        int width = frame.get()->width;
-        int height = frame.get()->height;
+        int width = localFrame.get()->width;
+        int height = localFrame.get()->height;
         int alignedPitch = (width * 3 + 255) & ~255;
         size_t alignedSize = alignedPitch * height;
         
@@ -750,38 +770,25 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             rgb24BufferSize_ = alignedSize;
         }
         
-        // 1. Convert to aligned GPU buffer
-        transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
+        // Convert to aligned GPU buffer
+        transferAndConvertFrame(localFrame.get(), rgb24Buffer_, alignedPitch);
+
+        // Ensure conversion completes before copy
+        cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
+        if (sync_err != cudaSuccess)
+        {
+            throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
+                             cudaGetErrorString(sync_err));
+        }
         
-        // 2. Copy to output buffer (removing padding if any)
-        // buffer is likely Host memory if calling decodeNextFrame with NVDEC frame
+        // Copy to output buffer
         cudaMemcpy2D(buffer, width * 3, rgb24Buffer_, alignedPitch, 
                      width * 3, height, cudaMemcpyDeviceToHost);
     }
     else
     {
-        // Do not attempt CPU conversion into a CUDA buffer.
-        // Surface an error so the caller can fall back to a CPU decoder safely.
         throw CxException("CUDA DECODER: Received non-CUDA frame. NVDEC not available for this stream.");
     }
-    
-    // Record an event to track when the conversion is complete
-    // This allows consumers to wait for the operation if needed
-    if (decodeCompleteEvent_)
-    {
-        cudaError_t err = cudaEventRecord(decodeCompleteEvent_, cudaStream_);
-        if (err != cudaSuccess)
-        {
-            NELUX_WARN("CUDA DECODER: Failed to record event: {}", cudaGetErrorString(err));
-        }
-    }
-    
-    // Note: We intentionally do NOT synchronize here.
-    // The CUDA kernel launch is asynchronous and the stream ordering ensures
-    // conversion completes before the output buffer is accessed.
-    // Consumers can call waitForDecodeComplete() before accessing the data,
-    // or rely on PyTorch's automatic synchronization when using the tensor.
-    // This allows the CPU to start the next decode while GPU processes the current frame.
     
     return true;
 }
@@ -791,6 +798,7 @@ bool Decoder::seek(double timestamp)
     // Stop decoding thread, clear queue, and seek
     stopDecodingThread();
     clearQueue();
+    resetTimestampState();
 
     NELUX_TRACE("CUDA DECODER: Seeking to timestamp: {}", timestamp);
     if (timestamp < 0 || timestamp > properties.duration)
@@ -1098,6 +1106,14 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
                 );
             }
         }
+
+        // Ensure all CUDA work completes before the tensor is consumed on the default stream.
+        cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
+        if (sync_err != cudaSuccess)
+        {
+            throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
+                             cudaGetErrorString(sync_err));
+        }
     }
     else
     {
@@ -1124,6 +1140,7 @@ void Decoder::reconfigure(const std::string& filePath)
     // Stop decoding thread first
     stopDecodingThread();
     clearQueue();
+    resetTimestampState();
     
     // Close audio if initialized
     closeAudio();
