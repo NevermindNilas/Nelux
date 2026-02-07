@@ -18,14 +18,6 @@ Originall created by [Trentonom0r3](https://github.com/Trentonom0r3)
 ```bash
 pip install nelux
 ```
-
-**Note**: The package is named `nelux` on PyPI (not `nelux`).
-
-**For Linux**: Download the most recent release (.whl) and install manually:
-```bash
-pip install ./*.whl
-```
-
 ---
 
 ## Quick Start
