@@ -723,7 +723,9 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
     Frame frame = std::move(frameQueue.front());
     frameQueue.pop();
-    producerCond.notify_one();
+    // NOTE: Do NOT notify producer yet. We must finish reading the NVDEC
+    // hardware frame's GPU data before allowing the decode thread to proceed,
+    // otherwise NVDEC may reuse the surface while we are still converting it.
     lock.unlock();
 
     if (frame_timestamp)
@@ -760,14 +762,19 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                              cudaGetErrorString(sync_err));
         }
         
-        // Copy to output buffer
+        // Copy to output buffer (both buffers are on GPU device memory)
         cudaMemcpy2D(buffer, width * 3, rgb24Buffer_, alignedPitch, 
-                     width * 3, height, cudaMemcpyDeviceToHost);
+                     width * 3, height, cudaMemcpyDeviceToDevice);
     }
     else
     {
         throw CxException("CUDA DECODER: Received non-CUDA frame.");
     }
+    
+    // GPU conversion complete and data has been fully read from the HW frame.
+    // Now it is safe for the producer to decode new frames (which may reuse
+    // NVDEC hardware surfaces).
+    producerCond.notify_one();
     
     return true;
 }
@@ -986,7 +993,8 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
 
     Frame frame = std::move(frameQueue.front());
     frameQueue.pop();
-    producerCond.notify_one();
+    // NOTE: Do NOT notify producer yet. We must finish reading the NVDEC
+    // hardware frame's GPU data before allowing the decode thread to proceed.
     lock.unlock();
 
     if (frame_timestamp)
@@ -1122,6 +1130,11 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             NELUX_WARN("CUDA DECODER: Failed to record event: {}", cudaGetErrorString(err));
         }
     }
+    
+    // GPU conversion complete and data has been fully read from the HW frame.
+    // Now it is safe for the producer to decode new frames (which may reuse
+    // NVDEC hardware surfaces).
+    producerCond.notify_one();
     
     return true;
 }
