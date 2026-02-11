@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "error/CxException.hpp"
 #include <Conversion.hpp>
@@ -109,6 +109,7 @@ class Decoder
     virtual void reconfigure(const std::string& filePath);
 
     virtual std::vector<std::string> listSupportedDecoders() const;
+
     AVCodecContext* getCtx();
 
     bool extractAudioToFile(const std::string& outputFilePath);

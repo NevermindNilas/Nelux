@@ -554,6 +554,10 @@ void Decoder::initCodecContextWithHwAccel()
     }
     
     NELUX_DEBUG("CUDA DECODER: Codec opened with hardware acceleration");
+    
+    // Limit queue size for NVDEC to prevent hardware frame buffer overwriting
+    // Must be 1 because hardware frames share buffer pools
+    maxQueueSize = 1;
 }
 
 void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch)
@@ -694,71 +698,46 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         NELUX_WARN("CUDA DECODER: Hardware not initialized");
         return false;
     }
-    
-    // Synchronous decode for NVDEC - hardware frames share buffer pools,
-    // so we cannot queue them. Decode and convert immediately.
-    Frame localFrame;
-    bool frameDecoded = false;
-    
-    while (!frameDecoded)
+
+    // Ensure this thread uses the correct CUDA device.
+    cudaError_t device_err = cudaSetDevice(cudaDeviceIndex_);
+    if (device_err != cudaSuccess)
     {
-        // Try to receive a decoded frame
-        int ret = avcodec_receive_frame(codecCtx.get(), localFrame.get());
-        
-        if (ret == 0)
-        {
-            // Successfully got a frame
-            frameDecoded = true;
-            break;
-        }
-        else if (ret == AVERROR_EOF)
-        {
-            // End of file
-            return false;
-        }
-        else if (ret != AVERROR(EAGAIN))
-        {
-            // Error
-            NELUX_WARN("Error receiving frame: {}", ret);
-            return false;
-        }
-        
-        // Need more input - read and send a packet
-        if (av_read_frame(formatCtx.get(), pkt.get()) >= 0)
-        {
-            if (pkt->stream_index == videoStreamIndex)
-            {
-                int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
-                if (sendRet < 0 && sendRet != AVERROR(EAGAIN))
-                {
-                    NELUX_WARN("Error sending packet to decoder: {}", sendRet);
-                }
-            }
-            av_packet_unref(pkt.get());
-        }
-        else
-        {
-            // EOF - flush decoder
-            avcodec_send_packet(codecCtx.get(), nullptr);
-        }
+        throw CxException(std::string("CUDA DECODER: Failed to set CUDA device: ") +
+                          cudaGetErrorString(device_err));
     }
     
-    if (!frameDecoded)
+    // Use the base class decoding thread infrastructure
+    if (!decodingThread.joinable())
+    {
+        startDecodingThread();
+    }
+
+    std::unique_lock<std::mutex> lock(queueMutex);
+    queueCond.wait(lock, [this] { return !frameQueue.empty() || isFinished || stopDecoding; });
+
+    if (frameQueue.empty())
     {
         return false;
     }
 
+    Frame frame = std::move(frameQueue.front());
+    frameQueue.pop();
+    producerCond.notify_one();
+    lock.unlock();
+
     if (frame_timestamp)
     {
-        *frame_timestamp = getFrameTimestamp(localFrame.get());
+        *frame_timestamp = getFrameTimestamp(frame.get());
     }
 
-    // Convert and transfer the frame immediately (don't queue hardware frames)
-    if (localFrame.get()->format == AV_PIX_FMT_CUDA)
+    std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
+
+    // Convert and transfer the frame
+    if (frame.get()->format == AV_PIX_FMT_CUDA)
     {
-        // Use intermediate aligned buffer to ensure kernel works correctly
-        int width = localFrame.get()->width;
-        int height = localFrame.get()->height;
+        int width = frame.get()->width;
+        int height = frame.get()->height;
         int alignedPitch = (width * 3 + 255) & ~255;
         size_t alignedSize = alignedPitch * height;
         
@@ -771,7 +750,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         }
         
         // Convert to aligned GPU buffer
-        transferAndConvertFrame(localFrame.get(), rgb24Buffer_, alignedPitch);
+        transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
 
         // Ensure conversion completes before copy
         cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
@@ -787,7 +766,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     }
     else
     {
-        throw CxException("CUDA DECODER: Received non-CUDA frame. NVDEC not available for this stream.");
+        throw CxException("CUDA DECODER: Received non-CUDA frame.");
     }
     
     return true;
@@ -795,6 +774,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
 bool Decoder::seek(double timestamp)
 {
+    std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
+
     // Stop decoding thread, clear queue, and seek
     stopDecodingThread();
     clearQueue();
@@ -828,6 +809,8 @@ bool Decoder::seek(double timestamp)
 void Decoder::close()
 {
     NELUX_DEBUG("CUDA DECODER: Closing");
+
+    std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
     
     // Stop decoding thread first
     stopDecodingThread();
@@ -978,6 +961,14 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         NELUX_WARN("CUDA DECODER: decodeNextFrameML called but ML mode not enabled");
         return false;
     }
+
+    // Ensure this thread uses the correct CUDA device.
+    cudaError_t device_err = cudaSetDevice(cudaDeviceIndex_);
+    if (device_err != cudaSuccess)
+    {
+        throw CxException(std::string("CUDA DECODER: Failed to set CUDA device: ") +
+                          cudaGetErrorString(device_err));
+    }
     
     // Use the base class decoding thread infrastructure
     if (!decodingThread.joinable())
@@ -1002,6 +993,8 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
     {
         *frame_timestamp = getFrameTimestamp(frame.get());
     }
+
+    std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
     // Convert and transfer the frame using unified two-step approach
     if (frame.get()->format == AV_PIX_FMT_CUDA)
@@ -1135,6 +1128,8 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
 
 void Decoder::reconfigure(const std::string& filePath)
 {
+    std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
+
     NELUX_INFO("CUDA DECODER: Reconfiguring for new file: {}", filePath);
     
     // Stop decoding thread first

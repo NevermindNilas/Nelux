@@ -7,6 +7,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <mutex>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -29,7 +30,7 @@ namespace nelux::backends::cuda
  * 
  * Thread safety:
  * - C++ side: Uses mutex for frame queue access
- * - CUDA side: Uses stream-ordered operations for thread safety
+ * - CUDA side: Uses a decode mutex to serialize shared buffers/stream
  */
 class Decoder : public nelux::Decoder
 {
@@ -162,7 +163,7 @@ public:
      */
     torch::Tensor decode_batch(const std::vector<int64_t>& indices) override;
 
-protected:
+ protected:
     void initialize(const std::string& filePath);
     void initHardwareContext();
     void initCodecContextWithHwAccel();
@@ -203,6 +204,9 @@ private:
     bool mlUseFP16_;     // Use float16 (half) instead of float32
     float3 mlMean_;      // Pre-computed mean for ML normalization
     float3 mlInvStd_;    // Pre-computed inverse std for ML normalization
+
+    // Serialize access to shared CUDA buffers/stream across threads.
+    std::mutex cudaDecodeMutex_;
 };
 
 } // namespace nelux::backends::cuda
