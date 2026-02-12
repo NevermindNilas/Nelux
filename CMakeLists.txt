@@ -504,27 +504,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     "${VCPKG_INSTALLED_BIN}/fmt*.dll"
   )
   
-  # Add FFmpeg DLLs from external directory
-  file(GLOB NELUX_FFMPEG_DLLS
-    "${CMAKE_SOURCE_DIR}/external/ffmpeg/bin/av*.dll"
-    "${CMAKE_SOURCE_DIR}/external/ffmpeg/bin/sw*.dll"
-  )
-  if(NELUX_FFMPEG_DLLS)
-    list(APPEND NELUX_DLLS ${NELUX_FFMPEG_DLLS})
-    message(STATUS "Found FFmpeg DLLs: ${NELUX_FFMPEG_DLLS}")
-  endif()
-  
-  # Add libyuv and other dependencies from nelux directory (if vcpkg didn't install them)
-  file(GLOB NELUX_LOCAL_DLLS
-    "${CMAKE_SOURCE_DIR}/nelux/libyuv*.dll"
-    "${CMAKE_SOURCE_DIR}/nelux/jpeg*.dll"
-    "${CMAKE_SOURCE_DIR}/nelux/npp*.dll"
-  )
-  if(NELUX_LOCAL_DLLS)
-    list(APPEND NELUX_DLLS ${NELUX_LOCAL_DLLS})
-    message(STATUS "Found local DLLs: ${NELUX_LOCAL_DLLS}")
-  endif()
-  
   # If not found, try packages directory (manifest mode)
   if(NOT NELUX_DLLS)
     message(STATUS "DLLs not found in installed directory, checking packages directory...")
@@ -602,11 +581,12 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endforeach()
   endif()
 
-  # Install DLLs so they get bundled in the wheel
-  # delvewheel will handle proper name mangling in nelux.libs/
-  install(FILES ${NELUX_DLLS}
-          DESTINATION nelux
-          OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
+  # NOTE: We no longer copy DLLs to the build directory or install them.
+  # Delvewheel handles all DLL bundling into nelux.libs/ with proper name mangling.
+  # This prevents duplicate DLLs in both nelux/ and nelux.libs/ folders.
+  # install(FILES ${NELUX_DLLS}
+  #         DESTINATION nelux
+  #         OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
 endif()
 
 if(UNIX AND NELUX_BUILD_PYTHON)
