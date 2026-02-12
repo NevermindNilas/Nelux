@@ -4,7 +4,6 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
-
 namespace py = pybind11;
 #define PYBIND11_DETAILED_ERROR_MESSAGES
 
@@ -29,7 +28,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.8.7";
+    m.attr("__version__") = "0.8.8";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -199,10 +198,10 @@ Uses the secondary decoder; does not disturb iteration.)doc")
         // -------------------
         // Prefetch Control API
         // -------------------
-        .def("start_prefetch", &VideoReader::startPrefetch,
-             py::arg("buffer_size") = 16,
-             py::arg("start_immediately") = true,
-             R"doc(Start background frame prefetching for improved iteration performance.
+        .def(
+            "start_prefetch", &VideoReader::startPrefetch, py::arg("buffer_size") = 16,
+            py::arg("start_immediately") = true,
+            R"doc(Start background frame prefetching for improved iteration performance.
 
 Prefetching decodes frames in a background thread, filling a buffer.
 When iterating, frames are returned from the buffer for near-zero latency.
@@ -231,18 +230,20 @@ Call this when:
 - Done iterating and want to free resources
 - Need to seek to a different position
 )doc")
-        .def_property_readonly("prefetch_buffered", &VideoReader::getPrefetchBufferedCount,
-             "Number of frames currently in the prefetch buffer (read-only)")
-        .def_property_readonly("is_prefetching", &VideoReader::isPrefetching,
-             "True if the background prefetch thread is currently running (read-only)")
-        .def_property_readonly("prefetch_size", &VideoReader::getPrefetchSize,
-             "Maximum number of frames that can be buffered (read-only)")
-        
+        .def_property_readonly(
+            "prefetch_buffered", &VideoReader::getPrefetchBufferedCount,
+            "Number of frames currently in the prefetch buffer (read-only)")
+        .def_property_readonly(
+            "is_prefetching", &VideoReader::isPrefetching,
+            "True if the background prefetch thread is currently running (read-only)")
+        .def_property_readonly(
+            "prefetch_size", &VideoReader::getPrefetchSize,
+            "Maximum number of frames that can be buffered (read-only)")
+
         // -------------------
         // Decoder Reconfiguration API
         // -------------------
-        .def("reconfigure", &VideoReader::reconfigure,
-             py::arg("file_path"),
+        .def("reconfigure", &VideoReader::reconfigure, py::arg("file_path"),
              R"doc(Reconfigure the reader to use a new video file.
 
 This method reuses the existing decoder instance for a different file,
@@ -270,7 +271,7 @@ Example:
     >>> # Process video2...
 )doc")
         .def_property_readonly("file_path", &VideoReader::getFilePath,
-             "Path to the currently loaded video file (read-only)");
+                               "Path to the currently loaded video file (read-only)");
 
     // ----------- Audio Class -----------
     py::class_<VideoReader::Audio, std::shared_ptr<VideoReader::Audio>>(m, "Audio")
@@ -310,10 +311,8 @@ Example:
              py::arg("audio_bit_rate") = py::none(),
              py::arg("audio_sample_rate") = py::none(),
              py::arg("audio_channels") = py::none(),
-             py::arg("audio_codec") = py::none(),
-             py::arg("preset") = py::none(),
-             py::arg("cq") = py::none(),
-             py::arg("pixel_format") = py::none(),
+             py::arg("audio_codec") = py::none(), py::arg("preset") = py::none(),
+             py::arg("cq") = py::none(), py::arg("pixel_format") = py::none(),
              R"doc(Create a video encoder.
 
 Args:
@@ -338,8 +337,9 @@ Args:
              py::arg("audio"), "Encode one audio buffer (1-D torch.int16 PCM tensor).")
         .def("close", &nelux::VideoEncoder::close,
              "Finalize file and flush audio/video streams.")
-        .def_property_readonly("is_hardware_encoder", &nelux::VideoEncoder::isHardwareEncoder,
-             "True if using hardware-accelerated encoding (NVENC).")
+        .def_property_readonly("is_hardware_encoder",
+                               &nelux::VideoEncoder::isHardwareEncoder,
+                               "True if using hardware-accelerated encoding (NVENC).")
         .def(
             "__enter__", [](nelux::VideoEncoder& e) -> nelux::VideoEncoder&
             { return e; }, py::return_value_policy::reference_internal)
@@ -351,45 +351,51 @@ Args:
              });
 
     // ---------- Module-level functions -----------
-    m.def("get_available_encoders", []() -> py::list
-    {
-        py::list encoders;
-        void* it = nullptr;
-        const AVCodec* codec = nullptr;
-        while ((codec = av_codec_iterate(&it)))
+    m.def(
+        "get_available_encoders",
+        []() -> py::list
         {
-            if (av_codec_is_encoder(codec) && codec->type == AVMEDIA_TYPE_VIDEO)
+            py::list encoders;
+            void* it = nullptr;
+            const AVCodec* codec = nullptr;
+            while ((codec = av_codec_iterate(&it)))
             {
-                py::dict info;
-                info["name"] = codec->name;
-                info["long_name"] = codec->long_name ? codec->long_name : "";
-                info["is_hardware"] = (codec->capabilities & AV_CODEC_CAP_HARDWARE) != 0 ||
-                                      std::string(codec->name).find("nvenc") != std::string::npos ||
-                                      std::string(codec->name).find("qsv") != std::string::npos ||
-                                      std::string(codec->name).find("amf") != std::string::npos;
-                encoders.append(info);
+                if (av_codec_is_encoder(codec) && codec->type == AVMEDIA_TYPE_VIDEO)
+                {
+                    py::dict info;
+                    info["name"] = codec->name;
+                    info["long_name"] = codec->long_name ? codec->long_name : "";
+                    info["is_hardware"] =
+                        (codec->capabilities & AV_CODEC_CAP_HARDWARE) != 0 ||
+                        std::string(codec->name).find("nvenc") != std::string::npos ||
+                        std::string(codec->name).find("qsv") != std::string::npos ||
+                        std::string(codec->name).find("amf") != std::string::npos;
+                    encoders.append(info);
+                }
             }
-        }
-        return encoders;
-    }, "Get a list of available video encoders with their properties.");
+            return encoders;
+        },
+        "Get a list of available video encoders with their properties.");
 
-    m.def("get_nvenc_encoders", []() -> py::list
-    {
-        py::list nvenc;
-        void* it = nullptr;
-        const AVCodec* codec = nullptr;
-        while ((codec = av_codec_iterate(&it)))
+    m.def(
+        "get_nvenc_encoders",
+        []() -> py::list
         {
-            if (av_codec_is_encoder(codec) && 
-                codec->type == AVMEDIA_TYPE_VIDEO &&
-                std::string(codec->name).find("nvenc") != std::string::npos)
+            py::list nvenc;
+            void* it = nullptr;
+            const AVCodec* codec = nullptr;
+            while ((codec = av_codec_iterate(&it)))
             {
-                py::dict info;
-                info["name"] = codec->name;
-                info["long_name"] = codec->long_name ? codec->long_name : "";
-                nvenc.append(info);
+                if (av_codec_is_encoder(codec) && codec->type == AVMEDIA_TYPE_VIDEO &&
+                    std::string(codec->name).find("nvenc") != std::string::npos)
+                {
+                    py::dict info;
+                    info["name"] = codec->name;
+                    info["long_name"] = codec->long_name ? codec->long_name : "";
+                    nvenc.append(info);
+                }
             }
-        }
-        return nvenc;
-    }, "Get a list of available NVENC hardware encoders.");
+            return nvenc;
+        },
+        "Get a list of available NVENC hardware encoders.");
 }

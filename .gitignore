@@ -196,3 +196,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 celux/_celux.pyd
+
+build_cuda/
+build_test/

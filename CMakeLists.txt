@@ -581,12 +581,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endforeach()
   endif()
 
-  # NOTE: We no longer copy DLLs to the build directory or install them.
-  # Delvewheel handles all DLL bundling into nelux.libs/ with proper name mangling.
-  # This prevents duplicate DLLs in both nelux/ and nelux.libs/ folders.
-  # install(FILES ${NELUX_DLLS}
-  #         DESTINATION nelux
-  #         OPTIONAL)   # OPTIONAL just suppresses warnings if any DLL wasn't globbed
+
 endif()
 
 if(UNIX AND NELUX_BUILD_PYTHON)
