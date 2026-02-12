@@ -1,4 +1,15 @@
 
+### **Version 0.8.8 (2026-02-12)**
+
+#### **Hardware Acceleration**
+- **NVENC Encoding:** Added full support for NVENC hardware encoding.
+
+#### **Visual Quality**
+- **Better Color Accuracy:** Improved color accuracy in decoding and encoding pipelines.
+
+#### **Dependencies**
+- **PyTorch:** Reverted PyTorch dependency to version 2.9.1.
+
 ### **Version 0.8.7 (2026-02-01)**
 
 #### **Breaking Change: PyTorch Import Order**
