@@ -109,6 +109,23 @@ def test_numpy_backend_iteration():
     print(f"✓ NumPy backend iteration: processed {count} frames")
 
 
+def test_numpy_backend_frames_do_not_alias_memory():
+    """Ensure consecutive NumPy frames own independent memory."""
+    vr = VideoReader(VIDEO_PATH, backend="numpy")
+
+    frame1 = vr.read_frame()
+    frame2 = vr.read_frame()
+
+    assert isinstance(frame1, np.ndarray)
+    assert isinstance(frame2, np.ndarray)
+    assert not np.shares_memory(frame1, frame2), (
+        "Consecutive NumPy frames should not share memory; shared storage can "
+        "cause earlier frames to be overwritten by later decodes."
+    )
+
+    print("✓ NumPy backend frames use independent memory")
+
+
 def test_numpy_backend_frame_at():
     """Test that frame_at with numpy backend returns numpy.ndarray."""
     vr = VideoReader(VIDEO_PATH, backend="numpy")
@@ -171,6 +188,7 @@ def main():
     test_numpy_backend_preserves_dtype()
     test_pytorch_vs_numpy_same_content()
     test_numpy_backend_iteration()
+    test_numpy_backend_frames_do_not_alias_memory()
     test_numpy_backend_frame_at()
     test_numpy_backend_getitem()
     test_invalid_backend_raises_error()

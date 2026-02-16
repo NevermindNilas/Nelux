@@ -343,11 +343,12 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
 
     if (backend == Backend::NumPy)
     {
-        // Convert torch::Tensor to numpy array
-        // Ensure tensor is on CPU and contiguous
-        // Note: PyTorch's .cpu().contiguous() is already optimized - it returns
-        // the same tensor if already CPU and contiguous (no copy)
-        torch::Tensor cpu_tensor = t.cpu().contiguous();
+        // Convert torch::Tensor to numpy array.
+        // IMPORTANT: clone() is required here because the decode path reuses the
+        // same internal tensor storage for subsequent frames. Returning a NumPy
+        // view over shared storage can make earlier frames appear overwritten,
+        // which can look like dropped/duplicated frames at stream start.
+        torch::Tensor cpu_tensor = t.cpu().contiguous().clone();
 
         // Determine numpy dtype based on torch dtype
         py::dtype numpy_dtype;
@@ -394,7 +395,7 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
             shape.push_back(static_cast<py::ssize_t>(dim));
         }
 
-        // Zero-copy: expose the tensor's CPU buffer via NumPy and keep it alive.
+        // Expose the cloned tensor's CPU buffer via NumPy and keep it alive.
         std::vector<py::ssize_t> strides;
         strides.reserve(static_cast<size_t>(cpu_tensor.dim()));
         const auto elem_size = static_cast<py::ssize_t>(cpu_tensor.element_size());

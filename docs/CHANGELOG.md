@@ -1,4 +1,18 @@
 
+### **Version 0.8.9 (2026-02-16)**
+
+#### **Bug Fixes & Stability**
+- **Fixed:** `numpy` backend returned zero-copy views backed by a reused internal buffer, which could cause recently returned frames to be overwritten. `VideoReader` now clones CPU tensors before exposing them to NumPy so arrays own their memory.
+- **Added:** Regression test `test_numpy_backend_frames_do_not_alias_memory` to prevent re-introduction of this bug.
+
+#### **Packaging & Windows Runtime**
+- **Added:** Windows wheel now bundles essential runtime DLLs (FFmpeg runtimes plus `libyuv`, `fmt`, `spdlog`, and `jpeg62/turbojpeg`) so self-built wheels import without manual PATH changes.
+- **Improved:** CMake packaging logic to discover vcpkg manifest-mode installs and include transitive native DLLs; fixed delvewheel patching issues so wheels contain the expected runtime files.
+- **Added:** `diagnose_runtime_dlls()` runtime preflight helper and enhanced `ImportError` text to show exactly which native DLLs failed to load and actionable remediation (use `os.add_dll_directory()`, import `torch` first, or install the bundled wheel).
+
+#### **Validation**
+- **Verified:** Rebuilt wheel and validated install & runtime in downstream project workflows; addressed transitive dependency (`libyuv` → `jpeg62`) that previously caused import failures on some systems.
+
 ### **Version 0.8.8 (2026-02-12)**
 
 #### **Hardware Acceleration**

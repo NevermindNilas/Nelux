@@ -475,7 +475,7 @@ endif()
 
 if(WIN32 AND NELUX_BUILD_PYTHON)
   # DLL copy logic for Windows only
-  # NOTE: FFmpeg DLLs are NOT bundled - user must have FFmpeg in their PATH
+  # Bundle runtime DLLs into the wheel so self-built wheels import cleanly.
   set(NELUX_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
   
   # vcpkg provides spdlog, fmt, libyuv
@@ -502,7 +502,22 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     "${VCPKG_INSTALLED_BIN}/libyuv*.dll"
     "${VCPKG_INSTALLED_BIN}/spdlog*.dll"
     "${VCPKG_INSTALLED_BIN}/fmt*.dll"
+    "${VCPKG_INSTALLED_BIN}/jpeg*.dll"
+    "${VCPKG_INSTALLED_BIN}/turbojpeg*.dll"
   )
+
+  # Also try manifest-mode vcpkg_installed locations in the current build tree
+  # (common with scikit-build temp build directories).
+  file(GLOB NELUX_DLLS_BUILD_TREE
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/libyuv*.dll"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/spdlog*.dll"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/fmt*.dll"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/jpeg*.dll"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/turbojpeg*.dll"
+  )
+  if(NELUX_DLLS_BUILD_TREE)
+    list(APPEND NELUX_DLLS ${NELUX_DLLS_BUILD_TREE})
+  endif()
   
   # If not found, try packages directory (manifest mode)
   if(NOT NELUX_DLLS)
@@ -511,6 +526,8 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
       "${VCPKG_PACKAGES_DIR}/libyuv_${_vcpkg_triplet}/bin/libyuv*.dll"
       "${VCPKG_PACKAGES_DIR}/spdlog_${_vcpkg_triplet}/bin/spdlog*.dll"
       "${VCPKG_PACKAGES_DIR}/fmt_${_vcpkg_triplet}/bin/fmt*.dll"
+      "${VCPKG_PACKAGES_DIR}/libjpeg-turbo_${_vcpkg_triplet}/bin/jpeg*.dll"
+      "${VCPKG_PACKAGES_DIR}/libjpeg-turbo_${_vcpkg_triplet}/bin/turbojpeg*.dll"
     )
   endif()
 
@@ -565,13 +582,30 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endif()
   endif()
 
+  # Bundle FFmpeg runtime DLLs from external/ffmpeg/bin
+  file(GLOB NELUX_FFMPEG_DLLS
+    "${NELUX_FFMPEG_DIR}/bin/avcodec-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/swscale-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/swresample-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
+    "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
+  )
+  if(NELUX_FFMPEG_DLLS)
+    list(APPEND NELUX_DLLS ${NELUX_FFMPEG_DLLS})
+  else()
+    message(WARNING "FFmpeg runtime DLLs not found under ${NELUX_FFMPEG_DIR}/bin")
+  endif()
+
+  # Deduplicate in case multiple glob sources overlap
+  if(NELUX_DLLS)
+    list(REMOVE_DUPLICATES NELUX_DLLS)
+  endif()
+
   message(STATUS "Found ${CMAKE_CURRENT_LIST_DIR} DLLs for delvewheel: ${NELUX_DLLS}")
 
-  # NOTE: We no longer copy DLLs to the build directory or install them.
-  # Delvewheel handles all DLL bundling into nelux.libs/ with proper name mangling.
-  # This prevents duplicate DLLs in both nelux/ and nelux.libs/ folders.
-  
-  # Only for local development: copy to build directory for testing
+  # Keep local dev copy option for in-tree testing.
   if(DEFINED ENV{NELUX_COPY_DLLS_FOR_DEV})
     foreach(dll ${NELUX_DLLS})
       add_custom_command(TARGET nelux POST_BUILD
@@ -625,6 +659,15 @@ install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/nelux/_nelux.pyi
   DESTINATION nelux
 )
+
+if(WIN32 AND NELUX_BUILD_PYTHON)
+  if(NELUX_DLLS)
+    install(FILES ${NELUX_DLLS} DESTINATION nelux)
+    message(STATUS "Bundling ${CMAKE_CURRENT_LIST_DIR} runtime DLLs into wheel: ${NELUX_DLLS}")
+  else()
+    message(WARNING "No runtime DLLs found to bundle into wheel on Windows")
+  endif()
+endif()
 
 # debug dump of the variables we care about
 message(STATUS "---- CMake Debug Dump ----")
