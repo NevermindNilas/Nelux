@@ -28,7 +28,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.8.8";
+    m.attr("__version__") = "0.8.9";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
