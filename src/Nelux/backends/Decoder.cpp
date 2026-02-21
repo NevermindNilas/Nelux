@@ -1,8 +1,8 @@
 // Decoder.cpp
 #include "Decoder.hpp"
 #include "BatchDecoder.hpp"
-#include <Factory.hpp>
 #include "conversion/cpu/AutoToRGB.hpp"
+#include <Factory.hpp>
 #include <cstring>
 
 using namespace nelux::error;
@@ -95,7 +95,7 @@ void Decoder::setProperties()
         {
             properties.hasAudio = true; // Set to true if an audio stream is found
             properties.audioBitrate = formatCtx->streams[i]->codecpar->bit_rate;
-            properties.audioChannels = 
+            properties.audioChannels =
                 formatCtx->streams[i]->codecpar->ch_layout.nb_channels;
             properties.audioSampleRate = formatCtx->streams[i]->codecpar->sample_rate;
             properties.audioCodec =
@@ -139,8 +139,6 @@ void Decoder::setProperties()
         properties.audioSampleRate, properties.audioCodec, properties.aspectRatio);
 }
 
-
-
 void Decoder::initialize(const std::string& filePath)
 {
     NELUX_DEBUG("BASE DECODER: Initializing decoder with file: {}", filePath);
@@ -150,7 +148,8 @@ void Decoder::initialize(const std::string& filePath)
     setProperties();
 
     converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
-    auto* autoConverter = dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
+    auto* autoConverter =
+        dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
     if (autoConverter)
     {
         autoConverter->setForce8Bit(force_8bit);
@@ -165,7 +164,7 @@ void Decoder::initialize(const std::string& filePath)
                           static_cast<size_t>(elemSize);
 
     const AVCodecParameters* params = formatCtx->streams[videoStreamIndex]->codecpar;
-    AVColorSpace color_space = params->color_space;         // matrix_coefficients
+    AVColorSpace color_space = params->color_space;        // matrix_coefficients
     AVColorPrimaries colorprim = params->color_primaries;  // color primaries
     AVColorTransferCharacteristic trc = params->color_trc; // transfer curve
     AVColorRange colorrange = params->color_range;         // AVCOL_RANGE_MPEG/JPEG
@@ -213,9 +212,9 @@ void Decoder::findVideoStream()
         av_find_best_stream(formatCtx.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (ret < 0)
     {
-		NELUX_DEBUG("No video stream found");
-		throw CxException("No video stream found");
-	}
+        NELUX_DEBUG("No video stream found");
+        throw CxException("No video stream found");
+    }
 
     videoStreamIndex = ret;
     NELUX_DEBUG("BASE DECODER: Video stream found at index {}", videoStreamIndex);
@@ -225,40 +224,45 @@ void Decoder::initCodecContext()
 {
     const AVCodec* codec = nullptr;
     AVCodecID codec_id = formatCtx->streams[videoStreamIndex]->codecpar->codec_id;
-    
+
     // For AV1, we MUST use a software decoder to avoid hardware acceleration issues
-    // The built-in "av1" decoder tries hardware first and fails on unsupported platforms
-    if (codec_id == AV_CODEC_ID_AV1) {
+    // The built-in "av1" decoder tries hardware first and fails on unsupported
+    // platforms
+    if (codec_id == AV_CODEC_ID_AV1)
+    {
         // Try software decoders in order of preference
         const char* av1_decoders[] = {
-            "libdav1d",    // Best performance, most compatible
-            "libaom-av1",  // Reference implementation, slower but reliable
-            "av1",         // FFmpeg's internal decoder (last resort)
-            nullptr
-        };
-        
-        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i) {
+            "libdav1d",   // Best performance, most compatible
+            "libaom-av1", // Reference implementation, slower but reliable
+            "av1",        // FFmpeg's internal decoder (last resort)
+            nullptr};
+
+        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i)
+        {
             codec = avcodec_find_decoder_by_name(av1_decoders[i]);
-            if (codec) {
+            if (codec)
+            {
                 NELUX_INFO("Using {} for AV1 decoding", av1_decoders[i]);
             }
         }
-        
-        if (!codec) {
+
+        if (!codec)
+        {
             // Final fallback: try generic lookup but warn user
             codec = avcodec_find_decoder(codec_id);
-            if (codec) {
+            if (codec)
+            {
                 NELUX_WARN("No preferred AV1 software decoder found, using: {}. "
-                          "Consider installing libdav1d for better AV1 support.", 
-                          codec->name);
+                           "Consider installing libdav1d for better AV1 support.",
+                           codec->name);
             }
         }
     }
 
-    if (!codec) {
+    if (!codec)
+    {
         codec = avcodec_find_decoder(codec_id);
     }
-    
 
     NELUX_DEBUG("BASE DECODER: Initializing codec context");
     if (!codec)
@@ -277,7 +281,6 @@ void Decoder::initCodecContext()
     codecCtx.reset(codec_ctx);
     NELUX_DEBUG("BASE DECODER: Codec context allocated");
 
-
     // Copy codec parameters from input stream to codec context
     FF_CHECK_MSG(avcodec_parameters_to_context(
                      codecCtx.get(), formatCtx->streams[videoStreamIndex]->codecpar),
@@ -286,13 +289,23 @@ void Decoder::initCodecContext()
     NELUX_DEBUG("BASE DECODER: Codec parameters copied to codec context");
 
     codecCtx->thread_count = numThreads;
-    // Force single thread for AV1 as it can be unstable with multithreading in some builds
-    if (codecCtx->codec_id == AV_CODEC_ID_AV1) {
+    // Force single thread for AV1 as it can be unstable with multithreading in some
+    // builds
+    if (codecCtx->codec_id == AV_CODEC_ID_AV1)
+    {
         NELUX_INFO("Forcing thread_count=1 for AV1");
         codecCtx->thread_count = 1;
     }
 
-    codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    // Only apply thread types the codec actually supports.
+    // Using unsupported threading modes (e.g. FF_THREAD_FRAME on rawvideo)
+    // can cause hard crashes / segfaults in FFmpeg internals.
+    int supported_types = 0;
+    if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
+        supported_types |= FF_THREAD_FRAME;
+    if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
+        supported_types |= FF_THREAD_SLICE;
+    codecCtx->thread_type = supported_types ? supported_types : 0;
     NELUX_DEBUG("BASE DECODER: Codec context threading configured: thread_count={}, "
                 "thread_type={}",
                 codecCtx->thread_count, codecCtx->thread_type);
@@ -300,83 +313,91 @@ void Decoder::initCodecContext()
 
     // Allow experimental compliance (needed for some AV1 implementations)
     codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
-    
+
     // Set get_format callback to handle pixel format negotiation
     // This is critical for codecs like AV1 that may try hardware acceleration first
-    codecCtx->get_format = [](AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) -> AVPixelFormat {
-        const enum AVPixelFormat *p;
+    codecCtx->get_format = [](AVCodecContext* ctx,
+                              const enum AVPixelFormat* pix_fmts) -> AVPixelFormat
+    {
+        const enum AVPixelFormat* p;
 
         // Log all available formats for debugging
         NELUX_DEBUG("Pixel format negotiation - available formats:");
-        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++)
+        {
+            const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
             bool is_hw = desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL);
-            NELUX_DEBUG("  - {} ({})", av_get_pix_fmt_name(*p), is_hw ? "hardware" : "software");
+            NELUX_DEBUG("  - {} ({})", av_get_pix_fmt_name(*p),
+                        is_hw ? "hardware" : "software");
         }
 
-        // First pass: prefer common software-decoded YUV formats that our converter handles well
+        // First pass: prefer common software-decoded YUV formats that our converter
+        // handles well
         static const AVPixelFormat preferred_formats[] = {
-            AV_PIX_FMT_YUV420P,
-            AV_PIX_FMT_YUV420P10LE,
-            AV_PIX_FMT_YUV420P10BE,
-            AV_PIX_FMT_YUV422P,
-            AV_PIX_FMT_YUV422P10LE,
-            AV_PIX_FMT_YUV444P,
-            AV_PIX_FMT_YUV444P10LE,
-            AV_PIX_FMT_NV12,
-            AV_PIX_FMT_P010LE,
-            AV_PIX_FMT_GBRP,
-            AV_PIX_FMT_RGB24,
-            AV_PIX_FMT_BGR24,
-            AV_PIX_FMT_NONE
-        };
-        
-        for (int i = 0; preferred_formats[i] != AV_PIX_FMT_NONE; i++) {
-            for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-                if (*p == preferred_formats[i]) {
-                    NELUX_INFO("Selected preferred pixel format: {}", av_get_pix_fmt_name(*p));
+            AV_PIX_FMT_YUV420P,     AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV420P10BE,
+            AV_PIX_FMT_YUV422P,     AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV444P,
+            AV_PIX_FMT_YUV444P10LE, AV_PIX_FMT_NV12,        AV_PIX_FMT_P010LE,
+            AV_PIX_FMT_GBRP,        AV_PIX_FMT_RGB24,       AV_PIX_FMT_BGR24,
+            AV_PIX_FMT_NONE};
+
+        for (int i = 0; preferred_formats[i] != AV_PIX_FMT_NONE; i++)
+        {
+            for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++)
+            {
+                if (*p == preferred_formats[i])
+                {
+                    NELUX_INFO("Selected preferred pixel format: {}",
+                               av_get_pix_fmt_name(*p));
                     return *p;
                 }
             }
         }
 
         // Second pass: accept any software format
-        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
-            if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
-                NELUX_INFO("Selected software pixel format: {}", av_get_pix_fmt_name(*p));
+        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++)
+        {
+            const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+            if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+            {
+                NELUX_INFO("Selected software pixel format: {}",
+                           av_get_pix_fmt_name(*p));
                 return *p;
             }
         }
-        
+
         // Last resort: if no software format is available, fail to avoid
         // returning a hardware-only format (which can crash CPU decode).
-        if (*pix_fmts != AV_PIX_FMT_NONE) {
+        if (*pix_fmts != AV_PIX_FMT_NONE)
+        {
             NELUX_ERROR("No software pixel format available (first is {}).",
                         av_get_pix_fmt_name(*pix_fmts));
-        } else {
+        }
+        else
+        {
             NELUX_ERROR("No suitable pixel format found!");
         }
         return AV_PIX_FMT_NONE;
     };
-    
+
     // Create codec options dictionary
     AVDictionary* opts = nullptr;
-    
+
     // For AV1 specifically, set options to prefer software decoding
-    if (codec_id == AV_CODEC_ID_AV1) {
+    if (codec_id == AV_CODEC_ID_AV1)
+    {
         // Disable any hardware device selection
         av_dict_set(&opts, "hwaccel", "none", 0);
         // Request software-only decoding
         av_dict_set(&opts, "threads", "1", 0);
         NELUX_DEBUG("AV1 decoder options set to prefer software decoding");
     }
-    
+
     // Open codec with options
     int ret = avcodec_open2(codecCtx.get(), codec, &opts);
     av_dict_free(&opts);
-    
-    if (ret < 0) {
+
+    if (ret < 0)
+    {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
         NELUX_ERROR("Failed to open codec: {}", errbuf);
@@ -385,7 +406,6 @@ void Decoder::initCodecContext()
 
     NELUX_DEBUG("BASE DECODER: Codec opened successfully");
 }
-
 
 // Decoder.cpp
 
@@ -397,9 +417,11 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     }
 
     std::unique_lock<std::mutex> lock(queueMutex);
-    queueCond.wait(lock, [this]
+    queueCond.wait(lock,
+                   [this]
                    {
-                       return (preconvertEnabled ? !convertedQueue.empty() : !frameQueue.empty()) ||
+                       return (preconvertEnabled ? !convertedQueue.empty()
+                                                 : !frameQueue.empty()) ||
                               isFinished || stopDecoding;
                    });
 
@@ -465,7 +487,6 @@ bool Decoder::seekFrame(int frameIndex)
     return seek(target_pts * av_q2d(formatCtx->streams[videoStreamIndex]->time_base));
 }
 
-
 bool Decoder::seek(double timestamp)
 {
     stopDecodingThread();
@@ -482,8 +503,8 @@ bool Decoder::seek(double timestamp)
 
     int64_t ts = convertTimestamp(timestamp);
     NELUX_DEBUG("Converted timestamp for seeking: {}", ts);
-    int ret = av_seek_frame(formatCtx.get(), videoStreamIndex, ts,
-                            AVSEEK_FLAG_BACKWARD);
+    int ret =
+        av_seek_frame(formatCtx.get(), videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
 
     if (ret < 0)
     {
@@ -499,7 +520,6 @@ bool Decoder::seek(double timestamp)
     startDecodingThread();
     return true;
 }
-
 
 Decoder::VideoProperties Decoder::getVideoProperties() const
 {
@@ -589,7 +609,8 @@ int Decoder::getBitDepth() const
         AVPixelFormat(formatCtx->streams[videoStreamIndex]->codecpar->format));
     if (!desc)
     {
-        NELUX_WARN("Unknown pixel format, defaulting to NV12ToRGB");
+        NELUX_WARN("Unknown pixel format, defaulting to 8-bit");
+        return 8;
     }
 
     int bitDepth = desc->comp[0].depth;
@@ -632,7 +653,7 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     return true;
 }
 
-double Decoder::getFrameTimestamp(AVFrame* frame) 
+double Decoder::getFrameTimestamp(AVFrame* frame)
 {
     if (!frame)
     {
@@ -820,7 +841,6 @@ void Decoder::closeAudio()
     audioStreamIndex = -1;
     NELUX_DEBUG("Audio decoding resources have been released.");
 }
-
 
 bool Decoder::extractAudioToFile(const std::string& outputFilePath)
 {
@@ -1088,8 +1108,7 @@ torch::Tensor Decoder::getAudioTensor()
             // Allocate buffer for converted samples
             int bufferSize = av_samples_get_buffer_size(
                 nullptr, audioCodecCtx->ch_layout.nb_channels,
-                audioFrame.get()->nb_samples,
-                AV_SAMPLE_FMT_S16, 1);
+                audioFrame.get()->nb_samples, AV_SAMPLE_FMT_S16, 1);
             if (bufferSize < 0)
             {
                 NELUX_DEBUG("Failed to calculate buffer size for audio samples.");
@@ -1100,14 +1119,14 @@ torch::Tensor Decoder::getAudioTensor()
             std::vector<uint8_t> buffer(bufferSize);
             uint8_t* out_buffers[] = {buffer.data()};
             // Convert samples to S16
-            int convertedSamples =
-                swr_convert(swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
+            int convertedSamples = swr_convert(
+                swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
                 (const uint8_t**)audioFrame.get()->data, audioFrame.get()->nb_samples);
 
             if (convertedSamples < 0)
             {
                 NELUX_DEBUG("Failed to convert audio samples.");
-    
+
                 return torch::Tensor();
             }
 
@@ -1127,10 +1146,9 @@ torch::Tensor Decoder::getAudioTensor()
                            audioFrame.get()->nb_samples;
 
         // Allocate buffer for converted samples
-        int bufferSize =
-            av_samples_get_buffer_size(nullptr, audioCodecCtx->ch_layout.nb_channels,
-                                                    audioFrame.get()->nb_samples,
-                                                    AV_SAMPLE_FMT_S16, 1);
+        int bufferSize = av_samples_get_buffer_size(
+            nullptr, audioCodecCtx->ch_layout.nb_channels, audioFrame.get()->nb_samples,
+            AV_SAMPLE_FMT_S16, 1);
         if (bufferSize < 0)
         {
             NELUX_DEBUG(
@@ -1141,8 +1159,8 @@ torch::Tensor Decoder::getAudioTensor()
         std::vector<uint8_t> buffer(bufferSize);
         uint8_t* out_buffers[] = {buffer.data()};
         // Convert samples to S16
-        int convertedSamples =
-            swr_convert(swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
+        int convertedSamples = swr_convert(
+            swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
             (const uint8_t**)audioFrame.get()->data, audioFrame.get()->nb_samples);
 
         if (convertedSamples < 0)
@@ -1179,7 +1197,8 @@ void Decoder::setForce8Bit(bool enabled)
     force_8bit = enabled;
     if (converter)
     {
-        auto* autoConverter = dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
+        auto* autoConverter =
+            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
         if (autoConverter)
         {
             autoConverter->setForce8Bit(enabled);
@@ -1190,7 +1209,7 @@ void Decoder::setForce8Bit(bool enabled)
 void Decoder::setPrefetchSize(size_t size)
 {
     NELUX_DEBUG("Setting prefetch buffer size to {}", size);
-    
+
     // If we're changing the size while prefetching, we need to restart
     bool wasRunning = decodingThread.joinable() && !stopDecoding;
     if (wasRunning)
@@ -1198,9 +1217,9 @@ void Decoder::setPrefetchSize(size_t size)
         stopDecodingThread();
         clearQueue();
     }
-    
+
     maxQueueSize = size > 0 ? size : 1; // Minimum of 1 for queue-based operation
-    
+
     if (wasRunning && size > 0)
     {
         startDecodingThread();
@@ -1229,15 +1248,15 @@ void Decoder::stopPrefetch()
 void Decoder::reconfigure(const std::string& filePath)
 {
     NELUX_INFO("Reconfiguring decoder with new file: {}", filePath);
-    
+
     // Stop any running prefetch thread first
     stopDecodingThread();
     clearQueue();
     resetTimestampState();
-    
+
     // Close audio if it was initialized
     closeAudio();
-    
+
     // Reset codec context (but don't destroy the converter - we may reuse it)
     if (codecCtx)
     {
@@ -1245,34 +1264,34 @@ void Decoder::reconfigure(const std::string& filePath)
         codecCtx.reset();
         NELUX_DEBUG("Codec context reset for reconfiguration");
     }
-    
+
     // Reset format context
     if (formatCtx)
     {
         formatCtx.reset();
         NELUX_DEBUG("Format context reset for reconfiguration");
     }
-    
+
     // Reset state
     videoStreamIndex = -1;
     audioStreamIndex = -1;
     isFinished = false;
     seekRequested = false;
     cachedFilePath_ = "";
-    
+
     // Also reset batch decoder if it was initialized
     if (batch_decoder_)
     {
         batch_decoder_.reset();
         cached_frame_count_ = -1;
     }
-    
+
     // Re-initialize with new file (reusing existing converter settings if compatible)
     openFile(filePath);
     findVideoStream();
     initCodecContext();
     setProperties();
-    
+
     // Update converter if needed
     if (converter)
     {
@@ -1282,25 +1301,35 @@ void Decoder::reconfigure(const std::string& filePath)
     else
     {
         converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
-        auto* autoConverter = dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
+        auto* autoConverter =
+            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
         if (autoConverter)
         {
             autoConverter->setForce8Bit(force_8bit);
         }
     }
-    
+
     // Cache the file path
     cachedFilePath_ = filePath;
-    
+
+    // Re-enable preconversion (mirrors initialize() logic)
+    preconvertEnabled = true;
+    int bitDepth_r = getBitDepth();
+    int elemSize_r = (force_8bit || bitDepth_r <= 8) ? 1 : 2;
+    convertedFrameBytes = static_cast<size_t>(properties.width) *
+                          static_cast<size_t>(properties.height) * 3 *
+                          static_cast<size_t>(elemSize_r);
+
     // Restart prefetch thread
     startDecodingThread();
-    
+
     NELUX_INFO("Decoder reconfigured successfully for: {}", filePath);
 }
 
 void Decoder::startDecodingThread()
 {
-    if (decodingThread.joinable()) return;
+    if (decodingThread.joinable())
+        return;
     stopDecoding = false;
     isFinished = false;
     seekRequested = false;
@@ -1341,24 +1370,35 @@ void Decoder::decodingLoop()
 {
     Frame localFrame;
     bool packetPending = false;
-    
+
+    // Diagnostic logging to help pinpoint crash context
+    NELUX_INFO(
+        "decodingLoop started: preconvert={}, convertedBytes={}, codec={}, pix_fmt={}",
+        preconvertEnabled, convertedFrameBytes,
+        codecCtx->codec ? codecCtx->codec->name : "unknown",
+        codecCtx->pix_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(codecCtx->pix_fmt)
+                                             : "unknown");
+
     while (!stopDecoding)
     {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
-            producerCond.wait(lock, [this]
-                               {
-                                   size_t qsize = preconvertEnabled ? convertedQueue.size()
-                                                                  : frameQueue.size();
-                                   return qsize < maxQueueSize || stopDecoding;
-                               });
+            producerCond.wait(lock,
+                              [this]
+                              {
+                                  size_t qsize = preconvertEnabled
+                                                     ? convertedQueue.size()
+                                                     : frameQueue.size();
+                                  return qsize < maxQueueSize || stopDecoding;
+                              });
         }
 
-        if (stopDecoding) break;
+        if (stopDecoding)
+            break;
 
         // Try to receive a decoded frame
         int ret = avcodec_receive_frame(codecCtx.get(), localFrame.get());
-        
+
         if (ret == 0)
         {
             if (preconvertEnabled)
@@ -1377,7 +1417,8 @@ void Decoder::decodingLoop()
 
                 if (!converter)
                 {
-                    NELUX_WARN("Decoder: converter missing during preconversion; falling back");
+                    NELUX_WARN("Decoder: converter missing during preconversion; "
+                               "falling back");
                     Frame queuedFrame(localFrame);
                     std::unique_lock<std::mutex> lock(queueMutex);
                     frameQueue.push(std::move(queuedFrame));
@@ -1402,9 +1443,10 @@ void Decoder::decodingLoop()
             }
 
             av_frame_unref(localFrame.get());
-            continue; // Successfully got a frame, try to get another one before sending more input
+            continue; // Successfully got a frame, try to get another one before sending
+                      // more input
         }
-        
+
         if (ret == AVERROR_EOF)
         {
             std::unique_lock<std::mutex> lock(queueMutex);
@@ -1412,11 +1454,11 @@ void Decoder::decodingLoop()
             queueCond.notify_all();
             break;
         }
-        
+
         if (ret != AVERROR(EAGAIN))
         {
             NELUX_WARN("Error receiving frame: {}", ret);
-            break; 
+            break;
         }
 
         // --- Packet Sending Logic ---
@@ -1427,8 +1469,8 @@ void Decoder::decodingLoop()
             int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
             if (sendRet == AVERROR(EAGAIN))
             {
-                // Still failed, loop back to receive_frame (maybe we need to drain more)
-                // Do NOT unref packet, keep it pending
+                // Still failed, loop back to receive_frame (maybe we need to drain
+                // more) Do NOT unref packet, keep it pending
                 continue;
             }
             else if (sendRet < 0)
@@ -1454,7 +1496,8 @@ void Decoder::decodingLoop()
                 int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
                 if (sendRet == AVERROR(EAGAIN))
                 {
-                    // Input buffer full. Keep packet pending and loop back to receive_frame
+                    // Input buffer full. Keep packet pending and loop back to
+                    // receive_frame
                     packetPending = true;
                 }
                 else
@@ -1483,14 +1526,16 @@ void Decoder::decodingLoop()
 
 int64_t Decoder::get_frame_count()
 {
-    if (cached_frame_count_ >= 0) {
+    if (cached_frame_count_ >= 0)
+    {
         return cached_frame_count_;
     }
 
     AVStream* stream = formatCtx->streams[videoStreamIndex];
-    
+
     // Try nb_frames first (most reliable if available)
-    if (stream->nb_frames > 0) {
+    if (stream->nb_frames > 0)
+    {
         cached_frame_count_ = stream->nb_frames;
         NELUX_DEBUG("Frame count from nb_frames: {}", cached_frame_count_);
         return cached_frame_count_;
@@ -1498,18 +1543,25 @@ int64_t Decoder::get_frame_count()
 
     // Fallback: calculate from duration and frame rate
     double duration = 0.0;
-    if (stream->duration != AV_NOPTS_VALUE) {
+    if (stream->duration != AV_NOPTS_VALUE)
+    {
         duration = stream->duration * av_q2d(stream->time_base);
-    } else if (formatCtx->duration != AV_NOPTS_VALUE) {
+    }
+    else if (formatCtx->duration != AV_NOPTS_VALUE)
+    {
         duration = formatCtx->duration / static_cast<double>(AV_TIME_BASE);
     }
 
-    double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
-    
-    if (duration > 0.0 && fps > 0.0) {
+    double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate
+                                                       : stream->r_frame_rate);
+
+    if (duration > 0.0 && fps > 0.0)
+    {
         cached_frame_count_ = static_cast<int64_t>(duration * fps + 0.5);
         NELUX_DEBUG("Frame count from duration*fps: {}", cached_frame_count_);
-    } else {
+    }
+    else
+    {
         cached_frame_count_ = 0;
         NELUX_WARN("Unable to determine frame count");
     }
@@ -1520,18 +1572,19 @@ int64_t Decoder::get_frame_count()
 torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("decode_batch called with {} indices", indices.size());
-    
-    if (!batch_decoder_) {
+
+    if (!batch_decoder_)
+    {
         // Lazy initialize batch decoder with same config as main decoder
         // Use aggregate initialization (positional) for C++17 compatibility
         BatchDecoder::Config config{
-            properties.height,                    // height
-            properties.width,                     // width
-            3,                                    // channels
-            force_8bit ? torch::kUInt8 :          // dtype
+            properties.height,           // height
+            properties.width,            // width
+            3,                           // channels
+            force_8bit ? torch::kUInt8 : // dtype
                 (properties.bitDepth <= 8 ? torch::kUInt8 : torch::kUInt16),
-            torch::kCPU,                          // device - always decode to CPU first
-            false                                 // normalize
+            torch::kCPU, // device - always decode to CPU first
+            false        // normalize
         };
 
         batch_decoder_ = std::make_unique<BatchDecoder>(config);
@@ -1539,10 +1592,7 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
     }
 
     return batch_decoder_->decode_batch(
-        indices,
-        formatCtx.get(),
-        codecCtx.get(),
-        videoStreamIndex,
+        indices, formatCtx.get(), codecCtx.get(), videoStreamIndex,
         nullptr, // SwsContext managed internally by BatchDecoder
         get_frame_count());
 }
