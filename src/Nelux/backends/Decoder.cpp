@@ -1374,7 +1374,7 @@ void Decoder::decodingLoop()
     // Diagnostic logging to help pinpoint crash context
     NELUX_INFO(
         "decodingLoop started: preconvert={}, convertedBytes={}, codec={}, pix_fmt={}",
-        preconvertEnabled, convertedFrameBytes,
+        preconvertEnabled.load(std::memory_order_relaxed), convertedFrameBytes,
         codecCtx->codec ? codecCtx->codec->name : "unknown",
         codecCtx->pix_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(codecCtx->pix_fmt)
                                              : "unknown");
