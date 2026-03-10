@@ -183,6 +183,34 @@ static int mapColorRange(AVColorRange cr)
     return (cr == AVCOL_RANGE_JPEG) ? ColorRange_Full : ColorRange_Limited;
 }
 
+static bool isDeviceAccessiblePointer(const void* ptr)
+{
+    if (!ptr)
+    {
+        return false;
+    }
+
+    cudaPointerAttributes attrs{};
+    cudaError_t attrErr = cudaPointerGetAttributes(&attrs, ptr);
+    if (attrErr != cudaSuccess)
+    {
+        if (attrErr == cudaErrorInvalidValue || attrErr == cudaErrorInvalidDevice)
+        {
+            cudaGetLastError();
+            return false;
+        }
+
+        throw CxException(std::string("CUDA DECODER: Failed to inspect output pointer: ") +
+                          cudaGetErrorString(attrErr));
+    }
+
+#if CUDART_VERSION >= 10000
+    return attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged;
+#else
+    return attrs.memoryType == cudaMemoryTypeDevice;
+#endif
+}
+
 Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex)
     : nelux::Decoder(numThreads), cudaDeviceIndex_(cudaDeviceIndex),
       cudaStream_(nullptr), decodeCompleteEvent_(nullptr), hwDeviceCtx_(nullptr),
@@ -456,9 +484,11 @@ void Decoder::initCodecContextWithHwAccel()
     currentInstance_ = this;
     codecCtx->get_format = getHwFormat;
 
-    // Configure threading
-    codecCtx->thread_count = numThreads;
-    codecCtx->thread_type = FF_THREAD_FRAME;
+    // NVDEC/CUVID decoders already manage decode parallelism internally.
+    // Enabling FFmpeg frame threads on top can reorder surface ownership and
+    // has been a recurring source of stutter/skipped frames on hardware paths.
+    codecCtx->thread_count = 1;
+    codecCtx->thread_type = 0;
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
 
     // Open the codec
@@ -669,21 +699,48 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             rgb24BufferSize_ = alignedSize;
         }
 
+        const bool outputOnDevice = isDeviceAccessiblePointer(buffer);
+
         // 1. Convert to aligned GPU buffer
         transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
 
-        // Ensure the conversion kernel on cudaStream_ completes before host readback.
+        if (outputOnDevice)
+        {
+            cudaError_t copy_err = cudaMemcpy2DAsync(
+                buffer, width * 3, rgb24Buffer_, alignedPitch, width * 3, height,
+                cudaMemcpyDeviceToDevice, cudaStream_);
+            if (copy_err != cudaSuccess)
+            {
+                throw CxException(std::string("CUDA DECODER: Device copy failed: ") +
+                                  cudaGetErrorString(copy_err));
+            }
+        }
+        else
+        {
+            // Host readback must wait for the conversion kernel to finish first.
+            cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
+            if (sync_err != cudaSuccess)
+            {
+                throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
+                                  cudaGetErrorString(sync_err));
+            }
+
+            cudaError_t copy_err = cudaMemcpy2D(buffer, width * 3, rgb24Buffer_,
+                                                alignedPitch, width * 3, height,
+                                                cudaMemcpyDeviceToHost);
+            if (copy_err != cudaSuccess)
+            {
+                throw CxException(std::string("CUDA DECODER: Host readback failed: ") +
+                                  cudaGetErrorString(copy_err));
+            }
+        }
+
         cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
         if (sync_err != cudaSuccess)
         {
             throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
                               cudaGetErrorString(sync_err));
         }
-
-        // 2. Copy to output buffer (removing padding if any)
-        // buffer is likely Host memory if calling decodeNextFrame with NVDEC frame
-        cudaMemcpy2D(buffer, width * 3, rgb24Buffer_, alignedPitch, width * 3, height,
-                     cudaMemcpyDeviceToHost);
     }
     else
     {
