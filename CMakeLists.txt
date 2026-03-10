@@ -47,6 +47,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(NELUX_ENABLE_CUDA   "Enable CUDA support in Nelux" OFF)
 option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)
+option(NELUX_BUNDLE_FFMPEG_DLLS "Bundle FFmpeg runtime DLLs into Windows wheels" ON)
 
 # Host-side performance options (C++ only)
 # - AVX2: targets modern x86_64 CPUs; can be disabled for broader compatibility.
@@ -582,20 +583,24 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endif()
   endif()
 
-  # Bundle FFmpeg runtime DLLs from external/ffmpeg/bin
-  file(GLOB NELUX_FFMPEG_DLLS
-    "${NELUX_FFMPEG_DIR}/bin/avcodec-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/swscale-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/swresample-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
-    "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
-  )
-  if(NELUX_FFMPEG_DLLS)
-    list(APPEND NELUX_DLLS ${NELUX_FFMPEG_DLLS})
+  if(NELUX_BUNDLE_FFMPEG_DLLS)
+    # Bundle FFmpeg runtime DLLs from external/ffmpeg/bin when explicitly enabled.
+    file(GLOB NELUX_FFMPEG_DLLS
+      "${NELUX_FFMPEG_DIR}/bin/avcodec-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/swscale-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/swresample-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
+    )
+    if(NELUX_FFMPEG_DLLS)
+      list(APPEND NELUX_DLLS ${NELUX_FFMPEG_DLLS})
+    else()
+      message(WARNING "FFmpeg runtime DLLs not found under ${NELUX_FFMPEG_DIR}/bin")
+    endif()
   else()
-    message(WARNING "FFmpeg runtime DLLs not found under ${NELUX_FFMPEG_DIR}/bin")
+    message(STATUS "NELUX_BUNDLE_FFMPEG_DLLS=OFF, skipping FFmpeg runtime DLL bundling")
   endif()
 
   # Deduplicate in case multiple glob sources overlap

@@ -149,6 +149,7 @@ jobs:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
+          NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
         run: |
           # Convert backslashes to forward slashes to avoid CMake escaping issues on Windows
           TEMP_FWD=$(echo "$RUNNER_TEMP" | tr '\\' '/')
@@ -162,8 +163,8 @@ jobs:
           export VCPKG_TARGET_TRIPLET=x64-windows-release
           export CMAKE_PREFIX_PATH="${VCPKG_ROOT}/installed/x64-windows-release"
 
-          # Construct CMAKE_ARGS with sanitized paths AND FORCE NELUX_ENABLE_CUDA=ON
-          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON"
+          # Construct CMAKE_ARGS with sanitized paths and explicit wheel-bundling policy.
+          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
           # Use --no-build-isolation so we usage the pre-installed CUDA-enabled Torch

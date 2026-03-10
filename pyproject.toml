@@ -34,4 +34,5 @@ ninja.make-fallback = false
 
 [tool.scikit-build.cmake.define]
 NELUX_ENABLE_CUDA = {env="NELUX_ENABLE_CUDA", default="OFF"}
+NELUX_BUNDLE_FFMPEG_DLLS = {env="NELUX_BUNDLE_FFMPEG_DLLS", default="ON"}
 
