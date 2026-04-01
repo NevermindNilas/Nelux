@@ -1,4 +1,10 @@
 
+### **Version 0.8.10 (2026-04-01)**
+
+#### **Dependencies**
+- **PyTorch:** Updated the default CI/build workflow dependency to PyTorch 2.11.0.
+- **TorchVision:** Updated the matching workflow dependency to torchvision 0.26.0.
+
 ### **Version 0.8.9 (2026-02-16)**
 
 #### **Bug Fixes & Stability**
