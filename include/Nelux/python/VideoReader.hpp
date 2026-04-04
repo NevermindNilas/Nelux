@@ -49,11 +49,13 @@ class VideoReader
      * @brief Create a VideoEncoder configured to this reader's video & audio
      * properties.
      * @param outputPath Path where the new file will be saved.
+    * @param audioMode Audio handling mode: "copy", "encode", or "off".
      * @return Shared pointer to a VideoEncoder pre-configured for resolution, fps, and
      * audio.
      */
     std::shared_ptr<nelux::VideoEncoder>
-    createEncoder(const std::string& outputPath) const;
+    createEncoder(const std::string& outputPath,
+               const std::string& audioMode = "copy") const;
 
     // Direct property getters for performance
     int getWidth() const

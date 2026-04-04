@@ -31,7 +31,11 @@ class VideoEncoder
                  // NVENC options
                  std::optional<int> preset = std::nullopt,   // 1-7, higher=better quality
                  std::optional<int> cq = std::nullopt,       // Constant quality (0-51)
-                 std::optional<std::string> pixelFormat = std::nullopt);
+                 std::optional<std::string> pixelFormat = std::nullopt,
+                 std::optional<std::string> audioMode = std::nullopt,
+                 std::optional<std::string> sourcePath = std::nullopt,
+                 std::optional<double> sourceStartTime = std::nullopt,
+                 std::optional<double> sourceEndTime = std::nullopt);
 
     ~VideoEncoder();
 
@@ -65,7 +69,11 @@ class VideoEncoder
         std::optional<int> audioSampleRate, std::optional<int> audioChannels,
         std::optional<std::string> audioCodec,
         std::optional<int> preset, std::optional<int> cq,
-        std::optional<std::string> pixelFormat);
+        std::optional<std::string> pixelFormat,
+        std::optional<std::string> audioMode,
+        std::optional<std::string> sourcePath,
+        std::optional<double> sourceStartTime,
+        std::optional<double> sourceEndTime);
 };
 
 } // namespace nelux

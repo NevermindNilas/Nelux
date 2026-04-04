@@ -27,6 +27,20 @@ namespace nvenc
 class Encoder
 {
   public:
+    enum class AudioMode
+    {
+        Off,
+        Encode,
+        Copy,
+    };
+
+    struct AudioCopyProperties
+    {
+        std::string sourcePath;
+        double sourceStartTime = 0.0;
+        std::optional<double> sourceEndTime = std::nullopt;
+    };
+
     struct EncodingProperties
     {
         std::string codec;
@@ -46,6 +60,8 @@ class Encoder
         bool useHardwareEncoder = false;  // Auto-detected from codec name
         int preset = -1;  // NVENC preset (0=fastest, higher=better quality)
         int cq = -1;      // Constant quality mode (0-51, lower=better)
+        AudioMode audioMode = AudioMode::Off;
+        AudioCopyProperties audioCopy;
     };
 
     Encoder() = default;
@@ -79,9 +95,11 @@ class Encoder
   private:
     void initVideoStream();
     void initAudioStream();
+    void initAudioCopyStream();
     void initHardwareContext();  // NEW: Initialize CUDA device context for NVENC
     void openOutputFile();
     void validateCodecContainerCompatibility();
+    void copyAudioPackets();
     std::string
     inferContainerFormat(const std::string& filename) const;
 
@@ -92,6 +110,8 @@ class Encoder
     AVCodecContextPtr audioCodecCtx;
     AVStream* videoStream = nullptr;
     AVStream* audioStream = nullptr;
+    AVFormatContextPtr sourceAudioFormatCtx;
+    int sourceAudioStreamIndex = -1;
     SwrContextPtr swrCtx;
     AVPacketPtr pkt;
     int64_t nextAudioPts = 0;

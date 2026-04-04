@@ -44,7 +44,7 @@ def main() -> None:
     print(f"Output: {output_path}")
 
     with VideoReader(input_path) as reader:
-        with reader.create_encoder(output_path) as encoder:
+        with reader.create_encoder(output_path, audio_mode="copy") as encoder:
             # Encode the first 60 frames (or fewer if video is short)
             max_frames = min(60, len(reader))
             for i, frame in enumerate(reader):
@@ -55,13 +55,8 @@ def main() -> None:
                 processed = frame
                 encoder.encode_frame(processed)
 
-            # Encode audio if present
-            if reader.has_audio:
-                try:
-                    pcm = reader.audio.tensor()
-                    encoder.encode_audio_frame(pcm)
-                except Exception as exc:
-                    print(f"Audio encoding skipped: {exc}")
+            # For transformed or generated audio, switch to audio_mode="encode"
+            # and feed PCM through encode_audio_frame().
 
     print("\n✓ Encode example completed.")
 

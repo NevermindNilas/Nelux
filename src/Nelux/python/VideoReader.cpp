@@ -3,6 +3,7 @@
 #include <cstring> // For std::memcpy
 #include <iostream>
 #include <cmath>
+#include <cctype>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -1060,20 +1061,68 @@ torch::ScalarType VideoReader::findMLTypeFromBitDepth()
 }
 
 std::shared_ptr<nelux::VideoEncoder>
-VideoReader::createEncoder(const std::string& outputPath) const
+VideoReader::createEncoder(const std::string& outputPath,
+                           const std::string& audioMode) const
 {
-    // Build optional audio parameters only if this reader has audio
+    auto normalizeMode = [](std::string mode) -> std::string
+    {
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+                       [](unsigned char ch)
+                       { return static_cast<char>(std::tolower(ch)); });
+        return mode;
+    };
+
+    const std::string normalizedAudioMode = normalizeMode(audioMode);
+
+    // Build optional audio parameters only if this reader has audio.
     std::optional<int> abr = properties.hasAudio
-                                 ? std::make_optional(properties.audioBitrate)
+                                 ? std::make_optional(properties.audioBitrate > 0
+                                                          ? properties.audioBitrate
+                                                          : 128000)
                                  : std::nullopt;
     std::optional<int> asr = properties.hasAudio
-                                 ? std::make_optional(properties.audioSampleRate)
+                                 ? std::make_optional(properties.audioSampleRate > 0
+                                                          ? properties.audioSampleRate
+                                                          : 48000)
                                  : std::nullopt;
     std::optional<int> ach = properties.hasAudio
-                                 ? std::make_optional(properties.audioChannels)
+                                 ? std::make_optional(properties.audioChannels > 0
+                                                          ? properties.audioChannels
+                                                          : 2)
                                  : std::nullopt;
     std::optional<std::string> acodec =
-        properties.hasAudio ? std::make_optional(properties.audioCodec) : std::nullopt;
+        properties.hasAudio
+            ? std::make_optional(properties.audioCodec.empty() ? std::string("aac")
+                                                               : properties.audioCodec)
+            : std::nullopt;
+
+    std::optional<std::string> sourcePath = std::nullopt;
+    std::optional<double> sourceStartTime = std::nullopt;
+    std::optional<double> sourceEndTime = std::nullopt;
+
+    if (properties.hasAudio && normalizedAudioMode == "copy")
+    {
+        sourcePath = filePath;
+
+        if (start_time >= 0.0 && end_time > 0.0)
+        {
+            sourceStartTime = start_time;
+            sourceEndTime = end_time;
+        }
+        else if (start_frame >= 0 && end_frame >= 0 && properties.fps > 0.0)
+        {
+            sourceStartTime = static_cast<double>(start_frame) / properties.fps;
+            sourceEndTime = static_cast<double>(end_frame + 1) / properties.fps;
+        }
+        else
+        {
+            sourceStartTime = 0.0;
+        }
+    }
+
+    std::optional<std::string> requestedAudioMode =
+        properties.hasAudio ? std::make_optional(normalizedAudioMode)
+                            : std::make_optional(std::string("off"));
 
     // Create and return the matching encoder
     return std::make_shared<nelux::VideoEncoder>(
@@ -1086,7 +1135,14 @@ VideoReader::createEncoder(const std::string& outputPath) const
         /* audioBitRate   */ abr,
         /* audioSampleRate*/ asr,
         /* audioChannels  */ ach,
-        /* audioCodec     */ acodec);
+        /* audioCodec     */ acodec,
+        /* preset         */ std::nullopt,
+        /* cq             */ std::nullopt,
+        /* pixelFormat    */ std::nullopt,
+        /* audioMode      */ requestedAudioMode,
+        /* sourcePath     */ sourcePath,
+        /* sourceStartTime*/ sourceStartTime,
+        /* sourceEndTime  */ sourceEndTime);
 }
 
 std::string VideoReader::getPixelFormat() const

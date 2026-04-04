@@ -104,11 +104,12 @@ Args:
         .def_property_readonly("aspect_ratio", &VideoReader::getAspectRatio)
         .def_property_readonly("codec", &VideoReader::getCodec)
         .def_property_readonly("audio", &VideoReader::getAudio)
-        .def("supported_codecs", &VideoReader::supportedCodecs)
-        .def("get_properties", &VideoReader::getProperties)
-        .def("create_encoder", &VideoReader::createEncoder, py::arg("output_path"),
-             "Create a nelux::VideoEncoder configured to this reader's video + audio "
-             "settings.")
+           .def("supported_codecs", &VideoReader::supportedCodecs)
+           .def("get_properties", &VideoReader::getProperties)
+           .def("create_encoder", &VideoReader::createEncoder, py::arg("output_path"),
+               py::arg("audio_mode") = "copy",
+               "Create a nelux::VideoEncoder configured to this reader's video + audio "
+               "settings. audio_mode can be 'copy', 'encode', or 'off'.")
         .def("__getitem__", &VideoReader::operator[])
         .def("__len__", &VideoReader::length)
         .def(
@@ -303,7 +304,11 @@ Example:
                       std::optional<std::string>, // audio_codec
                       std::optional<int>,         // preset (NVENC)
                       std::optional<int>,         // cq (NVENC)
-                      std::optional<std::string>  // pixel_format
+                      std::optional<std::string>, // pixel_format
+                      std::optional<std::string>, // audio_mode
+                      std::optional<std::string>, // source_path
+                      std::optional<double>,      // source_start_time
+                      std::optional<double>       // source_end_time
                       >(),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
@@ -313,6 +318,10 @@ Example:
              py::arg("audio_channels") = py::none(),
              py::arg("audio_codec") = py::none(), py::arg("preset") = py::none(),
              py::arg("cq") = py::none(), py::arg("pixel_format") = py::none(),
+             py::arg("audio_mode") = py::none(),
+             py::arg("source_path") = py::none(),
+             py::arg("source_start_time") = py::none(),
+             py::arg("source_end_time") = py::none(),
              R"doc(Create a video encoder.
 
 Args:
@@ -329,12 +338,17 @@ Args:
     audio_codec (str, optional): Audio codec name.
     preset (int, optional): NVENC encoding preset (1-7). Higher = better quality.
     cq (int, optional): NVENC constant quality mode (0-51). Lower = better quality.
-    pixel_format (str, optional): Output pixel format (e.g., "yuv420p", "nv12").
+        pixel_format (str, optional): Output pixel format (e.g., "yuv420p", "nv12").
+        audio_mode (str, optional): "off", "encode", or "copy".
+        source_path (str, optional): Source media path used when audio_mode="copy".
+        source_start_time (float, optional): Source start time in seconds for copied audio.
+        source_end_time (float, optional): Optional source end bound for copied audio.
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
              "Encode one video frame (H×W×3 torch.uint8 tensor).")
         .def("encode_audio_frame", &nelux::VideoEncoder::encodeAudioFrame,
-             py::arg("audio"), "Encode one audio buffer (1-D torch.int16 PCM tensor).")
+                         py::arg("audio"),
+               "Encode one audio buffer (1-D torch.int16 PCM tensor). Requires audio_mode='encode'.")
         .def("close", &nelux::VideoEncoder::close,
              "Finalize file and flush audio/video streams.")
         .def_property_readonly("is_hardware_encoder",

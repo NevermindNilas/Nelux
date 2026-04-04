@@ -284,8 +284,33 @@ public:
     
     int getPitch() const { return nv12Pitch; }
     int getSurfaceHeight() const { return surfaceHeight; }
+
+    void synchronize() const
+    {
+        cudaError_t err = stream ? cudaStreamSynchronize(stream) : cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            throw std::runtime_error("RGBToAutoGPUConverter: CUDA sync failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+    }
     
 private:
+    void copyPlane2DToCuda(uint8_t* dst, int dstPitch, const uint8_t* src, int srcPitch,
+                           size_t widthBytes, size_t copyHeight)
+    {
+        cudaError_t err = stream
+                              ? cudaMemcpy2DAsync(dst, dstPitch, src, srcPitch,
+                                                  widthBytes, copyHeight,
+                                                  cudaMemcpyDeviceToDevice, stream)
+                              : cudaMemcpy2D(dst, dstPitch, src, srcPitch,
+                                             widthBytes, copyHeight,
+                                             cudaMemcpyDeviceToDevice);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("RGBToAutoGPUConverter: CUDA D2D copy failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+    }
+
     void allocateNv12Buffer()
     {
         // NV12: Y plane (width * height) + UV plane (width * height/2)
@@ -483,17 +508,12 @@ private:
 
     void copyNv12ToCudaFrame(AVFrame* frame)
     {
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[0], frame->linesize[0], cudaNv12Buffer,
+                          nv12Pitch, width, height);
 
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width, height / 2,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width, height / 2);
     }
     
     void copyP010ToCpuFrame(AVFrame* frame)
@@ -515,53 +535,34 @@ private:
 
     void copyP010ToCudaFrame(AVFrame* frame)
     {
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width * 2, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[0], frame->linesize[0], cudaNv12Buffer,
+                          nv12Pitch, width * 2, height);
 
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width * 2, height / 2,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width * 2, height / 2);
     }
 
     void copyYuv444ToCudaFrame(AVFrame* frame)
     {
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaYBuffer, width,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[0], frame->linesize[0], cudaYBuffer, width,
+                          width, height);
 
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaUBuffer, width,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[1], frame->linesize[1], cudaUBuffer, width,
+                          width, height);
 
-        cudaMemcpy2D(
-            frame->data[2], frame->linesize[2],
-            cudaVBuffer, width,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[2], frame->linesize[2], cudaVBuffer, width,
+                          width, height);
     }
 
     void copyNv16ToCudaFrame(AVFrame* frame)
     {
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[0], frame->linesize[0], cudaNv12Buffer,
+                          nv12Pitch, width, height);
 
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width, height);
     }
     
     void copyYuv444ToCpuFrame(AVFrame* frame)
@@ -615,26 +616,14 @@ private:
     
     void copyYuv420pToCudaFrame(AVFrame* frame)
     {
-        // Copy Y plane (full resolution)
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaYBuffer, width,
-            width, height,
-            cudaMemcpyDeviceToDevice);
-        
-        // Copy U plane (quarter resolution)
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaUBuffer, width / 2,
-            width / 2, height / 2,
-            cudaMemcpyDeviceToDevice);
-        
-        // Copy V plane (quarter resolution)
-        cudaMemcpy2D(
-            frame->data[2], frame->linesize[2],
-            cudaVBuffer, width / 2,
-            width / 2, height / 2,
-            cudaMemcpyDeviceToDevice);
+        copyPlane2DToCuda(frame->data[0], frame->linesize[0], cudaYBuffer, width,
+                          width, height);
+
+        copyPlane2DToCuda(frame->data[1], frame->linesize[1], cudaUBuffer,
+                          width / 2, width / 2, height / 2);
+
+        copyPlane2DToCuda(frame->data[2], frame->linesize[2], cudaVBuffer,
+                          width / 2, width / 2, height / 2);
     }
 };
 

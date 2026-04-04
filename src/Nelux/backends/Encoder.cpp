@@ -1,5 +1,7 @@
 ﻿#include "Encoder.hpp"
 
+#include <cmath>
+
 extern "C" {
 #include <libavutil/pixdesc.h>
 }
@@ -8,6 +10,28 @@ namespace fs = std::filesystem;
 
 namespace nelux
 {
+
+namespace
+{
+int findFirstAudioStreamIndex(AVFormatContext* formatCtx)
+{
+    for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
+    {
+        if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        {
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1;
+}
+
+int64_t secondsToPts(double seconds, AVRational timeBase)
+{
+    return av_rescale_q(static_cast<int64_t>(std::llround(seconds * AV_TIME_BASE)),
+                        AVRational{1, AV_TIME_BASE}, timeBase);
+}
+} // namespace
 
 Encoder::Encoder(const std::string& filename, const EncodingProperties& properties)
     : properties(properties), filename(filename) // Store filename
@@ -42,7 +66,11 @@ void Encoder::initialize()
     validateCodecContainerCompatibility();
 
     initVideoStream();
-    if (properties.audioBitRate > 0)
+    if (properties.audioMode == AudioMode::Copy)
+    {
+        initAudioCopyStream();
+    }
+    else if (properties.audioMode == AudioMode::Encode && properties.audioBitRate > 0)
     {
         initAudioStream();
     }
@@ -216,6 +244,11 @@ void Encoder::initVideoStream()
     if (videoCodecCtx->hw_frames_ctx)
     {
         videoCodecCtx->pix_fmt = AV_PIX_FMT_CUDA;
+
+        // Match the NVDEC fix: keep FFmpeg-managed threading out of the NVENC
+        // hardware path and let the NVIDIA stack own its internal scheduling.
+        videoCodecCtx->thread_count = 1;
+        videoCodecCtx->thread_type = 0;
     }
     else
     {
@@ -295,6 +328,64 @@ void Encoder::initAudioStream()
         NELUX_WARN("Failed to open audio codec.");
 
     avcodec_parameters_from_context(audioStream->codecpar, audioCodecCtx.get());
+}
+
+void Encoder::initAudioCopyStream()
+{
+    const std::string sourcePath = normalizePath(properties.audioCopy.sourcePath);
+    if (sourcePath.empty())
+    {
+        throw std::runtime_error(
+            "Audio copy mode requires a valid source file path.");
+    }
+
+    AVFormatContext* sourceCtx = nullptr;
+    int ret = avformat_open_input(&sourceCtx, sourcePath.c_str(), nullptr, nullptr);
+    if (ret < 0)
+    {
+        throw std::runtime_error("Failed to open source audio file: " + sourcePath +
+                                 " (" + errorToString(ret) + ")");
+    }
+    sourceAudioFormatCtx.reset(sourceCtx);
+
+    ret = avformat_find_stream_info(sourceAudioFormatCtx.get(), nullptr);
+    if (ret < 0)
+    {
+        throw std::runtime_error("Failed to read source audio stream info: " +
+                                 errorToString(ret));
+    }
+
+    sourceAudioStreamIndex = findFirstAudioStreamIndex(sourceAudioFormatCtx.get());
+    if (sourceAudioStreamIndex < 0)
+    {
+        throw std::runtime_error("Source file does not contain an audio stream to copy.");
+    }
+
+    AVStream* inputAudioStream =
+        sourceAudioFormatCtx->streams[sourceAudioStreamIndex];
+
+    if (!avformat_query_codec(formatCtx->oformat,
+                              static_cast<AVCodecID>(inputAudioStream->codecpar->codec_id),
+                              0))
+    {
+        throw std::runtime_error("Audio codec cannot be copied into the output container.");
+    }
+
+    audioStream = avformat_new_stream(formatCtx.get(), nullptr);
+    if (!audioStream)
+    {
+        throw std::runtime_error("Failed to create output audio stream for passthrough.");
+    }
+
+    ret = avcodec_parameters_copy(audioStream->codecpar, inputAudioStream->codecpar);
+    if (ret < 0)
+    {
+        throw std::runtime_error("Failed to copy audio stream parameters: " +
+                                 errorToString(ret));
+    }
+
+    audioStream->codecpar->codec_tag = 0;
+    audioStream->time_base = inputAudioStream->time_base;
 }
 
 bool Encoder::encodeFrame(const Frame& frame)
@@ -421,6 +512,124 @@ void Encoder::writePacket()
     av_interleaved_write_frame(formatCtx.get(), pkt.get());
 }
 
+void Encoder::copyAudioPackets()
+{
+    if (!sourceAudioFormatCtx || sourceAudioStreamIndex < 0 || !audioStream)
+    {
+        return;
+    }
+
+    if (nextVideoPts <= 0 || properties.fps <= 0)
+    {
+        NELUX_INFO("Skipping audio copy because no video frames were encoded.");
+        return;
+    }
+
+    AVStream* inputAudioStream =
+        sourceAudioFormatCtx->streams[sourceAudioStreamIndex];
+
+    const double copyStartTime = std::max(0.0, properties.audioCopy.sourceStartTime);
+    double copyEndTime = copyStartTime +
+                         (static_cast<double>(nextVideoPts) /
+                          static_cast<double>(properties.fps));
+    if (properties.audioCopy.sourceEndTime.has_value())
+    {
+        copyEndTime = std::min(copyEndTime, *properties.audioCopy.sourceEndTime);
+    }
+
+    if (copyEndTime <= copyStartTime)
+    {
+        NELUX_INFO("Skipping audio copy because the requested time window is empty.");
+        return;
+    }
+
+    const int64_t startPts = secondsToPts(copyStartTime, inputAudioStream->time_base);
+    const int64_t endPts = secondsToPts(copyEndTime, inputAudioStream->time_base);
+
+    int ret = av_seek_frame(sourceAudioFormatCtx.get(), sourceAudioStreamIndex, startPts,
+                            AVSEEK_FLAG_BACKWARD);
+    if (ret < 0)
+    {
+        throw std::runtime_error("Failed to seek source audio stream: " +
+                                 errorToString(ret));
+    }
+
+    AVPacketPtr sourcePacket(av_packet_alloc());
+    if (!sourcePacket)
+    {
+        throw std::runtime_error("Failed to allocate packet for audio passthrough.");
+    }
+
+    int64_t firstPts = AV_NOPTS_VALUE;
+    int64_t firstDts = AV_NOPTS_VALUE;
+
+    while (av_read_frame(sourceAudioFormatCtx.get(), sourcePacket.get()) >= 0)
+    {
+        if (sourcePacket->stream_index != sourceAudioStreamIndex)
+        {
+            av_packet_unref(sourcePacket.get());
+            continue;
+        }
+
+        const int64_t packetTs = sourcePacket->pts != AV_NOPTS_VALUE
+                                     ? sourcePacket->pts
+                                     : sourcePacket->dts;
+        int64_t packetEndTs = packetTs;
+        if (packetTs != AV_NOPTS_VALUE && sourcePacket->duration > 0)
+        {
+            packetEndTs = packetTs + sourcePacket->duration;
+        }
+
+        if (packetTs != AV_NOPTS_VALUE && packetEndTs <= startPts)
+        {
+            av_packet_unref(sourcePacket.get());
+            continue;
+        }
+
+        if (packetTs != AV_NOPTS_VALUE && packetTs >= endPts)
+        {
+            av_packet_unref(sourcePacket.get());
+            break;
+        }
+
+        if (firstPts == AV_NOPTS_VALUE && sourcePacket->pts != AV_NOPTS_VALUE)
+        {
+            firstPts = sourcePacket->pts;
+        }
+        if (firstDts == AV_NOPTS_VALUE && sourcePacket->dts != AV_NOPTS_VALUE)
+        {
+            firstDts = sourcePacket->dts;
+        }
+
+        if (sourcePacket->pts != AV_NOPTS_VALUE && firstPts != AV_NOPTS_VALUE)
+        {
+            sourcePacket->pts -= firstPts;
+        }
+        if (sourcePacket->dts != AV_NOPTS_VALUE && firstDts != AV_NOPTS_VALUE)
+        {
+            sourcePacket->dts -= firstDts;
+        }
+        if (sourcePacket->pts != AV_NOPTS_VALUE && sourcePacket->dts != AV_NOPTS_VALUE &&
+            sourcePacket->pts < sourcePacket->dts)
+        {
+            sourcePacket->pts = sourcePacket->dts;
+        }
+
+        av_packet_rescale_ts(sourcePacket.get(), inputAudioStream->time_base,
+                             audioStream->time_base);
+        sourcePacket->stream_index = audioStream->index;
+
+        ret = av_interleaved_write_frame(formatCtx.get(), sourcePacket.get());
+        av_packet_unref(sourcePacket.get());
+
+        if (ret < 0)
+        {
+            throw std::runtime_error("Failed to write copied audio packet: " +
+                                     errorToString(ret));
+        }
+    }
+}
+
 
 
 void Encoder::close()
@@ -454,6 +663,11 @@ void Encoder::close()
         }
     }
 
+    if (properties.audioMode == AudioMode::Copy)
+    {
+        copyAudioPackets();
+    }
+
     // Trailer finalizes moov box in .mp4
     av_write_trailer(formatCtx.get());
 
@@ -475,6 +689,7 @@ void Encoder::close()
 
     videoCodecCtx.reset();
     audioCodecCtx.reset();
+    sourceAudioFormatCtx.reset();
     formatCtx.reset();
 }
 

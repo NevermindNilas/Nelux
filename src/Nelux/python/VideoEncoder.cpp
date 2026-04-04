@@ -1,4 +1,5 @@
 ﻿#include "python/VideoEncoder.hpp"
+#include <cctype>
 #include <filesystem>
 #include <stdexcept>
 #include <Factory.hpp>
@@ -8,6 +9,47 @@ namespace fs = std::filesystem;
 
 namespace nelux
 {
+namespace
+{
+std::string toLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+Encoder::AudioMode parseAudioMode(const std::optional<std::string>& audioMode,
+                                  bool hasAudioEncodeSettings,
+                                  const std::optional<std::string>& sourcePath)
+{
+    if (!audioMode.has_value() || audioMode->empty())
+    {
+        if (sourcePath.has_value() && !sourcePath->empty())
+        {
+            return Encoder::AudioMode::Copy;
+        }
+        return hasAudioEncodeSettings ? Encoder::AudioMode::Encode
+                                      : Encoder::AudioMode::Off;
+    }
+
+    const std::string mode = toLower(*audioMode);
+    if (mode == "off")
+    {
+        return Encoder::AudioMode::Off;
+    }
+    if (mode == "encode")
+    {
+        return Encoder::AudioMode::Encode;
+    }
+    if (mode == "copy")
+    {
+        return Encoder::AudioMode::Copy;
+    }
+
+    throw std::runtime_error("audio_mode must be one of: off, encode, copy");
+}
+} // namespace
+
     //NOTE --- USED HWC
 VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> codec, std::optional<int> width,
@@ -18,12 +60,19 @@ VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> audioCodec,
                            std::optional<int> preset,
                            std::optional<int> cq,
-                           std::optional<std::string> pixelFormat)
+                           std::optional<std::string> pixelFormat,
+                           std::optional<std::string> audioMode,
+                           std::optional<std::string> sourcePath,
+                           std::optional<double> sourceStartTime,
+                           std::optional<double> sourceEndTime)
 {
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
                                               fps, audioBitRate, audioSampleRate,
                                               audioChannels, audioCodec,
-                                              preset, cq, pixelFormat);
+                                              preset, cq, pixelFormat, audioMode,
+                                              sourcePath, sourceStartTime,
+                                              sourceEndTime);
+    this->props = properties;
     this->width = properties.width;
     this->height = properties.height;
     this->outputPixelFormat = properties.pixelFormat;
@@ -41,7 +90,11 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     std::optional<int> audioSampleRate, std::optional<int> audioChannels,
     std::optional<std::string> audioCodec,
     std::optional<int> preset, std::optional<int> cq,
-    std::optional<std::string> pixelFormat)
+    std::optional<std::string> pixelFormat,
+    std::optional<std::string> audioMode,
+    std::optional<std::string> sourcePath,
+    std::optional<double> sourceStartTime,
+    std::optional<double> sourceEndTime)
 {
     // Populate video encoding settings
     nelux::Encoder::EncodingProperties props;
@@ -75,14 +128,17 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     props.preset = preset.value_or(-1);  // -1 means use default
     props.cq = cq.value_or(-1);          // -1 means use bitrate mode
 
-    // Populate audio encoding settings (0 → no audio)
-    if (audioBitRate.has_value() && audioSampleRate.has_value() &&
-        audioChannels.has_value() && audioCodec.has_value())
+    const bool hasAudioEncodeSettings = audioSampleRate.has_value() &&
+                                        audioChannels.has_value();
+    props.audioMode = parseAudioMode(audioMode, hasAudioEncodeSettings, sourcePath);
+
+    // Populate audio encoding settings (0 -> no encoded audio stream)
+    if (props.audioMode == Encoder::AudioMode::Encode)
     {
-        props.audioBitRate = *audioBitRate;
-        props.audioSampleRate = *audioSampleRate;
-        props.audioChannels = *audioChannels;
-        props.audioCodec = *audioCodec;
+        props.audioBitRate = audioBitRate.value_or(128000);
+        props.audioSampleRate = audioSampleRate.value_or(48000);
+        props.audioChannels = audioChannels.value_or(2);
+        props.audioCodec = audioCodec.value_or("aac");
     }
     else
     {
@@ -90,6 +146,19 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
         props.audioSampleRate = 0;
         props.audioChannels = 0;
         props.audioCodec = std::string();
+    }
+
+    if (props.audioMode == Encoder::AudioMode::Copy)
+    {
+        if (!sourcePath.has_value() || sourcePath->empty())
+        {
+            throw std::runtime_error(
+                "audio_mode='copy' requires a source_path for passthrough");
+        }
+
+        props.audioCopy.sourcePath = *sourcePath;
+        props.audioCopy.sourceStartTime = sourceStartTime.value_or(0.0);
+        props.audioCopy.sourceEndTime = sourceEndTime;
     }
 
     return props;
@@ -106,6 +175,30 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     // GPU path: When tensor is on CUDA and we're using NVENC
     if (frame.device().is_cuda() && encoder->isHardwareEncoder())
     {
+        int deviceIndex = frame.device().index();
+        if (deviceIndex < 0)
+        {
+            deviceIndex = 0;
+        }
+
+        cudaError_t deviceErr = cudaSetDevice(deviceIndex);
+        if (deviceErr != cudaSuccess)
+        {
+            throw std::runtime_error("Failed to select CUDA device for NVENC encode: " +
+                                     std::string(cudaGetErrorString(deviceErr)));
+        }
+
+        if (!encoderStream)
+        {
+            cudaError_t streamErr = cudaStreamCreateWithFlags(&encoderStream,
+                                                              cudaStreamNonBlocking);
+            if (streamErr != cudaSuccess)
+            {
+                throw std::runtime_error("Failed to create NVENC CUDA stream: " +
+                                         std::string(cudaGetErrorString(streamErr)));
+            }
+        }
+
         // Convert tensor dtype to uint8 if needed (on GPU)
         if (frame.dtype() == torch::kFloat16 || frame.dtype() == torch::kFloat32)
         {
@@ -151,6 +244,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
 
         // Copy from converter's CUDA buffer into the CUDA AVFrame (device-to-device)
         gpuConverter->copyToCudaFrame(hwFrame.get());
+        gpuConverter->synchronize();
 
         // Send CUDA frame directly to encoder (no CPU upload)
         encoder->encodeFrame(hwFrame);
@@ -223,15 +317,32 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
 
 void VideoEncoder::close()
 {
+#ifdef NELUX_ENABLE_CUDA
+    if (gpuConverter)
+    {
+        gpuConverter->synchronize();
+        gpuConverter.reset();
+    }
+
+    if (encoderStream)
+    {
+        cudaStreamDestroy(encoderStream);
+        encoderStream = nullptr;
+    }
+#endif
+
     if (encoder)
     {
         encoder->close();
         encoder.reset();
     }
+
+    converter.reset();
 }
 
 VideoEncoder::~VideoEncoder()
 {
+    close();
 }
 
 // video side stays the same…
@@ -240,6 +351,12 @@ VideoEncoder::~VideoEncoder()
 void VideoEncoder::encodeAudioFrame(const torch::Tensor& pcm)
 {
     py::gil_scoped_release release;
+
+    if (!encoder || encoder->Properties().audioMode != Encoder::AudioMode::Encode)
+    {
+        throw std::runtime_error(
+            "encode_audio_frame requires audio_mode='encode' on the encoder");
+    }
 
     // 1) grab properties
     auto& props = encoder->Properties();
