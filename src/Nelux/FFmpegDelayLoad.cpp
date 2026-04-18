@@ -15,7 +15,6 @@ static const char* AVCODEC_VERSIONS[] = {"avcodec-62.dll", "avcodec-61.dll", "av
 static const char* AVFORMAT_VERSIONS[] = {"avformat-62.dll", "avformat-61.dll", "avformat-60.dll", nullptr};
 static const char* AVUTIL_VERSIONS[] = {"avutil-60.dll", "avutil-59.dll", "avutil-58.dll", nullptr};
 static const char* SWSCALE_VERSIONS[] = {"swscale-9.dll", "swscale-8.dll", "swscale-7.dll", nullptr};
-static const char* SWRESAMPLE_VERSIONS[] = {"swresample-6.dll", "swresample-5.dll", "swresample-4.dll", nullptr};
 static const char* AVFILTER_VERSIONS[] = {"avfilter-11.dll", "avfilter-10.dll", "avfilter-9.dll", nullptr};
 static const char* AVDEVICE_VERSIONS[] = {"avdevice-62.dll", "avdevice-61.dll", "avdevice-60.dll", nullptr};
 
@@ -30,7 +29,6 @@ static const DllVersionMap DLL_VERSIONS[] = {
     {"avformat", AVFORMAT_VERSIONS},
     {"avutil", AVUTIL_VERSIONS},
     {"swscale", SWSCALE_VERSIONS},
-    {"swresample", SWRESAMPLE_VERSIONS},
     {"avfilter", AVFILTER_VERSIONS},
     {"avdevice", AVDEVICE_VERSIONS},
 };

@@ -12,7 +12,6 @@ class Decoder : public nelux::Decoder
         : nelux::Decoder( numThreads)
     {
         initialize(filePath);
-        initializeAudio();
     }
 
     // No need to override methods unless specific behavior is needed

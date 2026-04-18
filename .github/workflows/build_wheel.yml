@@ -234,58 +234,17 @@ jobs:
           echo "=== Wheel contents (CUDA DLLs bundled via delvewheel, FFmpeg NOT bundled) ==="
           unzip -l dist/*.whl | grep nelux/
 
-      - name: Test wheel import and API
+      - name: Test wheel (import + real decode smoke test)
         shell: powershell
         run: |
-          Write-Host "=== Installing wheel and testing import ==="
+          Write-Host "=== Installing wheel ==="
           pip install (Get-ChildItem dist/*.whl) --force-reinstall
 
-          # Add FFmpeg bin to PATH for the test
           $FFmpegBin = Join-Path $pwd "external\ffmpeg\bin"
-          Write-Host "Adding to PATH: $FFmpegBin"
           $env:PATH = "$FFmpegBin;$env:PATH"
           $env:FFMPEG_BIN = $FFmpegBin
 
-          # Check torch and basic import with explicit DLL path adding for FFmpeg
-          python -c "import os, sys, torch; os.add_dll_directory(os.environ['FFMPEG_BIN']) if os.path.exists(os.environ.get('FFMPEG_BIN', '')) else None; import nelux; print(f'torch {torch.__version__}, nelux {nelux.__version__}')"
-
-          # Verify 0.8.3 API features are present
-          Write-Host "--- Verifying 0.8.3 API Features ---"
-          $ApiCode = @'
-          import os
-          import sys
-
-          # Set up FFmpeg DLL path
-          ffmpeg_bin = os.environ.get('FFMPEG_BIN', '')
-          if os.path.exists(ffmpeg_bin) and hasattr(os, 'add_dll_directory'):
-              print(f"Adding FFmpeg DLL directory: {ffmpeg_bin}")
-              os.add_dll_directory(ffmpeg_bin)
-
-          # Import torch FIRST (required before nelux)
-          import torch
-
-          # Import nelux (now loads immediately, not lazily)
-          import nelux
-          
-          # Get the VideoReader class directly
-          vr_class = nelux.VideoReader
-          
-          # Prefetch API
-          assert hasattr(vr_class, 'start_prefetch'), 'MISSING: start_prefetch'
-          assert hasattr(vr_class, 'stop_prefetch'), 'MISSING: stop_prefetch'
-          # These are properties in pybind11
-          assert hasattr(vr_class, 'prefetch_buffered'), 'MISSING: prefetch_buffered'
-          assert hasattr(vr_class, 'is_prefetching'), 'MISSING: is_prefetching'
-          assert hasattr(vr_class, 'prefetch_size'), 'MISSING: prefetch_size'
-
-          # Reconfigure API
-          assert hasattr(vr_class, 'reconfigure'), 'MISSING: reconfigure'
-          assert hasattr(vr_class, 'file_path'), 'MISSING: file_path'
-
-          print('All 0.8.3 API features verified!')
-          '@
-          $ApiCode | Set-Content -Path "verify_api.py" -Encoding UTF8
-          python verify_api.py
+          python tests/wheel_smoke_test.py
 
       - name: Upload Windows wheel
         uses: actions/upload-artifact@v4

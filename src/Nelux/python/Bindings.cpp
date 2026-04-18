@@ -28,7 +28,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.8.10";
+    m.attr("__version__") = "0.9.0";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -39,7 +39,7 @@ PYBIND11_MODULE(_nelux, m)
 
     m.attr("__all__") =
         py::make_tuple("__version__", "__cuda_support__", "VideoReader", "VideoEncoder",
-                       "Audio", "set_log_level", "LogLevel");
+                       "set_log_level", "LogLevel");
     py::enum_<spdlog::level::level_enum>(m, "LogLevel")
         .value("trace", spdlog::level::trace)
         .value("debug", spdlog::level::debug)
@@ -96,20 +96,13 @@ Args:
         .def_property_readonly("total_frames", &VideoReader::getTotalFrames)
         .def_property_readonly("pixel_format", &VideoReader::getPixelFormat)
         .def_property_readonly("has_audio", &VideoReader::getHasAudio)
-        .def_property_readonly("audio_bitrate", &VideoReader::getAudioBitrate)
-        .def_property_readonly("audio_channels", &VideoReader::getAudioChannels)
-        .def_property_readonly("audio_sample_rate", &VideoReader::getAudioSampleRate)
-        .def_property_readonly("audio_codec", &VideoReader::getAudioCodec)
         .def_property_readonly("bit_depth", &VideoReader::getBitDepth)
         .def_property_readonly("aspect_ratio", &VideoReader::getAspectRatio)
         .def_property_readonly("codec", &VideoReader::getCodec)
-        .def_property_readonly("audio", &VideoReader::getAudio)
            .def("supported_codecs", &VideoReader::supportedCodecs)
            .def("get_properties", &VideoReader::getProperties)
            .def("create_encoder", &VideoReader::createEncoder, py::arg("output_path"),
-               py::arg("audio_mode") = "copy",
-               "Create a nelux::VideoEncoder configured to this reader's video + audio "
-               "settings. audio_mode can be 'copy', 'encode', or 'off'.")
+               "Create a nelux::VideoEncoder configured to this reader's video settings.")
         .def("__getitem__", &VideoReader::operator[])
         .def("__len__", &VideoReader::length)
         .def(
@@ -192,11 +185,6 @@ Uses the secondary decoder; does not disturb iteration.)doc")
             },
             py::return_value_policy::reference_internal)
         // -------------------
-        // Bind getAudio()
-        // -------------------
-        .def("get_audio", &VideoReader::getAudio,
-             py::return_value_policy::reference_internal, "Retrieve the Audio object")
-        // -------------------
         // Prefetch Control API
         // -------------------
         .def(
@@ -274,21 +262,6 @@ Example:
         .def_property_readonly("file_path", &VideoReader::getFilePath,
                                "Path to the currently loaded video file (read-only)");
 
-    // ----------- Audio Class -----------
-    py::class_<VideoReader::Audio, std::shared_ptr<VideoReader::Audio>>(m, "Audio")
-        .def("tensor", &VideoReader::Audio::getAudioTensor,
-             "Return audio track as a 1-D torch.int16 tensor of interleaved PCM.")
-        .def("file", &VideoReader::Audio::extractToFile, py::arg("output_path"),
-             "Extract audio to an external file (e.g. WAV)")
-        .def_property_readonly("sample_rate", [](VideoReader::Audio const& a)
-                               { return a.getProperties().audioSampleRate; })
-        .def_property_readonly("channels", [](VideoReader::Audio const& a)
-                               { return a.getProperties().audioChannels; })
-        .def_property_readonly("bitrate", [](VideoReader::Audio const& a)
-                               { return a.getProperties().audioBitrate; })
-        .def_property_readonly("codec", [](VideoReader::Audio const& a)
-                               { return a.getProperties().audioCodec; });
-
     // ---------- nelux::VideoEncoder -----------
     py::class_<nelux::VideoEncoder, std::shared_ptr<nelux::VideoEncoder>>(
         m, "VideoEncoder")
@@ -298,30 +271,15 @@ Example:
                       std::optional<int>,         // height
                       std::optional<int>,         // bit_rate
                       std::optional<float>,       // fps
-                      std::optional<int>,         // audio_bit_rate
-                      std::optional<int>,         // audio_sample_rate
-                      std::optional<int>,         // audio_channels
-                      std::optional<std::string>, // audio_codec
                       std::optional<int>,         // preset (NVENC)
                       std::optional<int>,         // cq (NVENC)
-                      std::optional<std::string>, // pixel_format
-                      std::optional<std::string>, // audio_mode
-                      std::optional<std::string>, // source_path
-                      std::optional<double>,      // source_start_time
-                      std::optional<double>       // source_end_time
+                      std::optional<std::string>  // pixel_format
                       >(),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
              py::arg("bit_rate") = py::none(), py::arg("fps") = py::none(),
-             py::arg("audio_bit_rate") = py::none(),
-             py::arg("audio_sample_rate") = py::none(),
-             py::arg("audio_channels") = py::none(),
-             py::arg("audio_codec") = py::none(), py::arg("preset") = py::none(),
+             py::arg("preset") = py::none(),
              py::arg("cq") = py::none(), py::arg("pixel_format") = py::none(),
-             py::arg("audio_mode") = py::none(),
-             py::arg("source_path") = py::none(),
-             py::arg("source_start_time") = py::none(),
-             py::arg("source_end_time") = py::none(),
              R"doc(Create a video encoder.
 
 Args:
@@ -332,25 +290,18 @@ Args:
     height (int, optional): Frame height. Defaults to 1080.
     bit_rate (int, optional): Video bitrate in bps. Defaults to 4000000 (4 Mbps).
     fps (float, optional): Frames per second. Defaults to 30.
-    audio_bit_rate (int, optional): Audio bitrate in bps.
-    audio_sample_rate (int, optional): Audio sample rate in Hz.
-    audio_channels (int, optional): Number of audio channels.
-    audio_codec (str, optional): Audio codec name.
     preset (int, optional): NVENC encoding preset (1-7). Higher = better quality.
     cq (int, optional): NVENC constant quality mode (0-51). Lower = better quality.
-        pixel_format (str, optional): Output pixel format (e.g., "yuv420p", "nv12").
-        audio_mode (str, optional): "off", "encode", or "copy".
-        source_path (str, optional): Source media path used when audio_mode="copy".
-        source_start_time (float, optional): Source start time in seconds for copied audio.
-        source_end_time (float, optional): Optional source end bound for copied audio.
+    pixel_format (str, optional): Output pixel format (e.g., "yuv420p", "nv12",
+        "yuv444p", "gray", "gray16le"). Grayscale formats ("gray", "gray16le",
+        etc.) are supported natively only by software encoders such as
+        "libx264"/"libx265"; with NVENC codecs the encoder falls back to NV12
+        and emits a warning.
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
              "Encode one video frame (H×W×3 torch.uint8 tensor).")
-        .def("encode_audio_frame", &nelux::VideoEncoder::encodeAudioFrame,
-                         py::arg("audio"),
-               "Encode one audio buffer (1-D torch.int16 PCM tensor). Requires audio_mode='encode'.")
         .def("close", &nelux::VideoEncoder::close,
-             "Finalize file and flush audio/video streams.")
+             "Finalize file and flush video streams.")
         .def_property_readonly("is_hardware_encoder",
                                &nelux::VideoEncoder::isHardwareEncoder,
                                "True if using hardware-accelerated encoding (NVENC).")

@@ -44,7 +44,7 @@ def main() -> None:
     print(f"Output: {output_path}")
 
     with VideoReader(input_path) as reader:
-        with reader.create_encoder(output_path, audio_mode="copy") as encoder:
+        with reader.create_encoder(output_path) as encoder:
             # Encode the first 60 frames (or fewer if video is short)
             max_frames = min(60, len(reader))
             for i, frame in enumerate(reader):
@@ -54,9 +54,6 @@ def main() -> None:
                 # Example light processing: no-op or simple clamp
                 processed = frame
                 encoder.encode_frame(processed)
-
-            # For transformed or generated audio, switch to audio_mode="encode"
-            # and feed PCM through encode_audio_frame().
 
     print("\n✓ Encode example completed.")
 

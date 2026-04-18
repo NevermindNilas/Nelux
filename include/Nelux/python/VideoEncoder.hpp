@@ -24,23 +24,14 @@ class VideoEncoder
                  std::optional<int> height = std::nullopt,
                  std::optional<int> bitRate = std::nullopt,
                  std::optional<float> fps = std::nullopt,
-                 std::optional<int> audioBitRate = std::nullopt,
-                 std::optional<int> audioSampleRate = std::nullopt,
-                 std::optional<int> audioChannels = std::nullopt,
-                 std::optional<std::string> audioCodec = std::nullopt,
                  // NVENC options
                  std::optional<int> preset = std::nullopt,   // 1-7, higher=better quality
                  std::optional<int> cq = std::nullopt,       // Constant quality (0-51)
-                 std::optional<std::string> pixelFormat = std::nullopt,
-                 std::optional<std::string> audioMode = std::nullopt,
-                 std::optional<std::string> sourcePath = std::nullopt,
-                 std::optional<double> sourceStartTime = std::nullopt,
-                 std::optional<double> sourceEndTime = std::nullopt);
+                 std::optional<std::string> pixelFormat = std::nullopt);
 
     ~VideoEncoder();
 
     void encodeFrame(torch::Tensor frame);
-    void encodeAudioFrame(const torch::Tensor& audio);
     void close();
     
     // Check if using hardware encoder
@@ -65,15 +56,9 @@ class VideoEncoder
     nelux::Encoder::EncodingProperties inferEncodingProperties(
         const std::string& filename, std::optional<std::string> codec,
         std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
-        std::optional<float> fps, std::optional<int> audioBitRate,
-        std::optional<int> audioSampleRate, std::optional<int> audioChannels,
-        std::optional<std::string> audioCodec,
+        std::optional<float> fps,
         std::optional<int> preset, std::optional<int> cq,
-        std::optional<std::string> pixelFormat,
-        std::optional<std::string> audioMode,
-        std::optional<std::string> sourcePath,
-        std::optional<double> sourceStartTime,
-        std::optional<double> sourceEndTime);
+        std::optional<std::string> pixelFormat);
 };
 
 } // namespace nelux

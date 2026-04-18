@@ -113,10 +113,9 @@ foreach ($subdir in $Subdirs) {
 # Verify installation (version-agnostic patterns)
 $RequiredDlls = @(
     "avcodec-*.dll",
-    "avformat-*.dll", 
+    "avformat-*.dll",
     "avutil-*.dll",
     "swscale-*.dll",
-    "swresample-*.dll",
     "avfilter-*.dll",
     "avdevice-*.dll"
 )

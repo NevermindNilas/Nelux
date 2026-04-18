@@ -16,7 +16,6 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
   - [Prefetch API](#prefetch-api)
   - [Decoder Reconfiguration](#decoder-reconfiguration)
   - [Hardware Acceleration (NVDEC)](#hardware-acceleration-nvdec)
-- [Audio](#audio)
 - [VideoEncoder](#videoencoder)
 - [Logging](#logging)
 - [Module Attributes](#module-attributes)
@@ -130,11 +129,7 @@ reader.bit_depth      # int: Bit depth (8, 10, 12, etc.)
 reader.codec          # str: Video codec name (e.g., "h264", "hevc")
 
 # Audio
-reader.has_audio      # bool: True if audio track exists
-reader.audio_bitrate  # int: Audio bitrate in bps
-reader.audio_channels # int: Number of audio channels
-reader.audio_sample_rate  # int: Audio sample rate in Hz
-reader.audio_codec    # str: Audio codec name
+reader.has_audio      # bool: True if source has an audio track
 
 # File info
 reader.file_path      # str: Path to currently loaded video
@@ -392,34 +387,9 @@ for frame in reader:
 
 ---
 
-## Audio
-
-Access and extract audio from video files.
-
-```python
-reader = VideoReader("video.mp4")
-
-if reader.has_audio:
-    audio = reader.audio  # Get Audio object
-    
-    # Audio properties
-    audio.sample_rate  # int: Sample rate in Hz
-    audio.channels     # int: Number of channels
-    audio.bitrate      # int: Bitrate in bps
-    audio.codec        # str: Codec name
-    
-    # Extract as tensor (interleaved PCM, int16)
-    pcm_tensor = audio.tensor()  # 1-D torch.int16 tensor
-    
-    # Extract to file
-    success = audio.file("output.wav")  # Returns bool
-```
-
----
-
 ## VideoEncoder
 
-Encode video and audio frames to a file.
+Encode video frames to a file.
 
 ### Constructor
 
@@ -431,10 +401,9 @@ VideoEncoder(
     height: Optional[int] = None,
     bit_rate: Optional[int] = None,
     fps: Optional[float] = None,
-    audio_bit_rate: Optional[int] = None,
-    audio_sample_rate: Optional[int] = None,
-    audio_channels: Optional[int] = None,
-    audio_codec: Optional[str] = None
+    preset: Optional[int] = None,
+    cq: Optional[int] = None,
+    pixel_format: Optional[str] = None,
 )
 ```
 
@@ -446,10 +415,9 @@ VideoEncoder(
 | `height` | `int` | Auto | Output height |
 | `bit_rate` | `int` | Auto | Video bitrate |
 | `fps` | `float` | Auto | Output frame rate |
-| `audio_bit_rate` | `int` | Auto | Audio bitrate |
-| `audio_sample_rate` | `int` | Auto | Audio sample rate |
-| `audio_channels` | `int` | Auto | Audio channels |
-| `audio_codec` | `str` | Auto | Audio codec (e.g., "aac") |
+| `preset` | `int` | Auto | NVENC/x26x preset (1-9) |
+| `cq` | `int` | Auto | Constant quality (0-51) |
+| `pixel_format` | `str` | Auto | Output pixel format |
 
 ### Basic Usage
 
@@ -493,28 +461,6 @@ with reader.create_encoder("output.mp4") as encoder:
         # Process frame
         processed = some_filter(frame)
         encoder.encode_frame(processed)
-    
-    # Encode audio if present
-    if reader.has_audio:
-        pcm = reader.audio.tensor()
-        encoder.encode_audio_frame(pcm)
-```
-
-### Audio Encoding
-
-```python
-import torch
-
-# Audio must be 1-D int16 tensor (interleaved PCM)
-pcm_audio = torch.randint(-32768, 32767, (44100 * 10,), dtype=torch.int16)
-
-with VideoEncoder("output.mp4", audio_sample_rate=44100, audio_channels=2) as encoder:
-    # Encode video frames...
-    for frame in frames:
-        encoder.encode_frame(frame)
-    
-    # Encode all audio at once
-    encoder.encode_audio_frame(pcm_audio)
 ```
 
 ---
@@ -584,11 +530,7 @@ def process_video(input_path: str, output_path: str, model):
                 processed = processed.cpu()
             
             encoder.encode_frame(processed)
-        
-        # Copy audio
-        if reader.has_audio:
-            encoder.encode_audio_frame(reader.audio.tensor())
-    
+
     reader.stop_prefetch()
     print(f"Processed {reader.total_frames} frames")
 

@@ -12,6 +12,12 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
     if(NOT DEFINED VCPKG_TARGET_TRIPLET AND NOT DEFINED ENV{VCPKG_TARGET_TRIPLET})
       if(WIN32)
         set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg target triplet")
+      elseif(APPLE)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+          set(VCPKG_TARGET_TRIPLET "arm64-osx-dynamic" CACHE STRING "vcpkg target triplet")
+        else()
+          set(VCPKG_TARGET_TRIPLET "x64-osx-dynamic" CACHE STRING "vcpkg target triplet")
+        endif()
       else()
         set(VCPKG_TARGET_TRIPLET "x64-linux-dynamic" CACHE STRING "vcpkg target triplet")
       endif()
@@ -20,7 +26,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   endif()
 endif()
 
-project(Nelux VERSION 0.8.6 LANGUAGES CXX)
+project(Nelux VERSION 0.9.0 LANGUAGES CXX)
 
 # ─── Compiler options ─── 
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.
@@ -49,11 +55,62 @@ option(NELUX_ENABLE_CUDA   "Enable CUDA support in Nelux" OFF)
 option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)
 option(NELUX_BUNDLE_FFMPEG_DLLS "Bundle FFmpeg runtime DLLs into Windows wheels" ON)
 
-# Host-side performance options (C++ only)
+# Host-side performance options
 # - AVX2: targets modern x86_64 CPUs; can be disabled for broader compatibility.
+#   Auto-disabled on non-x86 architectures (e.g. Apple Silicon arm64).
+#   Applied to both CXX and CUDA host compilation.
 # - LTO: enables interprocedural optimization (IPO/LTO) in Release when supported.
-option(NELUX_ENABLE_AVX2 "Enable AVX2 for host (C++) code" ON)
-option(NELUX_ENABLE_LTO  "Enable IPO/LTO for Release builds" ON)
+#   Applied to every Nelux target (NeluxLib, nelux, NeluxCuda).
+# - CUDA_FAST_MATH: passes --use_fast_math to nvcc; safe for the NV12<->RGB
+#   color-conversion kernels we ship.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i386|i686")
+  set(_NELUX_AVX2_DEFAULT ON)
+else()
+  set(_NELUX_AVX2_DEFAULT OFF)
+endif()
+option(NELUX_ENABLE_AVX2            "Enable AVX2/FMA for host code (x86 only)" ${_NELUX_AVX2_DEFAULT})
+option(NELUX_ENABLE_LTO             "Enable IPO/LTO for Release builds"        ON)
+option(NELUX_ENABLE_CUDA_FAST_MATH  "Pass --use_fast_math to nvcc"             ON)
+
+if(NELUX_ENABLE_AVX2 AND NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i386|i686"))
+  message(WARNING "NELUX_ENABLE_AVX2 requested on non-x86 target (${CMAKE_SYSTEM_PROCESSOR}); forcing OFF")
+  set(NELUX_ENABLE_AVX2 OFF CACHE BOOL "" FORCE)
+endif()
+
+# Resolve IPO support once; used by nelux_apply_perf_flags below.
+set(NELUX_IPO_SUPPORTED FALSE)
+if(NELUX_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT NELUX_IPO_SUPPORTED OUTPUT _nelux_ipo_error)
+  if(NOT NELUX_IPO_SUPPORTED)
+    message(WARNING "IPO/LTO requested but not supported: ${_nelux_ipo_error}")
+  endif()
+endif()
+
+# Apply host performance flags (AVX2/FMA, LTO) to a target. Covers CXX sources
+# and CUDA host-side compilation (via nvcc -Xcompiler). No-op for languages
+# that aren't present in the target.
+function(nelux_apply_perf_flags target)
+  if(NELUX_ENABLE_AVX2)
+    if(MSVC)
+      target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>
+      )
+    else()
+      target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+        $<$<COMPILE_LANGUAGE:CXX>:-mfma>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mfma>
+      )
+    endif()
+  endif()
+
+  if(NELUX_ENABLE_LTO AND NELUX_IPO_SUPPORTED)
+    set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+  endif()
+endfunction()
 
 # --- Enable CUDA language if requested ---
 if(NELUX_ENABLE_CUDA)
@@ -164,28 +221,52 @@ message(STATUS "Using external FFmpeg from: ${NELUX_FFMPEG_DIR}")
 set(NELUX_FFMPEG_INCS "${NELUX_FFMPEG_DIR}/include")
 
 # Find import libraries
+set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
+set(_ffmpeg_components avcodec avformat avutil avfilter swscale avdevice)
+
 if(WIN32)
-  set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
-  set(NELUX_FFMPEG_LIBS
-    "${_ffmpeg_lib_dir}/avcodec.lib"
-    "${_ffmpeg_lib_dir}/avformat.lib"
-    "${_ffmpeg_lib_dir}/avutil.lib"
-    "${_ffmpeg_lib_dir}/avfilter.lib"
-    "${_ffmpeg_lib_dir}/swscale.lib"
-    "${_ffmpeg_lib_dir}/swresample.lib"
-    "${_ffmpeg_lib_dir}/avdevice.lib"
-  )
+  set(NELUX_FFMPEG_LIBS)
+  foreach(_c ${_ffmpeg_components})
+    list(APPEND NELUX_FFMPEG_LIBS "${_ffmpeg_lib_dir}/${_c}.lib")
+  endforeach()
+elseif(APPLE)
+  # Prefer unversioned symlink, fall back to highest-version .dylib found
+  set(NELUX_FFMPEG_LIBS)
+  foreach(_c ${_ffmpeg_components})
+    set(_plain "${_ffmpeg_lib_dir}/lib${_c}.dylib")
+    if(EXISTS "${_plain}")
+      list(APPEND NELUX_FFMPEG_LIBS "${_plain}")
+    else()
+      file(GLOB _versioned "${_ffmpeg_lib_dir}/lib${_c}.*.dylib")
+      if(_versioned)
+        list(SORT _versioned)
+        list(REVERSE _versioned)
+        list(GET _versioned 0 _picked)
+        list(APPEND NELUX_FFMPEG_LIBS "${_picked}")
+      else()
+        list(APPEND NELUX_FFMPEG_LIBS "${_plain}")
+      endif()
+    endif()
+  endforeach()
 else()
-  set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
-  set(NELUX_FFMPEG_LIBS
-    "${_ffmpeg_lib_dir}/libavcodec.so"
-    "${_ffmpeg_lib_dir}/libavformat.so"
-    "${_ffmpeg_lib_dir}/libavutil.so"
-    "${_ffmpeg_lib_dir}/libavfilter.so"
-    "${_ffmpeg_lib_dir}/libswscale.so"
-    "${_ffmpeg_lib_dir}/libswresample.so"
-    "${_ffmpeg_lib_dir}/libavdevice.so"
-  )
+  # Linux: prefer unversioned .so symlink
+  set(NELUX_FFMPEG_LIBS)
+  foreach(_c ${_ffmpeg_components})
+    set(_plain "${_ffmpeg_lib_dir}/lib${_c}.so")
+    if(EXISTS "${_plain}")
+      list(APPEND NELUX_FFMPEG_LIBS "${_plain}")
+    else()
+      file(GLOB _versioned "${_ffmpeg_lib_dir}/lib${_c}.so.*")
+      if(_versioned)
+        list(SORT _versioned)
+        list(REVERSE _versioned)
+        list(GET _versioned 0 _picked)
+        list(APPEND NELUX_FFMPEG_LIBS "${_picked}")
+      else()
+        list(APPEND NELUX_FFMPEG_LIBS "${_plain}")
+      endif()
+    endif()
+  endforeach()
 endif()
 
 # Verify libraries exist
@@ -298,6 +379,15 @@ if(NELUX_ENABLE_CUDA)
       ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/gpu
     )
     target_compile_definitions(NeluxCuda PUBLIC NELUX_ENABLE_CUDA)
+
+    nelux_apply_perf_flags(NeluxCuda)
+
+    if(NELUX_ENABLE_CUDA_FAST_MATH)
+      target_compile_options(NeluxCuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+      )
+    endif()
+
     # Do NOT link CUDA::cudart here - let the runtime be resolved at link time
     message(STATUS "CUDA .cu sources: ${NELUX_CUDA_CU_SOURCES}")
   endif()
@@ -312,25 +402,7 @@ endif()
 
 add_library(NeluxLib STATIC ${NELUX_SOURCES})
 
-# --- Host ISA / AVX2 ---
-if(NELUX_ENABLE_AVX2)
-  if(MSVC)
-    target_compile_options(NeluxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
-  else()
-    target_compile_options(NeluxLib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
-  endif()
-endif()
-
-# --- IPO / LTO (Release) ---
-if(NELUX_ENABLE_LTO)
-  include(CheckIPOSupported)
-  check_ipo_supported(RESULT _nelux_ipo_supported OUTPUT _nelux_ipo_error)
-  if(_nelux_ipo_supported)
-    set_property(TARGET NeluxLib PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-  else()
-    message(WARNING "IPO/LTO requested but not supported: ${_nelux_ipo_error}")
-  endif()
-endif()
+nelux_apply_perf_flags(NeluxLib)
 
 # Link CUDA library if enabled
 if(NELUX_ENABLE_CUDA)
@@ -370,33 +442,16 @@ target_link_libraries(NeluxLib PUBLIC
 )
 if(WIN32)
   target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
+elseif(APPLE)
+  target_link_libraries(NeluxLib PUBLIC pthread dl)
+elseif(UNIX)
+  target_link_libraries(NeluxLib PUBLIC pthread dl rt)
 endif()
-# If you want to add Linux-specific libs:
-#if(UNIX AND NOT APPLE)
-#  target_link_libraries(NeluxLib PUBLIC pthread dl rt)
-#endif()
 
 if(NELUX_BUILD_PYTHON)
   add_library(nelux MODULE src/Nelux/python/Bindings.cpp)
 
-  # Match host performance flags on the Python extension module
-  if(NELUX_ENABLE_AVX2)
-    if(MSVC)
-      target_compile_options(nelux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
-    else()
-      target_compile_options(nelux PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
-    endif()
-  endif()
-
-  if(NELUX_ENABLE_LTO)
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT _nelux_ipo_supported_py OUTPUT _nelux_ipo_error_py)
-    if(_nelux_ipo_supported_py)
-      set_property(TARGET nelux PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    else()
-      message(WARNING "IPO/LTO requested but not supported for nelux module: ${_nelux_ipo_error_py}")
-    endif()
-  endif()
+  nelux_apply_perf_flags(nelux)
 
   target_include_directories(nelux PRIVATE
     ${NELUX_PYBIND11_INCS}
@@ -427,7 +482,6 @@ if(NELUX_BUILD_PYTHON)
       "/DELAYLOAD:avformat-62.dll"
       "/DELAYLOAD:avutil-60.dll"
       "/DELAYLOAD:swscale-9.dll"
-      "/DELAYLOAD:swresample-6.dll"
       "/DELAYLOAD:avfilter-11.dll"
       "/DELAYLOAD:avdevice-62.dll"
     )
@@ -465,8 +519,14 @@ if(NELUX_BUILD_PYTHON)
     set_target_properties(nelux PROPERTIES SUFFIX ".so")
   endif()
 
-  # RPATH for Linux (optional, to run .so without LD_LIBRARY_PATH)
-  if(UNIX AND NOT APPLE)
+  # RPATH so nelux/_nelux.so|.dylib finds sibling deps at runtime.
+  if(APPLE)
+    set_target_properties(nelux PROPERTIES
+      INSTALL_RPATH "@loader_path"
+      BUILD_WITH_INSTALL_RPATH TRUE
+      MACOSX_RPATH TRUE
+    )
+  elseif(UNIX)
     set_target_properties(nelux PROPERTIES
       INSTALL_RPATH "$ORIGIN"
       BUILD_WITH_INSTALL_RPATH TRUE
@@ -590,7 +650,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
       "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/swscale-*.dll"
-      "${NELUX_FFMPEG_DIR}/bin/swresample-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
     )
@@ -624,30 +683,52 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
 endif()
 
 if(UNIX AND NELUX_BUILD_PYTHON)
-  # -- where vcpkg puts its .so’s for x64-linux-dynamic
-  # NOTE: FFmpeg .so files are NOT bundled - user must have FFmpeg installed
+  # Locate the vcpkg install tree for this triplet. NOTE: FFmpeg libs are NOT
+  # bundled here — users must have FFmpeg installed (or use auditwheel/delocate
+  # at wheel-repair time).
+  if(DEFINED ENV{VCPKG_TARGET_TRIPLET})
+    set(_nelux_triplet "$ENV{VCPKG_TARGET_TRIPLET}")
+  elseif(DEFINED VCPKG_TARGET_TRIPLET)
+    set(_nelux_triplet "${VCPKG_TARGET_TRIPLET}")
+  elseif(APPLE)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+      set(_nelux_triplet "arm64-osx-dynamic")
+    else()
+      set(_nelux_triplet "x64-osx-dynamic")
+    endif()
+  else()
+    set(_nelux_triplet "x64-linux-dynamic")
+  endif()
+
   if(DEFINED ENV{VCPKG_ROOT})
     file(TO_CMAKE_PATH "$ENV{VCPKG_ROOT}" _vcpkg_root_cmake)
-    set(VCPKG_LIB "${_vcpkg_root_cmake}/installed/x64-linux-dynamic/lib")
+    set(VCPKG_LIB "${_vcpkg_root_cmake}/installed/${_nelux_triplet}/lib")
   else()
-    set(VCPKG_LIB "${CMAKE_SOURCE_DIR}/vcpkg/installed/x64-linux-dynamic/lib")
+    set(VCPKG_LIB "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_nelux_triplet}/lib")
   endif()
 
   set(NELUX_SO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
 
-  # Only bundle vcpkg-provided libs (spdlog, fmt, libyuv) - NOT FFmpeg
-  file(GLOB NELUX_SOS
-    "${VCPKG_LIB}/libspdlog.so*"
-    "${VCPKG_LIB}/libyuv.so*"
-    "${VCPKG_LIB}/libfmt.so*"
-  )
+  if(APPLE)
+    file(GLOB NELUX_SOS
+      "${VCPKG_LIB}/libspdlog*.dylib"
+      "${VCPKG_LIB}/libyuv*.dylib"
+      "${VCPKG_LIB}/libfmt*.dylib"
+    )
+  else()
+    file(GLOB NELUX_SOS
+      "${VCPKG_LIB}/libspdlog.so*"
+      "${VCPKG_LIB}/libyuv.so*"
+      "${VCPKG_LIB}/libfmt.so*"
+    )
+  endif()
 
   foreach(sofile ${NELUX_SOS})
     add_custom_command(TARGET nelux POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${sofile}"
         "${NELUX_SO_DIR}"
-      COMMENT "Copying dependency .so: ${sofile} → ${NELUX_SO_DIR}"
+      COMMENT "Copying dependency shared lib: ${sofile} -> ${NELUX_SO_DIR}"
     )
   endforeach()
 endif()

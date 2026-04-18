@@ -3,6 +3,7 @@
 extern "C"
 {
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -90,22 +91,22 @@ class RGBToAutoConverter : public ConverterBase
         uint8_t* dstData[4] = {nullptr, nullptr, nullptr, nullptr};
         int dstLineSize[4] = {0, 0, 0, 0};
 
-       // std::cerr << "Preparing destination planes...\n";
-        for (int i = 0; i < 3; ++i)
+        // Single-plane formats (gray, gray16le, packed RGB) expose only plane 0.
+        int numPlanes = av_pix_fmt_count_planes(dst_fmt);
+        if (numPlanes <= 0) numPlanes = 1;
+        if (numPlanes > 4) numPlanes = 4;
+
+        for (int i = 0; i < numPlanes; ++i)
         {
             dstData[i] = frame.getData(i);
             dstLineSize[i] = frame.getLineSize(i);
-         
         }
 
-
-        // Extra safety assertions
         if (!srcData[0])
         {
-            // std::cerr << "!! ERROR: srcData[0] is NULL !!\n";
             throw std::runtime_error("Source data pointer is null");
         }
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < numPlanes; ++i)
         {
             if (!dstData[i])
                 std::cerr << "!! WARNING: dstData[" << i << "] is NULL !!\n";

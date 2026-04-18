@@ -78,8 +78,12 @@ class RGBToAutoLibyuvConverter : public ConverterBase
         switch (dst_fmt)
         {
         case AV_PIX_FMT_YUV420P:
+            success = convertToI420(rgb, rgbStride, dstY, dstStrideY,
+                                    dstU, dstStrideU, dstV, dstStrideV);
+            break;
+
         case AV_PIX_FMT_YUVJ420P:
-            success = convertToI420(rgb, rgbStride, dstY, dstStrideY, 
+            success = convertToJ420(rgb, rgbStride, dstY, dstStrideY,
                                     dstU, dstStrideU, dstV, dstStrideV);
             break;
 
@@ -89,14 +93,22 @@ class RGBToAutoLibyuvConverter : public ConverterBase
             break;
 
         case AV_PIX_FMT_YUV422P:
-        case AV_PIX_FMT_YUVJ422P:
             success = convertToI422(rgb, rgbStride, dstY, dstStrideY,
                                     dstU, dstStrideU, dstV, dstStrideV);
             break;
 
+        case AV_PIX_FMT_YUVJ422P:
+            success = convertToJ422(rgb, rgbStride, dstY, dstStrideY,
+                                    dstU, dstStrideU, dstV, dstStrideV);
+            break;
+
         case AV_PIX_FMT_YUV444P:
-        case AV_PIX_FMT_YUVJ444P:
             success = convertToI444(rgb, rgbStride, dstY, dstStrideY,
+                                    dstU, dstStrideU, dstV, dstStrideV);
+            break;
+
+        case AV_PIX_FMT_YUVJ444P:
+            success = convertToJ444(rgb, rgbStride, dstY, dstStrideY,
                                     dstU, dstStrideU, dstV, dstStrideV);
             break;
 
@@ -116,27 +128,32 @@ class RGBToAutoLibyuvConverter : public ConverterBase
     AVPixelFormat dst_fmt;
     AVColorSpace targetColorspace;
 
-    /**
-     * @brief Convert RGB24 to I420 (YUV420P) using libyuv.
-     *
-     * Note: Nelux decoder outputs RGB (R first in memory), which is "RAW" in libyuv terminology.
-     * libyuv's RGB24 functions expect BGR, so we use RAWToI420 instead.
-     */
+    // libyuv naming: RAW = RGB (R first), RGB24 = BGR. Nelux tensors are RGB.
+    // I-variants => BT.601 limited-range (TV). J-variants => BT.601 full-range
+    // (JPEG / yuvj*). libyuv does not expose a forward BT.709 path.
+
     bool convertToI420(const uint8_t* rgb, int rgbStride,
                        uint8_t* dstY, int dstStrideY,
                        uint8_t* dstU, int dstStrideU,
                        uint8_t* dstV, int dstStrideV)
     {
-        // Use RAWToI420 since input is RGB (R first), not BGR
-        // libyuv naming: RAW = RGB, RGB24 = BGR
-        int result = libyuv::RAWToI420(
-            rgb, rgbStride,
-            dstY, dstStrideY,
-            dstU, dstStrideU,
-            dstV, dstStrideV,
-            width, height);
+        return libyuv::RAWToI420(rgb, rgbStride,
+                                 dstY, dstStrideY,
+                                 dstU, dstStrideU,
+                                 dstV, dstStrideV,
+                                 width, height) == 0;
+    }
 
-        return result == 0;
+    bool convertToJ420(const uint8_t* rgb, int rgbStride,
+                       uint8_t* dstY, int dstStrideY,
+                       uint8_t* dstU, int dstStrideU,
+                       uint8_t* dstV, int dstStrideV)
+    {
+        return libyuv::RAWToJ420(rgb, rgbStride,
+                                 dstY, dstStrideY,
+                                 dstU, dstStrideU,
+                                 dstV, dstStrideV,
+                                 width, height) == 0;
     }
 
     /**
@@ -179,70 +196,64 @@ class RGBToAutoLibyuvConverter : public ConverterBase
         return ret == 0;
     }
 
-    /**
-     * @brief Convert RGB24 to I422 (YUV422P) using libyuv.
-     * 
-     * Note: Nelux outputs RGB (RAW), so we use RAWToARGB → ARGBToI422.
-     */
+    // libyuv has no direct RAWToI422 / RAWToJ422; RAW->ARGB then ARGB->I/J422.
     bool convertToI422(const uint8_t* rgb, int rgbStride,
                        uint8_t* dstY, int dstStrideY,
                        uint8_t* dstU, int dstStrideU,
                        uint8_t* dstV, int dstStrideV)
     {
-        // Allocate ARGB intermediate buffer
-        int argbStride = width * 4;
-        std::vector<uint8_t> argb(argbStride * height);
-        
-        // RGB (RAW) -> ARGB (use RAWToARGB since input is RGB, not BGR)
-        int ret = libyuv::RAWToARGB(
-            rgb, rgbStride,
-            argb.data(), argbStride,
-            width, height);
-        
-        if (ret != 0) return false;
-        
-        // ARGB -> I422
-        ret = libyuv::ARGBToI422(
-            argb.data(), argbStride,
-            dstY, dstStrideY,
-            dstU, dstStrideU,
-            dstV, dstStrideV,
-            width, height);
-
-        return ret == 0;
+        const int argbStride = width * 4;
+        std::vector<uint8_t> argb(static_cast<size_t>(argbStride) * height);
+        if (libyuv::RAWToARGB(rgb, rgbStride, argb.data(), argbStride,
+                              width, height) != 0)
+            return false;
+        return libyuv::ARGBToI422(argb.data(), argbStride,
+                                  dstY, dstStrideY,
+                                  dstU, dstStrideU,
+                                  dstV, dstStrideV,
+                                  width, height) == 0;
     }
 
-    /**
-     * @brief Convert RGB24 to I444 (YUV444P) using libyuv.
-     * 
-     * Note: Nelux outputs RGB (RAW), so we use RAWToARGB → ARGBToI444.
-     */
+    bool convertToJ422(const uint8_t* rgb, int rgbStride,
+                       uint8_t* dstY, int dstStrideY,
+                       uint8_t* dstU, int dstStrideU,
+                       uint8_t* dstV, int dstStrideV)
+    {
+        const int argbStride = width * 4;
+        std::vector<uint8_t> argb(static_cast<size_t>(argbStride) * height);
+        if (libyuv::RAWToARGB(rgb, rgbStride, argb.data(), argbStride,
+                              width, height) != 0)
+            return false;
+        return libyuv::ARGBToJ422(argb.data(), argbStride,
+                                  dstY, dstStrideY,
+                                  dstU, dstStrideU,
+                                  dstV, dstStrideV,
+                                  width, height) == 0;
+    }
+
+    // 444: libyuv has direct RAWToI444/RAWToJ444 — no ARGB intermediate needed.
     bool convertToI444(const uint8_t* rgb, int rgbStride,
                        uint8_t* dstY, int dstStrideY,
                        uint8_t* dstU, int dstStrideU,
                        uint8_t* dstV, int dstStrideV)
     {
-        // Allocate ARGB intermediate buffer
-        int argbStride = width * 4;
-        std::vector<uint8_t> argb(argbStride * height);
-        
-        // RGB (RAW) -> ARGB (use RAWToARGB since input is RGB, not BGR)
-        int ret = libyuv::RAWToARGB(
-            rgb, rgbStride,
-            argb.data(), argbStride,
-            width, height);
-        
-        if (ret != 0) return false;
-        
-        // ARGB -> I444
-        ret = libyuv::ARGBToI444(
-            argb.data(), argbStride,
-            dstY, dstStrideY,
-            dstU, dstStrideU,
-            dstV, dstStrideV,
-            width, height);
+        return libyuv::RAWToI444(rgb, rgbStride,
+                                 dstY, dstStrideY,
+                                 dstU, dstStrideU,
+                                 dstV, dstStrideV,
+                                 width, height) == 0;
+    }
 
-        return ret == 0;
+    bool convertToJ444(const uint8_t* rgb, int rgbStride,
+                       uint8_t* dstY, int dstStrideY,
+                       uint8_t* dstU, int dstStrideU,
+                       uint8_t* dstV, int dstStrideV)
+    {
+        return libyuv::RAWToJ444(rgb, rgbStride,
+                                 dstY, dstStrideY,
+                                 dstU, dstStrideU,
+                                 dstV, dstStrideV,
+                                 width, height) == 0;
     }
 };
 

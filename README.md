@@ -18,6 +18,25 @@ Originall created by [Trentonom0r3](https://github.com/Trentonom0r3)
 ```bash
 pip install nelux
 ```
+
+Supported platforms:
+
+| Platform | Backends | Notes |
+|----------|----------|-------|
+| Windows x64 | CPU + CUDA (NVDEC/NVENC) | Requires FFmpeg DLLs on `PATH` (or pass to `os.add_dll_directory`). |
+| Linux x86_64 (manylinux_2_28+) | CPU + CUDA (NVDEC/NVENC) | Install FFmpeg via `apt install ffmpeg libavcodec62 libavformat62 libavutil60 libswscale9 libavfilter11 libavdevice62`. |
+| macOS arm64 (Apple Silicon, ≥ 12.0) | CPU / MPS (via PyTorch) | Install FFmpeg via `brew install ffmpeg`. No CUDA on macOS. |
+
+PyTorch must be importable **before** `nelux` — the package uses torch's C++ runtime. For CUDA builds, install the matching CUDA torch wheel:
+
+```bash
+# Linux CUDA
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# macOS / Linux CPU
+pip install torch torchvision
+```
+
 ---
 
 ## Quick Start
@@ -62,23 +81,16 @@ print(len(vr))                              # Total frame count
 print(vr.shape)                             # (frames, 3, H, W)
 ```
 
-### Video Encoding with Audio
+### Video Encoding
 
 ```python
 from nelux import VideoReader
-import torch
 
 reader = VideoReader("input.mp4")
 
 with reader.create_encoder("output.mp4") as enc:
-    # Re-encode video frames
     for frame in reader:
         enc.encode_frame(frame)
-    
-    # Encode audio if present
-    if reader.has_audio:
-        pcm = reader.audio.tensor().to(torch.int16)
-        enc.encode_audio_frame(pcm)
 
 print("Done!")
 ```
@@ -95,7 +107,6 @@ print("Done!")
   - FP32 for 10/12/16-bit videos (higher precision)
 - **Zero-Copy**: Direct GPU tensor output, no CPU round-trip
 - **Batch Decoding**: Efficient multi-frame decoding with smart optimization
-- **Audio Support**: Extract and encode audio streams
 
 ### Performance Optimizations
 
@@ -110,7 +121,6 @@ print("Done!")
 |---------|---------|
 | **Video Codecs** | H.264, H.265/HEVC, VP9, AV1 (with NVDEC) |
 | **Pixel Formats** | NV12, P010, P016, YUV444 (8/10/12/16-bit) |
-| **Audio** | AAC, MP3, FLAC, PCM (extraction & encoding) |
 | **Containers** | MP4, MKV, AVI, MOV, WebM |
 
 ---
@@ -134,7 +144,7 @@ VideoReader(
 - `frame_count`: Total number of frames
 - `fps`: Frame rate
 - `duration`: Video duration in seconds
-- `has_audio`: Whether video has audio stream
+- `has_audio`: Whether the source has an audio track
 
 **Methods:**
 - `get_batch(indices)`: Decode multiple frames efficiently

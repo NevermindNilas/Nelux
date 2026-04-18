@@ -182,6 +182,7 @@ private:
     int cudaDeviceIndex_;
     cudaStream_t cudaStream_;
     cudaEvent_t decodeCompleteEvent_;  // Event to signal when decode is complete
+    cudaEvent_t consumerSyncEvent_;    // Cross-stream barrier: torch stream -> our stream
     AVBufferRef* hwDeviceCtx_;
     AVPixelFormat hwPixFmt_;
     

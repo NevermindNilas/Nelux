@@ -49,7 +49,7 @@ jobs:
     - name: Install C++ deps via vcpkg
       shell: cmd
       run: |
-        "${{ runner.temp }}\\vcpkg\\vcpkg" install spdlog fmt ffmpeg[avcodec,avdevice,avfilter,avformat,core,swresample,swscale,x264,x265] --triplet x64-windows --recurse
+        "${{ runner.temp }}\\vcpkg\\vcpkg" install spdlog fmt ffmpeg[avcodec,avdevice,avfilter,avformat,core,swscale,x264,x265] --triplet x64-windows --recurse
 
     - name: Add FFmpeg to PATH
       shell: bash

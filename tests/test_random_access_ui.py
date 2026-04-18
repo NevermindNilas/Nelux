@@ -1,22 +1,38 @@
+"""
+Interactive random-access playback demo.
+
+Exercises three access paths on the same VideoReader:
+  - sequential read_frame()
+  - explicit frame_at(timestamp)
+  - smart __getitem__ (index or timestamp)
+
+Controls: q=quit, space=pause, r=manual random-access frame.
+"""
+
 import random
-import numpy as np
-import cv2
-import torch
 import sys
+
+import cv2
+import numpy as np
+import torch
 
 sys.path.append(".")
 
 from nelux import VideoReader
-from utils.video_downloader import get_video
 
-VIDEO_PATH = get_video("lite")  # short clip for quick manual runs
+try:
+    from tests.utils.video_downloader import get_video
+except ImportError:
+    from utils.video_downloader import get_video
+
+VIDEO_PATH = get_video("lite")
 
 
-def tensor_to_bgr_uint8(frame: torch.Tensor, bit_depth: int) -> np.ndarray | None:
-    """Convert HxWxC tensor (uint8/uint16/float/uint32) to uint8 BGR for imshow."""
-    if frame is None or (frame.numel() == 0):
+def tensor_to_bgr_uint8(frame: torch.Tensor, bit_depth: int):
+    """HxWxC tensor (uint8/uint16/float/uint32) -> uint8 BGR for imshow."""
+    if frame is None or frame.numel() == 0:
         return None
-    arr = frame.cpu().contiguous().numpy()  # HWC
+    arr = frame.cpu().contiguous().numpy()
     if arr.dtype == np.uint8:
         rgb8 = arr
     elif arr.dtype == np.uint16:
@@ -35,6 +51,10 @@ def tensor_to_bgr_uint8(frame: torch.Tensor, bit_depth: int) -> np.ndarray | Non
     return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
 
 
+def _annotate(img, text, color):
+    cv2.putText(img, text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+
 def main():
     vr = VideoReader(VIDEO_PATH)
     props = vr.get_properties()
@@ -49,70 +69,40 @@ def main():
     paused = False
     i = 0
     last_random_show = 0
-    random_interval_frames = max(30, int(fps * 3))  # ~every 3s
+    random_interval_frames = max(30, int(fps * 3))
 
     while True:
         if not paused:
-            # Sequential decode
             frame = vr.read_frame()
-            if frame is None:
+            if frame is None or frame.numel() == 0:
                 print("EOF or decode fail")
                 break
             img = tensor_to_bgr_uint8(frame, bit_depth)
             if img is None:
                 print("Bad frame")
                 break
-            cv2.putText(
-                img,
-                f"Sequential frame {i}/{total_frames}",
-                (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+            _annotate(img, f"Sequential frame {i}/{total_frames}", (0, 255, 0))
             cv2.imshow("Sequential", img)
             i += 1
 
-            # Periodic random-access demo (explicit frame_at, separate decoder)
             if i - last_random_show >= random_interval_frames:
                 t = random.uniform(0.0, max(0.0, duration - 0.001))
                 try:
-                    rnd = vr.frame_at(t)  # explicit random-access path
+                    rnd = vr.frame_at(t)
                     rnd_img = tensor_to_bgr_uint8(rnd, bit_depth)
                     if rnd_img is not None:
-                        cv2.putText(
-                            rnd_img,
-                            f"Random @ {t:.3f}s (frame_at)",
-                            (15, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 200, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                        _annotate(rnd_img, f"Random @ {t:.3f}s (frame_at)", (0, 200, 255))
                         cv2.imshow("RandomAccess", rnd_img)
                     last_random_show = i
                 except Exception as e:
                     print(f"Random access failed: {e}")
 
-            # Also show the smart __getitem__ by timestamp a tiny bit ahead (near case)
             near_ts = min(duration, i / max(1.0, fps) + 1.0 / max(1.0, fps))
             try:
                 smart = vr[near_ts]
                 smart_img = tensor_to_bgr_uint8(smart, bit_depth)
                 if smart_img is not None:
-                    cv2.putText(
-                        smart_img,
-                        f"Smart __getitem__ ~{near_ts:.3f}s",
-                        (15, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (255, 200, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                    _annotate(smart_img, f"Smart __getitem__ ~{near_ts:.3f}s", (255, 200, 0))
                     cv2.imshow("SmartGetItem", smart_img)
             except Exception as e:
                 print(f"Smart __getitem__ failed: {e}")
@@ -128,16 +118,7 @@ def main():
                 rnd = vr.frame_at(t)
                 rnd_img = tensor_to_bgr_uint8(rnd, bit_depth)
                 if rnd_img is not None:
-                    cv2.putText(
-                        rnd_img,
-                        f"Random @ {t:.3f}s (manual)",
-                        (15, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 200, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                    _annotate(rnd_img, f"Random @ {t:.3f}s (manual)", (0, 200, 255))
                     cv2.imshow("RandomAccess", rnd_img)
             except Exception as e:
                 print(f"Random access failed: {e}")

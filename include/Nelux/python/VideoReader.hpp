@@ -46,16 +46,12 @@ class VideoReader
     ~VideoReader();
 
     /**
-     * @brief Create a VideoEncoder configured to this reader's video & audio
-     * properties.
+     * @brief Create a VideoEncoder configured to this reader's video properties.
      * @param outputPath Path where the new file will be saved.
-    * @param audioMode Audio handling mode: "copy", "encode", or "off".
-     * @return Shared pointer to a VideoEncoder pre-configured for resolution, fps, and
-     * audio.
+     * @return Shared pointer to a VideoEncoder pre-configured for resolution and fps.
      */
     std::shared_ptr<nelux::VideoEncoder>
-    createEncoder(const std::string& outputPath,
-               const std::string& audioMode = "copy") const;
+    createEncoder(const std::string& outputPath) const;
 
     // Direct property getters for performance
     int getWidth() const
@@ -89,22 +85,6 @@ class VideoReader
     bool getHasAudio() const
     {
         return properties.hasAudio;
-    }
-    int getAudioBitrate() const
-    {
-        return properties.audioBitrate;
-    }
-    int getAudioChannels() const
-    {
-        return properties.audioChannels;
-    }
-    int getAudioSampleRate() const
-    {
-        return properties.audioSampleRate;
-    }
-    std::string getAudioCodec() const
-    {
-        return properties.audioCodec;
     }
     int getBitDepth() const
     {
@@ -220,48 +200,6 @@ class VideoReader
      */
     void setRangeByTimestamps(double startTime, double endTime);
 
-    /**
-     * @brief Retrieve the audio object for interaction.
-     *
-     * @return Audio instance.
-     */
-    class Audio
-    {
-      public:
-        explicit Audio(std::shared_ptr<nelux::Decoder> decoder);
-
-        /**
-         * @brief Get audio data as a tensor.
-         *
-         * @return torch::Tensor The extracted audio data.
-         */
-        torch::Tensor getAudioTensor();
-
-        /**
-         * @brief Extracts the audio to a file.
-         *
-         * @param outputFilePath The path where the audio file should be saved.
-         * @return True if successful, false otherwise.
-         */
-        bool extractToFile(const std::string& outputFilePath);
-
-        /**
-         * @brief Get audio properties such as sample rate, channels, and codec.
-         *
-         * @return A struct containing audio properties.
-         */
-        nelux::Decoder::VideoProperties getProperties() const;
-
-      private:
-        std::shared_ptr<nelux::Decoder> decoder;
-    };
-
-    /**
-     * @brief Get the audio interface.
-     *
-     * @return A reference to the Audio class.
-     */
-    std::shared_ptr<Audio> getAudio();
     /**
      * @brief Get the frame at (or immediately after) a timestamp, in seconds.
      *        Uses a secondary decoder; does not disturb sequential iteration.
@@ -496,7 +434,6 @@ class VideoReader
     // List of filters to be added before initialization
     torch::Tensor bufferedFrame; // The "first valid" frame, if we found it early
     bool hasBufferedFrame = false;
-    std::shared_ptr<Audio> audio;
 
     // Lazy loading support
     std::string filePath;

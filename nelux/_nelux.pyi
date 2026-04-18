@@ -26,51 +26,9 @@ def set_log_level(level: LogLevel) -> None:
     """
     ...
 
-class Audio:
-    """
-    Helper class for audio extraction and processing.
-    """
-    def tensor(self) -> torch.Tensor:
-        """
-        Return the audio track as a 1-D torch.int16 tensor of interleaved PCM.
-        """
-        ...
-
-    def file(self, output_path: str) -> bool:
-        """
-        Extract audio to an external file (e.g., WAV).
-
-        Args:
-            output_path (str): Path to save the extracted audio file.
-
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        ...
-
-    @property
-    def sample_rate(self) -> int:
-        """Audio sample rate (Hz)."""
-        ...
-
-    @property
-    def channels(self) -> int:
-        """Number of audio channels."""
-        ...
-
-    @property
-    def bitrate(self) -> int:
-        """Audio bitrate."""
-        ...
-
-    @property
-    def codec(self) -> str:
-        """Audio codec name."""
-        ...
-
 class VideoReader:
     """
-    Read video frames and audio from a file.
+    Read video frames from a file.
 
     Supports two backends for frame output:
     - "pytorch" (default): Returns frames as torch.Tensor
@@ -138,12 +96,7 @@ class VideoReader:
 
     @property
     def has_audio(self) -> bool:
-        """True if an audio track is present."""
-        ...
-
-    @property
-    def audio(self) -> Audio:
-        """Access the Audio helper object."""
+        """True if an audio track is present in the source."""
         ...
 
     def read_frame(self) -> Union[torch.Tensor, NDArray]:
@@ -210,7 +163,7 @@ class VideoReader:
 
     def create_encoder(self, output_path: str) -> "VideoEncoder":
         """
-        Create a VideoEncoder matching this reader's settings (video+audio).
+        Create a VideoEncoder matching this reader's video settings.
 
         Args:
             output_path (str): Path for the output file.
@@ -232,7 +185,7 @@ class VideoReader:
 
 class VideoEncoder:
     """
-    Encode video and audio frames into a file.
+    Encode video frames into a file.
     """
     def __init__(
         self,
@@ -242,10 +195,9 @@ class VideoEncoder:
         height: Optional[int] = None,
         bit_rate: Optional[int] = None,
         fps: Optional[float] = None,
-        audio_bit_rate: Optional[int] = None,
-        audio_sample_rate: Optional[int] = None,
-        audio_channels: Optional[int] = None,
-        audio_codec: Optional[str] = None,
+        preset: Optional[int] = None,
+        cq: Optional[int] = None,
+        pixel_format: Optional[str] = None,
     ) -> None:
         """
         Create a VideoEncoder; pass None for defaults.
@@ -255,12 +207,6 @@ class VideoEncoder:
     def encode_frame(self, frame: torch.Tensor) -> None:
         """
         Encode one video frame HWC, 3-channel, uint8 tensor).
-        """
-        ...
-
-    def encode_audio_frame(self, audio: torch.Tensor) -> None:
-        """
-        Encode one audio buffer (1-D torch.int16 PCM tensor).
         """
         ...
 

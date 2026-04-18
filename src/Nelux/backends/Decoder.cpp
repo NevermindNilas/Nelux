@@ -20,7 +20,6 @@ Decoder::~Decoder()
 {
     NELUX_DEBUG("BASE DECODER: Decoder destructor called");
     close();
-    closeAudio();
 }
 
 Decoder::Decoder(Decoder&& other) noexcept
@@ -87,20 +86,14 @@ void Decoder::setProperties()
     properties.pixelFormat = codecCtx->pix_fmt;
     properties.bitDepth = getBitDepth();
 
-    // Check for audio stream
-    properties.hasAudio = false; // Initialize as false
-    for (int i = 0; i < formatCtx->nb_streams; ++i)
+    // Detect audio stream presence only (no audio decoding)
+    properties.hasAudio = false;
+    for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
     {
         if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
         {
-            properties.hasAudio = true; // Set to true if an audio stream is found
-            properties.audioBitrate = formatCtx->streams[i]->codecpar->bit_rate;
-            properties.audioChannels =
-                formatCtx->streams[i]->codecpar->ch_layout.nb_channels;
-            properties.audioSampleRate = formatCtx->streams[i]->codecpar->sample_rate;
-            properties.audioCodec =
-                avcodec_get_name(formatCtx->streams[i]->codecpar->codec_id);
-            break; // Stop after finding the first audio stream
+            properties.hasAudio = true;
+            break;
         }
     }
 
@@ -132,11 +125,9 @@ void Decoder::setProperties()
     // Log the video properties
     NELUX_INFO(
         "Video properties: width={}, height={}, fps={}, duration={}, totalFrames={}, "
-        "audioBitrate={}, audioChannels={}, audioSampleRate={}, audioCodec={}, "
         "aspectRatio={}",
         properties.width, properties.height, properties.fps, properties.duration,
-        properties.totalFrames, properties.audioBitrate, properties.audioChannels,
-        properties.audioSampleRate, properties.audioCodec, properties.aspectRatio);
+        properties.totalFrames, properties.aspectRatio);
 }
 
 void Decoder::initialize(const std::string& filePath)
@@ -448,6 +439,16 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         }
 
         std::memcpy(buffer, cf.buffer.data(), cf.buffer.size());
+
+        // Return the buffer to the pool for the producer to reuse on the
+        // next frame. Avoids an alloc+zero-init of the whole frame each call.
+        {
+            std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
+            if (convertedBufferPool.size() < maxQueueSize + 2)
+            {
+                convertedBufferPool.push_back(std::move(cf.buffer));
+            }
+        }
         return true;
     }
     else
@@ -696,502 +697,6 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     NELUX_WARN("Frame has no valid timestamp. Returning -1.0");
     return -1.0;
 }
-bool Decoder::initializeAudio()
-{
-    try
-    {
-        if (!properties.hasAudio)
-        {
-            NELUX_DEBUG("No audio stream available to initialize.");
-            return false;
-        }
-
-        NELUX_DEBUG("Initializing audio decoding.");
-
-        // Find the audio stream index if not already set
-        if (audioStreamIndex == -1)
-        {
-            NELUX_DEBUG("Finding audio stream index.");
-            for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
-            {
-                if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-                {
-                    audioStreamIndex = i;
-                    NELUX_DEBUG("Audio stream found at index: {}", audioStreamIndex);
-                    break;
-                }
-            }
-
-            if (audioStreamIndex == -1)
-            {
-                NELUX_DEBUG("Audio stream not found.");
-                return false;
-            }
-        }
-        NELUX_DEBUG("Audio stream index: {}", audioStreamIndex);
-
-        AVCodecParameters* codecPar = formatCtx->streams[audioStreamIndex]->codecpar;
-        const AVCodec* codec = avcodec_find_decoder(codecPar->codec_id);
-        if (!codec)
-        {
-            NELUX_DEBUG("Unsupported audio codec!");
-            return false;
-        }
-
-        // Allocate audio codec context
-        AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
-        if (!codec_ctx)
-        {
-            NELUX_DEBUG("Could not allocate audio codec context.");
-            return false;
-        }
-        audioCodecCtx.reset(codec_ctx); // Assign to smart pointer
-
-        // Copy codec parameters from input stream to codec context
-        if (avcodec_parameters_to_context(audioCodecCtx.get(), codecPar) < 0)
-        {
-            NELUX_DEBUG("Failed to copy audio codec parameters to context.");
-            return false;
-        }
-
-        // Open audio codec
-        if (avcodec_open2(audioCodecCtx.get(), codec, nullptr) < 0)
-        {
-            NELUX_DEBUG("Failed to open audio codec.");
-            return false;
-        }
-
-        // Initialize channel layouts
-        AVChannelLayout in_channel_layout = audioCodecCtx->ch_layout;
-        if (in_channel_layout.nb_channels == 0)
-        {
-            // If channel layout is not set, infer from channels
-            av_channel_layout_default(&in_channel_layout,
-                                      audioCodecCtx->ch_layout.nb_channels);
-        }
-
-        AVChannelLayout out_channel_layout;
-        av_channel_layout_default(&out_channel_layout, 2); // Stereo output
-
-        AVSampleFormat out_sample_fmt =
-            AV_SAMPLE_FMT_S16; // Desired output sample format
-        int out_sample_rate = audioCodecCtx->sample_rate; // Desired output sample rate
-
-        // Allocate and set up SwrContext
-        SwrContext* swr = nullptr;
-
-        int ret = swr_alloc_set_opts2(&swr,                // Pointer to SwrContext
-                                      &out_channel_layout, // Output channel layout
-                                      out_sample_fmt,      // Output sample format
-                                      out_sample_rate,     // Output sample rate
-                                      &in_channel_layout,  // Input channel layout
-                                      audioCodecCtx->sample_fmt,  // Input sample format
-                                      audioCodecCtx->sample_rate, // Input sample rate
-                                      0,                          // Log offset
-                                      nullptr                     // Log context
-        );
-
-        if (ret < 0 || swr_init(swr) < 0)
-        {
-            NELUX_DEBUG("Failed to allocate and set SwrContext options: {}",
-                        nelux::errorToString(ret));
-            swr_free(&swr);
-            return false;
-        }
-
-        swrCtx.reset(swr); // Assign to smart pointer
-        NELUX_DEBUG("SwrContext options set successfully.");
-
-        // Allocate audio frame if not already allocated
-        if (!audioFrame)
-        {
-            AVFrame* frame = av_frame_alloc();
-            if (!frame)
-            {
-                NELUX_DEBUG("Could not allocate audio frame.");
-                return false;
-            }
-            audioFrame = Frame(frame);
-        }
-
-        // Allocate audio packet if not already allocated
-        if (!audioPkt)
-        {
-            AVPacket* pkt = av_packet_alloc();
-            if (!pkt)
-            {
-                NELUX_DEBUG("Could not allocate audio packet.");
-                return false;
-            }
-            audioPkt.reset(pkt);
-        }
-
-        NELUX_DEBUG("Audio decoding initialized successfully.");
-        return true;
-    }
-    catch (const std::exception& e)
-    {
-        NELUX_DEBUG("Exception occurred during audio initialization: {}", e.what());
-        return false;
-    }
-}
-
-void Decoder::closeAudio()
-{
-    audioStreamIndex = -1;
-    NELUX_DEBUG("Audio decoding resources have been released.");
-}
-
-bool Decoder::extractAudioToFile(const std::string& outputFilePath)
-{
-    stopDecodingThread();
-    NELUX_DEBUG("Starting audio extraction to file: {}", outputFilePath);
-
-    if (!properties.hasAudio)
-    {
-        NELUX_DEBUG("No audio stream available to extract.");
-        return false;
-    }
-
-    if (!initializeAudio())
-    {
-        NELUX_DEBUG("Failed to initialize audio decoding.");
-        return false;
-    }
-
-    // Reset decoding process
-    if (av_seek_frame(formatCtx.get(), audioStreamIndex, 0, AVSEEK_FLAG_BACKWARD) < 0)
-    {
-        NELUX_DEBUG("Failed to seek audio stream to beginning.");
-        return false;
-    }
-    avcodec_flush_buffers(audioCodecCtx.get());
-
-    // Detect output format
-    const AVOutputFormat* outputFormat =
-        av_guess_format(nullptr, outputFilePath.c_str(), nullptr);
-    if (!outputFormat)
-    {
-        NELUX_DEBUG("Could not determine output format for: {}", outputFilePath);
-        return false;
-    }
-
-    // Create output format context
-    AVFormatContext* outFormatCtx = nullptr;
-    if (avformat_alloc_output_context2(&outFormatCtx, outputFormat, nullptr,
-                                       outputFilePath.c_str()) < 0)
-    {
-        NELUX_DEBUG("Could not allocate output format context.");
-        return false;
-    }
-
-    // Find encoder for the format
-    const AVCodec* audioEncoder = nullptr;
-    if (outputFormat->audio_codec == AV_CODEC_ID_MP3)
-    {
-        audioEncoder = avcodec_find_encoder_by_name("libmp3lame"); // Use LAME for MP3
-    }
-    else
-    {
-        audioEncoder = avcodec_find_encoder(outputFormat->audio_codec);
-    }
-
-    if (!audioEncoder)
-    {
-        NELUX_DEBUG("Could not find encoder for format.");
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    // Create new codec context
-    AVCodecContext* audioEncCtx = avcodec_alloc_context3(audioEncoder);
-    if (!audioEncCtx)
-    {
-        NELUX_DEBUG("Could not allocate encoder context.");
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    // Set codec parameters
-    audioEncCtx->bit_rate = 128000;
-    audioEncCtx->sample_rate = audioCodecCtx->sample_rate;
-    av_channel_layout_default(&audioEncCtx->ch_layout, 2); // Stereo
-
-    // Ensure proper sample format for AAC
-    if (outputFormat->audio_codec == AV_CODEC_ID_AAC)
-    {
-        audioEncCtx->sample_fmt = AV_SAMPLE_FMT_FLTP; // AAC expects float planar
-    }
-    else
-    {
-        audioEncCtx->sample_fmt = audioEncoder->sample_fmts
-                                      ? audioEncoder->sample_fmts[0]
-                                      : AV_SAMPLE_FMT_FLTP;
-    }
-
-    audioEncCtx->time_base = {1, audioEncCtx->sample_rate};
-
-    // Open encoder
-    if (avcodec_open2(audioEncCtx, audioEncoder, nullptr) < 0)
-    {
-        NELUX_DEBUG("Could not open encoder.");
-        avcodec_free_context(&audioEncCtx);
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    // Create a new audio stream
-    AVStream* audioStream = avformat_new_stream(outFormatCtx, audioEncoder);
-    if (!audioStream)
-    {
-        NELUX_DEBUG("Failed to create audio stream.");
-        avcodec_free_context(&audioEncCtx);
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    audioStream->time_base = {1, audioEncCtx->sample_rate};
-
-    // Copy codec parameters to the stream
-    if (avcodec_parameters_from_context(audioStream->codecpar, audioEncCtx) < 0)
-    {
-        NELUX_DEBUG("Failed to copy encoder parameters.");
-        avcodec_free_context(&audioEncCtx);
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    // Open output file
-    if (!(outFormatCtx->oformat->flags & AVFMT_NOFILE))
-    {
-        if (avio_open(&outFormatCtx->pb, outputFilePath.c_str(), AVIO_FLAG_WRITE) < 0)
-        {
-            NELUX_DEBUG("Could not open output file: {}", outputFilePath);
-            avcodec_free_context(&audioEncCtx);
-            avformat_free_context(outFormatCtx);
-            return false;
-        }
-    }
-
-    // Write file header
-    if (avformat_write_header(outFormatCtx, nullptr) < 0)
-    {
-        NELUX_DEBUG("Could not write file header.");
-        avcodec_free_context(&audioEncCtx);
-        avformat_free_context(outFormatCtx);
-        return false;
-    }
-
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-
-    // Read and decode audio
-    while (av_read_frame(formatCtx.get(), audioPkt.get()) >= 0)
-    {
-        if (audioPkt->stream_index != audioStreamIndex)
-        {
-            av_packet_unref(audioPkt.get());
-            continue;
-        }
-
-        if (avcodec_send_packet(audioCodecCtx.get(), audioPkt.get()) < 0)
-        {
-            NELUX_DEBUG("Error sending audio packet.");
-            break;
-        }
-
-        av_packet_unref(audioPkt.get());
-
-        while (avcodec_receive_frame(audioCodecCtx.get(), frame) >= 0)
-        {
-            // Check for NaN/Inf values
-            for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch)
-            {
-                for (int i = 0; i < frame->nb_samples; ++i)
-                {
-                    float* sample = (float*)frame->data[ch];
-                    if (std::isnan(sample[i]) || std::isinf(sample[i]))
-                    {
-                        sample[i] = 0.0f; // Replace invalid values with silence
-                    }
-                }
-            }
-
-            // Encode the frame
-            if (avcodec_send_frame(audioEncCtx, frame) < 0)
-            {
-                NELUX_DEBUG("Error sending frame to encoder.");
-                break;
-            }
-
-            while (avcodec_receive_packet(audioEncCtx, pkt) >= 0)
-            {
-                pkt->stream_index = audioStream->index;
-                av_interleaved_write_frame(outFormatCtx, pkt);
-                av_packet_unref(pkt);
-            }
-        }
-    }
-
-    // Flush encoder
-    avcodec_send_frame(audioEncCtx, nullptr);
-    while (avcodec_receive_packet(audioEncCtx, pkt) >= 0)
-    {
-        pkt->stream_index = audioStream->index;
-        av_interleaved_write_frame(outFormatCtx, pkt);
-        av_packet_unref(pkt);
-    }
-
-    // Write trailer and cleanup
-    av_write_trailer(outFormatCtx);
-    avcodec_free_context(&audioEncCtx);
-    avformat_free_context(outFormatCtx);
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
-
-    NELUX_DEBUG("Audio extraction completed successfully.");
-    return true;
-}
-
-torch::Tensor Decoder::getAudioTensor()
-{
-    stopDecodingThread();
-    NELUX_DEBUG("Starting extraction of audio to torch::Tensor.");
-
-    if (!properties.hasAudio)
-    {
-        NELUX_DEBUG("No audio stream available to extract.");
-        return torch::Tensor();
-    }
-
-    if (!initializeAudio())
-    {
-        NELUX_DEBUG("Failed to initialize audio decoding.");
-        return torch::Tensor();
-    }
-
-    std::vector<int16_t> audioBuffer; // Assuming S16 format
-    // Reset the decoding process before extracting audio
-    if (av_seek_frame(formatCtx.get(), audioStreamIndex, 0, AVSEEK_FLAG_BACKWARD) < 0)
-    {
-        NELUX_DEBUG("Failed to seek audio stream to beginning.");
-        return torch::Tensor();
-    }
-    avcodec_flush_buffers(audioCodecCtx.get());
-
-    // Read and decode audio packets
-    while (av_read_frame(formatCtx.get(), audioPkt.get()) >= 0)
-    {
-        if (audioPkt->stream_index != audioStreamIndex)
-        {
-            av_packet_unref(audioPkt.get());
-            continue;
-        }
-
-        // Send packet to decoder
-        if (avcodec_send_packet(audioCodecCtx.get(), audioPkt.get()) < 0)
-        {
-            NELUX_DEBUG("Failed to send audio packet for decoding.");
-
-            return torch::Tensor();
-        }
-
-        av_packet_unref(audioPkt.get());
-
-        // Receive all available frames
-        while (avcodec_receive_frame(audioCodecCtx.get(), audioFrame.get()) >= 0)
-        {
-            // Allocate buffer for converted samples
-            int dstNbSamples = swr_get_delay(swrCtx.get(), audioCodecCtx->sample_rate) +
-                               audioFrame.get()->nb_samples;
-
-            // Allocate buffer for converted samples
-            int bufferSize = av_samples_get_buffer_size(
-                nullptr, audioCodecCtx->ch_layout.nb_channels,
-                audioFrame.get()->nb_samples, AV_SAMPLE_FMT_S16, 1);
-            if (bufferSize < 0)
-            {
-                NELUX_DEBUG("Failed to calculate buffer size for audio samples.");
-
-                return torch::Tensor();
-            }
-
-            std::vector<uint8_t> buffer(bufferSize);
-            uint8_t* out_buffers[] = {buffer.data()};
-            // Convert samples to S16
-            int convertedSamples = swr_convert(
-                swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
-                (const uint8_t**)audioFrame.get()->data, audioFrame.get()->nb_samples);
-
-            if (convertedSamples < 0)
-            {
-                NELUX_DEBUG("Failed to convert audio samples.");
-
-                return torch::Tensor();
-            }
-
-            // Append samples to audioBuffer
-            int16_t* samples = reinterpret_cast<int16_t*>(buffer.data());
-            int numSamples = convertedSamples * audioCodecCtx->ch_layout.nb_channels;
-            audioBuffer.insert(audioBuffer.end(), samples, samples + numSamples);
-        }
-    }
-
-    // Flush decoder
-    avcodec_send_packet(audioCodecCtx.get(), nullptr);
-    while (avcodec_receive_frame(audioCodecCtx.get(), audioFrame.get()) >= 0)
-    {
-        // Allocate buffer for converted samples
-        int dstNbSamples = swr_get_delay(swrCtx.get(), audioCodecCtx->sample_rate) +
-                           audioFrame.get()->nb_samples;
-
-        // Allocate buffer for converted samples
-        int bufferSize = av_samples_get_buffer_size(
-            nullptr, audioCodecCtx->ch_layout.nb_channels, audioFrame.get()->nb_samples,
-            AV_SAMPLE_FMT_S16, 1);
-        if (bufferSize < 0)
-        {
-            NELUX_DEBUG(
-                "Failed to calculate buffer size for audio samples during flush.");
-            return torch::Tensor();
-        }
-
-        std::vector<uint8_t> buffer(bufferSize);
-        uint8_t* out_buffers[] = {buffer.data()};
-        // Convert samples to S16
-        int convertedSamples = swr_convert(
-            swrCtx.get(), out_buffers, audioFrame.get()->nb_samples,
-            (const uint8_t**)audioFrame.get()->data, audioFrame.get()->nb_samples);
-
-        if (convertedSamples < 0)
-        {
-            NELUX_DEBUG("Failed to convert audio samples during flush.");
-            return torch::Tensor();
-        }
-
-        // Append samples to audioBuffer
-        int16_t* samples = reinterpret_cast<int16_t*>(buffer.data());
-        int numSamples = convertedSamples * audioCodecCtx->ch_layout.nb_channels;
-        audioBuffer.insert(audioBuffer.end(), samples, samples + numSamples);
-    }
-
-    if (audioBuffer.empty())
-    {
-        NELUX_DEBUG("No audio samples were extracted.");
-        return torch::Tensor();
-    }
-
-    // Create a Torch tensor from the buffer
-    torch::TensorOptions options = torch::TensorOptions().dtype(torch::kInt16);
-    torch::Tensor audioTensor =
-        torch::from_blob(audioBuffer.data(), {static_cast<long>(audioBuffer.size())},
-                         options)
-            .clone(); // Clone to ensure the tensor owns its memory
-
-    NELUX_DEBUG("Audio extraction to tensor completed successfully.");
-    return audioTensor;
-}
-
 void Decoder::setForce8Bit(bool enabled)
 {
     force_8bit = enabled;
@@ -1254,9 +759,6 @@ void Decoder::reconfigure(const std::string& filePath)
     clearQueue();
     resetTimestampState();
 
-    // Close audio if it was initialized
-    closeAudio();
-
     // Reset codec context (but don't destroy the converter - we may reuse it)
     if (codecCtx)
     {
@@ -1274,7 +776,6 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Reset state
     videoStreamIndex = -1;
-    audioStreamIndex = -1;
     isFinished = false;
     seekRequested = false;
     cachedFilePath_ = "";
@@ -1413,13 +914,27 @@ void Decoder::decodingLoop()
                                           static_cast<size_t>(properties.height) * 3 *
                                           static_cast<size_t>(elemSize);
                 }
+                // Take a pooled buffer if available (avoids alloc + zero-init
+                // per frame once the pool is warm).
+                {
+                    std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
+                    if (!convertedBufferPool.empty())
+                    {
+                        cf.buffer = std::move(convertedBufferPool.back());
+                        convertedBufferPool.pop_back();
+                    }
+                }
                 cf.buffer.resize(convertedFrameBytes);
 
                 if (!converter)
                 {
                     NELUX_WARN("Decoder: converter missing during preconversion; "
                                "falling back");
-                    Frame queuedFrame(localFrame);
+                    // Transfer buffer refs out of localFrame into a fresh Frame
+                    // (O(1) pointer moves) instead of av_frame_clone via the
+                    // copy constructor (which bumps refcounts on every plane).
+                    Frame queuedFrame;
+                    av_frame_move_ref(queuedFrame.get(), localFrame.get());
                     std::unique_lock<std::mutex> lock(queueMutex);
                     frameQueue.push(std::move(queuedFrame));
                     queueCond.notify_one();
@@ -1434,7 +949,10 @@ void Decoder::decodingLoop()
             }
             else
             {
-                Frame queuedFrame(localFrame);
+                // Zero-copy hand-off: av_frame_move_ref leaves localFrame
+                // empty and the queued frame owning the buffer refs.
+                Frame queuedFrame;
+                av_frame_move_ref(queuedFrame.get(), localFrame.get());
                 {
                     std::unique_lock<std::mutex> lock(queueMutex);
                     frameQueue.push(std::move(queuedFrame));
@@ -1442,6 +960,9 @@ void Decoder::decodingLoop()
                 }
             }
 
+            // av_frame_move_ref already resets localFrame; unref is a no-op
+            // here but cheap and keeps the function tolerant of paths that
+            // skip the move above.
             av_frame_unref(localFrame.get());
             continue; // Successfully got a frame, try to get another one before sending
                       // more input

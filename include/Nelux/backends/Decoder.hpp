@@ -32,10 +32,6 @@ class Decoder
         bool hasAudio;
         int bitDepth;
         double aspectRatio;
-        int audioBitrate;
-        int audioChannels;
-        int audioSampleRate;
-        std::string audioCodec;
         double min_fps;
         double max_fps;
     };
@@ -118,9 +114,6 @@ class Decoder
 
     AVCodecContext* getCtx();
 
-    bool extractAudioToFile(const std::string& outputFilePath);
-    torch::Tensor getAudioTensor();
-
     // Batch decoding support
     int64_t get_frame_count();
     virtual torch::Tensor decode_batch(const std::vector<int64_t>& indices);
@@ -144,14 +137,6 @@ class Decoder
     VideoProperties properties;
     Frame frame;
     bool force_8bit = false;
-    int audioStreamIndex = -1;
-    AVCodecContextPtr audioCodecCtx;
-    Frame audioFrame;
-    AVPacketPtr audioPkt;
-    SwrContextPtr swrCtx;
-
-    bool initializeAudio();
-    void closeAudio();
 
     std::thread decodingThread;
     std::atomic<bool> stopDecoding{false};
@@ -163,6 +148,10 @@ class Decoder
         double timestamp = 0.0;
     };
     std::queue<ConvertedFrame> convertedQueue;
+    // Pool of pre-sized byte buffers used by preconversion to avoid
+    // heap-thrashing (alloc + zero-init of 6+MB per decoded frame).
+    std::vector<std::vector<uint8_t>> convertedBufferPool;
+    std::mutex convertedBufferPoolMutex;
     std::mutex queueMutex;
     std::condition_variable queueCond;
     std::condition_variable producerCond;

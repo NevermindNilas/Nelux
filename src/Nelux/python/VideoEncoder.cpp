@@ -3,75 +3,29 @@
 #include <filesystem>
 #include <stdexcept>
 #include <Factory.hpp>
+#include <cpu/RGBToAuto.hpp>
 #include <cpu/RGBToAutoLibyuv.hpp>
+
+extern "C"
+{
+#include <libavutil/pixdesc.h>
+}
 
 namespace fs = std::filesystem;
 
 namespace nelux
 {
-namespace
-{
-std::string toLower(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return value;
-}
-
-Encoder::AudioMode parseAudioMode(const std::optional<std::string>& audioMode,
-                                  bool hasAudioEncodeSettings,
-                                  const std::optional<std::string>& sourcePath)
-{
-    if (!audioMode.has_value() || audioMode->empty())
-    {
-        if (sourcePath.has_value() && !sourcePath->empty())
-        {
-            return Encoder::AudioMode::Copy;
-        }
-        return hasAudioEncodeSettings ? Encoder::AudioMode::Encode
-                                      : Encoder::AudioMode::Off;
-    }
-
-    const std::string mode = toLower(*audioMode);
-    if (mode == "off")
-    {
-        return Encoder::AudioMode::Off;
-    }
-    if (mode == "encode")
-    {
-        return Encoder::AudioMode::Encode;
-    }
-    if (mode == "copy")
-    {
-        return Encoder::AudioMode::Copy;
-    }
-
-    throw std::runtime_error("audio_mode must be one of: off, encode, copy");
-}
-} // namespace
-
     //NOTE --- USED HWC
 VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> codec, std::optional<int> width,
                            std::optional<int> height, std::optional<int> bitRate,
-                           std::optional<float> fps, std::optional<int> audioBitRate,
-                           std::optional<int> audioSampleRate,
-                           std::optional<int> audioChannels,
-                           std::optional<std::string> audioCodec,
+                           std::optional<float> fps,
                            std::optional<int> preset,
                            std::optional<int> cq,
-                           std::optional<std::string> pixelFormat,
-                           std::optional<std::string> audioMode,
-                           std::optional<std::string> sourcePath,
-                           std::optional<double> sourceStartTime,
-                           std::optional<double> sourceEndTime)
+                           std::optional<std::string> pixelFormat)
 {
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
-                                              fps, audioBitRate, audioSampleRate,
-                                              audioChannels, audioCodec,
-                                              preset, cq, pixelFormat, audioMode,
-                                              sourcePath, sourceStartTime,
-                                              sourceEndTime);
+                                              fps, preset, cq, pixelFormat);
     this->props = properties;
     this->width = properties.width;
     this->height = properties.height;
@@ -86,15 +40,9 @@ VideoEncoder::VideoEncoder(const std::string& filename,
 nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     const std::string& filename, std::optional<std::string> codec,
     std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
-    std::optional<float> fps, std::optional<int> audioBitRate,
-    std::optional<int> audioSampleRate, std::optional<int> audioChannels,
-    std::optional<std::string> audioCodec,
+    std::optional<float> fps,
     std::optional<int> preset, std::optional<int> cq,
-    std::optional<std::string> pixelFormat,
-    std::optional<std::string> audioMode,
-    std::optional<std::string> sourcePath,
-    std::optional<double> sourceStartTime,
-    std::optional<double> sourceEndTime)
+    std::optional<std::string> pixelFormat)
 {
     // Populate video encoding settings
     nelux::Encoder::EncodingProperties props;
@@ -105,7 +53,7 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     props.fps = static_cast<int>(std::round(fps.value_or(30.0f)));
     props.gopSize = 60;
     props.maxBFrames = 2;
-    
+
     // Parse pixel format string
     if (pixelFormat.has_value())
     {
@@ -123,43 +71,10 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     {
         props.pixelFormat = AV_PIX_FMT_YUV420P;
     }
-    
+
     // NVENC-specific options
     props.preset = preset.value_or(-1);  // -1 means use default
     props.cq = cq.value_or(-1);          // -1 means use bitrate mode
-
-    const bool hasAudioEncodeSettings = audioSampleRate.has_value() &&
-                                        audioChannels.has_value();
-    props.audioMode = parseAudioMode(audioMode, hasAudioEncodeSettings, sourcePath);
-
-    // Populate audio encoding settings (0 -> no encoded audio stream)
-    if (props.audioMode == Encoder::AudioMode::Encode)
-    {
-        props.audioBitRate = audioBitRate.value_or(128000);
-        props.audioSampleRate = audioSampleRate.value_or(48000);
-        props.audioChannels = audioChannels.value_or(2);
-        props.audioCodec = audioCodec.value_or("aac");
-    }
-    else
-    {
-        props.audioBitRate = 0;
-        props.audioSampleRate = 0;
-        props.audioChannels = 0;
-        props.audioCodec = std::string();
-    }
-
-    if (props.audioMode == Encoder::AudioMode::Copy)
-    {
-        if (!sourcePath.has_value() || sourcePath->empty())
-        {
-            throw std::runtime_error(
-                "audio_mode='copy' requires a source_path for passthrough");
-        }
-
-        props.audioCopy.sourcePath = *sourcePath;
-        props.audioCopy.sourceStartTime = sourceStartTime.value_or(0.0);
-        props.audioCopy.sourceEndTime = sourceEndTime;
-    }
 
     return props;
 }
@@ -301,11 +216,38 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         frame = frame.contiguous();
     }
 
-    // Use libyuv converter for CPU path
+    // libyuv provides fast paths only for the common 8-bit YUV planar/biplanar
+    // formats; anything else (gray*, 10/12-bit YUV, packed RGB, GBRP, ProRes
+    // targets like yuv422p10le) goes through swscale which supports the full
+    // pix_fmt matrix.
     if (!converter)
-    { 
-        converter = std::make_unique<nelux::conversion::cpu::RGBToAutoLibyuvConverter>(
-            width, height, outputPixelFormat);
+    {
+        bool libyuvSupported = false;
+        switch (outputPixelFormat)
+        {
+            case AV_PIX_FMT_YUV420P:
+            case AV_PIX_FMT_YUVJ420P:
+            case AV_PIX_FMT_NV12:
+            case AV_PIX_FMT_YUV422P:
+            case AV_PIX_FMT_YUVJ422P:
+            case AV_PIX_FMT_YUV444P:
+            case AV_PIX_FMT_YUVJ444P:
+                libyuvSupported = true;
+                break;
+            default:
+                libyuvSupported = false;
+                break;
+        }
+        if (libyuvSupported)
+        {
+            converter = std::make_unique<nelux::conversion::cpu::RGBToAutoLibyuvConverter>(
+                width, height, outputPixelFormat);
+        }
+        else
+        {
+            converter = std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
+                width, height, outputPixelFormat);
+        }
     }
 
     // Convert RGB24 → YUV (I420 or NV12)
@@ -344,72 +286,5 @@ VideoEncoder::~VideoEncoder()
 {
     close();
 }
-
-// video side stays the same…
-
-/// Replace your old single‑frame binding
-void VideoEncoder::encodeAudioFrame(const torch::Tensor& pcm)
-{
-    py::gil_scoped_release release;
-
-    if (!encoder || encoder->Properties().audioMode != Encoder::AudioMode::Encode)
-    {
-        throw std::runtime_error(
-            "encode_audio_frame requires audio_mode='encode' on the encoder");
-    }
-
-    // 1) grab properties
-    auto& props = encoder->Properties();
-    int channels = props.audioChannels;
-    int sampleRate = props.audioSampleRate;
-    int frameSz = encoder->audioFrameSize();
-    if (!frameSz)
-        throw std::runtime_error("audioFrameSize not set");
-
-    // 2) move to CPU, int16, contiguous
-    // move to CPU and cast to Int16 in one go:
-    auto t = pcm.to(torch::Device(torch::kCPU), // <— device
-                    torch::kInt16,              // <— dtype
-                    /*non_blocking=*/false,     // optional
-                    /*copy=*/false)             // optional
-                 .contiguous();
-
-    auto ptr = t.data_ptr<int16_t>();
-    int64_t totalSamples = t.numel() / channels;
-    int64_t offset = 0;
-
-    // 3) loop over full‑sized (and final smaller) frames
-    while (offset < totalSamples)
-    {
-        int thisCount = std::min<int64_t>(frameSz, totalSamples - offset);
-
-        // build an AVFrame
-        nelux::Frame af;
-        AVFrame* f = af.get();
-        f->nb_samples = thisCount;
-        f->sample_rate = sampleRate;
-        f->format = AV_SAMPLE_FMT_FLTP; // planar float for AAC
-        av_channel_layout_default(&f->ch_layout, channels);
-        af.allocateBuffer(0);
-
-        // de‑interleave & convert
-        std::vector<float> buf(channels * thisCount);
-        for (int ch = 0; ch < channels; ++ch)
-        {
-            float* dst = buf.data() + ch * thisCount;
-            int16_t* src = ptr + (offset * channels) + ch;
-            for (int i = 0; i < thisCount; ++i)
-                dst[i] = src[i * channels] / 32768.0f;
-            std::memcpy(f->data[ch], dst, thisCount * sizeof(float));
-        }
-
-        // call the low‑level API
-        if (!encoder->encodeAudioFrame(af))
-            throw std::runtime_error("audio encode failed");
-
-        offset += thisCount;
-    }
-}
-
 
 } // namespace nelux

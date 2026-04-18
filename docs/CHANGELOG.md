@@ -1,4 +1,51 @@
 
+### **Version 0.9.0 (2026-04-18)**
+
+#### **Software Video Encoders**
+- **Added:** Quality-control plumbing for `libx264`, `libx265`, `libsvtav1`, and `libaom-av1`. The existing `cq` and `preset` parameters now flow through to software encoders (previously NVENC-only): `cq` maps to CRF (0–51 for x264/x265, 0–63 for AV1), and `preset` maps to each encoder's native scale (`ultrafast`…`veryslow` for x26x, `cpu-used` 0–8 for libaom, SVT preset 4–12). Setting `cq` on AV1 also clears `bit_rate` so `avcodec_open2` doesn't reject the mixed rate-control mode.
+- **Fixed:** Missing `AV_CODEC_FLAG_GLOBAL_HEADER` for muxers that require extradata in `codecpar` (MP4, MKV, …). Without it, libaom-av1 / libsvtav1 / libx265 produced MKV files with no `CodecPrivate`, which `ffprobe` could not parse and players could not decode.
+
+#### **Color Conversion**
+- **Fixed:** `RGBToAutoLibyuvConverter` now dispatches per pixel format instead of collapsing limited- and full-range cases onto the same libyuv entry point. `yuvj420p`/`yuvj422p`/`yuvj444p` route to `RAWToJ420`/`ARGBToJ422`/`RAWToJ444` (BT.601 full-range), while `yuv420p`/`yuv422p`/`yuv444p` keep the I-variants (BT.601 limited). The previously-unused `colorspace` ctor argument is documented as BT.601-only — libyuv exposes no forward BT.709 path; that requires swscale or a custom matrix and is tracked separately.
+- **Changed:** YUV444P / YUVJ444P paths use libyuv's direct `RAWToI444` / `RAWToJ444` instead of routing through an ARGB intermediate, removing one full-frame allocation and copy per encoded frame.
+
+#### **Tests**
+- **Added:** `tests/test_software_encoders.py` — a 68-cell matrix (4 codecs × pixel formats × {240p, 480p, 720p, 1080p}) measured with PSNR (Y), SSIM, and VMAF computed by ffmpeg's `libvmaf` filter against a rawvideo `rgb24` reference. Encoder settings target lossless / near-lossless (`cq=0`, medium preset). Per-case JSON metrics land in `tests/output/software_encoders/metrics/`.
+
+  Worst case across the matrix:
+
+  | Encoder       | Pix_fmts         | PSNR_Y (dB)  | SSIM            | VMAF        |
+  |---------------|------------------|--------------|-----------------|-------------|
+  | libx264 yuvj* | 420 / 422 / 444  | **60.00**    | **1.0000**      | **97.2**    |
+  | libx265 yuvj* | 420 / 422 / 444  | **60.00**    | **1.0000**      | **97.0**    |
+  | libx264 yuv*  | 420 / nv12 / 422 / 444 | 59.36  | 0.9994          | 95.1–96.2   |
+  | libx265 yuv*  | 420 / 422 / 444  | 59.13–59.22  | 0.9991–0.9994   | 95.0–96.0   |
+  | libaom-av1    | 420 / 422 / 444  | 59.36        | 0.9992–0.9994   | 95.1–96.2   |
+  | libsvtav1     | 420              | 53.63–55.35  | 0.9966–0.9988   | 87.9–90.6   |
+
+#### **Platform Support**
+- **Added:** Official Linux x86_64 wheels (CPU + CUDA variants) on `manylinux_2_28`. Built via `auditwheel repair` with torch/FFmpeg/CUDA libraries excluded so user-installed versions are reused at runtime.
+- **Added:** Official macOS arm64 (Apple Silicon) wheels, min deployment target 12.0. Built via `delocate-wheel` and linked against Homebrew FFmpeg. CUDA is not supported on macOS — CPU / PyTorch MPS only.
+- **Added:** `MacOS` trove classifier to `pyproject.toml`; updated README with platform matrix and per-OS FFmpeg prerequisites.
+
+#### **Build System**
+- **Changed:** CMake resolves FFmpeg libraries per-platform: `.lib` on Windows, `.dylib` on macOS, `.so` on Linux. Unversioned symlinks preferred with version-sorted fallback.
+- **Changed:** `NELUX_ENABLE_AVX2` now defaults OFF on non-x86 targets (Apple Silicon arm64) and warns if forced on.
+- **Added:** macOS `@loader_path` RPATH and `MACOSX_RPATH TRUE` on the Python extension so sibling dylibs load without `DYLD_*` env vars.
+- **Added:** POSIX link libraries — `pthread`+`dl` on Linux/macOS, plus `rt` on Linux.
+- **Added:** Default vcpkg triplet auto-selection: `x64-windows` / `x64-linux-dynamic` / `arm64-osx-dynamic` / `x64-osx-dynamic`.
+- **Added:** `tools/download_ffmpeg.sh` — POSIX counterpart to `download_ffmpeg.ps1`. Pulls BtbN GPL-shared tarball on Linux (x86_64/arm64); mirrors Homebrew FFmpeg into `external/ffmpeg/` on macOS.
+
+#### **Build Performance**
+- **Extended LTO/AVX2 coverage to CUDA:** The `NeluxCuda` static library previously compiled without IPO/LTO and without host SIMD flags. A new `nelux_apply_perf_flags()` CMake helper now applies AVX2/FMA (via `-Xcompiler` on nvcc) and IPO/LTO uniformly across `NeluxLib`, the `nelux` Python module, and `NeluxCuda`.
+- **Added `NELUX_ENABLE_CUDA_FAST_MATH` option (default ON):** Passes `--use_fast_math` to nvcc for the NV12↔RGB color-conversion kernels.
+- **Centralized `check_ipo_supported`:** Replaced three duplicated AVX2/LTO blocks with a single helper invocation per target.
+
+#### **CI / Packaging**
+- **Added:** `build_wheel_linux.yml` and `build_wheel_macos.yml` workflows (`workflow_dispatch`) mirroring the Windows wheel build for ad-hoc verification.
+- **Changed:** `createRelease.yaml` now builds Windows + Linux (CPU + CUDA) + macOS (arm64) wheels in parallel; `release` and `pypi-publish` jobs depend on all three and download via the `*-wheel-Release-*` pattern.
+- **Added:** Real post-install decode smoke test (`tests/wheel_smoke_test.py`). Synthesizes a 2 s H.264 clip with `ffmpeg -f lavfi testsrc2`, opens it with `VideoReader`, asserts tensor shape/dtype/non-zero pixels, batch slicing, and `reconfigure()` round-trip. Wired into all four wheel workflows, replacing the previous import-and-attribute-only check.
+
 ### **Version 0.8.10 (2026-04-01)**
 
 #### **Dependencies**

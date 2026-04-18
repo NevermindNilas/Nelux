@@ -11,28 +11,6 @@ namespace fs = std::filesystem;
 namespace nelux
 {
 
-namespace
-{
-int findFirstAudioStreamIndex(AVFormatContext* formatCtx)
-{
-    for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
-    {
-        if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        {
-            return static_cast<int>(i);
-        }
-    }
-
-    return -1;
-}
-
-int64_t secondsToPts(double seconds, AVRational timeBase)
-{
-    return av_rescale_q(static_cast<int64_t>(std::llround(seconds * AV_TIME_BASE)),
-                        AVRational{1, AV_TIME_BASE}, timeBase);
-}
-} // namespace
-
 Encoder::Encoder(const std::string& filename, const EncodingProperties& properties)
     : properties(properties), filename(filename) // Store filename
 {
@@ -66,14 +44,6 @@ void Encoder::initialize()
     validateCodecContainerCompatibility();
 
     initVideoStream();
-    if (properties.audioMode == AudioMode::Copy)
-    {
-        initAudioCopyStream();
-    }
-    else if (properties.audioMode == AudioMode::Encode && properties.audioBitRate > 0)
-    {
-        initAudioStream();
-    }
     pkt.reset(av_packet_alloc());
 }
 void Encoder::openOutputFile()
@@ -194,12 +164,28 @@ void Encoder::initVideoStream()
                     hwSwFormat = requestedFormat;
                     break;
                 default:
-                    // Fall back to NV12 for unsupported formats
-                    NELUX_WARN("Pixel format {} not directly supported for NVENC, using NV12", 
-                               av_get_pix_fmt_name(requestedFormat));
+                {
+                    // NVENC has no monochrome mode. Grayscale formats
+                    // (gray, gray16le, ...) fall back to NV12; use a software
+                    // encoder (libx264/libx265) for native grayscale encode.
+                    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(requestedFormat);
+                    const bool isGray = desc && desc->nb_components == 1;
+                    if (isGray)
+                    {
+                        NELUX_WARN("NVENC does not support grayscale pixel format {}; "
+                                   "falling back to NV12. Use a software encoder "
+                                   "(e.g. libx264) for native grayscale encoding.",
+                                   av_get_pix_fmt_name(requestedFormat));
+                    }
+                    else
+                    {
+                        NELUX_WARN("Pixel format {} not directly supported for NVENC, using NV12",
+                                   av_get_pix_fmt_name(requestedFormat));
+                    }
                     properties.pixelFormat = AV_PIX_FMT_NV12;
                     hwSwFormat = AV_PIX_FMT_NV12;
                     break;
+                }
             }
             
             // Set up hardware frames context
@@ -252,15 +238,114 @@ void Encoder::initVideoStream()
     }
     else
     {
+        // Validate the requested pixel format against the codec's advertised
+        // list. This covers every software encoder (libx264, libx265,
+        // libsvtav1, libaom-av1, h264_mf, hevc_mf, ...) uniformly: unsupported
+        // formats (notably grayscale on codecs without monochrome support)
+        // fall back with a warning instead of failing at avcodec_open2.
+        if (codec->pix_fmts)
+        {
+            bool supported = false;
+            for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+            {
+                if (codec->pix_fmts[i] == properties.pixelFormat)
+                {
+                    supported = true;
+                    break;
+                }
+            }
+            if (!supported)
+            {
+                const AVPixFmtDescriptor* reqDesc =
+                    av_pix_fmt_desc_get(properties.pixelFormat);
+                const bool wantGray = reqDesc && reqDesc->nb_components == 1;
+
+                AVPixelFormat fallback = AV_PIX_FMT_NONE;
+
+                // 1. If gray was requested, try any gray variant from the list.
+                if (wantGray)
+                {
+                    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+                    {
+                        const AVPixFmtDescriptor* d =
+                            av_pix_fmt_desc_get(codec->pix_fmts[i]);
+                        if (d && d->nb_components == 1)
+                        {
+                            fallback = codec->pix_fmts[i];
+                            break;
+                        }
+                    }
+                }
+                // 2. yuv420p is the most universal YUV fallback.
+                if (fallback == AV_PIX_FMT_NONE)
+                {
+                    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+                    {
+                        if (codec->pix_fmts[i] == AV_PIX_FMT_YUV420P)
+                        {
+                            fallback = AV_PIX_FMT_YUV420P;
+                            break;
+                        }
+                    }
+                }
+                // 3. Last resort: first format the codec advertises.
+                if (fallback == AV_PIX_FMT_NONE)
+                {
+                    fallback = codec->pix_fmts[0];
+                }
+
+                if (wantGray)
+                {
+                    const AVPixFmtDescriptor* fd = av_pix_fmt_desc_get(fallback);
+                    const bool fallbackIsGray = fd && fd->nb_components == 1;
+                    if (fallbackIsGray)
+                    {
+                        NELUX_WARN("Codec {} does not expose pixel format {}; "
+                                   "using compatible grayscale format {} instead.",
+                                   properties.codec,
+                                   av_get_pix_fmt_name(properties.pixelFormat),
+                                   av_get_pix_fmt_name(fallback));
+                    }
+                    else
+                    {
+                        NELUX_WARN("Codec {} has no monochrome pixel format; "
+                                   "falling back from {} to {}. Chroma is neutral "
+                                   "when the input is already gray (R==G==B).",
+                                   properties.codec,
+                                   av_get_pix_fmt_name(properties.pixelFormat),
+                                   av_get_pix_fmt_name(fallback));
+                    }
+                }
+                else
+                {
+                    NELUX_WARN("Codec {} does not support pixel format {}; "
+                               "falling back to {}.",
+                               properties.codec,
+                               av_get_pix_fmt_name(properties.pixelFormat),
+                               av_get_pix_fmt_name(fallback));
+                }
+
+                properties.pixelFormat = fallback;
+            }
+        }
+
         videoCodecCtx->pix_fmt = properties.pixelFormat;
-        
+
         // Ensure multithreading for software encoders (e.g., libx264)
         if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
         {
             videoCodecCtx->thread_count = 0; // 0 = auto-detect number of threads
         }
     }
-    
+
+    // Some muxers (MP4, MKV, ...) require extradata in the codec parameters
+    // rather than in-band. Without this, libaom-av1 / libsvtav1 / libx265
+    // produce invalid files with missing CodecPrivate/extradata.
+    if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER)
+    {
+        videoCodecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
     // NVENC-specific options
     AVDictionary* opts = nullptr;
     if (isNvenc && hwDeviceCtx)
@@ -287,8 +372,65 @@ void Encoder::initVideoStream()
         
         // Enable B-frames for better compression (NVENC supports this)
         av_dict_set(&opts, "b_ref_mode", "middle", 0);
-        
+
         NELUX_INFO("NVENC: Using hardware-accelerated encoding");
+    }
+    else
+    {
+        // Software encoder options (libx264, libx265, libsvtav1, libaom-av1)
+        const std::string& codecName = properties.codec;
+        const bool isX264 = codecName == "libx264" || codecName == "libx264rgb";
+        const bool isX265 = codecName == "libx265";
+        const bool isSvtAv1 = codecName == "libsvtav1";
+        const bool isAomAv1 = codecName == "libaom-av1";
+
+        if (isX264 || isX265)
+        {
+            // x264/x265 preset: 1=ultrafast ... 9=veryslow
+            static const char* x26xPresets[] = {
+                "ultrafast", "superfast", "veryfast", "faster", "fast",
+                "medium",    "slow",      "slower",   "veryslow"
+            };
+            if (properties.preset >= 1 && properties.preset <= 9)
+            {
+                av_dict_set(&opts, "preset", x26xPresets[properties.preset - 1], 0);
+            }
+            if (properties.cq >= 0 && properties.cq <= 51)
+            {
+                av_dict_set_int(&opts, "crf", properties.cq, 0);
+            }
+        }
+        else if (isSvtAv1)
+        {
+            // SVT-AV1 preset: higher = faster (0=slowest/best, 13=fastest)
+            // Map our 1..9 to SVT 12..4 (9=slowest)
+            if (properties.preset >= 1 && properties.preset <= 9)
+            {
+                int svtPreset = 13 - properties.preset;
+                av_dict_set_int(&opts, "preset", svtPreset, 0);
+            }
+            if (properties.cq >= 0 && properties.cq <= 63)
+            {
+                av_dict_set_int(&opts, "crf", properties.cq, 0);
+                // SVT-AV1 rejects avcodec_open2 with EINVAL when both bitrate
+                // and CRF are non-zero — clear the bitrate to enter CRF mode.
+                videoCodecCtx->bit_rate = 0;
+            }
+        }
+        else if (isAomAv1)
+        {
+            // libaom-av1: cpu-used 0..8 (0=slowest/best, 8=fastest)
+            if (properties.preset >= 1 && properties.preset <= 9)
+            {
+                int cpuUsed = std::clamp(9 - properties.preset, 0, 8);
+                av_dict_set_int(&opts, "cpu-used", cpuUsed, 0);
+            }
+            if (properties.cq >= 0 && properties.cq <= 63)
+            {
+                av_dict_set_int(&opts, "crf", properties.cq, 0);
+                videoCodecCtx->bit_rate = 0;
+            }
+        }
     }
 
     int ret = avcodec_open2(videoCodecCtx.get(), codec, &opts);
@@ -301,91 +443,6 @@ void Encoder::initVideoStream()
     }
 
     avcodec_parameters_from_context(videoStream->codecpar, videoCodecCtx.get());
-}
-
-void Encoder::initAudioStream()
-{
-    audioStream = avformat_new_stream(formatCtx.get(), nullptr);
-    if (!audioStream)
-        throw std::runtime_error("Failed to create audio stream");
-
-    const AVCodec* codec = avcodec_find_encoder_by_name(properties.audioCodec.c_str());
-    audioCodecCtx.reset(avcodec_alloc_context3(codec));
-    if (!audioCodecCtx)
-        throw std::runtime_error("Failed to allocate audio codec context");
-
-    // Basic parameters
-    audioCodecCtx->bit_rate = properties.audioBitRate;
-    audioCodecCtx->sample_rate = properties.audioSampleRate;
-    audioCodecCtx->ch_layout.nb_channels = properties.audioChannels;
-    av_channel_layout_default(&audioCodecCtx->ch_layout, properties.audioChannels);
-    audioCodecCtx->time_base = {1, properties.audioSampleRate};
-
-    // Force AAC’s planar‑float format
-    audioCodecCtx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-
-    if (avcodec_open2(audioCodecCtx.get(), codec, nullptr) < 0)
-        NELUX_WARN("Failed to open audio codec.");
-
-    avcodec_parameters_from_context(audioStream->codecpar, audioCodecCtx.get());
-}
-
-void Encoder::initAudioCopyStream()
-{
-    const std::string sourcePath = normalizePath(properties.audioCopy.sourcePath);
-    if (sourcePath.empty())
-    {
-        throw std::runtime_error(
-            "Audio copy mode requires a valid source file path.");
-    }
-
-    AVFormatContext* sourceCtx = nullptr;
-    int ret = avformat_open_input(&sourceCtx, sourcePath.c_str(), nullptr, nullptr);
-    if (ret < 0)
-    {
-        throw std::runtime_error("Failed to open source audio file: " + sourcePath +
-                                 " (" + errorToString(ret) + ")");
-    }
-    sourceAudioFormatCtx.reset(sourceCtx);
-
-    ret = avformat_find_stream_info(sourceAudioFormatCtx.get(), nullptr);
-    if (ret < 0)
-    {
-        throw std::runtime_error("Failed to read source audio stream info: " +
-                                 errorToString(ret));
-    }
-
-    sourceAudioStreamIndex = findFirstAudioStreamIndex(sourceAudioFormatCtx.get());
-    if (sourceAudioStreamIndex < 0)
-    {
-        throw std::runtime_error("Source file does not contain an audio stream to copy.");
-    }
-
-    AVStream* inputAudioStream =
-        sourceAudioFormatCtx->streams[sourceAudioStreamIndex];
-
-    if (!avformat_query_codec(formatCtx->oformat,
-                              static_cast<AVCodecID>(inputAudioStream->codecpar->codec_id),
-                              0))
-    {
-        throw std::runtime_error("Audio codec cannot be copied into the output container.");
-    }
-
-    audioStream = avformat_new_stream(formatCtx.get(), nullptr);
-    if (!audioStream)
-    {
-        throw std::runtime_error("Failed to create output audio stream for passthrough.");
-    }
-
-    ret = avcodec_parameters_copy(audioStream->codecpar, inputAudioStream->codecpar);
-    if (ret < 0)
-    {
-        throw std::runtime_error("Failed to copy audio stream parameters: " +
-                                 errorToString(ret));
-    }
-
-    audioStream->codecpar->codec_tag = 0;
-    audioStream->time_base = inputAudioStream->time_base;
 }
 
 bool Encoder::encodeFrame(const Frame& frame)
@@ -471,39 +528,6 @@ bool Encoder::encodeFrame(const Frame& frame)
 }
 
 
-// In Encoder::encodeAudioFrame
-bool Encoder::encodeAudioFrame(const Frame& frame)
-{
-    if (!audioCodecCtx)
-        return false;
-
-    AVFrame* af = frame.get();
-
-    // 1) assign a proper PTS (in units of audioCodecCtx->time_base = 1/sample_rate)
-    af->pts = nextAudioPts;
-    nextAudioPts += af->nb_samples;
-
-    // 2) send to encoder
-    if (avcodec_send_frame(audioCodecCtx.get(), af) < 0)
-        return false;
-
-    // 3) pull out packets and mux them immediately
-    while (avcodec_receive_packet(audioCodecCtx.get(), pkt.get()) == 0)
-    {
-        // mark as audio stream
-        pkt->stream_index = audioStream->index;
-
-        // rescale audio‐codec time_base -> audio‐stream time_base
-        av_packet_rescale_ts(pkt.get(), audioCodecCtx->time_base,
-                             audioStream->time_base);
-
-        av_interleaved_write_frame(formatCtx.get(), pkt.get());
-    }
-
-    return true;
-}
-
-// In writePacket(), simplify to only handle video (we now handle audio above)
 void Encoder::writePacket()
 {
     // ONLY video packets should ever reach this helper;
@@ -511,126 +535,6 @@ void Encoder::writePacket()
     av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base, videoStream->time_base);
     av_interleaved_write_frame(formatCtx.get(), pkt.get());
 }
-
-void Encoder::copyAudioPackets()
-{
-    if (!sourceAudioFormatCtx || sourceAudioStreamIndex < 0 || !audioStream)
-    {
-        return;
-    }
-
-    if (nextVideoPts <= 0 || properties.fps <= 0)
-    {
-        NELUX_INFO("Skipping audio copy because no video frames were encoded.");
-        return;
-    }
-
-    AVStream* inputAudioStream =
-        sourceAudioFormatCtx->streams[sourceAudioStreamIndex];
-
-    const double copyStartTime = std::max(0.0, properties.audioCopy.sourceStartTime);
-    double copyEndTime = copyStartTime +
-                         (static_cast<double>(nextVideoPts) /
-                          static_cast<double>(properties.fps));
-    if (properties.audioCopy.sourceEndTime.has_value())
-    {
-        copyEndTime = std::min(copyEndTime, *properties.audioCopy.sourceEndTime);
-    }
-
-    if (copyEndTime <= copyStartTime)
-    {
-        NELUX_INFO("Skipping audio copy because the requested time window is empty.");
-        return;
-    }
-
-    const int64_t startPts = secondsToPts(copyStartTime, inputAudioStream->time_base);
-    const int64_t endPts = secondsToPts(copyEndTime, inputAudioStream->time_base);
-
-    int ret = av_seek_frame(sourceAudioFormatCtx.get(), sourceAudioStreamIndex, startPts,
-                            AVSEEK_FLAG_BACKWARD);
-    if (ret < 0)
-    {
-        throw std::runtime_error("Failed to seek source audio stream: " +
-                                 errorToString(ret));
-    }
-
-    AVPacketPtr sourcePacket(av_packet_alloc());
-    if (!sourcePacket)
-    {
-        throw std::runtime_error("Failed to allocate packet for audio passthrough.");
-    }
-
-    int64_t firstPts = AV_NOPTS_VALUE;
-    int64_t firstDts = AV_NOPTS_VALUE;
-
-    while (av_read_frame(sourceAudioFormatCtx.get(), sourcePacket.get()) >= 0)
-    {
-        if (sourcePacket->stream_index != sourceAudioStreamIndex)
-        {
-            av_packet_unref(sourcePacket.get());
-            continue;
-        }
-
-        const int64_t packetTs = sourcePacket->pts != AV_NOPTS_VALUE
-                                     ? sourcePacket->pts
-                                     : sourcePacket->dts;
-        int64_t packetEndTs = packetTs;
-        if (packetTs != AV_NOPTS_VALUE && sourcePacket->duration > 0)
-        {
-            packetEndTs = packetTs + sourcePacket->duration;
-        }
-
-        if (packetTs != AV_NOPTS_VALUE && packetEndTs <= startPts)
-        {
-            av_packet_unref(sourcePacket.get());
-            continue;
-        }
-
-        if (packetTs != AV_NOPTS_VALUE && packetTs >= endPts)
-        {
-            av_packet_unref(sourcePacket.get());
-            break;
-        }
-
-        if (firstPts == AV_NOPTS_VALUE && sourcePacket->pts != AV_NOPTS_VALUE)
-        {
-            firstPts = sourcePacket->pts;
-        }
-        if (firstDts == AV_NOPTS_VALUE && sourcePacket->dts != AV_NOPTS_VALUE)
-        {
-            firstDts = sourcePacket->dts;
-        }
-
-        if (sourcePacket->pts != AV_NOPTS_VALUE && firstPts != AV_NOPTS_VALUE)
-        {
-            sourcePacket->pts -= firstPts;
-        }
-        if (sourcePacket->dts != AV_NOPTS_VALUE && firstDts != AV_NOPTS_VALUE)
-        {
-            sourcePacket->dts -= firstDts;
-        }
-        if (sourcePacket->pts != AV_NOPTS_VALUE && sourcePacket->dts != AV_NOPTS_VALUE &&
-            sourcePacket->pts < sourcePacket->dts)
-        {
-            sourcePacket->pts = sourcePacket->dts;
-        }
-
-        av_packet_rescale_ts(sourcePacket.get(), inputAudioStream->time_base,
-                             audioStream->time_base);
-        sourcePacket->stream_index = audioStream->index;
-
-        ret = av_interleaved_write_frame(formatCtx.get(), sourcePacket.get());
-        av_packet_unref(sourcePacket.get());
-
-        if (ret < 0)
-        {
-            throw std::runtime_error("Failed to write copied audio packet: " +
-                                     errorToString(ret));
-        }
-    }
-}
-
-
 
 void Encoder::close()
 {
@@ -648,24 +552,6 @@ void Encoder::close()
                                  videoStream->time_base);
             av_interleaved_write_frame(formatCtx.get(), pkt.get());
         }
-    }
-
-    // Flush audio
-    if (audioCodecCtx)
-    {
-        avcodec_send_frame(audioCodecCtx.get(), nullptr);
-        while (avcodec_receive_packet(audioCodecCtx.get(), pkt.get()) == 0)
-        {
-            pkt->stream_index = audioStream->index;
-            av_packet_rescale_ts(pkt.get(), audioCodecCtx->time_base,
-                                 audioStream->time_base);
-            av_interleaved_write_frame(formatCtx.get(), pkt.get());
-        }
-    }
-
-    if (properties.audioMode == AudioMode::Copy)
-    {
-        copyAudioPackets();
     }
 
     // Trailer finalizes moov box in .mp4
@@ -688,8 +574,6 @@ void Encoder::close()
     }
 
     videoCodecCtx.reset();
-    audioCodecCtx.reset();
-    sourceAudioFormatCtx.reset();
     formatCtx.reset();
 }
 

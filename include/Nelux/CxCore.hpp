@@ -39,16 +39,11 @@ extern "C"
 #include <libavutil/imgutils.h>       // For image utilities
 #include <libavutil/opt.h>            // For AVOptions
 #include <libavutil/pixfmt.h>         // For pixel formats
-#include <libavutil/samplefmt.h>      // For handling sample format information
-#include <libswresample/swresample.h> // Include for SwrContext and resampling functions
-                                      // hwaccel
 
 #include <libavutil/hwcontext.h>
-    // audio headers
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
-#include <libavutil/audio_fifo.h>
 #include <libswscale/swscale.h>
 
 }
@@ -107,14 +102,6 @@ struct AVFilterGraphDeleter
         avfilter_graph_free(&graph);
     }
 };
-// SwrContext* swrCtx = nullptr;
-struct SwrContextDeleter
-{
-    void operator()(SwrContext* ctx) const
-    {
-		swr_free(&ctx);
-	}
-};
 inline int effective_bit_depth_from_frame(const AVFrame* f)
 {
     const AVPixFmtDescriptor* d =
@@ -138,7 +125,6 @@ using AVFormatContextPtr = std::unique_ptr<AVFormatContext, AVFormatContextDelet
     using AVBufferRefPtr = std::unique_ptr<AVBufferRef, AVBufferRefDeleter>;
     using AVPacketPtr = std::unique_ptr<AVPacket, AVPacketDeleter>;
     using AVFilterGraphPtr = std::unique_ptr<AVFilterGraph, AVFilterGraphDeleter>;
-    using SwrContextPtr = std::unique_ptr<SwrContext, SwrContextDeleter>;
 
         inline void PrintSupportedVideoEncoders()
     {

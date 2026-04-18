@@ -5,6 +5,8 @@
 
 #include <cuda_fp16.h>
 
+#include <c10/cuda/CUDAStream.h>
+
 #include <BatchDecoder.hpp>
 #include <Logger.hpp>
 #include <chrono>
@@ -213,7 +215,8 @@ static bool isDeviceAccessiblePointer(const void* ptr)
 
 Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex)
     : nelux::Decoder(numThreads), cudaDeviceIndex_(cudaDeviceIndex),
-      cudaStream_(nullptr), decodeCompleteEvent_(nullptr), hwDeviceCtx_(nullptr),
+      cudaStream_(nullptr), decodeCompleteEvent_(nullptr),
+      consumerSyncEvent_(nullptr), hwDeviceCtx_(nullptr),
       hwPixFmt_(AV_PIX_FMT_CUDA), nv12Buffer_(nullptr), nv12BufferSize_(0),
       rgb24Buffer_(nullptr), rgb24BufferSize_(0), hwInitialized_(false),
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
@@ -251,8 +254,14 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
                           cudaGetErrorString(err));
     }
 
+    err = cudaEventCreateWithFlags(&consumerSyncEvent_, cudaEventDisableTiming);
+    if (err != cudaSuccess)
+    {
+        throw CxException(std::string("Failed to create CUDA sync event: ") +
+                          cudaGetErrorString(err));
+    }
+
     initialize(filePath);
-    initializeAudio();
 
     // Enable ML output mode by default for optimal BCHW format
     // This will be configured with appropriate dtype (FP16/FP32) based on bit depth
@@ -269,6 +278,7 @@ Decoder::~Decoder()
 Decoder::Decoder(Decoder&& other) noexcept
     : nelux::Decoder(std::move(other)), cudaDeviceIndex_(other.cudaDeviceIndex_),
       cudaStream_(other.cudaStream_), decodeCompleteEvent_(other.decodeCompleteEvent_),
+      consumerSyncEvent_(other.consumerSyncEvent_),
       hwDeviceCtx_(other.hwDeviceCtx_), hwPixFmt_(other.hwPixFmt_),
       nv12Buffer_(other.nv12Buffer_), nv12BufferSize_(other.nv12BufferSize_),
       rgb24Buffer_(other.rgb24Buffer_), rgb24BufferSize_(other.rgb24BufferSize_),
@@ -276,6 +286,7 @@ Decoder::Decoder(Decoder&& other) noexcept
 {
     other.cudaStream_ = nullptr;
     other.decodeCompleteEvent_ = nullptr;
+    other.consumerSyncEvent_ = nullptr;
     other.hwDeviceCtx_ = nullptr;
     other.nv12Buffer_ = nullptr;
     other.rgb24Buffer_ = nullptr;
@@ -293,6 +304,7 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         cudaDeviceIndex_ = other.cudaDeviceIndex_;
         cudaStream_ = other.cudaStream_;
         decodeCompleteEvent_ = other.decodeCompleteEvent_;
+        consumerSyncEvent_ = other.consumerSyncEvent_;
         hwDeviceCtx_ = other.hwDeviceCtx_;
         hwPixFmt_ = other.hwPixFmt_;
         nv12Buffer_ = other.nv12Buffer_;
@@ -303,6 +315,7 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
 
         other.cudaStream_ = nullptr;
         other.decodeCompleteEvent_ = nullptr;
+        other.consumerSyncEvent_ = nullptr;
         other.hwDeviceCtx_ = nullptr;
         other.nv12Buffer_ = nullptr;
         other.rgb24Buffer_ = nullptr;
@@ -735,6 +748,10 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             }
         }
 
+        // Wait for our decode stream to finish writing before returning the
+        // buffer to the caller. CPU-blocks only on our stream (not the whole
+        // device), and guarantees any torch read from any stream sees full
+        // data. Cheap compared to the original cudaDeviceSynchronize at entry.
         cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
         if (sync_err != cudaSuccess)
         {
@@ -750,25 +767,12 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                           "for this stream.");
     }
 
-    // Record an event to track when the conversion is complete
-    // This allows consumers to wait for the operation if needed
+    // Record the completion event (stream already synchronized above) so
+    // waitForDecodeComplete() remains functional for external consumers.
     if (decodeCompleteEvent_)
     {
-        cudaError_t err = cudaEventRecord(decodeCompleteEvent_, cudaStream_);
-        if (err != cudaSuccess)
-        {
-            NELUX_WARN("CUDA DECODER: Failed to record event: {}",
-                       cudaGetErrorString(err));
-        }
+        cudaEventRecord(decodeCompleteEvent_, cudaStream_);
     }
-
-    // Note: We intentionally do NOT synchronize here.
-    // The CUDA kernel launch is asynchronous and the stream ordering ensures
-    // conversion completes before the output buffer is accessed.
-    // Consumers can call waitForDecodeComplete() before accessing the data,
-    // or rely on PyTorch's automatic synchronization when using the tensor.
-    // This allows the CPU to start the next decode while GPU processes the current
-    // frame.
 
     return true;
 }
@@ -844,6 +848,12 @@ void Decoder::close()
     {
         cudaEventDestroy(decodeCompleteEvent_);
         decodeCompleteEvent_ = nullptr;
+    }
+
+    if (consumerSyncEvent_)
+    {
+        cudaEventDestroy(consumerSyncEvent_);
+        consumerSyncEvent_ = nullptr;
     }
 
     // Destroy CUDA stream
@@ -1056,15 +1066,9 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             launchRgba32ToBchw(static_cast<uint8_t*>(rgb24Buffer_), rgbaPitch,
                                static_cast<float*>(buffer), width, height, mlMean_,
                                mlInvStd_, cudaStream_);
-
-            // Synchronize and check for errors
-            cudaError_t err = cudaStreamSynchronize(cudaStream_);
-            if (err != cudaSuccess)
-            {
-                // Log error but try to continue
-                // fprintf(stderr, "CUDA ERROR after kernel: %s\n",
-                // cudaGetErrorString(err));
-            }
+            // No intra-branch sync: the outer stream sync below (or the event
+            // barrier for async consumers) orders consumer work against the
+            // conversion kernel without paying a second CPU stall per frame.
         }
         else
         {
@@ -1100,8 +1104,8 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             }
         }
 
-        // Ensure all CUDA work completes before the tensor is consumed on the default
-        // stream.
+        // Ensure our decode stream finishes writing before the tensor is
+        // consumed on any torch stream. CPU-blocks on our own stream only.
         cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
         if (sync_err != cudaSuccess)
         {
@@ -1114,15 +1118,9 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         throw CxException("CUDA DECODER ML mode: Received non-CUDA frame.");
     }
 
-    // Record event for synchronization tracking
     if (decodeCompleteEvent_)
     {
-        cudaError_t err = cudaEventRecord(decodeCompleteEvent_, cudaStream_);
-        if (err != cudaSuccess)
-        {
-            NELUX_WARN("CUDA DECODER: Failed to record event: {}",
-                       cudaGetErrorString(err));
-        }
+        cudaEventRecord(decodeCompleteEvent_, cudaStream_);
     }
 
     return true;
@@ -1138,9 +1136,6 @@ void Decoder::reconfigure(const std::string& filePath)
     stopDecodingThread();
     clearQueue();
     resetTimestampState();
-
-    // Close audio if initialized
-    closeAudio();
 
     // Reset codec context (but keep hardware context!)
     if (codecCtx)
@@ -1159,7 +1154,6 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Reset state
     videoStreamIndex = -1;
-    audioStreamIndex = -1;
     isFinished = false;
     seekRequested = false;
     cachedFilePath_ = "";

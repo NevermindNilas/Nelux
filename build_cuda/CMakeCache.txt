@@ -155,16 +155,16 @@ CMAKE_PROJECT_NAME:STATIC=Nelux
 CMAKE_PROJECT_SPDX_LICENSE:STATIC=
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION:STATIC=0.8.6
+CMAKE_PROJECT_VERSION:STATIC=0.9.0
 
 //Value Computed by CMake
 CMAKE_PROJECT_VERSION_MAJOR:STATIC=0
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION_MINOR:STATIC=8
+CMAKE_PROJECT_VERSION_MINOR:STATIC=9
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION_PATCH:STATIC=6
+CMAKE_PROJECT_VERSION_PATCH:STATIC=0
 
 //Value Computed by CMake
 CMAKE_PROJECT_VERSION_TWEAK:STATIC=
@@ -260,6 +260,9 @@ CUDA_CUDART:FILEPATH=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/li
 
 //Path to a library.
 CUDA_OpenCL_LIBRARY:FILEPATH=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64/OpenCL.lib
+
+//Path to a program.
+CUDA_bin2c_EXECUTABLE:FILEPATH=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/bin2c.exe
 
 //Path to a library.
 CUDA_cuFile_LIBRARY:FILEPATH=CUDA_cuFile_LIBRARY-NOTFOUND
@@ -489,11 +492,17 @@ JPEG_LIBRARY_RELEASE:FILEPATH=D:/Nelux/build_cuda/vcpkg_installed/x64-windows/li
 //Build Python bindings
 NELUX_BUILD_PYTHON:BOOL=ON
 
-//Enable AVX2 for host (C++) code
+//Bundle FFmpeg runtime DLLs into Windows wheels
+NELUX_BUNDLE_FFMPEG_DLLS:BOOL=ON
+
+//Enable AVX2/FMA for host code (x86 only)
 NELUX_ENABLE_AVX2:BOOL=ON
 
 //Enable CUDA support in Nelux
 NELUX_ENABLE_CUDA:BOOL=ON
+
+//Pass --use_fast_math to nvcc
+NELUX_ENABLE_CUDA_FAST_MATH:BOOL=ON
 
 //Enable IPO/LTO for Release builds
 NELUX_ENABLE_LTO:BOOL=ON
@@ -598,7 +607,7 @@ CMAKE_CACHEFILE_DIR:INTERNAL=d:/Nelux/build_cuda
 //Major version of cmake used to create the current loaded cache
 CMAKE_CACHE_MAJOR_VERSION:INTERNAL=4
 //Minor version of cmake used to create the current loaded cache
-CMAKE_CACHE_MINOR_VERSION:INTERNAL=2
+CMAKE_CACHE_MINOR_VERSION:INTERNAL=3
 //Patch version of cmake used to create the current loaded cache
 CMAKE_CACHE_PATCH_VERSION:INTERNAL=1
 //Path to CMake executable.
@@ -720,7 +729,7 @@ CMAKE_RC_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_READELF
 CMAKE_READELF-ADVANCED:INTERNAL=1
 //Path to CMake installation.
-CMAKE_ROOT:INTERNAL=C:/Users/nilas/AppData/Local/Programs/Python/Python313/Lib/site-packages/cmake/data/share/cmake-4.2
+CMAKE_ROOT:INTERNAL=C:/Users/nilas/AppData/Local/Programs/Python/Python313/Lib/site-packages/cmake/data/share/cmake-4.3
 //ADVANCED property for variable: CMAKE_SHARED_LINKER_FLAGS
 CMAKE_SHARED_LINKER_FLAGS-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_SHARED_LINKER_FLAGS_DEBUG
@@ -908,7 +917,7 @@ FIND_PACKAGE_MESSAGE_DETAILS_CUDAToolkit:INTERNAL=[C:/Program Files/NVIDIA GPU C
 //Details about finding JPEG
 FIND_PACKAGE_MESSAGE_DETAILS_JPEG:INTERNAL=[optimized;D:/Nelux/build_cuda/vcpkg_installed/x64-windows/lib/jpeg.lib;debug;D:/Nelux/build_cuda/vcpkg_installed/x64-windows/debug/lib/jpeg.lib][D:/Nelux/build_cuda/vcpkg_installed/x64-windows/include][v62()]
 //Details about finding Python3
-FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[C:/Users/nilas/AppData/Local/Programs/Python/Python313/python.exe][C:/Users/nilas/AppData/Local/Programs/Python/Python313/libs/python313.lib][C:/Users/nilas/AppData/Local/Programs/Python/Python313/Include][found components: Interpreter Development.Module ][v3.13.11(3.13)]
+FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[C:/Users/nilas/AppData/Local/Programs/Python/Python313/python.exe][C:/Users/nilas/AppData/Local/Programs/Python/Python313/libs/python313.lib][C:/Users/nilas/AppData/Local/Programs/Python/Python313/Include][found components: Interpreter Development.Module ][v3.13.12(3.13)]
 //Details about finding Threads
 FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
 //ADVANCED property for variable: JPEG_INCLUDE_DIR

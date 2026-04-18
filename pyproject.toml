@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nelux"
-version = "0.8.10"
+version = "0.9.0"
 readme = "README.md"
 authors = [
     {name = "Nilas Tiago", email = "nilascontact@gmail.com"},
@@ -17,6 +17,7 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
 ]
 keywords = ["ffmpeg", "video", "ml", "pytorch", "decode", "tensors", "inference"]
 

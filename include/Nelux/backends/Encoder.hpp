@@ -27,20 +27,6 @@ namespace nvenc
 class Encoder
 {
   public:
-    enum class AudioMode
-    {
-        Off,
-        Encode,
-        Copy,
-    };
-
-    struct AudioCopyProperties
-    {
-        std::string sourcePath;
-        double sourceStartTime = 0.0;
-        std::optional<double> sourceEndTime = std::nullopt;
-    };
-
     struct EncodingProperties
     {
         std::string codec;
@@ -51,17 +37,11 @@ class Encoder
         int gopSize;
         int maxBFrames;
         int fps;
-        int audioBitRate;
-        int audioSampleRate;
-        int audioChannels;
-        std::string audioCodec;
-        
+
         // NVENC/Hardware encoding options
         bool useHardwareEncoder = false;  // Auto-detected from codec name
         int preset = -1;  // NVENC preset (0=fastest, higher=better quality)
         int cq = -1;      // Constant quality mode (0-51, lower=better)
-        AudioMode audioMode = AudioMode::Off;
-        AudioCopyProperties audioCopy;
     };
 
     Encoder() = default;
@@ -70,10 +50,9 @@ class Encoder
 
     void initialize();
     bool encodeFrame(const Frame& frame);
-    bool encodeAudioFrame(const Frame& frame);
     void writePacket();
     void close();
-    
+
     // Check if hardware encoding is active
     bool isHardwareEncoder() const { return hwDeviceCtx != nullptr; }
 
@@ -83,23 +62,16 @@ class Encoder
     // Deleted copy constructor and assignment operator
     Encoder(const Encoder&) = delete;
     Encoder& operator=(const Encoder&) = delete;
-    
+
     EncodingProperties& Properties()
     {
         return properties;
     }
-    int audioFrameSize() const
-    {
-        return audioCodecCtx ? audioCodecCtx->frame_size : 0;
-    }
   private:
     void initVideoStream();
-    void initAudioStream();
-    void initAudioCopyStream();
     void initHardwareContext();  // NEW: Initialize CUDA device context for NVENC
     void openOutputFile();
     void validateCodecContainerCompatibility();
-    void copyAudioPackets();
     std::string
     inferContainerFormat(const std::string& filename) const;
 
@@ -107,16 +79,10 @@ class Encoder
     std::string filename;
     AVFormatContextPtr formatCtx;
     AVCodecContextPtr videoCodecCtx;
-    AVCodecContextPtr audioCodecCtx;
     AVStream* videoStream = nullptr;
-    AVStream* audioStream = nullptr;
-    AVFormatContextPtr sourceAudioFormatCtx;
-    int sourceAudioStreamIndex = -1;
-    SwrContextPtr swrCtx;
     AVPacketPtr pkt;
-    int64_t nextAudioPts = 0;
     int64_t nextVideoPts = 0;
-    
+
     // Hardware encoding context (NVENC)
     AVBufferRef* hwDeviceCtx = nullptr;   // CUDA device context
     AVBufferRef* hwFramesCtx = nullptr;   // Hardware frames context

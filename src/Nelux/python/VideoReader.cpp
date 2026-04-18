@@ -89,8 +89,6 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
 
         // Random-access decoder is now lazy-loaded in ensureRandDecoder()
 
-        audio = std::make_shared<Audio>(decoder);
-
         properties = decoder->getVideoProperties();
 
         // Always use HWC format with native dtype (uint8/int16):
@@ -127,39 +125,6 @@ void VideoReader::close()
         rand_decoder.reset();
     }
     NELUX_INFO("All decoders closed");
-}
-
-std::shared_ptr<VideoReader::Audio> VideoReader::getAudio()
-{
-    return audio;
-}
-
-// -------------------------
-// Audio Class Implementation
-// -------------------------
-
-VideoReader::Audio::Audio(std::shared_ptr<nelux::Decoder> decoder)
-    : decoder(std::move(decoder))
-{
-    if (!this->decoder)
-    {
-        throw std::runtime_error("Audio: Invalid decoder instance provided.");
-    }
-}
-
-torch::Tensor VideoReader::Audio::getAudioTensor()
-{
-    return decoder->getAudioTensor();
-}
-
-bool VideoReader::Audio::extractToFile(const std::string& outputFilePath)
-{
-    return decoder->extractAudioToFile(outputFilePath);
-}
-
-nelux::Decoder::VideoProperties VideoReader::Audio::getProperties() const
-{
-    return decoder->getVideoProperties();
 }
 
 VideoReader::~VideoReader()
@@ -476,10 +441,6 @@ py::dict VideoReader::getProperties() const
                                 ? av_get_pix_fmt_name(properties.pixelFormat)
                                 : "Unknown";
     props["has_audio"] = properties.hasAudio;
-    props["audio_bitrate"] = properties.audioBitrate;        // New property
-    props["audio_channels"] = properties.audioChannels;      // New property
-    props["audio_sample_rate"] = properties.audioSampleRate; // New property
-    props["audio_codec"] = properties.audioCodec;            // New property
     props["bit_depth"] = properties.bitDepth;
     props["aspect_ratio"] = properties.aspectRatio; // New property
     props["codec"] = properties.codec;
@@ -1061,70 +1022,8 @@ torch::ScalarType VideoReader::findMLTypeFromBitDepth()
 }
 
 std::shared_ptr<nelux::VideoEncoder>
-VideoReader::createEncoder(const std::string& outputPath,
-                           const std::string& audioMode) const
+VideoReader::createEncoder(const std::string& outputPath) const
 {
-    auto normalizeMode = [](std::string mode) -> std::string
-    {
-        std::transform(mode.begin(), mode.end(), mode.begin(),
-                       [](unsigned char ch)
-                       { return static_cast<char>(std::tolower(ch)); });
-        return mode;
-    };
-
-    const std::string normalizedAudioMode = normalizeMode(audioMode);
-
-    // Build optional audio parameters only if this reader has audio.
-    std::optional<int> abr = properties.hasAudio
-                                 ? std::make_optional(properties.audioBitrate > 0
-                                                          ? properties.audioBitrate
-                                                          : 128000)
-                                 : std::nullopt;
-    std::optional<int> asr = properties.hasAudio
-                                 ? std::make_optional(properties.audioSampleRate > 0
-                                                          ? properties.audioSampleRate
-                                                          : 48000)
-                                 : std::nullopt;
-    std::optional<int> ach = properties.hasAudio
-                                 ? std::make_optional(properties.audioChannels > 0
-                                                          ? properties.audioChannels
-                                                          : 2)
-                                 : std::nullopt;
-    std::optional<std::string> acodec =
-        properties.hasAudio
-            ? std::make_optional(properties.audioCodec.empty() ? std::string("aac")
-                                                               : properties.audioCodec)
-            : std::nullopt;
-
-    std::optional<std::string> sourcePath = std::nullopt;
-    std::optional<double> sourceStartTime = std::nullopt;
-    std::optional<double> sourceEndTime = std::nullopt;
-
-    if (properties.hasAudio && normalizedAudioMode == "copy")
-    {
-        sourcePath = filePath;
-
-        if (start_time >= 0.0 && end_time > 0.0)
-        {
-            sourceStartTime = start_time;
-            sourceEndTime = end_time;
-        }
-        else if (start_frame >= 0 && end_frame >= 0 && properties.fps > 0.0)
-        {
-            sourceStartTime = static_cast<double>(start_frame) / properties.fps;
-            sourceEndTime = static_cast<double>(end_frame + 1) / properties.fps;
-        }
-        else
-        {
-            sourceStartTime = 0.0;
-        }
-    }
-
-    std::optional<std::string> requestedAudioMode =
-        properties.hasAudio ? std::make_optional(normalizedAudioMode)
-                            : std::make_optional(std::string("off"));
-
-    // Create and return the matching encoder
     return std::make_shared<nelux::VideoEncoder>(
         outputPath,
         /* codec          */ std::nullopt,
@@ -1132,17 +1031,9 @@ VideoReader::createEncoder(const std::string& outputPath,
         /* height         */ properties.height,
         /* bitRate        */ std::nullopt,
         /* fps            */ static_cast<float>(properties.fps),
-        /* audioBitRate   */ abr,
-        /* audioSampleRate*/ asr,
-        /* audioChannels  */ ach,
-        /* audioCodec     */ acodec,
         /* preset         */ std::nullopt,
         /* cq             */ std::nullopt,
-        /* pixelFormat    */ std::nullopt,
-        /* audioMode      */ requestedAudioMode,
-        /* sourcePath     */ sourcePath,
-        /* sourceStartTime*/ sourceStartTime,
-        /* sourceEndTime  */ sourceEndTime);
+        /* pixelFormat    */ std::nullopt);
 }
 
 std::string VideoReader::getPixelFormat() const
@@ -1228,9 +1119,6 @@ void VideoReader::reconfigure(const std::string& newFilePath)
         rand_decoder->close();
         rand_decoder.reset();
     }
-    
-    // Reset Audio object with updated decoder
-    audio = std::make_shared<Audio>(decoder);
     
     // Update properties from the new file
     properties = decoder->getVideoProperties();
