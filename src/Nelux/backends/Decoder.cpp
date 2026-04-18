@@ -289,14 +289,14 @@ void Decoder::initCodecContext()
     }
 
     // Only apply thread types the codec actually supports.
-    // Using unsupported threading modes (e.g. FF_THREAD_FRAME on rawvideo)
-    // can cause hard crashes / segfaults in FFmpeg internals.
+    // Frame threading (FF_THREAD_FRAME) is intentionally disabled: when the
+    // batch decode path calls avcodec_flush_buffers after seek, frame-threaded
+    // codecs trigger `fctx->async_lock` assertions on Linux glibc and segfaults
+    // on macOS. Slice threading still provides intra-frame parallelism.
     int supported_types = 0;
-    if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
-        supported_types |= FF_THREAD_FRAME;
     if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
         supported_types |= FF_THREAD_SLICE;
-    codecCtx->thread_type = supported_types ? supported_types : 0;
+    codecCtx->thread_type = supported_types;
     NELUX_DEBUG("BASE DECODER: Codec context threading configured: thread_count={}, "
                 "thread_type={}",
                 codecCtx->thread_count, codecCtx->thread_type);
