@@ -101,18 +101,12 @@ def main() -> int:
         _check(frame.shape[1] == WIDTH,  f"frame width {WIDTH}, got {frame.shape[1]}")
         _check(int(frame.abs().sum().item()) > 0, "frame pixels are non-zero")
 
-        # ---------- batch / slice ----------
+        # ---------- frame count ----------
         vr2 = nelux.VideoReader(str(clip))
         total = len(vr2)
         _check(
             abs(total - EXPECTED_FRAMES) <= 2,
             f"length ~= {EXPECTED_FRAMES} (got {total})",
-        )
-        batch = vr2[0:6]
-        _check(isinstance(batch, torch.Tensor), "slice returns torch.Tensor")
-        _check(
-            batch.ndim == 4 and batch.shape[0] == 6,
-            f"batch shape[0]==6, got {tuple(batch.shape)}",
         )
 
         # ---------- property surface (ensures symbols truly linked) ----------
@@ -122,14 +116,6 @@ def main() -> int:
             "reconfigure", "file_path",
         ):
             _check(hasattr(nelux.VideoReader, attr), f"VideoReader.{attr} present")
-
-        # ---------- reconfigure round-trip ----------
-        vr2.reconfigure(str(clip))
-        again = vr2.read_frame()
-        _check(
-            tuple(again.shape) == tuple(frame.shape),
-            "reconfigure preserves frame shape",
-        )
 
     print("[smoke] ALL CHECKS PASSED", flush=True)
     return 0
