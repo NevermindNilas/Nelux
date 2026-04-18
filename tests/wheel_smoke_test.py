@@ -106,7 +106,7 @@ def main() -> int:
         total = len(vr2)
         _check(
             abs(total - EXPECTED_FRAMES) <= 2,
-            f"length ≈ {EXPECTED_FRAMES} (got {total})",
+            f"length ~= {EXPECTED_FRAMES} (got {total})",
         )
         batch = vr2[0:6]
         _check(isinstance(batch, torch.Tensor), "slice returns torch.Tensor")
