@@ -87,7 +87,9 @@ def main() -> int:
         flush=True,
     )
 
-    with tempfile.TemporaryDirectory() as tmp:
+    # ignore_cleanup_errors so Windows does not fail on temp-dir rmtree while
+    # VideoReader still holds the file handle during GC.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         clip = Path(tmp) / "smoke.mp4"
         _make_clip(clip)
 
@@ -116,6 +118,8 @@ def main() -> int:
             "reconfigure", "file_path",
         ):
             _check(hasattr(nelux.VideoReader, attr), f"VideoReader.{attr} present")
+
+        del vr, vr2, frame
 
     print("[smoke] ALL CHECKS PASSED", flush=True)
     return 0
