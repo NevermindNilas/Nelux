@@ -110,7 +110,7 @@ class BatchMixin:
                 raise IndexError(f"Frame index {idx} out of bounds [0, {frame_count})")
 
         # Call C++ decode_batch method
-        return self._decoder.decode_batch(normalized)
+        return self.decode_batch(normalized)
 
     def get_batch_range(
         self, start: int = 0, end: int = None, step: int = 1
@@ -176,7 +176,7 @@ class BatchMixin:
         """Total number of frames in the video (from metadata)."""
         # Use get_frame_count which caches the result and is specifically
         # designed for batch operations
-        return self._decoder.get_frame_count()
+        return self.get_frame_count()
 
     @property
     def shape(self) -> tuple:

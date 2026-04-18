@@ -9,11 +9,13 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-22.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14"]
-        variant: [cpu, cuda]
+        # cpXYZ tags map to /opt/python/<tag>-<tag> inside the manylinux image.
+        python: ["cp313", "cp314"]
     env:
       SKBUILD_CONFIG: Release
       VCPKG_TARGET_TRIPLET: x64-linux-dynamic
@@ -21,37 +23,41 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install system build deps
+      - name: Select Python from manylinux image
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential ninja-build pkg-config \
+          PYBIN=/opt/python/${{ matrix.python }}-${{ matrix.python }}/bin
+          echo "PYBIN=${PYBIN}" >> $GITHUB_ENV
+          echo "${PYBIN}" >> $GITHUB_PATH
+          "${PYBIN}/python" --version
+
+      - name: Install system build deps (RHEL8)
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            ninja-build pkgconf-pkg-config \
             autoconf automake libtool \
             patchelf curl ca-certificates \
-            zip unzip tar xz-utils
+            zip unzip tar xz git which perl-IPC-Cmd
+          # gcc-toolset-14 is already the default on manylinux_2_28.
+          gcc --version
 
       - name: Upgrade pip & install Python build deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install scikit-build-core pybind11 numpy ninja auditwheel
 
-      - name: Install PyTorch (CPU)
-        if: matrix.variant == 'cpu'
-        run: |
-          python -m pip install torch==2.11.0 torchvision==0.26.0 \
-            --index-url https://download.pytorch.org/whl/cpu
-
       - name: Install PyTorch (CUDA)
-        if: matrix.variant == 'cuda'
         run: |
           python -m pip install torch==2.11.0 torchvision==0.26.0 \
             --index-url https://download.pytorch.org/whl/cu130
+
+      - name: Install CUDA toolkit (RHEL8)
+        run: |
+          dnf config-manager --add-repo \
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf clean all
+          dnf install -y cuda-toolkit-13-1
+          echo "CUDA_HOME=/usr/local/cuda-13.1" >> $GITHUB_ENV
+          echo "/usr/local/cuda-13.1/bin" >> $GITHUB_PATH
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -60,9 +66,9 @@ jobs:
             ${{ runner.temp }}/vcpkg
             ${{ runner.temp }}/vcpkg/installed
             ${{ runner.temp }}/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-v2-${{ hashFiles('pyproject.toml') }}
+          key: vcpkg-manylinux_2_28-${{ env.VCPKG_TARGET_TRIPLET }}-v3-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-v2-
+            vcpkg-manylinux_2_28-${{ env.VCPKG_TARGET_TRIPLET }}-v3-
 
       - name: Bootstrap vcpkg
         run: |
@@ -88,22 +94,11 @@ jobs:
           ./tools/download_ffmpeg.sh
           ls -l external/ffmpeg/lib | head -30
 
-      - name: Setup CUDA toolkit
-        if: matrix.variant == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.30
-        id: cuda-toolkit
-        with:
-          cuda: "13.1.0"
-          method: "network"
-          linux-local-args: '["--toolkit"]'
-          use-github-cache: true
-          use-local-cache: true
-
       - name: Build Linux wheel
         env:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
-          NELUX_ENABLE_CUDA: ${{ matrix.variant == 'cuda' && 'ON' || 'OFF' }}
+          NELUX_ENABLE_CUDA: "ON"
           NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
@@ -115,7 +110,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} \
             -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} \
             -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} \
-            -DNELUX_ENABLE_CUDA=${NELUX_ENABLE_CUDA} \
+            -DNELUX_ENABLE_CUDA=ON \
             -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
@@ -128,9 +123,7 @@ jobs:
           echo "=== dist/ ==="
           ls -la dist/
 
-      - name: Repair wheel with auditwheel (bundle sibling libs, exclude torch/ffmpeg)
-        env:
-          VARIANT: ${{ matrix.variant }}
+      - name: Repair wheel with auditwheel (bundle sibling libs, exclude torch/ffmpeg/cuda)
         run: |
           WHEEL=$(ls dist/*.whl | head -n1)
           echo "Repairing: ${WHEEL}"
@@ -142,28 +135,22 @@ jobs:
           export LD_LIBRARY_PATH="${VCPKG_LIB}:${FFMPEG_LIB}:${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
           # Libraries we exclude from bundling — users bring their own torch
-          # (already a runtime dep) and their own FFmpeg.
+          # (already a runtime dep), their own FFmpeg, and CUDA comes from PyTorch.
           EXCLUDES=(
             libtorch.so libtorch_cpu.so libtorch_python.so libtorch_cuda.so
             libc10.so libc10_cuda.so libshm.so
             libavcodec.so.* libavformat.so.* libavutil.so.*
             libavfilter.so.* libavdevice.so.*
             libswscale.so.*
+            libcudart.so.* libnvrtc.so.* libnvrtc-builtins.so.*
+            libcufft.so.* libcurand.so.* libcusolver.so.*
+            libcusparse.so.* libcublas.so.* libcublasLt.so.*
+            libcudnn.so.* libnvToolsExt.so.*
           )
-          if [ "${VARIANT}" = "cuda" ]; then
-            EXCLUDES+=(
-              libcudart.so.* libnvrtc.so.* libnvrtc-builtins.so.*
-              libcufft.so.* libcurand.so.* libcusolver.so.*
-              libcusparse.so.* libcublas.so.* libcublasLt.so.*
-              libcudnn.so.* libnvToolsExt.so.*
-            )
-          fi
           EXCLUDE_ARGS=()
           for l in "${EXCLUDES[@]}"; do EXCLUDE_ARGS+=(--exclude "$l"); done
 
           mkdir -p dist_repaired
-          # Use a lower manylinux policy tag so the resulting wheel works on
-          # the same glibc level torch currently ships against.
           auditwheel repair "${WHEEL}" \
             --plat manylinux_2_28_x86_64 \
             "${EXCLUDE_ARGS[@]}" \
@@ -184,7 +171,6 @@ jobs:
         run: |
           pip install dist/*.whl --force-reinstall
 
-          # FFmpeg .so runtime path + ffmpeg binary for smoke clip synthesis.
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/external/ffmpeg/lib:${LD_LIBRARY_PATH:-}"
           export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
@@ -194,5 +180,5 @@ jobs:
       - name: Upload Linux wheel
         uses: actions/upload-artifact@v4
         with:
-          name: linux-wheel-${{ matrix.variant }}-py${{ matrix.python-version }}
+          name: linux-wheel-${{ matrix.python }}
           path: dist/*.whl
