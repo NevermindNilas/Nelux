@@ -41,7 +41,8 @@ class AutoToRGBConverter : public ConverterBase
         : ConverterBase(), sws_ctx(nullptr), last_src_fmt(AV_PIX_FMT_NONE),
           last_dst_fmt(AV_PIX_FMT_NONE), last_src_colorspace(AVCOL_SPC_UNSPECIFIED),
           last_src_color_range(AVCOL_RANGE_UNSPECIFIED), last_width(0), last_height(0),
-                    force_8bit(false)
+          last_out_width(0), last_out_height(0),
+                    force_8bit(false), out_width(0), out_height(0)
     {
     }
 
@@ -52,6 +53,15 @@ class AutoToRGBConverter : public ConverterBase
     }
 
     void setForce8Bit(bool enabled) { force_8bit = enabled; }
+
+    // Set decoder-side output dimensions. Pass (0, 0) to disable (use source dims).
+    // When both are > 0, sws_scale will resize the frame to these dimensions and
+    // libyuv/RGB-passthrough fast paths are bypassed.
+    void setOutputSize(int width, int height)
+    {
+        out_width = (width > 0 && height > 0) ? width : 0;
+        out_height = (width > 0 && height > 0) ? height : 0;
+    }
 
     void convert(nelux::Frame& frame, void* buffer) override
     {
@@ -77,6 +87,12 @@ class AutoToRGBConverter : public ConverterBase
             throw std::runtime_error("AutoToRGBConverter: Invalid frame dimensions");
         }
 
+        // Decoder-side resize target. 0 means: output matches source dims.
+        const int dst_w = (out_width  > 0) ? out_width  : width;
+        const int dst_h = (out_height > 0) ? out_height : height;
+        const bool resize_active = (out_width > 0 && out_height > 0) &&
+                                   (out_width != width || out_height != height);
+
         // 1) Derive effective bit depth from the frame itself
         const int bit_depth = effective_bit_depth_from_frame(av_frame);
 
@@ -90,7 +106,8 @@ class AutoToRGBConverter : public ConverterBase
             src_color_range = AVCOL_RANGE_MPEG;
 
         // 1.8) Fast-path for RGB inputs (Passthrough or Swizzle) - "Piece of cake" optimization
-        if (bit_depth <= 8 && (src_fmt == AV_PIX_FMT_RGB24 || src_fmt == AV_PIX_FMT_BGR24))
+        // Skip when resizing: these paths write source-sized output.
+        if (!resize_active && bit_depth <= 8 && (src_fmt == AV_PIX_FMT_RGB24 || src_fmt == AV_PIX_FMT_BGR24))
         {
              // We can let swscale handle BGR24->RGB24 switch efficiently if configured with SWS_POINT (done below)
              // or handle identical format copy here
@@ -111,13 +128,14 @@ class AutoToRGBConverter : public ConverterBase
         // 2) Always prefer libyuv where it is applicable.
         // - For <=8-bit sources, try libyuv first.
         // - For >8-bit sources, only use libyuv when explicitly forcing 8-bit output.
-        if (bit_depth <= 8)
+        // Skip libyuv paths when resizing: they do not rescale.
+        if (!resize_active && bit_depth <= 8)
         {
             // Pass the DEDUCED colorspace (src_colorspace) which handles the "Unspecified -> BT.709" logic
             if (convertViaLibyuv(av_frame, buffer, width, height, src_colorspace))
                 return;
         }
-        else if (force_8bit)
+        else if (!resize_active && force_8bit)
         {
             if (convert10BitTo8BitLibyuv(av_frame, buffer, width, height, src_colorspace))
                 return;
@@ -136,29 +154,29 @@ class AutoToRGBConverter : public ConverterBase
         if (!sws_ctx || src_fmt != last_src_fmt || dst_fmt != last_dst_fmt ||
             src_colorspace != last_src_colorspace ||
             src_color_range != last_src_color_range || width != last_width ||
-            height != last_height)
+            height != last_height || dst_w != last_out_width || dst_h != last_out_height)
         {
             int flags = SWS_SPLINE | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_V_INT;
-            
+
             // Only use POINT (nearest neighbor) if dimensions match AND we are likely just shuffling channels (RGB/BGR/BGRA etc.)
             // Using POINT for YUV420P would result in nearest-neighbor chroma upsampling (blocky colors), which we want to avoid.
-            if (width == last_width && height == last_height)
+            if (!resize_active && width == last_width && height == last_height)
             {
-               if (src_fmt == AV_PIX_FMT_RGB24 || src_fmt == AV_PIX_FMT_BGR24 || 
+               if (src_fmt == AV_PIX_FMT_RGB24 || src_fmt == AV_PIX_FMT_BGR24 ||
                    src_fmt == AV_PIX_FMT_ARGB || src_fmt == AV_PIX_FMT_RGBA ||
-                   src_fmt == AV_PIX_FMT_ABGR || src_fmt == AV_PIX_FMT_BGRA) 
+                   src_fmt == AV_PIX_FMT_ABGR || src_fmt == AV_PIX_FMT_BGRA)
                {
                    flags = SWS_POINT;
                }
             }
-            
+
             sws_ctx = sws_getCachedContext(
                 sws_ctx,
                 width,
                 height,
                 src_fmt,
-                width,
-                height,
+                dst_w,
+                dst_h,
                 dst_fmt,
                 flags,
                 nullptr,
@@ -187,6 +205,8 @@ class AutoToRGBConverter : public ConverterBase
             last_src_color_range = src_color_range;
             last_width = width;
             last_height = height;
+            last_out_width = dst_w;
+            last_out_height = dst_h;
         }
 
         // 6) Do the conversion
@@ -197,11 +217,11 @@ class AutoToRGBConverter : public ConverterBase
 
         uint8_t* dstData[4] = {static_cast<uint8_t*>(buffer), nullptr, nullptr,
                                nullptr};
-        const int dstLineSize[4] = {width * channels * elem_size, 0, 0, 0};
+        const int dstLineSize[4] = {dst_w * channels * elem_size, 0, 0, 0};
 
         const int result =
             sws_scale(sws_ctx, srcData, srcLineSize, 0, height, dstData, dstLineSize);
-        if (result != height)
+        if (result != dst_h)
             throw std::runtime_error("sws_scale failed or incomplete");
     }
 
@@ -212,7 +232,9 @@ class AutoToRGBConverter : public ConverterBase
     AVColorSpace last_src_colorspace;
     AVColorRange last_src_color_range;
     int last_width, last_height;
+    int last_out_width, last_out_height;
     bool force_8bit;
+    int out_width, out_height;
 
     // Temporary buffers for 10-bit -> 8-bit downscaling
     std::vector<uint8_t> tmp_y, tmp_u, tmp_v;

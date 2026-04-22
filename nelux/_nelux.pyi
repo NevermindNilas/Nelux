@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Tuple, Union
 import os
 import torch
 import numpy as np
@@ -46,6 +46,7 @@ class VideoReader:
         backend: Literal["pytorch", "numpy"] = "pytorch",
         decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
         cuda_device_index: int = 0,
+        resize: Optional[Tuple[int, int]] = None,
     ) -> None:
         """
         Open a video file for reading.
@@ -61,6 +62,11 @@ class VideoReader:
                 - "cpu": Software decoding on CPU (default)
                 - "nvdec": NVIDIA hardware decoding via NVDEC. Frames remain on GPU as CUDA tensors.
             cuda_device_index (int, optional): CUDA device index for NVDEC. Defaults to 0.
+            resize (tuple[int, int] | None, optional): Decoder-side resize target as (width, height).
+                CPU path uses libswscale; NVDEC path uses the cuvid ``resize=WxH`` option for
+                GPU-side scaling. All reported properties and frame shapes reflect the resize
+                target. ``None`` (default) disables resize. ``decode_batch`` is not supported
+                while resize is active.
         """
         ...
 

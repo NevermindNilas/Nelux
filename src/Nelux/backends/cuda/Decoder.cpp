@@ -213,8 +213,10 @@ static bool isDeviceAccessiblePointer(const void* ptr)
 #endif
 }
 
-Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex)
-    : nelux::Decoder(numThreads), cudaDeviceIndex_(cudaDeviceIndex),
+Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex,
+                 int resizeWidth, int resizeHeight)
+    : nelux::Decoder(numThreads, resizeWidth, resizeHeight),
+      cudaDeviceIndex_(cudaDeviceIndex),
       cudaStream_(nullptr), decodeCompleteEvent_(nullptr),
       consumerSyncEvent_(nullptr), hwDeviceCtx_(nullptr),
       hwPixFmt_(AV_PIX_FMT_CUDA), nv12Buffer_(nullptr), nv12BufferSize_(0),
@@ -222,7 +224,8 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
-    NELUX_DEBUG("CUDA DECODER: Constructing with device index {}", cudaDeviceIndex);
+    NELUX_DEBUG("CUDA DECODER: Constructing with device index {}, resize={}x{}",
+                cudaDeviceIndex, resizeWidth, resizeHeight);
     NELUX_INFO("CUDA DECODER BUILD: 2026-02-06T22:49:00 RGB24-BYTE-BY-BYTE-FIX-ACTIVE");
 
     // Suppress noisy FFmpeg/NVDEC warnings (e.g., "Invalid pkt_timebase")
@@ -267,6 +270,11 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
     // This will be configured with appropriate dtype (FP16/FP32) based on bit depth
     // by the VideoReader when it sets up the tensor
     setMLOutputMode(true, nullptr, nullptr);
+}
+
+Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex)
+    : Decoder(filePath, numThreads, cudaDeviceIndex, 0, 0)
+{
 }
 
 Decoder::~Decoder()
@@ -504,8 +512,19 @@ void Decoder::initCodecContextWithHwAccel()
     codecCtx->thread_type = 0;
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
 
+    // Build codec options. cuvid accepts "resize=WxH" for GPU-side scaling.
+    AVDictionary* opts = nullptr;
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    {
+        char resize_str[64];
+        snprintf(resize_str, sizeof(resize_str), "%dx%d", resizeWidth_, resizeHeight_);
+        av_dict_set(&opts, "resize", resize_str, 0);
+        NELUX_INFO("CUDA DECODER: Requesting cuvid GPU-side resize to {}", resize_str);
+    }
+
     // Open the codec
-    int ret = avcodec_open2(codecCtx.get(), codec, nullptr);
+    int ret = avcodec_open2(codecCtx.get(), codec, &opts);
+    av_dict_free(&opts);
     if (ret < 0)
     {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];

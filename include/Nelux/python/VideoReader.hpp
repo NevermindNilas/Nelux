@@ -38,7 +38,8 @@ class VideoReader
                                                   2),
                 bool force_8bit = false, Backend backend = Backend::PyTorch,
                 const std::string& decode_accelerator = "cpu",
-                int cuda_device_index = 0);
+                int cuda_device_index = 0, int resizeWidth = 0,
+                int resizeHeight = 0);
 
     /**
      * @brief Destructor for VideoReader.
@@ -442,6 +443,8 @@ class VideoReader
     Backend backend = Backend::PyTorch; // Output backend selection
     nelux::DecodeAccelerator decodeAccelerator = nelux::DecodeAccelerator::CPU;
     int cudaDeviceIndex = 0;
+    int resizeWidth_ = 0;
+    int resizeHeight_ = 0;
     
     // ML output mode
     bool mlOutputMode_ = false;

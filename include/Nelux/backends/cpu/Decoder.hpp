@@ -14,6 +14,13 @@ class Decoder : public nelux::Decoder
         initialize(filePath);
     }
 
+    Decoder(const std::string& filePath, int numThreads, int resizeWidth,
+            int resizeHeight)
+        : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
+    {
+        initialize(filePath);
+    }
+
     // No need to override methods unless specific behavior is needed
 };
 } // namespace nelux::backends::cpu

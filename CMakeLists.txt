@@ -26,7 +26,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   endif()
 endif()
 
-project(Nelux VERSION 0.9.1 LANGUAGES CXX)
+project(Nelux VERSION 0.9.2 LANGUAGES CXX)
 
 # ─── Compiler options ─── 
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.

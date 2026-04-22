@@ -23,7 +23,7 @@ namespace py = pybind11;
 
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
-                         int cuda_device_index)
+                         int cuda_device_index, int resizeWidth, int resizeHeight)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -31,15 +31,21 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
       filePath(filePath), numThreads(numThreads), force_8bit(force_8bit),
       backend(backend),
       decodeAccelerator(nelux::stringToDecodeAccelerator(decode_accelerator)),
-      cudaDeviceIndex(cuda_device_index)
+      cudaDeviceIndex(cuda_device_index),
+      resizeWidth_((resizeWidth > 0 && resizeHeight > 0) ? resizeWidth : 0),
+      resizeHeight_((resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0)
 {
     NELUX_INFO(
-        "VideoReader constructor called with filePath: {}, decode_accelerator: {}",
-        filePath, decode_accelerator);
+        "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
+        filePath, decode_accelerator, resizeWidth_, resizeHeight_);
 
     if (numThreads > std::thread::hardware_concurrency())
         throw std::invalid_argument(
             "Number of threads cannot exceed hardware concurrency");
+
+    if ((resizeWidth > 0) != (resizeHeight > 0))
+        throw std::invalid_argument(
+            "resize must be a (width, height) pair with both > 0, or (0, 0) to disable");
 
     try
     {
@@ -55,8 +61,9 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             try
             {
                 // Try NVDEC first
-                decoder = nelux::Factory::createDecoder(torchDevice, filePath, numThreads,
-                                                        decodeAccelerator, cuda_device_index);
+                decoder = nelux::Factory::createDecoder(
+                    torchDevice, filePath, numThreads, decodeAccelerator,
+                    cuda_device_index, resizeWidth_, resizeHeight_);
                 decoder->setForce8Bit(force_8bit);
                 NELUX_INFO("Main decoder created successfully with accelerator: {}",
                            decode_accelerator);
@@ -66,13 +73,14 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
                 // NVDEC failed - fall back to CPU decoder
                 NELUX_WARN("NVDEC decoder failed: {}. Falling back to CPU decoder.",
                            nvdec_ex.what());
-                
+
                 // Update internal state to reflect CPU fallback
                 decodeAccelerator = nelux::DecodeAccelerator::CPU;
                 torchDevice = torch::Device(torch::kCPU);
-                
-                decoder = nelux::Factory::createDecoder(torchDevice, filePath, numThreads,
-                                                        nelux::DecodeAccelerator::CPU, 0);
+
+                decoder = nelux::Factory::createDecoder(
+                    torchDevice, filePath, numThreads, nelux::DecodeAccelerator::CPU, 0,
+                    resizeWidth_, resizeHeight_);
                 decoder->setForce8Bit(force_8bit);
                 NELUX_INFO("Fallback to CPU decoder successful after NVDEC failure");
             }
@@ -80,8 +88,9 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         else
         {
             // Direct CPU decoder path
-            decoder = nelux::Factory::createDecoder(torchDevice, filePath, numThreads,
-                                                    decodeAccelerator, cuda_device_index);
+            decoder = nelux::Factory::createDecoder(
+                torchDevice, filePath, numThreads, decodeAccelerator, cuda_device_index,
+                resizeWidth_, resizeHeight_);
             decoder->setForce8Bit(force_8bit);
             NELUX_INFO("Main decoder created successfully with accelerator: {}",
                        decode_accelerator);
@@ -253,8 +262,9 @@ torch::Tensor VideoReader::decodeFrame()
                        ex.what());
 
             decodeAccelerator = nelux::DecodeAccelerator::CPU;
-            decoder = nelux::Factory::createDecoder(torch::Device(torch::kCPU), filePath,
-                                                    numThreads, decodeAccelerator, 0);
+            decoder = nelux::Factory::createDecoder(
+                torch::Device(torch::kCPU), filePath, numThreads, decodeAccelerator, 0,
+                resizeWidth_, resizeHeight_);
             decoder->setForce8Bit(force_8bit);
 
             // Recreate output tensor on CPU with HWC format
@@ -617,7 +627,8 @@ void VideoReader::ensureRandDecoder()
             {
                 // Try NVDEC first for random decoder too
                 rand_decoder = nelux::Factory::createDecoder(
-                    torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex);
+                    torchDevice, filePath, numThreads, decodeAccelerator,
+                    cudaDeviceIndex, resizeWidth_, resizeHeight_);
                 rand_decoder->setForce8Bit(force_8bit);
             }
             catch (const std::exception& nvdec_ex)
@@ -627,14 +638,15 @@ void VideoReader::ensureRandDecoder()
                            nvdec_ex.what());
                 rand_decoder = nelux::Factory::createDecoder(
                     torch::Device(torch::kCPU), filePath, numThreads,
-                    nelux::DecodeAccelerator::CPU, 0);
+                    nelux::DecodeAccelerator::CPU, 0, resizeWidth_, resizeHeight_);
                 rand_decoder->setForce8Bit(force_8bit);
             }
         }
         else
         {
             rand_decoder = nelux::Factory::createDecoder(
-                torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex);
+                torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
+                resizeWidth_, resizeHeight_);
             rand_decoder->setForce8Bit(force_8bit);
         }
     }
@@ -1050,6 +1062,14 @@ int64_t VideoReader::getFrameCount() const
 torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("VideoReader::decodeBatch called with {} indices", indices.size());
+
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    {
+        throw std::runtime_error(
+            "decode_batch is not supported when resize is configured on the "
+            "VideoReader. Create a reader without the resize argument for batch "
+            "decoding, or call frame_at() in a loop.");
+    }
 
     // Use the main decoder for batch operations
     torch::Tensor batch;

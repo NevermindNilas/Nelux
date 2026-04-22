@@ -42,7 +42,18 @@ public:
      * @param cudaDeviceIndex CUDA device index (default: 0)
      */
     Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex = 0);
-    
+
+    /**
+     * @brief Construct a CUDA decoder with decoder-side resize target.
+     *
+     * When resizeWidth and resizeHeight are both > 0, the cuvid decoder is
+     * opened with the `resize=WxH` option so frames come out of NVDEC already
+     * scaled on the GPU. Output tensor dims + properties.width/height will
+     * reflect the resize target.
+     */
+    Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex,
+            int resizeWidth, int resizeHeight);
+
     ~Decoder() override;
     
     // Disable copy

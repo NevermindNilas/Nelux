@@ -16,6 +16,16 @@ Decoder::Decoder(int numThreads)
     NELUX_DEBUG("BASE DECODER: Decoder constructed");
 }
 
+Decoder::Decoder(int numThreads, int resizeWidth, int resizeHeight)
+    : converter(nullptr), formatCtx(nullptr), codecCtx(nullptr), pkt(nullptr),
+      videoStreamIndex(-1), numThreads(numThreads)
+{
+    resizeWidth_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeWidth : 0;
+    resizeHeight_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0;
+    NELUX_DEBUG("BASE DECODER: Decoder constructed with resize={}x{}",
+                resizeWidth_, resizeHeight_);
+}
+
 Decoder::~Decoder()
 {
     NELUX_DEBUG("BASE DECODER: Decoder destructor called");
@@ -29,8 +39,11 @@ Decoder::Decoder(Decoder&& other) noexcept
       converter(std::move(other.converter))
 {
     NELUX_DEBUG("BASE DECODER: Decoder move constructor called");
+    resizeWidth_ = other.resizeWidth_;
+    resizeHeight_ = other.resizeHeight_;
     other.videoStreamIndex = -1;
-    // Reset other members if necessary
+    other.resizeWidth_ = 0;
+    other.resizeHeight_ = 0;
 }
 
 Decoder& Decoder::operator=(Decoder&& other) noexcept
@@ -47,9 +60,12 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         properties = std::move(other.properties);
         frame = std::move(other.frame);
         converter = std::move(other.converter);
+        resizeWidth_ = other.resizeWidth_;
+        resizeHeight_ = other.resizeHeight_;
 
         other.videoStreamIndex = -1;
-        // Reset other members if necessary
+        other.resizeWidth_ = 0;
+        other.resizeHeight_ = 0;
     }
     return *this;
 }
@@ -85,6 +101,15 @@ void Decoder::setProperties()
     // Set pixel format and bit depth
     properties.pixelFormat = codecCtx->pix_fmt;
     properties.bitDepth = getBitDepth();
+
+    // If decoder-side resize is active, report the resized output dims as the
+    // canonical width/height. Downstream buffer sizing, converter setup, and
+    // tensor allocation all key off properties.width/height.
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    {
+        properties.width = resizeWidth_;
+        properties.height = resizeHeight_;
+    }
 
     // Detect audio stream presence only (no audio decoding)
     properties.hasAudio = false;
@@ -144,6 +169,10 @@ void Decoder::initialize(const std::string& filePath)
     if (autoConverter)
     {
         autoConverter->setForce8Bit(force_8bit);
+        if (resizeWidth_ > 0 && resizeHeight_ > 0)
+        {
+            autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
+        }
     }
 
     // Enable pre-conversion in decode thread for CPU decoder
@@ -798,6 +827,12 @@ void Decoder::reconfigure(const std::string& filePath)
     {
         // Let the converter reinitialize on next frame
         converter->synchronize();
+        auto* autoConverter =
+            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
+        if (autoConverter && resizeWidth_ > 0 && resizeHeight_ > 0)
+        {
+            autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
+        }
     }
     else
     {
@@ -807,6 +842,10 @@ void Decoder::reconfigure(const std::string& filePath)
         if (autoConverter)
         {
             autoConverter->setForce8Bit(force_8bit);
+            if (resizeWidth_ > 0 && resizeHeight_ > 0)
+            {
+                autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
+            }
         }
     }
 

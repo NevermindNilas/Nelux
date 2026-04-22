@@ -38,6 +38,7 @@ class Decoder
 
     Decoder() = default;
     Decoder(int numThreads);
+    Decoder(int numThreads, int resizeWidth, int resizeHeight);
     bool seekToNearestKeyframe(double timestamp);
     virtual ~Decoder();
 
@@ -112,6 +113,21 @@ class Decoder
 
     virtual std::vector<std::string> listSupportedDecoders() const;
 
+    /**
+     * @brief Get the configured resize target width (0 if disabled).
+     */
+    int getResizeWidth() const { return resizeWidth_; }
+
+    /**
+     * @brief Get the configured resize target height (0 if disabled).
+     */
+    int getResizeHeight() const { return resizeHeight_; }
+
+    /**
+     * @brief True if a decoder-side resize is active.
+     */
+    bool isResizeActive() const { return resizeWidth_ > 0 && resizeHeight_ > 0; }
+
     AVCodecContext* getCtx();
 
     // Batch decoding support
@@ -179,5 +195,9 @@ class Decoder
 
     // Cached file path for reconfiguration
     std::string cachedFilePath_;
+
+    // Decoder-side resize target. 0 means disabled (output = source dims).
+    int resizeWidth_ = 0;
+    int resizeHeight_ = 0;
 };
 } // namespace nelux

@@ -66,22 +66,26 @@ class Factory
     static std::shared_ptr<Decoder>
     createDecoder(torch::Device device, const std::string& filename, int numThreads,
                   DecodeAccelerator accelerator = DecodeAccelerator::CPU,
-                  int cudaDeviceIndex = 0)
+                  int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0)
     {
         switch (accelerator)
         {
             case DecodeAccelerator::CPU:
+                if (resizeWidth > 0 && resizeHeight > 0)
+                    return std::make_shared<nelux::backends::cpu::Decoder>(
+                        filename, numThreads, resizeWidth, resizeHeight);
                 return std::make_shared<nelux::backends::cpu::Decoder>(filename, numThreads);
-            
+
             case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA
-                return std::make_shared<nelux::backends::cuda::Decoder>(filename, numThreads, cudaDeviceIndex);
+                return std::make_shared<nelux::backends::cuda::Decoder>(
+                    filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
 #else
                 throw std::runtime_error(
                     "NVDEC acceleration requested but Nelux was not built with CUDA support. "
                     "Rebuild with -DNELUX_ENABLE_CUDA=ON to enable NVDEC.");
 #endif
-            
+
             default:
                 throw std::invalid_argument("Unknown decode accelerator");
         }

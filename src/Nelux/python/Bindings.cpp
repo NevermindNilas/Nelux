@@ -1,5 +1,7 @@
 ﻿#include "VideoEncoder.hpp"
 #include "VideoReader.hpp"
+#include <optional>
+#include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -28,7 +30,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.9.1";
+    m.attr("__version__") = "0.9.2";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -57,18 +59,32 @@ PYBIND11_MODULE(_nelux, m)
         .def(py::init(
                  [](const std::string& input_path, int num_threads, bool force_8bit,
                     const std::string& backend, const std::string& decode_accelerator,
-                    int cuda_device_index)
+                    int cuda_device_index,
+                    std::optional<std::pair<int, int>> resize)
                  {
+                     int rw = 0, rh = 0;
+                     if (resize.has_value())
+                     {
+                         rw = resize->first;
+                         rh = resize->second;
+                         if (rw <= 0 || rh <= 0)
+                         {
+                             throw std::invalid_argument(
+                                 "resize must be a (width, height) tuple with both "
+                                 "values > 0, or None to disable");
+                         }
+                     }
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
-                         cuda_device_index);
+                         cuda_device_index, rw, rh);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") =
                  static_cast<int>(std::thread::hardware_concurrency() / 2),
              py::arg("force_8bit") = false, py::arg("backend") = "pytorch",
              py::arg("decode_accelerator") = "cpu", py::arg("cuda_device_index") = 0,
+             py::arg("resize") = py::none(),
              R"doc(Open a video file for reading.
 
 Args:
@@ -82,6 +98,13 @@ Args:
         - "cpu": Software decoding on CPU (default)
         - "nvdec": NVIDIA hardware decoding via NVDEC. Frames remain on GPU as CUDA tensors.
     cuda_device_index (int, optional): CUDA device index for NVDEC. Defaults to 0.
+    resize (tuple[int, int], optional): Decoder-side resize target as (width, height).
+        When set, frames are scaled during decode:
+        - CPU path: libswscale performs the resize in the conversion step.
+        - NVDEC path: the cuvid decoder's "resize=WxH" option scales on the GPU.
+        properties.width/height, width/height, and returned frame shapes all reflect
+        the resized dimensions. Pass None (default) to disable.
+        Note: decode_batch() is not supported while resize is active.
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

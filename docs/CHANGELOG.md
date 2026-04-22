@@ -1,4 +1,11 @@
 
+### **Version 0.9.2 (2026-04-22)**
+
+#### **Decoder-Side Resize**
+- **Added:** `resize=(width, height)` constructor argument on `VideoReader`. Scaling is performed inside the decoder (libswscale on the CPU path, cuvid's `resize=WxH` option on the NVDEC path) so frames are emitted at the target resolution with no post-decode `F.interpolate` or `cv2.resize` needed. `properties.width`/`height` and returned frame shapes reflect the resized dimensions; identity resizes (`target == source`) are byte-exact. `decode_batch` is rejected while resize is active — use `frame_at` in a loop for random access at the resized resolution.
+- **Plumbed through** `nelux::Decoder` (new `(numThreads, resizeWidth, resizeHeight)` ctor, `properties.width/height` override in `setProperties`), `AutoToRGBConverter` (`setOutputSize`, `sws_getCachedContext` destination dims + `dstLineSize`, libyuv/RGB24 fast-paths bypassed when resizing), the CPU and NVDEC decoder subclasses, `Factory::createDecoder`, `VideoReader`, and the pybind11 `VideoReader.__init__` signature (`resize: tuple[int, int] | None = None`).
+- **Quality check:** `tests/check_resize_quality.py` measures mean/max abs error, PSNR, and per-channel bias against a `cv2.INTER_AREA`/`INTER_CUBIC` reference across 4 clips (h264 8-bit, ProRes422 10-bit, yuv420p10le, yuv444p) × 2 decoders × 5 targets. Identity resizes come back bit-exact on every path. PSNR 32–50 dB otherwise with per-channel bias < 3 on the 0–255 scale — residual is scaler-choice (sws SPLINE / cuvid internal vs cv2 INTER_AREA / INTER_CUBIC), not color-space drift.
+
 ### **Version 0.9.1 (2026-04-22)**
 
 #### **Encoder Log Noise**
