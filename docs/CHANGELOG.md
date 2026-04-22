@@ -1,4 +1,9 @@
 
+### **Version 0.9.1 (2026-04-22)**
+
+#### **Encoder Log Noise**
+- **Fixed:** Suppressed startup banners and per-frame info lines from every software encoder. `libx264` (routed through `av_log`) is silenced by setting the FFmpeg log level to `ERROR` once in `Encoder::initialize()`. `libx265` — which bypasses `av_log` with its own logger — is silenced via `x265-params=log-level=none`. `libsvtav1` — which writes its banner/config/end-of-stream stats directly to stderr and does not accept any `log-level` key in v3.1 — is silenced by redirecting file descriptor 2 to the null device across `avcodec_open2` and codec-context destruction (RAII `ScopedStderrSilence`). NVENC paths are unaffected.
+
 ### **Version 0.9.0 (2026-04-18)**
 
 #### **Software Video Encoders**

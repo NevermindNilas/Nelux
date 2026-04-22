@@ -1,10 +1,77 @@
 ﻿#include "Encoder.hpp"
 
 #include <cmath>
+#include <cstdio>
+#include <mutex>
+#include <optional>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 extern "C" {
+#include <libavutil/log.h>
 #include <libavutil/pixdesc.h>
 }
+
+namespace
+{
+
+// SVT-AV1 prints a startup banner and end-of-stream stats directly to stderr
+// through its internal SVT_LOG, bypassing FFmpeg's av_log and the -svtav1-params
+// log-level key (which v3.1 does not accept). Redirect fd 2 around the calls
+// that trigger those prints.
+class ScopedStderrSilence
+{
+public:
+    ScopedStderrSilence()
+    {
+        std::fflush(stderr);
+#ifdef _WIN32
+        saved_ = _dup(_fileno(stderr));
+        int devnull = _open("NUL", _O_WRONLY);
+        if (devnull >= 0)
+        {
+            _dup2(devnull, _fileno(stderr));
+            _close(devnull);
+        }
+#else
+        saved_ = dup(fileno(stderr));
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, fileno(stderr));
+            close(devnull);
+        }
+#endif
+    }
+
+    ~ScopedStderrSilence()
+    {
+        std::fflush(stderr);
+        if (saved_ < 0)
+            return;
+#ifdef _WIN32
+        _dup2(saved_, _fileno(stderr));
+        _close(saved_);
+#else
+        dup2(saved_, fileno(stderr));
+        close(saved_);
+#endif
+    }
+
+    ScopedStderrSilence(const ScopedStderrSilence&) = delete;
+    ScopedStderrSilence& operator=(const ScopedStderrSilence&) = delete;
+
+private:
+    int saved_ = -1;
+};
+
+} // namespace
 
 namespace fs = std::filesystem;
 
@@ -25,6 +92,12 @@ Encoder::~Encoder()
 
 void Encoder::initialize()
 {
+    // Suppress libx264/libx265/libaom/libsvtav1 startup banners and per-frame
+    // info lines — keep errors only. av_log_set_level is process-wide; a
+    // previously installed callback (e.g. CUDA decoder) still overrides this.
+    static std::once_flag logLevelOnce;
+    std::call_once(logLevelOnce, [] { av_log_set_level(AV_LOG_ERROR); });
+
     AVFormatContext* fmt_ctx = nullptr;
 
     // Infer container format from filename extension
@@ -399,6 +472,11 @@ void Encoder::initVideoStream()
             {
                 av_dict_set_int(&opts, "crf", properties.cq, 0);
             }
+            if (isX265)
+            {
+                // libx265 logs via its own API, bypassing av_log. Silence it.
+                av_dict_set(&opts, "x265-params", "log-level=none", 0);
+            }
         }
         else if (isSvtAv1)
         {
@@ -416,6 +494,9 @@ void Encoder::initVideoStream()
                 // and CRF are non-zero — clear the bitrate to enter CRF mode.
                 videoCodecCtx->bit_rate = 0;
             }
+            // SVT-AV1 prints banner/config via its own logger. Drop to
+            // ERROR (level 1) via svtav1-params to silence startup spam.
+            av_dict_set(&opts, "svtav1-params", "log-level=1", 0);
         }
         else if (isAomAv1)
         {
@@ -433,7 +514,15 @@ void Encoder::initVideoStream()
         }
     }
 
-    int ret = avcodec_open2(videoCodecCtx.get(), codec, &opts);
+    int ret;
+    {
+        // SVT-AV1 prints its banner/config inside avcodec_open2 via its own
+        // logger — redirect stderr to /dev/null for the duration of the call.
+        std::optional<ScopedStderrSilence> silence;
+        if (properties.codec == "libsvtav1")
+            silence.emplace();
+        ret = avcodec_open2(videoCodecCtx.get(), codec, &opts);
+    }
     av_dict_free(&opts);
     
     if (ret < 0)
@@ -573,7 +662,13 @@ void Encoder::close()
         hwDeviceCtx = nullptr;
     }
 
-    videoCodecCtx.reset();
+    {
+        // SVT-AV1 prints end-of-stream stats during codec context destruction.
+        std::optional<ScopedStderrSilence> silence;
+        if (properties.codec == "libsvtav1")
+            silence.emplace();
+        videoCodecCtx.reset();
+    }
     formatCtx.reset();
 }
 
