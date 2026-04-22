@@ -533,7 +533,7 @@ jobs:
   release:
     needs: [build-windows, build-linux, build-macos]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -583,8 +583,14 @@ jobs:
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git tag v${{ env.VERSION }}
-          git push origin v${{ env.VERSION }}
+          # On tag-triggered runs the tag already exists; only create+push
+          # when the run was dispatched manually from a branch.
+          if git rev-parse -q --verify "refs/tags/v${{ env.VERSION }}" >/dev/null; then
+            echo "Tag v${{ env.VERSION }} already exists, skipping create."
+          else
+            git tag v${{ env.VERSION }}
+            git push origin v${{ env.VERSION }}
+          fi
       - name: Flatten wheel artifacts to top-level dist/
         run: |
           find dist -name '*.whl' -exec mv {} dist/ \;
@@ -600,7 +606,7 @@ jobs:
   pypi-publish:
     needs: release
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     environment:
       name: pypi
       url: https://pypi.org/p/nelux
