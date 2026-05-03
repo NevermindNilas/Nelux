@@ -23,7 +23,8 @@ namespace py = pybind11;
 
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
-                         int cuda_device_index, int resizeWidth, int resizeHeight)
+                         int cuda_device_index, int resizeWidth, int resizeHeight,
+                         bool prefetch)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -33,7 +34,8 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
       decodeAccelerator(nelux::stringToDecodeAccelerator(decode_accelerator)),
       cudaDeviceIndex(cuda_device_index),
       resizeWidth_((resizeWidth > 0 && resizeHeight > 0) ? resizeWidth : 0),
-      resizeHeight_((resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0)
+      resizeHeight_((resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0),
+      prefetch(prefetch)
 {
     NELUX_INFO(
         "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
@@ -87,10 +89,13 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         }
         else
         {
-            // Direct CPU decoder path
+            // Direct CPU decoder path. Sync mode is opt-in; bypasses the
+            // producer thread / queue for raw single-stream throughput.
+            const bool syncMode =
+                !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
             decoder = nelux::Factory::createDecoder(
                 torchDevice, filePath, numThreads, decodeAccelerator, cuda_device_index,
-                resizeWidth_, resizeHeight_);
+                resizeWidth_, resizeHeight_, syncMode);
             decoder->setForce8Bit(force_8bit);
             NELUX_INFO("Main decoder created successfully with accelerator: {}",
                        decode_accelerator);
@@ -245,12 +250,22 @@ torch::Tensor VideoReader::decodeFrame()
 
     double frame_timestamp = 0.0;
     bool success = false;
-    
+    torch::Tensor outTensor;  // populated by zero-copy CPU path
+
     try
     {
-        // Simple HWC decode - no conversions, no BCHW, no floating point
-        // Output is always HWC with native bit depth (uint8/int16)
-        success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        {
+            outTensor = prefetch
+                            ? decoder->decodeNextFrameTensor(&frame_timestamp)
+                            : decoder->decodeNextFrameTensorSync(&frame_timestamp);
+            success = outTensor.defined();
+        }
+        else
+        {
+            // NVDEC / hardware path: in-place write into shared CUDA tensor.
+            success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+        }
     }
     catch (const std::exception& ex)
     {
@@ -294,7 +309,9 @@ torch::Tensor VideoReader::decodeFrame()
 
     NELUX_TRACE("Frame decoded successfully index={}, timestamp={}", currentIndex - 1,
                 current_timestamp);
-    return tensor;
+    // CPU path returns a per-frame tensor (zero-copy from decoder pool).
+    // GPU path still returns the shared `tensor` member.
+    return outTensor.defined() ? outTensor : tensor;
 }
 
 py::object VideoReader::readFrame()
@@ -879,11 +896,20 @@ VideoReader& VideoReader::iter()
         NELUX_INFO("No range set; starting from the beginning");
         rangeFrameLimit_ = -1;
         rangeFramesEmitted_ = 0;
-        bool success = seek(0.0);
-        if (!success)
+        // Sync-mode CPU path uses a frame-threaded codec context; calling
+        // avcodec_flush_buffers (inside seek) on such a context is unsafe and
+        // trips an internal assertion. Since iter() at this branch is only
+        // hit when no range is set and we have not decoded anything yet,
+        // skipping the seek-to-zero is correct.
+        if (!(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch))
         {
-            NELUX_ERROR("Failed to seek to the beginning of the video");
-            throw std::runtime_error("Failed to seek to the beginning of the video.");
+            bool success = seek(0.0);
+            if (!success)
+            {
+                NELUX_ERROR("Failed to seek to the beginning of the video");
+                throw std::runtime_error(
+                    "Failed to seek to the beginning of the video.");
+            }
         }
         current_timestamp = 0.0;
     }
@@ -1014,23 +1040,9 @@ torch::ScalarType VideoReader::findTypeFromBitDepth()
 
 torch::ScalarType VideoReader::findMLTypeFromBitDepth()
 {
-    // For ML inference, we use normalized floating point:
-    // - FP16 for 8-bit videos: sufficient precision (0-255 range), 2x memory savings
-    // - FP32 for 10-bit+ videos: needed for higher precision (0-1023+ range)
-    
-    int bit_depth = decoder->getBitDepth();
-    NELUX_INFO("Bit depth for ML output: {}", bit_depth);
-    
-    if (force_8bit || bit_depth <= 8)
-    {
-        NELUX_DEBUG("Using FP32 for 8-bit video (FP16 path disabled due to artifacts)");
-        return torch::kFloat32;
-    }
-    else
-    {
-        NELUX_DEBUG("Using FP32 for {}-bit video (higher precision needed)", bit_depth);
-        return torch::kFloat32;
-    }
+    // FP16 path disabled due to artifacts; ML output is always FP32.
+    NELUX_DEBUG("Using FP32 for ML output (bit_depth={})", decoder->getBitDepth());
+    return torch::kFloat32;
 }
 
 std::shared_ptr<nelux::VideoEncoder>

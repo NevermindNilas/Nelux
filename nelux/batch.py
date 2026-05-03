@@ -1,14 +1,8 @@
 """Batch frame reading support for VideoReader."""
 
 import numpy as np
-from typing import Union, List, Iterable
-
-
-# Lazy import torch - only when actually needed
-def _get_torch():
-    import torch
-
-    return torch
+import torch
+from typing import Union, List
 
 
 class BatchMixin:
@@ -48,7 +42,6 @@ class BatchMixin:
             return list(indices)
 
         # Handle torch tensors
-        torch = _get_torch()
         if isinstance(indices, torch.Tensor):
             return indices.cpu().tolist()
 
@@ -93,7 +86,6 @@ class BatchMixin:
 
         if not indices_list:
             # Return empty tensor with correct shape
-            torch = _get_torch()
             return torch.empty(0, self.height, self.width, 3, dtype=torch.uint8)
 
         # Normalize negative indices
@@ -161,7 +153,6 @@ class BatchMixin:
             return super().__getitem__(key)
 
         # Slice or list - use batch decoding
-        torch = _get_torch()
         if isinstance(key, (slice, list, tuple, range, torch.Tensor, np.ndarray)):
             return self.get_batch(key)
 

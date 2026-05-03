@@ -39,7 +39,7 @@ class VideoReader
                 bool force_8bit = false, Backend backend = Backend::PyTorch,
                 const std::string& decode_accelerator = "cpu",
                 int cuda_device_index = 0, int resizeWidth = 0,
-                int resizeHeight = 0);
+                int resizeHeight = 0, bool prefetch = true);
 
     /**
      * @brief Destructor for VideoReader.
@@ -364,15 +364,8 @@ class VideoReader
     void ensureRandDecoder();
     bool seekToFrame(int frame_number);
     torch::ScalarType findTypeFromBitDepth();
-    
-    /**
-     * @brief Determine ML-optimized dtype based on bit depth
-     * 
-     * - FP16 for 8-bit videos (sufficient precision, 2x memory savings)
-     * - FP32 for 10-bit+ videos (needed for higher precision)
-     * 
-     * @return torch::kFloat16 for 8-bit, torch::kFloat32 for 10-bit+
-     */
+
+    // ML output dtype. Currently always FP32 (FP16 path disabled due to artifacts).
     torch::ScalarType findMLTypeFromBitDepth();
     
     double frameDuration() const
@@ -445,7 +438,8 @@ class VideoReader
     int cudaDeviceIndex = 0;
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;
-    
+    bool prefetch = true;
+
     // ML output mode
     bool mlOutputMode_ = false;
     bool mlUseFP16_ = false;

@@ -29,10 +29,15 @@ namespace cpu
 class RGBToAutoConverter : public ConverterBase
 {
   public:
-    RGBToAutoConverter(int dstWidth, int dstHeight, AVPixelFormat dstPixFmt)
-        : ConverterBase(), width(dstWidth), height(dstHeight), dst_fmt(dstPixFmt)
+    RGBToAutoConverter(int dstWidth, int dstHeight, AVPixelFormat dstPixFmt,
+                       AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED,
+                       AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED)
+        : ConverterBase(), width(dstWidth), height(dstHeight), dst_fmt(dstPixFmt),
+          dst_colorspace(colorspace), dst_color_range(colorRange)
     {
-        NELUX_DEBUG("Initializing RGBToAutoConverter ({}x{})", width, height);
+        NELUX_DEBUG("Initializing RGBToAutoConverter ({}x{}, cs={}, range={})", width,
+                    height, static_cast<int>(colorspace),
+                    static_cast<int>(colorRange));
     }
 
     ~RGBToAutoConverter() override
@@ -66,20 +71,54 @@ class RGBToAutoConverter : public ConverterBase
 
             swsContext =
                 sws_getContext(width, height, AV_PIX_FMT_RGB24, width, height, dst_fmt,
-                               SWS_LANCZOS | SWS_ACCURATE_RND, nullptr, nullptr,
+                               SWS_BILINEAR | SWS_ACCURATE_RND, nullptr, nullptr,
                                nullptr);
 
             if (!swsContext)
                 throw std::runtime_error(
                     "Failed to initialize swsContext for RGBToAutoConverter");
 
-            int srcRange = 1; // full (0-255)
-            int dstRange = 0; // limited (16-235)
-            const int* srcMatrix = sws_getCoefficients(SWS_CS_DEFAULT);
-            const int* dstMatrix = sws_getCoefficients(SWS_CS_DEFAULT);
+            // Derive destination range. Explicit override > YUVJ pixfmt > limited default.
+            int dstRange;
+            if (dst_color_range == AVCOL_RANGE_JPEG)
+                dstRange = 1;
+            else if (dst_color_range == AVCOL_RANGE_MPEG)
+                dstRange = 0;
+            else
+            {
+                dstRange = (dst_fmt == AV_PIX_FMT_YUVJ420P ||
+                            dst_fmt == AV_PIX_FMT_YUVJ422P ||
+                            dst_fmt == AV_PIX_FMT_YUVJ444P ||
+                            dst_fmt == AV_PIX_FMT_YUVJ440P ||
+                            dst_fmt == AV_PIX_FMT_YUVJ411P)
+                               ? 1
+                               : 0;
+            }
+
+            // Pick destination YUV matrix from colorspace. Default BT.709 for HD,
+            // BT.601 for SD when caller leaves it unspecified.
+            AVColorSpace effective_cs = dst_colorspace;
+            if (effective_cs == AVCOL_SPC_UNSPECIFIED)
+                effective_cs = (height > 576) ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
+
+            int dstCsId = SWS_CS_ITU601;
+            switch (effective_cs)
+            {
+            case AVCOL_SPC_BT709:        dstCsId = SWS_CS_ITU709;    break;
+            case AVCOL_SPC_FCC:          dstCsId = SWS_CS_FCC;       break;
+            case AVCOL_SPC_BT470BG:      dstCsId = SWS_CS_ITU601;    break;
+            case AVCOL_SPC_SMPTE170M:    dstCsId = SWS_CS_SMPTE170M; break;
+            case AVCOL_SPC_SMPTE240M:    dstCsId = SWS_CS_SMPTE240M; break;
+            case AVCOL_SPC_BT2020_NCL:
+            case AVCOL_SPC_BT2020_CL:    dstCsId = SWS_CS_BT2020;    break;
+            default:                     dstCsId = SWS_CS_ITU601;    break;
+            }
+
+            const int srcRange = 1; // RGB input is always full range
+            const int* srcMatrix = sws_getCoefficients(SWS_CS_ITU709); // unused for RGB src
+            const int* dstMatrix = sws_getCoefficients(dstCsId);
             sws_setColorspaceDetails(swsContext, srcMatrix, srcRange, dstMatrix,
                                      dstRange, 0, 1 << 16, 1 << 16);
-
         }
 
         // Prepare source data/stride
@@ -112,17 +151,12 @@ class RGBToAutoConverter : public ConverterBase
                 std::cerr << "!! WARNING: dstData[" << i << "] is NULL !!\n";
         }
 
-        // Convert
-        //  std::cerr << "Calling sws_scale...\n";
         int result = sws_scale(swsContext, srcData, srcLineSize, 0, height, dstData,
                                dstLineSize);
-        //  std::cerr << "sws_scale returned: " << result << "\n";
         if (result <= 0)
         {
-            //   std::cerr << "!! ERROR: sws_scale failed in RGBToAutoConverter !!\n";
             throw std::runtime_error("sws_scale failed in RGBToAutoConverter");
         }
-        //   std::cerr << "==== [RGBToAutoConverter] END convert ====\n";
     }
 
 
@@ -130,6 +164,8 @@ class RGBToAutoConverter : public ConverterBase
     int width;
     int height;
     AVPixelFormat dst_fmt;
+    AVColorSpace dst_colorspace;
+    AVColorRange dst_color_range;
 };
 
 } // namespace cpu

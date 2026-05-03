@@ -11,7 +11,6 @@
 #include <Logger.hpp>
 #include <chrono>
 #include <error/CxException.hpp>
-#include <iostream>
 #include <stdexcept>
 #include <thread>
 

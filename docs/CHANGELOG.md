@@ -1,4 +1,17 @@
 
+### **Version 0.10.0 (2026-05-03)**
+
+#### **Code Quality**
+- **Removed:** Dead `findMLTypeFromBitDepth()` conditional — both branches returned `torch::kFloat32` (FP16 path was disabled due to artifacts). Collapsed to single return; matching header doc-comment updated.
+- **Removed:** Unused `ConverterKey` / `ConverterKeyHash` typedef + functor in `Factory.hpp` (abandoned converter-cache scaffolding, zero call-sites).
+- **Removed:** Dead 3-arg `createDecoder` legacy overload in `Factory.hpp` (no callers in tree).
+- **Removed:** Dead `inferBitDepth` private static helper in `Factory.hpp` (no callers).
+- **Removed:** 4 stale commented `std::cerr` debug lines in `RGBToAuto.hpp`.
+- **Removed:** Unused `<iostream>` include in `src/Nelux/backends/cuda/Decoder.cpp` (no `std::cout`/`cerr` use in file).
+- **Changed:** `nelux/batch.py` — replaced `_get_torch()` lazy loader with module-level `import torch`; `torch` is already a hard import-time requirement enforced by `nelux/__init__.py`. Dropped unused `Iterable` import.
+
+No behavioral changes. All decoder paths (CPU, NVDEC) and `BatchMixin` (list / range / slice / numpy / torch indices) verified post-edit on Windows + CUDA 13.1.
+
 ### **Version 0.9.2 (2026-04-22)**
 
 #### **Decoder-Side Resize**
