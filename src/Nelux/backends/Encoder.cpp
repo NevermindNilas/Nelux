@@ -298,6 +298,14 @@ void Encoder::initVideoStream()
     videoCodecCtx->framerate = {properties.fps, 1};
     videoCodecCtx->gop_size = properties.gopSize;
     videoCodecCtx->max_b_frames = properties.maxBFrames;
+
+    // Tag color metadata so decoders apply the matching inverse matrix.
+    // Without this, players default to BT.709 for HD content regardless of
+    // what matrix we used during encode -> wrong colors on the round trip.
+    videoCodecCtx->colorspace = properties.colorspace;
+    videoCodecCtx->color_range = properties.colorRange;
+    videoCodecCtx->color_primaries = properties.colorPrimaries;
+    videoCodecCtx->color_trc = properties.colorTrc;
     // When using hardware frames (NVENC), pix_fmt must be the hardware format (CUDA)
     // The sw_format (NV12) is defined in the hw_frames_ctx
     if (videoCodecCtx->hw_frames_ctx)

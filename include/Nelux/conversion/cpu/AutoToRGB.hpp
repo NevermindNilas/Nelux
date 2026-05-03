@@ -126,19 +126,37 @@ class AutoToRGBConverter : public ConverterBase
         }
 
         // 2) Always prefer libyuv where it is applicable.
-        // - For <=8-bit sources, try libyuv first.
-        // - For >8-bit sources, only use libyuv when explicitly forcing 8-bit output.
-        // Skip libyuv paths when resizing: they do not rescale.
-        if (!resize_active && bit_depth <= 8)
+        // - 8-bit sources: libyuv direct (with resize prepass when needed).
+        // - >8-bit sources with force_8bit: libyuv 10->8 path (with resize prepass when needed).
+        // - >8-bit sources without force_8bit: fall through to swscale (RGB48LE output).
+        if (bit_depth <= 8)
         {
-            // Pass the DEDUCED colorspace (src_colorspace) which handles the "Unspecified -> BT.709" logic
-            if (convertViaLibyuv(av_frame, buffer, width, height, src_colorspace))
-                return;
+            if (resize_active)
+            {
+                if (convertViaLibyuvResize(av_frame, buffer, width, height,
+                                           dst_w, dst_h, src_colorspace))
+                    return;
+            }
+            else
+            {
+                if (convertViaLibyuv(av_frame, buffer, width, height, src_colorspace))
+                    return;
+            }
         }
-        else if (!resize_active && force_8bit)
+        else if (force_8bit)
         {
-            if (convert10BitTo8BitLibyuv(av_frame, buffer, width, height, src_colorspace))
-                return;
+            if (resize_active)
+            {
+                if (convert10BitTo8BitLibyuvResize(av_frame, buffer, width, height,
+                                                   dst_w, dst_h, src_colorspace))
+                    return;
+            }
+            else
+            {
+                if (convert10BitTo8BitLibyuv(av_frame, buffer, width, height,
+                                             src_colorspace))
+                    return;
+            }
         }
 
         // 3) Choose destination format/stride accordingly
@@ -156,7 +174,7 @@ class AutoToRGBConverter : public ConverterBase
             src_color_range != last_src_color_range || width != last_width ||
             height != last_height || dst_w != last_out_width || dst_h != last_out_height)
         {
-            int flags = SWS_SPLINE | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_V_INT;
+            int flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_V_INT;
 
             // Only use POINT (nearest neighbor) if dimensions match AND we are likely just shuffling channels (RGB/BGR/BGRA etc.)
             // Using POINT for YUV420P would result in nearest-neighbor chroma upsampling (blocky colors), which we want to avoid.
@@ -240,6 +258,158 @@ class AutoToRGBConverter : public ConverterBase
     std::vector<uint8_t> tmp_y, tmp_u, tmp_v;
     int tmp_width = 0, tmp_height = 0;
 
+    // Scaled YUV planes for the libyuv resize-then-convert prepass.
+    // Sized at dst dim; reused across frames.
+    std::vector<uint8_t> rs_y_, rs_u_, rs_v_;
+    int rs_dst_w_ = 0, rs_dst_h_ = 0;
+    int rs_dst_uv_w_ = 0, rs_dst_uv_h_ = 0;
+
+    static libyuv::FilterMode pickResizeFilter(int sw, int sh, int dw, int dh)
+    {
+        // Box averages source pixels covered by each dest pixel — best for downscale.
+        // libyuv treats Box as Bilinear when upscaling, so it is safe both ways.
+        return (dw < sw || dh < sh) ? libyuv::kFilterBox : libyuv::kFilterBilinear;
+    }
+
+    // Pick the YVU matrix that matches both colorspace and range. The "Yvu"
+    // (vs "Yuv") variants are used because libyuv's *ToRGB24Matrix produce BGR
+    // memory order; we feed swapped U/V planes with these to land RGB.
+    static const libyuv::YuvConstants* selectYvuConstants(AVColorSpace cs,
+                                                          AVColorRange range)
+    {
+        const bool full = (range == AVCOL_RANGE_JPEG);
+        if (cs == AVCOL_SPC_BT709)
+            return full ? &libyuv::kYvuF709Constants : &libyuv::kYvuH709Constants;
+        if (cs == AVCOL_SPC_BT2020_NCL || cs == AVCOL_SPC_BT2020_CL)
+            return full ? &libyuv::kYvuV2020Constants : &libyuv::kYvu2020Constants;
+        // BT.601 / BT.470BG / SMPTE170M / unspecified (defaulted upstream)
+        return full ? &libyuv::kYvuJPEGConstants : &libyuv::kYvuI601Constants;
+    }
+
+    void ensureResizeBufs(int dst_w, int dst_h, int dst_uv_w, int dst_uv_h)
+    {
+        if (rs_dst_w_ != dst_w || rs_dst_h_ != dst_h)
+        {
+            rs_y_.resize(static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h));
+            rs_dst_w_ = dst_w;
+            rs_dst_h_ = dst_h;
+        }
+        if (rs_dst_uv_w_ != dst_uv_w || rs_dst_uv_h_ != dst_uv_h)
+        {
+            const size_t uv_bytes = static_cast<size_t>(dst_uv_w) *
+                                    static_cast<size_t>(dst_uv_h);
+            rs_u_.resize(uv_bytes);
+            rs_v_.resize(uv_bytes);
+            rs_dst_uv_w_ = dst_uv_w;
+            rs_dst_uv_h_ = dst_uv_h;
+        }
+    }
+
+    bool convertViaLibyuvResize(AVFrame* frame, void* buffer,
+                                int src_w, int src_h, int dst_w, int dst_h,
+                                AVColorSpace colorspace)
+    {
+        const AVPixelFormat fmt = static_cast<AVPixelFormat>(frame->format);
+
+        int h_shift = 0, v_shift = 0;
+        if (av_pix_fmt_get_chroma_sub_sample(fmt, &h_shift, &v_shift) < 0)
+            return false;
+
+        // Only handle the planar YUV formats we know libyuv covers below.
+        const bool is_420 = (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUVJ420P);
+        const bool is_422 = (fmt == AV_PIX_FMT_YUV422P || fmt == AV_PIX_FMT_YUVJ422P);
+        const bool is_444 = (fmt == AV_PIX_FMT_YUV444P || fmt == AV_PIX_FMT_YUVJ444P);
+        if (!(is_420 || is_422 || is_444))
+            return false;
+
+        if (!frame->data[0] || !frame->data[1] || !frame->data[2])
+            return false;
+
+        const int dst_uv_w = AV_CEIL_RSHIFT(dst_w, h_shift);
+        const int dst_uv_h = AV_CEIL_RSHIFT(dst_h, v_shift);
+        ensureResizeBufs(dst_w, dst_h, dst_uv_w, dst_uv_h);
+
+        const libyuv::FilterMode filter = pickResizeFilter(src_w, src_h, dst_w, dst_h);
+
+        int rc = -1;
+        if (is_420)
+        {
+            rc = libyuv::I420Scale(
+                frame->data[0], frame->linesize[0],
+                frame->data[1], frame->linesize[1],
+                frame->data[2], frame->linesize[2],
+                src_w, src_h,
+                rs_y_.data(), dst_w,
+                rs_u_.data(), dst_uv_w,
+                rs_v_.data(), dst_uv_w,
+                dst_w, dst_h,
+                filter);
+        }
+        else if (is_422)
+        {
+            rc = libyuv::I422Scale(
+                frame->data[0], frame->linesize[0],
+                frame->data[1], frame->linesize[1],
+                frame->data[2], frame->linesize[2],
+                src_w, src_h,
+                rs_y_.data(), dst_w,
+                rs_u_.data(), dst_uv_w,
+                rs_v_.data(), dst_uv_w,
+                dst_w, dst_h,
+                filter);
+        }
+        else // is_444
+        {
+            rc = libyuv::I444Scale(
+                frame->data[0], frame->linesize[0],
+                frame->data[1], frame->linesize[1],
+                frame->data[2], frame->linesize[2],
+                src_w, src_h,
+                rs_y_.data(), dst_w,
+                rs_u_.data(), dst_uv_w,
+                rs_v_.data(), dst_uv_w,
+                dst_w, dst_h,
+                filter);
+        }
+        if (rc != 0)
+            return false;
+
+        // Convert scaled YUV -> RGB24 at dst dim. Mirrors the constant/swizzle
+        // selection used by convertViaLibyuv() so output matches the no-resize
+        // fast path byte-for-byte at the same dst dim.
+        uint8_t* dst_rgb = static_cast<uint8_t*>(buffer);
+        const int dst_stride = dst_w * 3;
+
+        const libyuv::YuvConstants* yvu_constants =
+            selectYvuConstants(colorspace, frame->color_range);
+
+        if (is_420)
+        {
+            return 0 == libyuv::I420ToRGB24Matrix(
+                            rs_y_.data(), dst_w,
+                            rs_v_.data(), dst_uv_w, // V as U (RGB swap)
+                            rs_u_.data(), dst_uv_w, // U as V
+                            dst_rgb, dst_stride,
+                            yvu_constants, dst_w, dst_h);
+        }
+        if (is_422)
+        {
+            return 0 == libyuv::I422ToRGB24Matrix(
+                            rs_y_.data(), dst_w,
+                            rs_v_.data(), dst_uv_w,
+                            rs_u_.data(), dst_uv_w,
+                            dst_rgb, dst_stride,
+                            yvu_constants, dst_w, dst_h);
+        }
+        // is_444
+        return 0 == libyuv::I444ToRGB24Matrix(
+                        rs_y_.data(), dst_w,
+                        rs_v_.data(), dst_uv_w,
+                        rs_u_.data(), dst_uv_w,
+                        dst_rgb, dst_stride,
+                        yvu_constants, dst_w, dst_h);
+    }
+
     bool convert10BitTo8BitLibyuv(AVFrame* frame, void* buffer, int width, int height, AVColorSpace colorspace)
     {
         // NEW: Direct conversion for YUV420P10LE using I010ToI420 + I420ToRAW
@@ -247,11 +417,11 @@ class AutoToRGBConverter : public ConverterBase
         if (frame->format == AV_PIX_FMT_YUV420P10LE)
         {
             const uint16_t* src_y = reinterpret_cast<const uint16_t*>(frame->data[0]);
-            int stride_y = frame->linesize[0]; // Stride in bytes
+            int stride_y = frame->linesize[0] / 2; // bytes -> uint16_t elements
             const uint16_t* src_u = reinterpret_cast<const uint16_t*>(frame->data[1]);
-            int stride_u = frame->linesize[1];
+            int stride_u = frame->linesize[1] / 2;
             const uint16_t* src_v = reinterpret_cast<const uint16_t*>(frame->data[2]);
-            int stride_v = frame->linesize[2];
+            int stride_v = frame->linesize[2] / 2;
 
             // Resize temp buffers for 8-bit intermediate YUV
             int uv_width = (width + 1) / 2;
@@ -382,20 +552,10 @@ class AutoToRGBConverter : public ConverterBase
         uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
         int dst_stride = width * 3;
 
-        // Select constants
-        const libyuv::YuvConstants* yuv_constants = &libyuv::kYuvI601Constants;
-        const libyuv::YuvConstants* yvu_constants = &libyuv::kYvuI601Constants;
-
-        if (frame->colorspace == AVCOL_SPC_BT709)
-        {
-            yuv_constants = &libyuv::kYuvH709Constants;
-            yvu_constants = &libyuv::kYvuH709Constants;
-        }
-        else if (frame->colorspace == AVCOL_SPC_BT2020_NCL || frame->colorspace == AVCOL_SPC_BT2020_CL)
-        {
-            yuv_constants = &libyuv::kYuv2020Constants;
-            yvu_constants = &libyuv::kYvu2020Constants;
-        }
+        // Select constants — picks the proper full-range variant
+        // (kYvuF709/V2020/JPEG) when frame->color_range == AVCOL_RANGE_JPEG.
+        const libyuv::YuvConstants* yvu_constants =
+            selectYvuConstants(frame->colorspace, frame->color_range);
 
         // Handle different subsamplings
         if (h_shift == 1 && v_shift == 1) // 4:2:0
@@ -434,32 +594,110 @@ class AutoToRGBConverter : public ConverterBase
         return false; // Unsupported subsampling for libyuv path
     }
 
+    // 10-bit/12-bit/16-bit planar YUV + resize + force_8bit fast path.
+    // Down-converts to 8-bit at native res into tmp_*, then ScalePlane each
+    // plane to dst dim into rs_*, then I{420,422,444}ToRGB24Matrix at dst dim.
+    bool convert10BitTo8BitLibyuvResize(AVFrame* frame, void* buffer,
+                                        int src_w, int src_h,
+                                        int dst_w, int dst_h,
+                                        AVColorSpace colorspace)
+    {
+        const AVPixelFormat fmt = static_cast<AVPixelFormat>(frame->format);
+
+        int h_shift = 0, v_shift = 0;
+        if (av_pix_fmt_get_chroma_sub_sample(fmt, &h_shift, &v_shift) < 0)
+            return false;
+        if (!frame->data[0] || !frame->data[1] || !frame->data[2])
+            return false;
+
+        const int src_uv_w = AV_CEIL_RSHIFT(src_w, h_shift);
+        const int src_uv_h = AV_CEIL_RSHIFT(src_h, v_shift);
+
+        // Step 1: 16-bit -> 8-bit at native res into tmp_*.
+        if (tmp_width != src_w || tmp_height != src_h)
+        {
+            tmp_y.resize(static_cast<size_t>(src_w) * static_cast<size_t>(src_h));
+            tmp_u.resize(static_cast<size_t>(src_uv_w) *
+                         static_cast<size_t>(src_uv_h));
+            tmp_v.resize(static_cast<size_t>(src_uv_w) *
+                         static_cast<size_t>(src_uv_h));
+            tmp_width = src_w;
+            tmp_height = src_h;
+        }
+
+        // Generic 10/12/16-bit planar -> 8-bit via Convert16To8Plane.
+        // Strides for uint16 source are in PIXELS (linesize is bytes -> /2).
+        // Scale 16384 maps 10-bit (0-1023) -> 8-bit (0-255):
+        //   (val * 16384) >> 16 = val / 4 for 10-bit input.
+        libyuv::Convert16To8Plane(
+            reinterpret_cast<const uint16_t*>(frame->data[0]),
+            frame->linesize[0] / 2,
+            tmp_y.data(), src_w, 16384, src_w, src_h);
+        libyuv::Convert16To8Plane(
+            reinterpret_cast<const uint16_t*>(frame->data[1]),
+            frame->linesize[1] / 2,
+            tmp_u.data(), src_uv_w, 16384, src_uv_w, src_uv_h);
+        libyuv::Convert16To8Plane(
+            reinterpret_cast<const uint16_t*>(frame->data[2]),
+            frame->linesize[2] / 2,
+            tmp_v.data(), src_uv_w, 16384, src_uv_w, src_uv_h);
+
+        // Step 2: ScalePlane each plane to dst dim into rs_*.
+        const int dst_uv_w = AV_CEIL_RSHIFT(dst_w, h_shift);
+        const int dst_uv_h = AV_CEIL_RSHIFT(dst_h, v_shift);
+        ensureResizeBufs(dst_w, dst_h, dst_uv_w, dst_uv_h);
+
+        const libyuv::FilterMode filter =
+            pickResizeFilter(src_w, src_h, dst_w, dst_h);
+
+        libyuv::ScalePlane(tmp_y.data(), src_w, src_w, src_h,
+                           rs_y_.data(), dst_w, dst_w, dst_h, filter);
+        libyuv::ScalePlane(tmp_u.data(), src_uv_w, src_uv_w, src_uv_h,
+                           rs_u_.data(), dst_uv_w, dst_uv_w, dst_uv_h, filter);
+        libyuv::ScalePlane(tmp_v.data(), src_uv_w, src_uv_w, src_uv_h,
+                           rs_v_.data(), dst_uv_w, dst_uv_w, dst_uv_h, filter);
+
+        // Step 3: RGB convert at dst dim.
+        uint8_t* dst_rgb = static_cast<uint8_t*>(buffer);
+        const int dst_stride = dst_w * 3;
+        const libyuv::YuvConstants* yvu =
+            selectYvuConstants(colorspace, frame->color_range);
+
+        if (h_shift == 1 && v_shift == 1)
+        {
+            return 0 == libyuv::I420ToRGB24Matrix(
+                            rs_y_.data(), dst_w,
+                            rs_v_.data(), dst_uv_w,
+                            rs_u_.data(), dst_uv_w,
+                            dst_rgb, dst_stride, yvu, dst_w, dst_h);
+        }
+        if (h_shift == 1 && v_shift == 0)
+        {
+            return 0 == libyuv::I422ToRGB24Matrix(
+                            rs_y_.data(), dst_w,
+                            rs_v_.data(), dst_uv_w,
+                            rs_u_.data(), dst_uv_w,
+                            dst_rgb, dst_stride, yvu, dst_w, dst_h);
+        }
+        if (h_shift == 0 && v_shift == 0)
+        {
+            return 0 == libyuv::I444ToRGB24Matrix(
+                            rs_y_.data(), dst_w,
+                            rs_v_.data(), dst_uv_w,
+                            rs_u_.data(), dst_uv_w,
+                            dst_rgb, dst_stride, yvu, dst_w, dst_h);
+        }
+        return false;
+    }
+
     bool convertViaLibyuv(AVFrame* frame, void* buffer, int width, int height, AVColorSpace colorspace)
     {
         uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
         int dst_stride = width * 3;
 
-        const libyuv::YuvConstants* yuv_constants = &libyuv::kYuvI601Constants;
-        const libyuv::YuvConstants* yvu_constants = &libyuv::kYvuI601Constants;
-
-        if (colorspace == AVCOL_SPC_BT709)
-        {
-            yuv_constants = &libyuv::kYuvH709Constants;
-            yvu_constants = &libyuv::kYvuH709Constants;
-        }
-        else if (colorspace == AVCOL_SPC_BT2020_NCL ||
-                 colorspace == AVCOL_SPC_BT2020_CL)
-        {
-            yuv_constants = &libyuv::kYuv2020Constants;
-            yvu_constants = &libyuv::kYvu2020Constants;
-        }
-
-        if (frame->color_range == AVCOL_RANGE_JPEG &&
-            yuv_constants == &libyuv::kYuvI601Constants)
-        {
-            yuv_constants = &libyuv::kYuvJPEGConstants;
-            yvu_constants = &libyuv::kYvuJPEGConstants;
-        }
+        const libyuv::YuvConstants* yvu_constants =
+            selectYvuConstants(colorspace, frame->color_range);
+        // YUV variant currently unused below; left out to avoid churn.
 
         // Note: libyuv's RGB24 functions produce BGR in memory (Windows friendly).
         // To get RGB (RAW) in memory, we use the "ToRAW" logic which typically involves

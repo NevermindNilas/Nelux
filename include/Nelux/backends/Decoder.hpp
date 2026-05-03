@@ -5,10 +5,12 @@
 #include <Frame.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <vector>
 #include <torch/torch.h>
 
 
@@ -50,6 +52,26 @@ class Decoder
     Decoder& operator=(Decoder&&) noexcept;
     bool seekFrame(int frameIndex);
     virtual bool decodeNextFrame(void* buffer, double* frame_timestamp = nullptr);
+
+    // Zero-copy variant: returns the next decoded frame as a fresh
+    // torch::Tensor (HWC, native dtype) whose storage was filled directly by
+    // the converter on the producer thread. Skips the producer->consumer
+    // memcpy that decodeNextFrame() performs. Returns an undefined Tensor
+    // when no more frames are available.
+    virtual torch::Tensor decodeNextFrameTensor(double* frame_timestamp = nullptr);
+
+    // Synchronous, single-threaded decode path: bypasses the producer thread,
+    // queue, and mutex entirely. Returns the next decoded frame as a fresh
+    // torch::Tensor. Intended for raw single-stream throughput where pipeline
+    // coordination overhead dominates. Caller must have set sync mode on the
+    // decoder before any decode call.
+    virtual torch::Tensor decodeNextFrameTensorSync(double* frame_timestamp = nullptr);
+
+    // Toggle synchronous decode mode. When true, the producer thread is never
+    // started; callers must use decodeNextFrameTensorSync(). Must be set
+    // before the first decode call.
+    void setSyncMode(bool enabled);
+
     virtual bool seek(double timestamp);
     virtual VideoProperties getVideoProperties() const;
     virtual bool isOpen() const;
@@ -160,7 +182,8 @@ class Decoder
     std::queue<Frame> frameQueue;
     struct ConvertedFrame
     {
-        std::vector<uint8_t> buffer;
+        std::vector<uint8_t> buffer;        // legacy memcpy path
+        torch::Tensor tensor;               // zero-copy path
         double timestamp = 0.0;
     };
     std::queue<ConvertedFrame> convertedQueue;
@@ -168,6 +191,20 @@ class Decoder
     // heap-thrashing (alloc + zero-init of 6+MB per decoded frame).
     std::vector<std::vector<uint8_t>> convertedBufferPool;
     std::mutex convertedBufferPoolMutex;
+
+    // Shared pool for consumer-convert path. Held via shared_ptr so the
+    // torch::Tensor deleter can recycle the buffer even if Decoder is gone.
+    struct OutputBufferPool
+    {
+        std::mutex mu;
+        std::vector<std::unique_ptr<uint8_t[]>> free_;
+        size_t bufferBytes = 0;
+        size_t maxRetained = 8;
+    };
+    std::shared_ptr<OutputBufferPool> outputBufferPool_;
+    // When true, producer fills a fresh torch::Tensor each frame instead of
+    // a pooled byte buffer. Consumer receives the tensor directly.
+    std::atomic<bool> tensorHandoff_{false};
     std::mutex queueMutex;
     std::condition_variable queueCond;
     std::condition_variable producerCond;
@@ -193,11 +230,62 @@ class Decoder
     std::unique_ptr<BatchDecoder> batch_decoder_;
     int64_t cached_frame_count_ = -1;
 
+    // Separate slice-only codec context for batch/seek work, so the main
+    // codecCtx can stay frame-threaded (faster sequential decode) without
+    // tripping flush asserts. Lazily allocated on first decode_batch call.
+    std::unique_ptr<AVCodecContext, AVCodecContextDeleter> batchCodecCtx_;
+
     // Cached file path for reconfiguration
     std::string cachedFilePath_;
 
     // Decoder-side resize target. 0 means disabled (output = source dims).
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;
+
+    // Synchronous decode mode (no producer thread / no queue).
+    bool syncMode_ = false;
+    // EOF latch for sync path; once set, subsequent calls return undefined.
+    bool syncDrained_ = false;
+    // Working AVFrame for the sync path (kept alive across calls so that
+    // av_frame_unref releases buffers but the AVFrame struct itself is reused).
+    Frame syncFrame_;
+
+    // Persistent feed state for sync mode (survives across calls).
+    bool syncEofReached_ = false;
+    bool syncFlushSent_ = false;
+
+    // Parallel convert pool used by sync mode. Each worker owns its own
+    // converter so swscale state isn't shared across threads.
+    struct SyncConvertWorkItem
+    {
+        int64_t seq;
+        Frame frame;
+    };
+    std::vector<std::thread> syncConvertWorkers_;
+    std::queue<SyncConvertWorkItem> syncConvertWorkQueue_;
+    std::map<int64_t, torch::Tensor> syncConvertOutMap_;
+    std::map<int64_t, double> syncConvertOutTs_;
+    std::mutex syncConvertWorkMu_;
+    std::condition_variable syncConvertWorkCv_;
+    std::mutex syncConvertOutMu_;
+    std::condition_variable syncConvertOutCv_;
+    std::atomic<bool> syncConvertStop_{false};
+    int64_t syncProduceSeq_ = 0;
+    int64_t syncConsumeSeq_ = 0;
+    size_t syncMaxInFlight_ = 16;
+    int syncConvertWorkerCount_ = 4;  // overridden by Decoder ctor based on hw concurrency
+
+    void startSyncConvertWorkers();
+    void stopSyncConvertWorkers();
+    void syncConvertWorkerLoop();
+
+  public:
+    /**
+     * @brief Configure the number of convert worker threads used by the
+     * sync decode path. Must be set before the first decode call.
+     *
+     * @param n Worker count. 0 keeps work on caller (single-threaded convert).
+     */
+    void setSyncConvertWorkers(int n);
 };
 } // namespace nelux

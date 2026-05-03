@@ -60,7 +60,7 @@ PYBIND11_MODULE(_nelux, m)
                  [](const std::string& input_path, int num_threads, bool force_8bit,
                     const std::string& backend, const std::string& decode_accelerator,
                     int cuda_device_index,
-                    std::optional<std::pair<int, int>> resize)
+                    std::optional<std::pair<int, int>> resize, bool prefetch)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -77,19 +77,19 @@ PYBIND11_MODULE(_nelux, m)
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
-                         cuda_device_index, rw, rh);
+                         cuda_device_index, rw, rh, prefetch);
                  }),
              py::arg("input_path"),
-             py::arg("num_threads") =
-                 static_cast<int>(std::thread::hardware_concurrency() / 2),
+             py::arg("num_threads") = 0,
              py::arg("force_8bit") = false, py::arg("backend") = "pytorch",
              py::arg("decode_accelerator") = "cpu", py::arg("cuda_device_index") = 0,
-             py::arg("resize") = py::none(),
+             py::arg("resize") = py::none(), py::arg("prefetch") = false,
              R"doc(Open a video file for reading.
 
 Args:
     input_path (str): Path to the video file.
-    num_threads (int, optional): Number of threads for decoding. Defaults to half CPU cores.
+    num_threads (int, optional): Number of threads for decoding. 0 = ffmpeg auto-detect
+        (default; matches torchcodec semantics). Pass a positive integer to pin.
     force_8bit (bool, optional): Force 8-bit output regardless of source bit depth. Defaults to False.
     backend (str, optional): Output backend type. Either "pytorch" (default) or "numpy".
         - "pytorch": Returns frames as torch.Tensor
@@ -105,6 +105,10 @@ Args:
         properties.width/height, width/height, and returned frame shapes all reflect
         the resized dimensions. Pass None (default) to disable.
         Note: decode_batch() is not supported while resize is active.
+    prefetch (bool, optional): If True, decode frames in a background thread.
+        Default False: producer/consumer queue handoff costs ~2.5x more than the
+        parallelism saves at typical decode speeds. Enable only for workloads where
+        per-frame consumer work is heavy enough to amortize the queue cost.
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

@@ -42,6 +42,12 @@ class Encoder
         bool useHardwareEncoder = false;  // Auto-detected from codec name
         int preset = -1;  // NVENC preset (0=fastest, higher=better quality)
         int cq = -1;      // Constant quality mode (0-51, lower=better)
+
+        // Color metadata. UNSPECIFIED = auto (BT.709 for HD, BT.601 for SD).
+        AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED;
+        AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED;
+        AVColorPrimaries colorPrimaries = AVCOL_PRI_UNSPECIFIED;
+        AVColorTransferCharacteristic colorTrc = AVCOL_TRC_UNSPECIFIED;
     };
 
     Encoder() = default;

@@ -9,11 +9,24 @@ using namespace nelux::error;
 
 namespace nelux
 {
+// Convert workers idle on cv.wait when queue empty so over-spawning is cheap;
+// the wins from extra parallelism on fast formats (nv12/yuv420p) outweigh
+// any cost of unused threads. Cap at hw_concurrency or 16, whichever is lower.
+static int defaultConvertWorkers()
+{
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw <= 0)
+        return 4;
+    return std::min(hw, 16);
+}
+
 Decoder::Decoder(int numThreads)
     : converter(nullptr), formatCtx(nullptr), codecCtx(nullptr), pkt(nullptr),
       videoStreamIndex(-1), numThreads(numThreads)
 {
-    NELUX_DEBUG("BASE DECODER: Decoder constructed");
+    syncConvertWorkerCount_ = defaultConvertWorkers();
+    NELUX_DEBUG("BASE DECODER: Decoder constructed (sync_workers={})",
+                syncConvertWorkerCount_);
 }
 
 Decoder::Decoder(int numThreads, int resizeWidth, int resizeHeight)
@@ -22,8 +35,9 @@ Decoder::Decoder(int numThreads, int resizeWidth, int resizeHeight)
 {
     resizeWidth_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeWidth : 0;
     resizeHeight_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0;
-    NELUX_DEBUG("BASE DECODER: Decoder constructed with resize={}x{}",
-                resizeWidth_, resizeHeight_);
+    syncConvertWorkerCount_ = defaultConvertWorkers();
+    NELUX_DEBUG("BASE DECODER: Decoder constructed with resize={}x{} (sync_workers={})",
+                resizeWidth_, resizeHeight_, syncConvertWorkerCount_);
 }
 
 Decoder::~Decoder()
@@ -175,8 +189,11 @@ void Decoder::initialize(const std::string& filePath)
         }
     }
 
-    // Enable pre-conversion in decode thread for CPU decoder
-    preconvertEnabled = true;
+    // Push raw AVFrames from the producer and convert on the consumer thread.
+    // Convert is single-threaded (libyuv), so doing it on the producer was
+    // serializing decode + convert and capping throughput. With consumer-side
+    // convert, ffmpeg's frame threads can run flat-out.
+    preconvertEnabled = false;
     int bitDepth = getBitDepth();
     int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
     convertedFrameBytes = static_cast<size_t>(properties.width) *
@@ -200,7 +217,8 @@ void Decoder::initialize(const std::string& filePath)
     NELUX_INFO("BASE DECODER: Decoder using codec: {}, and pixel format: {}",
                codecCtx->codec->name, av_get_pix_fmt_name(codecCtx->pix_fmt));
 
-    startDecodingThread();
+    if (!syncMode_)
+        startDecodingThread();
 }
 
 void Decoder::openFile(const std::string& filePath)
@@ -317,14 +335,16 @@ void Decoder::initCodecContext()
         codecCtx->thread_count = 1;
     }
 
-    // Only apply thread types the codec actually supports.
-    // Frame threading (FF_THREAD_FRAME) is intentionally disabled: when the
-    // batch decode path calls avcodec_flush_buffers after seek, frame-threaded
-    // codecs trigger `fctx->async_lock` assertions on Linux glibc and segfaults
-    // on macOS. Slice threading still provides intra-frame parallelism.
+    // Enable FRAME threading (the big win for h264/hevc -- 4-8x). Falls back
+    // to SLICE if frame threads aren't supported by this codec. Mixing both
+    // sometimes makes ffmpeg pick the slower one; prefer frame-only when
+    // available. avcodec_flush_buffers under FF_THREAD_FRAME is unsafe, so
+    // batch/seek work uses a separate slice-only context (see decode_batch).
     int supported_types = 0;
-    if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
-        supported_types |= FF_THREAD_SLICE;
+    if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
+        supported_types = FF_THREAD_FRAME;
+    else if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
+        supported_types = FF_THREAD_SLICE;
     codecCtx->thread_type = supported_types;
     NELUX_DEBUG("BASE DECODER: Codec context threading configured: thread_count={}, "
                 "thread_type={}",
@@ -502,6 +522,409 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     }
 }
 
+torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
+{
+    if (!decodingThread.joinable())
+    {
+        // Switch the producer to tensor-handoff mode before starting it.
+        tensorHandoff_.store(true, std::memory_order_relaxed);
+        startDecodingThread();
+    }
+    else if (!tensorHandoff_.load(std::memory_order_relaxed))
+    {
+        // First call to the tensor path on an already-running producer:
+        // flip the flag so subsequent frames take the zero-copy route.
+        // In-flight frames (already in convertedQueue with .buffer set)
+        // are still consumed correctly by decodeNextFrameTensor below.
+        tensorHandoff_.store(true, std::memory_order_relaxed);
+    }
+
+    std::unique_lock<std::mutex> lock(queueMutex);
+    queueCond.wait(lock,
+                   [this]
+                   {
+                       return (preconvertEnabled ? !convertedQueue.empty()
+                                                 : !frameQueue.empty()) ||
+                              isFinished || stopDecoding;
+                   });
+
+    if (preconvertEnabled)
+    {
+        if (convertedQueue.empty())
+            return torch::Tensor();
+
+        ConvertedFrame cf = std::move(convertedQueue.front());
+        convertedQueue.pop();
+        producerCond.notify_one();
+        lock.unlock();
+
+        if (frame_timestamp)
+            *frame_timestamp = cf.timestamp;
+
+        if (cf.tensor.defined())
+        {
+            // Zero-copy fast path: producer already filled the tensor.
+            return std::move(cf.tensor);
+        }
+
+        // Fallback: legacy buffer queued before tensorHandoff_ flipped on.
+        // Wrap or copy into a tensor.
+        auto dtype = (cf.buffer.size() ==
+                      static_cast<size_t>(properties.width) * properties.height * 3)
+                         ? torch::kUInt8
+                         : torch::kUInt16;
+        torch::Tensor t = torch::empty(
+            {properties.height, properties.width, 3},
+            torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+        std::memcpy(t.data_ptr(), cf.buffer.data(), cf.buffer.size());
+        {
+            std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
+            if (convertedBufferPool.size() < maxQueueSize + 2)
+                convertedBufferPool.push_back(std::move(cf.buffer));
+        }
+        return t;
+    }
+
+    // No-preconvert path: decoder hands raw AVFrame; convert here.
+    if (frameQueue.empty())
+        return torch::Tensor();
+
+    Frame frame = std::move(frameQueue.front());
+    frameQueue.pop();
+    producerCond.notify_one();
+    lock.unlock();
+
+    if (frame_timestamp)
+        *frame_timestamp = getFrameTimestamp(frame.get());
+
+    int bitDepth = getBitDepth();
+    int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
+    auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+    torch::Tensor t = torch::empty(
+        {properties.height, properties.width, 3},
+        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+    if (converter)
+        converter->convert(frame, t.data_ptr());
+    return t;
+}
+
+void Decoder::setSyncMode(bool enabled)
+{
+    syncMode_ = enabled;
+    if (enabled)
+    {
+        // Tear down any running producer thread; the sync path owns the
+        // codec context exclusively from this point on.
+        stopDecodingThread();
+        clearQueue();
+        syncDrained_ = false;
+        syncEofReached_ = false;
+        syncFlushSent_ = false;
+        syncProduceSeq_ = 0;
+        syncConsumeSeq_ = 0;
+    }
+    else
+    {
+        stopSyncConvertWorkers();
+    }
+}
+
+void Decoder::setSyncConvertWorkers(int n)
+{
+    syncConvertWorkerCount_ = (n < 0) ? 0 : n;
+}
+
+void Decoder::syncConvertWorkerLoop()
+{
+    auto local_converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
+    local_converter->setForce8Bit(force_8bit);
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+        local_converter->setOutputSize(resizeWidth_, resizeHeight_);
+
+    while (true)
+    {
+        SyncConvertWorkItem w;
+        {
+            std::unique_lock<std::mutex> lk(syncConvertWorkMu_);
+            syncConvertWorkCv_.wait(
+                lk, [&] { return !syncConvertWorkQueue_.empty() || syncConvertStop_; });
+            if (syncConvertStop_ && syncConvertWorkQueue_.empty())
+                return;
+            w = std::move(syncConvertWorkQueue_.front());
+            syncConvertWorkQueue_.pop();
+        }
+
+        int bitDepth = getBitDepth();
+        int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
+        auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+        torch::Tensor t = torch::empty(
+            {properties.height, properties.width, 3},
+            torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+        double ts = getFrameTimestamp(w.frame.get());
+        local_converter->convert(w.frame, t.data_ptr());
+
+        {
+            std::lock_guard<std::mutex> lk(syncConvertOutMu_);
+            syncConvertOutMap_.emplace(w.seq, std::move(t));
+            syncConvertOutTs_.emplace(w.seq, ts);
+        }
+        syncConvertOutCv_.notify_all();
+    }
+}
+
+void Decoder::startSyncConvertWorkers()
+{
+    if (!syncConvertWorkers_.empty() || syncConvertWorkerCount_ <= 0)
+        return;
+    syncConvertStop_ = false;
+    syncConvertWorkers_.reserve(syncConvertWorkerCount_);
+    for (int i = 0; i < syncConvertWorkerCount_; ++i)
+        syncConvertWorkers_.emplace_back(&Decoder::syncConvertWorkerLoop, this);
+}
+
+void Decoder::stopSyncConvertWorkers()
+{
+    if (syncConvertWorkers_.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> lk(syncConvertWorkMu_);
+        syncConvertStop_ = true;
+    }
+    syncConvertWorkCv_.notify_all();
+    for (auto& th : syncConvertWorkers_)
+    {
+        if (th.joinable())
+            th.join();
+    }
+    syncConvertWorkers_.clear();
+    syncConvertStop_ = false;
+    {
+        std::lock_guard<std::mutex> lk(syncConvertWorkMu_);
+        std::queue<SyncConvertWorkItem> empty;
+        std::swap(syncConvertWorkQueue_, empty);
+    }
+    {
+        std::lock_guard<std::mutex> lk(syncConvertOutMu_);
+        syncConvertOutMap_.clear();
+        syncConvertOutTs_.clear();
+    }
+}
+
+torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
+{
+    if (syncDrained_)
+        return torch::Tensor();
+
+    // Single-threaded fallback (worker count == 0): keep the original
+    // tight-loop behavior. Useful for diagnostics.
+    if (syncConvertWorkerCount_ <= 0)
+    {
+        AVFrame* f = syncFrame_.get();
+        while (true)
+        {
+            while (!syncEofReached_)
+            {
+                int rret = av_read_frame(formatCtx.get(), pkt.get());
+                if (rret < 0)
+                {
+                    syncEofReached_ = true;
+                    break;
+                }
+                if (pkt->stream_index != videoStreamIndex)
+                {
+                    av_packet_unref(pkt.get());
+                    continue;
+                }
+                int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
+                av_packet_unref(pkt.get());
+                if (sret == AVERROR(EAGAIN))
+                    break;
+                if (sret < 0)
+                {
+                    syncDrained_ = true;
+                    return torch::Tensor();
+                }
+                break;
+            }
+            if (syncEofReached_ && !syncFlushSent_)
+            {
+                avcodec_send_packet(codecCtx.get(), nullptr);
+                syncFlushSent_ = true;
+            }
+            int ret = avcodec_receive_frame(codecCtx.get(), f);
+            if (ret == 0)
+            {
+                if (frame_timestamp)
+                    *frame_timestamp = getFrameTimestamp(f);
+                int bitDepth = getBitDepth();
+                int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
+                auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+                torch::Tensor t = torch::empty(
+                    {properties.height, properties.width, 3},
+                    torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+                if (converter)
+                    converter->convert(syncFrame_, t.data_ptr());
+                av_frame_unref(f);
+                return t;
+            }
+            if (ret == AVERROR_EOF)
+            {
+                syncDrained_ = true;
+                return torch::Tensor();
+            }
+            if (ret != AVERROR(EAGAIN))
+            {
+                syncDrained_ = true;
+                return torch::Tensor();
+            }
+        }
+    }
+
+    if (syncConvertWorkers_.empty())
+        startSyncConvertWorkers();
+
+    while (true)
+    {
+        // 1) Try to deliver next-in-order converted tensor.
+        {
+            std::unique_lock<std::mutex> lk(syncConvertOutMu_);
+            auto it = syncConvertOutMap_.find(syncConsumeSeq_);
+            if (it != syncConvertOutMap_.end())
+            {
+                torch::Tensor t = std::move(it->second);
+                if (frame_timestamp)
+                    *frame_timestamp = syncConvertOutTs_[syncConsumeSeq_];
+                syncConvertOutMap_.erase(it);
+                syncConvertOutTs_.erase(syncConsumeSeq_);
+                syncConsumeSeq_++;
+                return t;
+            }
+        }
+
+        const int64_t in_flight = syncProduceSeq_ - syncConsumeSeq_;
+        const bool decoder_drained = syncEofReached_ && syncFlushSent_;
+
+        // No more frames coming and nothing in flight -> done.
+        if (decoder_drained && in_flight == 0)
+        {
+            // But verify receive_frame returns AVERROR_EOF before declaring done.
+            int ret = avcodec_receive_frame(codecCtx.get(), syncFrame_.get());
+            if (ret == 0)
+            {
+                Frame queued;
+                av_frame_move_ref(queued.get(), syncFrame_.get());
+                av_frame_unref(syncFrame_.get());
+                {
+                    std::lock_guard<std::mutex> lk(syncConvertWorkMu_);
+                    syncConvertWorkQueue_.push({syncProduceSeq_++, std::move(queued)});
+                }
+                syncConvertWorkCv_.notify_one();
+                continue;
+            }
+            syncDrained_ = true;
+            return torch::Tensor();
+        }
+
+        // 2) Refill in-flight buffer up to cap.
+        if (static_cast<size_t>(in_flight) < syncMaxInFlight_)
+        {
+            int ret = avcodec_receive_frame(codecCtx.get(), syncFrame_.get());
+            if (ret == 0)
+            {
+                Frame queued;
+                av_frame_move_ref(queued.get(), syncFrame_.get());
+                av_frame_unref(syncFrame_.get());
+                {
+                    std::lock_guard<std::mutex> lk(syncConvertWorkMu_);
+                    syncConvertWorkQueue_.push({syncProduceSeq_++, std::move(queued)});
+                }
+                syncConvertWorkCv_.notify_one();
+                continue;
+            }
+            if (ret == AVERROR_EOF)
+            {
+                // Decoder fully drained; rely on already-queued items.
+                if (in_flight == 0)
+                {
+                    syncDrained_ = true;
+                    return torch::Tensor();
+                }
+                std::unique_lock<std::mutex> lk(syncConvertOutMu_);
+                syncConvertOutCv_.wait(lk,
+                                       [&]
+                                       {
+                                           return syncConvertOutMap_.find(
+                                                      syncConsumeSeq_) !=
+                                                  syncConvertOutMap_.end();
+                                       });
+                continue;
+            }
+            if (ret != AVERROR(EAGAIN))
+            {
+                syncDrained_ = true;
+                return torch::Tensor();
+            }
+
+            // Need more packets.
+            if (!syncEofReached_)
+            {
+                int rret = av_read_frame(formatCtx.get(), pkt.get());
+                if (rret < 0)
+                {
+                    syncEofReached_ = true;
+                }
+                else if (pkt->stream_index != videoStreamIndex)
+                {
+                    av_packet_unref(pkt.get());
+                }
+                else
+                {
+                    int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
+                    av_packet_unref(pkt.get());
+                    if (sret < 0 && sret != AVERROR(EAGAIN))
+                    {
+                        syncDrained_ = true;
+                        return torch::Tensor();
+                    }
+                }
+            }
+            else if (!syncFlushSent_)
+            {
+                avcodec_send_packet(codecCtx.get(), nullptr);
+                syncFlushSent_ = true;
+            }
+            else
+            {
+                // Decoder drained but workers haven't produced next-in-order
+                // yet; wait.
+                if (in_flight == 0)
+                {
+                    syncDrained_ = true;
+                    return torch::Tensor();
+                }
+                std::unique_lock<std::mutex> lk(syncConvertOutMu_);
+                syncConvertOutCv_.wait(lk,
+                                       [&]
+                                       {
+                                           return syncConvertOutMap_.find(
+                                                      syncConsumeSeq_) !=
+                                                  syncConvertOutMap_.end();
+                                       });
+            }
+            continue;
+        }
+
+        // 3) Buffer full -> wait for output.
+        std::unique_lock<std::mutex> lk(syncConvertOutMu_);
+        syncConvertOutCv_.wait(lk,
+                               [&]
+                               {
+                                   return syncConvertOutMap_.find(syncConsumeSeq_) !=
+                                          syncConvertOutMap_.end();
+                               });
+    }
+}
+
 bool Decoder::seekFrame(int frameIndex)
 {
     NELUX_TRACE("Seeking to frame index: {}", frameIndex);
@@ -520,8 +943,14 @@ bool Decoder::seekFrame(int frameIndex)
 bool Decoder::seek(double timestamp)
 {
     stopDecodingThread();
+    stopSyncConvertWorkers();
     clearQueue();
     resetTimestampState();
+    syncEofReached_ = false;
+    syncFlushSent_ = false;
+    syncDrained_ = false;
+    syncProduceSeq_ = 0;
+    syncConsumeSeq_ = 0;
 
     NELUX_TRACE("Seeking to timestamp: {}", timestamp);
     if (timestamp < 0 || timestamp > properties.duration)
@@ -568,6 +997,7 @@ void Decoder::close()
 {
     NELUX_DEBUG("BASE DECODER: Closing decoder");
     stopDecodingThread();
+    stopSyncConvertWorkers();
     if (codecCtx)
     {
         codecCtx.reset();
@@ -651,8 +1081,14 @@ int Decoder::getBitDepth() const
 bool Decoder::seekToNearestKeyframe(double timestamp)
 {
     stopDecodingThread();
+    stopSyncConvertWorkers();
     clearQueue();
     resetTimestampState();
+    syncEofReached_ = false;
+    syncFlushSent_ = false;
+    syncDrained_ = false;
+    syncProduceSeq_ = 0;
+    syncConsumeSeq_ = 0;
 
     NELUX_TRACE("Seeking to the nearest keyframe for timestamp: {}", timestamp);
     if (timestamp < 0 || timestamp > properties.duration)
@@ -785,8 +1221,14 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Stop any running prefetch thread first
     stopDecodingThread();
+    stopSyncConvertWorkers();
     clearQueue();
     resetTimestampState();
+    syncEofReached_ = false;
+    syncFlushSent_ = false;
+    syncDrained_ = false;
+    syncProduceSeq_ = 0;
+    syncConsumeSeq_ = 0;
 
     // Reset codec context (but don't destroy the converter - we may reuse it)
     if (codecCtx)
@@ -852,16 +1294,19 @@ void Decoder::reconfigure(const std::string& filePath)
     // Cache the file path
     cachedFilePath_ = filePath;
 
-    // Re-enable preconversion (mirrors initialize() logic)
-    preconvertEnabled = true;
+    // Match initialize(): convert on consumer thread, not producer.
+    preconvertEnabled = false;
     int bitDepth_r = getBitDepth();
     int elemSize_r = (force_8bit || bitDepth_r <= 8) ? 1 : 2;
     convertedFrameBytes = static_cast<size_t>(properties.width) *
                           static_cast<size_t>(properties.height) * 3 *
                           static_cast<size_t>(elemSize_r);
 
-    // Restart prefetch thread
-    startDecodingThread();
+    // Restart prefetch thread (skip in sync mode -- sync owns the ctx).
+    if (!syncMode_)
+        startDecodingThread();
+    else
+        syncDrained_ = false;
 
     NELUX_INFO("Decoder reconfigured successfully for: {}", filePath);
 }
@@ -945,25 +1390,14 @@ void Decoder::decodingLoop()
             {
                 ConvertedFrame cf;
                 cf.timestamp = getFrameTimestamp(localFrame.get());
+                int bitDepth = getBitDepth();
+                int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
                 if (convertedFrameBytes == 0)
                 {
-                    int bitDepth = getBitDepth();
-                    int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
                     convertedFrameBytes = static_cast<size_t>(properties.width) *
                                           static_cast<size_t>(properties.height) * 3 *
                                           static_cast<size_t>(elemSize);
                 }
-                // Take a pooled buffer if available (avoids alloc + zero-init
-                // per frame once the pool is warm).
-                {
-                    std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
-                    if (!convertedBufferPool.empty())
-                    {
-                        cf.buffer = std::move(convertedBufferPool.back());
-                        convertedBufferPool.pop_back();
-                    }
-                }
-                cf.buffer.resize(convertedFrameBytes);
 
                 if (!converter)
                 {
@@ -978,8 +1412,33 @@ void Decoder::decodingLoop()
                     frameQueue.push(std::move(queuedFrame));
                     queueCond.notify_one();
                 }
+                else if (tensorHandoff_.load(std::memory_order_relaxed))
+                {
+                    // Zero-copy: convert directly into a fresh torch::Tensor
+                    // and hand it to the consumer. Saves one W*H*3 memcpy per
+                    // frame (~2.7 MB for 720p RGB).
+                    auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+                    cf.tensor = torch::empty(
+                        {properties.height, properties.width, 3},
+                        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+                    converter->convert(localFrame, cf.tensor.data_ptr());
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    convertedQueue.push(std::move(cf));
+                    queueCond.notify_one();
+                }
                 else
                 {
+                    // Take a pooled buffer if available (avoids alloc + zero-init
+                    // per frame once the pool is warm).
+                    {
+                        std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
+                        if (!convertedBufferPool.empty())
+                        {
+                            cf.buffer = std::move(convertedBufferPool.back());
+                            convertedBufferPool.pop_back();
+                        }
+                    }
+                    cf.buffer.resize(convertedFrameBytes);
                     converter->convert(localFrame, cf.buffer.data());
                     std::unique_lock<std::mutex> lock(queueMutex);
                     convertedQueue.push(std::move(cf));
@@ -1151,8 +1610,43 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         NELUX_DEBUG("Batch decoder initialized");
     }
 
+    // Lazily build a slice-only codec context dedicated to batch work. The
+    // main codecCtx is frame-threaded for fast sequential decode; flushing a
+    // frame-threaded codec under seek (as BatchDecoder does) is unsafe.
+    if (!batchCodecCtx_)
+    {
+        AVStream* stream = formatCtx->streams[videoStreamIndex];
+        const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!codec)
+            throw CxException("Failed to find decoder for batch context");
+
+        AVCodecContext* ctx = avcodec_alloc_context3(codec);
+        if (!ctx)
+            throw CxException("Failed to allocate batch codec context");
+        batchCodecCtx_.reset(ctx);
+
+        FF_CHECK_MSG(avcodec_parameters_to_context(ctx, stream->codecpar),
+                     std::string("Failed to copy codec params for batch ctx:"));
+
+        ctx->thread_count = numThreads;
+        if (ctx->codec_id == AV_CODEC_ID_AV1)
+            ctx->thread_count = 1;
+
+        // Slice-only -- safe under avcodec_flush_buffers after seek.
+        int batch_thread_types = 0;
+        if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
+            batch_thread_types |= FF_THREAD_SLICE;
+        ctx->thread_type = batch_thread_types;
+        ctx->time_base = stream->time_base;
+        ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+
+        FF_CHECK_MSG(avcodec_open2(ctx, codec, nullptr),
+                     std::string("Failed to open batch codec context:"));
+        NELUX_DEBUG("Batch codec context allocated (slice-only)");
+    }
+
     return batch_decoder_->decode_batch(
-        indices, formatCtx.get(), codecCtx.get(), videoStreamIndex,
+        indices, formatCtx.get(), batchCodecCtx_.get(), videoStreamIndex,
         nullptr, // SwsContext managed internally by BatchDecoder
         get_frame_count());
 }

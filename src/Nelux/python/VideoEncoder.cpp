@@ -76,6 +76,36 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     props.preset = preset.value_or(-1);  // -1 means use default
     props.cq = cq.value_or(-1);          // -1 means use bitrate mode
 
+    // Auto-pick colorspace from resolution. Mirrors decoder convention
+    // (AutoToRGB: height>576 => BT.709, else BT.601).
+    if (props.colorspace == AVCOL_SPC_UNSPECIFIED)
+    {
+        if (props.height > 576)
+        {
+            props.colorspace = AVCOL_SPC_BT709;
+            props.colorPrimaries = AVCOL_PRI_BT709;
+            props.colorTrc = AVCOL_TRC_BT709;
+        }
+        else
+        {
+            props.colorspace = AVCOL_SPC_BT470BG;
+            props.colorPrimaries = AVCOL_PRI_BT470BG;
+            props.colorTrc = AVCOL_TRC_BT709;
+        }
+    }
+
+    // Range follows pixfmt. YUVJ* implies full range (JPEG); rest is limited.
+    if (props.colorRange == AVCOL_RANGE_UNSPECIFIED)
+    {
+        const bool isFullRangePixFmt =
+            (props.pixelFormat == AV_PIX_FMT_YUVJ420P ||
+             props.pixelFormat == AV_PIX_FMT_YUVJ422P ||
+             props.pixelFormat == AV_PIX_FMT_YUVJ444P ||
+             props.pixelFormat == AV_PIX_FMT_YUVJ440P ||
+             props.pixelFormat == AV_PIX_FMT_YUVJ411P);
+        props.colorRange = isFullRangePixFmt ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+    }
+
     return props;
 }
 
@@ -138,6 +168,29 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         {
             gpuConverter = std::make_unique<nelux::conversion::gpu::RGBToAutoGPUConverter>(
                 width, height, outputPixelFormat, encoderStream);
+
+            int gpuCs;
+            switch (props.colorspace)
+            {
+            case AVCOL_SPC_BT709:
+                gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT709;
+                break;
+            case AVCOL_SPC_BT2020_NCL:
+            case AVCOL_SPC_BT2020_CL:
+                gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT2020;
+                break;
+            case AVCOL_SPC_BT470BG:
+            case AVCOL_SPC_SMPTE170M:
+                gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT601;
+                break;
+            default:
+                gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT709;
+                break;
+            }
+            gpuConverter->setColorSpace(gpuCs);
+            gpuConverter->setColorRange(props.colorRange == AVCOL_RANGE_JPEG
+                                            ? nelux::backends::cuda::ColorRangeEncode_Full
+                                            : nelux::backends::cuda::ColorRangeEncode_Limited);
         }
         
         // Convert RGB to NV12/YUV on GPU (writes to CUDA buffer)
@@ -220,9 +273,14 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     // formats; anything else (gray*, 10/12-bit YUV, packed RGB, GBRP, ProRes
     // targets like yuv422p10le) goes through swscale which supports the full
     // pix_fmt matrix.
+    //
+    // libyuv's RAWTo* family hardcodes BT.601 (I-variants limited, J-variants
+    // full). It exposes no forward BT.709 / BT.2020 path. Routing those
+    // colorspaces through libyuv would silently produce BT.601 pixels under a
+    // BT.709 tag -> green/magenta cast on playback. Send them to swscale.
     if (!converter)
     {
-        bool libyuvSupported = false;
+        bool libyuvFmtSupported = false;
         switch (outputPixelFormat)
         {
             case AV_PIX_FMT_YUV420P:
@@ -232,13 +290,19 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
             case AV_PIX_FMT_YUVJ422P:
             case AV_PIX_FMT_YUV444P:
             case AV_PIX_FMT_YUVJ444P:
-                libyuvSupported = true;
+                libyuvFmtSupported = true;
                 break;
             default:
-                libyuvSupported = false;
+                libyuvFmtSupported = false;
                 break;
         }
-        if (libyuvSupported)
+
+        const AVColorSpace cs = props.colorspace;
+        const bool csIsBt601 = (cs == AVCOL_SPC_BT470BG ||
+                                cs == AVCOL_SPC_SMPTE170M ||
+                                cs == AVCOL_SPC_UNSPECIFIED);
+
+        if (libyuvFmtSupported && csIsBt601)
         {
             converter = std::make_unique<nelux::conversion::cpu::RGBToAutoLibyuvConverter>(
                 width, height, outputPixelFormat);
@@ -246,7 +310,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         else
         {
             converter = std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
-                width, height, outputPixelFormat);
+                width, height, outputPixelFormat, props.colorspace, props.colorRange);
         }
     }
 

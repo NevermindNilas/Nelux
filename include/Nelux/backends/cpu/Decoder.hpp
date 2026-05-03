@@ -8,16 +8,20 @@ namespace nelux::backends::cpu
 class Decoder : public nelux::Decoder
 {
   public:
-    Decoder(const std::string& filePath, int numThreads)
+    Decoder(const std::string& filePath, int numThreads, bool syncMode = false)
         : nelux::Decoder( numThreads)
     {
+        if (syncMode)
+            setSyncMode(true);
         initialize(filePath);
     }
 
     Decoder(const std::string& filePath, int numThreads, int resizeWidth,
-            int resizeHeight)
+            int resizeHeight, bool syncMode = false)
         : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
     {
+        if (syncMode)
+            setSyncMode(true);
         initialize(filePath);
     }
 
