@@ -1,4 +1,11 @@
 
+### **Version 0.10.1 (2026-05-07)**
+
+#### **Wheel Size**
+- **Fixed:** Windows wheel shipped ~96 MB of redundant CUDA DLLs (`nvrtc64_130_0.dll`, `nvrtc-builtins64_131.dll`, `cudart64_13.dll`) that duplicated copies already provided by the user's PyTorch install at runtime. Root cause: `delvewheel --exclude` matches literal filenames only — the previous list used glob patterns (`nvrtc64*.dll`, `cudart64*.dll`, …) which never matched the real versioned filenames, so every CUDA DLL was bundled. The Linux wheel was unaffected because `auditwheel --exclude` does support globs.
+- **Changed:** `.github/workflows/build_wheel.yml` now enumerates the actual CUDA + Torch DLL filenames at CI time by scanning `torch/lib` and `$CUDA_PATH/bin` and matches them against pattern templates, then passes the resulting literal names (e.g. `nvrtc64_130_0.dll`) to `delvewheel --exclude`. Also added `c10_cuda.dll`, `cublas64_*.dll`, `cublasLt64_*.dll`, `cudnn*_*.dll` to the exclude set, which were previously missing from the Windows list (Linux already excluded them).
+- **Result:** Windows wheel drops from **42.3 MB → ~1.6 MB** (in line with Linux's 1.85 MB and macOS's 1.21 MB). Verified locally: stripped wheel imports cleanly, `__cuda_support__ == True`, CPU smoke test passes, NVDEC decode (`decode_accelerator="cuda"`) returns frames on `cuda:0` — all CUDA symbols resolve against torch's bundled copies.
+
 ### **Version 0.10.0 (2026-05-03)**
 
 #### **Code Quality**

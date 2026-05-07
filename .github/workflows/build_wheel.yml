@@ -202,10 +202,40 @@ jobs:
           $FFmpegDlls = Get-ChildItem -Path $FFmpegBin -Filter "*.dll" | Select-Object -ExpandProperty Name
           $FFmpegExclude = $FFmpegDlls -join ";"
 
+          # Dynamically enumerate CUDA + Torch DLLs so we exclude the EXACT
+          # versioned filenames (e.g. nvrtc64_130_0.dll, nvrtc-builtins64_131.dll).
+          # delvewheel --exclude matches literal filenames only — globs like
+          # "nvrtc64*.dll" do NOT match and would cause those DLLs to be bundled,
+          # inflating the wheel ~100 MB. We scan BOTH torch/lib and the CUDA
+          # toolkit bin because the dep walker may pick up either copy depending
+          # on PATH ordering, and they may have different minor versions.
+          $CudaPatterns = @(
+            "cudart64_*.dll", "nvrtc64_*.dll", "nvrtc-builtins64_*.dll",
+            "cufft64_*.dll", "curand64_*.dll", "cusolver64_*.dll",
+            "cusparse64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll",
+            "cudnn*64_*.dll", "nvToolsExt64_*.dll", "caffe2_nvrtc.dll",
+            "torch.dll", "torch_cpu.dll", "torch_cuda.dll",
+            "torch_python.dll", "c10.dll", "c10_cuda.dll", "shm.dll"
+          )
+          $ScanDirs = @($TorchLib)
+          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
+            $ScanDirs += (Join-Path $env:CUDA_PATH 'bin')
+          }
+          $TorchDllNames = foreach ($d in $ScanDirs) {
+            Get-ChildItem -Path (Join-Path $d '*.dll') -File -ErrorAction SilentlyContinue `
+              | Select-Object -ExpandProperty Name `
+              | Where-Object {
+                  $name = $_
+                  $CudaPatterns | Where-Object { $name -like $_ } | Select-Object -First 1
+                }
+          }
+          $TorchExclude = ($TorchDllNames | Sort-Object -Unique) -join ";"
+
           Write-Host "VCPKG bin: $VcpkgBin"
           Write-Host "Torch lib: $TorchLib"
           Write-Host "FFmpeg bin: $FFmpegBin"
           Write-Host "Excluding FFmpeg DLLs: $FFmpegExclude"
+          Write-Host "Excluding Torch/CUDA DLLs: $TorchExclude"
 
           # Find the wheel file
           $WheelFile = Get-ChildItem dist/*.whl | Select-Object -First 1
@@ -214,12 +244,13 @@ jobs:
           New-Item -ItemType Directory -Path dist_repaired -Force | Out-Null
 
           # Run delvewheel repair
-          # Note: We don't add CUDA bin path - CUDA DLLs come from PyTorch installation
+          # CUDA / Torch DLLs come from the user's PyTorch install at runtime —
+          # we never bundle them. FFmpeg DLLs likewise must be user-provided.
           delvewheel repair $WheelFile.FullName `
             --add-path "$VcpkgBin" `
             --add-path "$TorchLib" `
             --add-path "$FFmpegBin" `
-            --exclude "torch_cpu.dll;c10.dll;torch_python.dll;torch.dll;torch_cuda.dll;cudart64*.dll;nvrtc64*.dll;nvrtc-builtins64*.dll;cufft64*.dll;curand64*.dll;cusolver64*.dll;cusparse64*.dll;cudnn64*.dll;nvToolsExt64*.dll;$FFmpegExclude" `
+            --exclude "$TorchExclude;$FFmpegExclude" `
             --wheel-dir dist_repaired `
             -v
 
