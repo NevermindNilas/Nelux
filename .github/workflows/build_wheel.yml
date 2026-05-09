@@ -150,6 +150,9 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
           NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
+          # Skip CMake-side DLL install — delvewheel will pick up vcpkg DLLs
+          # via --add-path and bundle them into nelux.libs/ (avoids duplicates).
+          NELUX_SKIP_DLL_INSTALL: "ON"
         run: |
           # Convert backslashes to forward slashes to avoid CMake escaping issues on Windows
           TEMP_FWD=$(echo "$RUNNER_TEMP" | tr '\\' '/')

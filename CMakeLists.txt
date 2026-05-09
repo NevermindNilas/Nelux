@@ -592,56 +592,11 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     )
   endif()
 
-  if(NELUX_ENABLE_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "[CUDA DEBUG] CUDAToolkit_FOUND: ${CUDAToolkit_FOUND}")
-    message(STATUS "[CUDA DEBUG] CUDAToolkit_BIN_DIR: ${CUDAToolkit_BIN_DIR}")
-    message(STATUS "[CUDA DEBUG] ENV{CUDA_PATH}: $ENV{CUDA_PATH}")
-    
-    if(CUDAToolkit_FOUND AND DEFINED CUDAToolkit_BIN_DIR)
-      file(TO_CMAKE_PATH "${CUDAToolkit_BIN_DIR}" CUDA_BIN_DIR)
-    elseif(DEFINED ENV{CUDA_PATH})
-      file(TO_CMAKE_PATH "$ENV{CUDA_PATH}/bin" CUDA_BIN_DIR)
-    endif()
-
-    message(STATUS "[CUDA DEBUG] Resolved CUDA_BIN_DIR: ${CUDA_BIN_DIR}")
-
-    if(DEFINED CUDA_BIN_DIR)
-      # List all DLLs in CUDA bin for debugging
-      file(GLOB _cuda_bin_all_dlls "${CUDA_BIN_DIR}/*.dll")
-      message(STATUS "[CUDA DEBUG] All DLLs in CUDA bin (first 10): ")
-      list(LENGTH _cuda_bin_all_dlls _cuda_dll_count)
-      if(_cuda_dll_count GREATER 0)
-        list(SUBLIST _cuda_bin_all_dlls 0 10 _cuda_bin_sample)
-        foreach(_dll ${_cuda_bin_sample})
-          message(STATUS "  - ${_dll}")
-        endforeach()
-      else()
-        message(WARNING "[CUDA DEBUG] NO DLLs found in ${CUDA_BIN_DIR}!")
-      endif()
-
-      # CUDA 13+ stores DLLs in bin/x64 subdirectory
-      file(GLOB NELUX_CUDA_DLLS
-        "${CUDA_BIN_DIR}/x64/cudart64_*.dll"
-        "${CUDA_BIN_DIR}/x64/nvrtc64_*.dll"
-        "${CUDA_BIN_DIR}/x64/nvrtc-builtins64_*.dll"
-        # Also try root bin directory for older CUDA versions
-        "${CUDA_BIN_DIR}/cudart64_*.dll"
-        "${CUDA_BIN_DIR}/nvrtc64_*.dll"
-        "${CUDA_BIN_DIR}/nvrtc-builtins64_*.dll"
-      )
-      
-      list(LENGTH NELUX_CUDA_DLLS _cuda_dlls_found)
-      if(_cuda_dlls_found GREATER 0)
-        list(APPEND NELUX_DLLS ${NELUX_CUDA_DLLS})
-        message(STATUS "[CUDA DEBUG] Found ${_cuda_dlls_found} CUDA DLLs to bundle: ${NELUX_CUDA_DLLS}")
-      else()
-        message(WARNING "[CUDA DEBUG] GLOB found NO cudart64_*.dll or nvrtc64_*.dll in ${CUDA_BIN_DIR}!")
-      endif()
-    else()
-      message(WARNING "Could not determine CUDA BIN directory. CUDA DLLs will not be bundled!")
-    endif()
-  endif()
+  # CUDA runtime DLLs (cudart, nvrtc, nvrtc-builtins, …) are intentionally NOT
+  # bundled. PyTorch already ships them in torch/lib/ and loads them before
+  # nelux is imported (nelux/__init__.py enforces `import torch` first), so
+  # bundling our own copies would add ~100 MB of dead weight that duplicates
+  # what the user's PyTorch install already provides.
 
   if(NELUX_BUNDLE_FFMPEG_DLLS)
     # Bundle FFmpeg runtime DLLs from external/ffmpeg/bin when explicitly enabled.
@@ -747,7 +702,18 @@ install(FILES
 )
 
 if(WIN32 AND NELUX_BUILD_PYTHON)
-  if(NELUX_DLLS)
+  # In CI, delvewheel handles vcpkg DLL bundling via --add-path. Installing them
+  # into nelux/ here would duplicate every DLL (one in nelux/, one hashed copy
+  # in nelux.libs/). Set NELUX_SKIP_DLL_INSTALL=ON in CI to opt out; default
+  # remains ON so local dev (`pip install -e .`) gets DLLs next to _nelux.pyd.
+  option(NELUX_SKIP_DLL_INSTALL "Skip installing vcpkg DLLs into nelux/ (use when delvewheel will repair the wheel)" OFF)
+  if(DEFINED ENV{NELUX_SKIP_DLL_INSTALL})
+    set(NELUX_SKIP_DLL_INSTALL "$ENV{NELUX_SKIP_DLL_INSTALL}")
+  endif()
+
+  if(NELUX_SKIP_DLL_INSTALL)
+    message(STATUS "NELUX_SKIP_DLL_INSTALL=ON — leaving vcpkg DLL bundling to delvewheel")
+  elseif(NELUX_DLLS)
     install(FILES ${NELUX_DLLS} DESTINATION nelux)
     message(STATUS "Bundling ${CMAKE_CURRENT_LIST_DIR} runtime DLLs into wheel: ${NELUX_DLLS}")
   else()
