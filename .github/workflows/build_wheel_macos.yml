@@ -69,7 +69,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt libyuv \
+          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt \
             --triplet ${VCPKG_TARGET_TRIPLET} --recurse
 
       - name: Install FFmpeg (Homebrew + mirror into external/ffmpeg)

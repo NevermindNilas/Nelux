@@ -41,19 +41,21 @@ class VideoReader:
     def __init__(
         self,
         input_path: str,
-        num_threads: int = os.cpu_count() // 2,
+        num_threads: int = 0,
         force_8bit: bool = False,
         backend: Literal["pytorch", "numpy"] = "pytorch",
         decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
         cuda_device_index: int = 0,
         resize: Optional[Tuple[int, int]] = None,
+        prefetch: bool = False,
+        convert_workers: Optional[int] = None,
     ) -> None:
         """
         Open a video file for reading.
 
         Args:
             input_path (str): Path to the video file.
-            num_threads (int, optional): Number of threads for decoding. Defaults to half CPU cores.
+            num_threads (int, optional): Number of threads for decoding. 0 (default) = ffmpeg auto-detect; pass a positive integer to pin.
             force_8bit (bool, optional): Force 8-bit output regardless of source bit depth. Defaults to False.
             backend (str, optional): Output backend type. Either "pytorch" (default) or "numpy".
                 - "pytorch": Returns frames as torch.Tensor
@@ -67,6 +69,15 @@ class VideoReader:
                 GPU-side scaling. All reported properties and frame shapes reflect the resize
                 target. ``None`` (default) disables resize. ``decode_batch`` is not supported
                 while resize is active.
+            prefetch (bool, optional): If True, decode frames in a background thread.
+                Default False: producer/consumer queue handoff costs ~2.5x more than the
+                parallelism saves at typical decode speeds.
+            convert_workers (int | None, optional): Override convert worker pool size
+                (YUV→RGB libswscale parallelism). None (default) uses
+                ``min(hw_concurrency, 16)`` for max throughput. Pass a positive int to
+                pin the pool size; pass 0 to disable the pool (single-threaded convert,
+                polite mode that matches torchcodec's CPU footprint at the cost of
+                fanout fps). Smaller values lower CPU usage with a corresponding fps drop.
         """
         ...
 

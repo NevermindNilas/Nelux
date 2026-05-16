@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <mutex>
 
 namespace nelux::backends::cuda
 {
@@ -218,12 +219,29 @@ static const float kMatFCCLimited[3][3] = {
 // Set the YUV to RGB conversion matrix in constant memory
 // Uses pre-computed, validated matrices for color accuracy
 //------------------------------------------------------------------------------
+// Cache the last (matrix, range) loaded into __constant__ memory so that we
+// don't re-issue cudaMemcpyToSymbolAsync every frame when the colorspace is
+// stable (the common case — colorspace doesn't change mid-stream). Constant
+// memory is global per CUDA context, so this cache is also context-global;
+// guarded by a mutex to keep multiple-decoder safety.
+static std::mutex g_matCacheMu;
+static int g_matCachedMatrix = -1;
+static int g_matCachedRange = -1;
+
 void SetMatYuv2Rgb(int iMatrix, int colorRange, cudaStream_t stream) {
+    {
+        std::lock_guard<std::mutex> lk(g_matCacheMu);
+        if (iMatrix == g_matCachedMatrix && colorRange == g_matCachedRange)
+            return;  // Same matrix already in constant memory — skip H2D.
+        g_matCachedMatrix = iMatrix;
+        g_matCachedRange = colorRange;
+    }
+
     const float (*mat)[3] = nullptr;
-    
+
     // Select the appropriate pre-computed matrix based on color space and range
     bool isFullRange = (colorRange == ColorRange_Full);
-    
+
     switch (iMatrix) {
         case ColorSpaceStandard_BT709:
         case ColorSpaceStandard_Unspecified:  // Default to BT.709 for HD

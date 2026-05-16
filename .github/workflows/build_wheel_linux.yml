@@ -85,7 +85,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt libyuv \
+          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt \
             --triplet x64-linux-dynamic --recurse
 
       - name: Download FFmpeg (headers + shared libs for build/test)

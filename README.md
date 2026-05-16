@@ -44,53 +44,57 @@ pip install torch torchvision
 ### Basic Usage
 
 ```python
+import torch  # must be imported before nelux
 from nelux import VideoReader
 
-# Open video with hardware acceleration
+# Open video with hardware acceleration (CPU path also supported)
 reader = VideoReader("input.mp4", decode_accelerator="nvdec")
 
-# Read frames - automatically BCHW format!
+# Iterate frames — HWC uint8 by default (matches torchcodec convention)
 for frame in reader:
-    print(frame.shape)   # [1, 3, 1080, 1920] - BCHW
-    print(frame.dtype)   # torch.float16 for 8-bit videos
-    
-    # Ready for ML inference immediately
-    output = model(frame)
+    print(frame.shape)   # torch.Size([1080, 1920, 3]) — HWC
+    print(frame.dtype)   # torch.uint8 for 8-bit sources; torch.int16 for >8-bit
+                         # (override with force_8bit=True to always return uint8)
+
+    # Permute to BCHW + cast to float when feeding to an ML model
+    chw = frame.permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 255.0
+    output = model(chw)
 ```
 
 ### Batch Frame Reading
 
 ```python
+import torch
 from nelux import VideoReader
 
 vr = VideoReader("video.mp4")
 
-# Get specific frames
-batch = vr.get_batch([0, 10, 20])           # [3, 3, H, W]
-batch = vr.get_batch(range(0, 100, 10))     # [10, 3, H, W]
+# Get specific frames — returned tensor is [B, H, W, 3] HWC uint8
+batch = vr.get_batch([0, 10, 20])           # [3, H, W, 3]
+batch = vr.get_batch_range(0, 100, 10)      # [10, H, W, 3]
 
-# Pythonic slice notation
-batch = vr[0:100:10]                        # [10, 3, H, W]
-single = vr[42]                             # Single frame
-
-# Negative indexing
-batch = vr[[-3, -2, -1]]                    # Last 3 frames
+# Pythonic slice / list notation (delegates to get_batch under the hood)
+batch = vr[0:100:10]                        # [10, H, W, 3]
+batch = vr[[-3, -2, -1]]                    # Last 3 frames (negative indexing OK)
+single = vr[42]                             # Single frame [H, W, 3]
 
 # Properties
 print(len(vr))                              # Total frame count
-print(vr.shape)                             # (frames, 3, H, W)
+print(vr.shape)                             # (frames, H, W, 3)
 ```
 
 ### Video Encoding
 
 ```python
+import torch
 from nelux import VideoReader
 
 reader = VideoReader("input.mp4")
 
+# `create_encoder` pre-configures dimensions / fps / pixel format from the source.
 with reader.create_encoder("output.mp4") as enc:
     for frame in reader:
-        enc.encode_frame(frame)
+        enc.encode_frame(frame)            # frame is [H, W, 3] uint8
 
 print("Done!")
 ```
@@ -101,27 +105,87 @@ print("Done!")
 
 ### Core Features
 
-- **Hardware Acceleration**: NVDEC (decode) and NVENC (encode) support
-- **ML-Ready Output**: BCHW format with automatic dtype selection
-  - FP16 for 8-bit videos (optimal for ML)
-  - FP32 for 10/12/16-bit videos (higher precision)
-- **Zero-Copy**: Direct GPU tensor output, no CPU round-trip
-- **Batch Decoding**: Efficient multi-frame decoding with smart optimization
+- **Hardware Acceleration**: NVDEC (decode) and NVENC (encode) on NVIDIA GPUs
+- **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, 3]` (or `[H, W, 3]` `int16` for >8-bit sources; force_8bit=True clamps to uint8 always). No implicit float conversion — you cast/normalize on your side based on your model's expected input
+- **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
+- **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
 
-### Performance Optimizations
+### Performance Knobs
 
-- **Fused Operations**: Color conversion + format change + normalization in single CUDA kernel
-- **Smart Seeking**: Minimizes seeks in batch operations (only seeks on backward jumps or large gaps)
-- **Deduplication**: Duplicate frame requests decoded once and shared
-- **Asynchronous Decode**: Non-blocking GPU operations with event-based synchronization
+- **`prefetch=True`**: background producer thread (off by default — queue handoff costs ~2.5× more than the parallelism saves at typical decode speeds)
+- **`convert_workers=N`**: explicit control over the CPU convert-pool size. `None` (default) uses `min(hw_concurrency, 16)` for throughput-max; `0` matches torchcodec's polite single-threaded convert footprint; positive `N` pins to that count. See CHANGELOG v0.11.0 for measured tradeoffs
+- **NVDEC fused convert**: CUDA kernels for NV12 / P010 → RGB run in-line on the GPU; output stays on `cuda:0` as a torch tensor — no CPU round-trip when `decode_accelerator="nvdec"`
+- **Decoder-side `resize=(W, H)`**: CPU path scales in libswscale; NVDEC uses cuvid's built-in `resize=WxH` — single pass, no post-decode `F.interpolate`/`cv2.resize` needed
 
 ### Supported Codecs & Formats
 
-| Feature | Support |
-|---------|---------|
-| **Video Codecs** | H.264, H.265/HEVC, VP9, AV1 (with NVDEC) |
-| **Pixel Formats** | NV12, P010, P016, YUV444 (8/10/12/16-bit) |
-| **Containers** | MP4, MKV, AVI, MOV, WebM |
+CPU path supports anything libavcodec can decode (h264, hevc, vp8/9, av1, mpeg2/4, prores, …). NVDEC support depends on your GPU generation.
+
+| Feature | CPU path | NVDEC path |
+|---------|----------|------------|
+| **Codecs** | any libavcodec decoder | H.264, H.265/HEVC, VP9, AV1 (GPU-dependent) |
+| **Pixel formats** | all common YUV/RGB (yuv420p[10le]/yuv422p/yuv444p[10le]/nv12/nv21/rgb24/bgr24/gbrp/yuvj*) | NV12, P010, P016, YUV444 (8/10/12/16-bit) |
+| **Containers** | anything libavformat can demux | same |
+
+---
+
+## Benchmarks
+
+H.264 decode → RGB tensor throughput, measured on **Intel i9-13900K (24 logical cores) + RTX 3090, Windows 11, FFmpeg 8.x, PyTorch 2.11+cu130, nelux 0.11.0**. Each row is the **median of 5 fresh subprocess runs**, 600 frames per run (300 at 4K). Output is HWC `uint8` for every decoder (apples-to-apples).
+
+### Headline: nelux default vs torchcodec vs ffmpeg (CPU)
+
+| Resolution | Decoder | fps | CPU% avg | RSS MB |
+|---|---|---:|---:|---:|
+| **720p** | **nelux** (default) | **3422** | 874 | 2350 |
+| | torchcodec | 2924 | 344 | 2395 |
+| | ffmpeg-rgb24 (subprocess) | 2273 | — | — |
+| **1080p** | **nelux** (default) | **2642** | 1426 | 4480 |
+| | torchcodec | 1589 | 502 | 4502 |
+| | ffmpeg-rgb24 (subprocess) | 1102 | — | — |
+| **4K** | **nelux** (default) | **607** | 1656 | 9205 |
+| | torchcodec | 367 | 487 | 9098 |
+| | ffmpeg-rgb24 (subprocess) | 254 | — | — |
+
+nelux fan-outs libswscale convert across cores → +14–67% fps over torchcodec at every res. The trade: ~2.5–3× CPU. RSS is essentially identical.
+
+### Polite mode (`convert_workers=0`) vs torchcodec
+
+Disabling the convert worker pool matches torchcodec's single-threaded convert architecture exactly. fps + CPU + RSS land within ~2%:
+
+| Resolution | Decoder | fps | CPU% | RSS MB |
+|---|---|---:|---:|---:|
+| **720p** | nelux (`convert_workers=0`) | 3167 | 366 | 598 |
+| | torchcodec | 3090 | 343 | 673 |
+| **1080p** | nelux (`convert_workers=0`) | **1755** | **435** | **659** |
+| | torchcodec | 1728 | 432 | 732 |
+| **4K** | nelux (`convert_workers=0`) | 394 | 440 | 1022 |
+| | torchcodec | 401 | 477 | 1095 |
+
+So the "+14–67% fps" win above is entirely the convert worker pool — strip it and nelux ≈ torchcodec on every dimension. Pick the trade you want via `convert_workers=N`.
+
+### NVDEC (GPU decode) vs ffmpeg-nvdec
+
+| Resolution | Decoder | fps | CPU% | GPU mem MB |
+|---|---|---:|---:|---:|
+| **720p** | **nelux** (`decode_accelerator="nvdec"`) | **1651** | 45 | 2886 |
+| | ffmpeg-nvdec (subprocess) | 1253 | — | 2902 |
+| **1080p** | **nelux** | **667** | 40 | 2911 |
+| | ffmpeg-nvdec | 592 | — | 2967 |
+| **4K** | **nelux** | **175** | 24 | 3052 |
+| | ffmpeg-nvdec | 162 | — | 3259 |
+
+nelux NVDEC beats raw ffmpeg-nvdec by 8–32% on fps at lower CPU (NV12→RGB runs as a fused CUDA kernel; output stays on the GPU as a `torch.Tensor`, no host round-trip).
+
+### Quality (vs `ffmpeg -vf format=rgb24` reference, 30-frame compare)
+
+Across 14 (pix_fmt × colorspace) combos: **12 / 14 PSNR = ∞, SSIM = 1.000** — byte-identical to ffmpeg. The two exceptions are `yuv420p10le` (PSNR 47.9–48.3 dB / VMAF 99.85+) where 10→8-bit downconvert rounds differently from ffmpeg's direct 10-bit YUV→RGB path; perceptually identical. See [`tests/output/pixfmt_matrix/REPORT.md`](tests/output/pixfmt_matrix/REPORT.md) for the full table.
+
+### Caveats
+
+- **ffmpeg-rgb24 CPU% omitted** — it runs as a subprocess; the `psutil` sampler ticks every 100 ms and ffmpeg startup is short, so the few samples it gets are not representative. fps is valid (`time` wall-clock).
+- **Single hardware data point** — your numbers will differ. Reproduce with `python tests/comprehensive_bench.py --tag mybox` (full table) or `python tests/bench_thread_modes.py` (decoder-architecture comparison).
+- **Default `prefetch=False`** matches typical use. With `prefetch=True` nelux can squeeze another ~3–5% fps on big clips but burns more RAM (background producer queue).
 
 ---
 
@@ -131,26 +195,36 @@ print("Done!")
 
 ```python
 VideoReader(
-    file_path: str,
-    num_threads: int = 4,
-    force_8bit: bool = False,
-    decode_accelerator: str = "cpu",  # "cpu" or "nvdec"
-    cuda_device_index: int = 0
+    input_path: str,
+    num_threads: int = 0,                          # 0 = ffmpeg auto-detect
+    force_8bit: bool = False,                      # cast >8-bit YUV down to uint8
+    backend: Literal["pytorch", "numpy"] = "pytorch",
+    decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
+    cuda_device_index: int = 0,                    # NVDEC GPU index
+    resize: tuple[int, int] | None = None,         # decoder-side scale to (W, H)
+    prefetch: bool = False,                        # background producer thread
+    convert_workers: int | None = None,            # None = min(hw, 16); 0 = polite
 )
 ```
 
 **Properties:**
-- `shape`: Tuple of `(frames, 3, height, width)`
-- `frame_count`: Total number of frames
-- `fps`: Frame rate
-- `duration`: Video duration in seconds
-- `has_audio`: Whether the source has an audio track
+- `width`, `height`, `fps`, `min_fps`, `max_fps`, `duration`, `total_frames`
+- `pixel_format`, `bit_depth`, `aspect_ratio`, `codec`, `has_audio`
+- `properties` (full `VideoProperties` struct)
+- `shape` → `(frame_count, H, W, 3)`  (Python-side `BatchMixin`)
+- `frame_count` → cached `get_frame_count()` (Python-side `BatchMixin`)
 
 **Methods:**
-- `get_batch(indices)`: Decode multiple frames efficiently
-- `get_batch_range(start, end, step)`: Decode frame range
-- `create_encoder(output_path)`: Create video encoder
-- `__getitem__(index)`: Frame access via `reader[42]` or `reader[0:100:10]`
+- `read_frame()` / `__next__()` / iteration → next `[H, W, 3]` frame
+- `frame_at(timestamp: float | index: int)` → random-access frame via secondary decoder (doesn't disturb iteration)
+- `__getitem__(int | float | slice | list | range)` → single frame OR `[B, H, W, 3]` batch
+- `decode_batch(indices: list[int])` → C++ batch path; called by `get_batch` after validation
+- `get_batch(indices)` / `get_batch_range(start, end, step)` → batch decode with seek minimization
+- `set_range(start, end)` / `reset()` → bound iteration
+- `reconfigure(...)` → reuse this VideoReader for a different file (10-50× faster than re-constructing)
+- `create_encoder(output_path)` → `VideoEncoder` pre-configured to this source's dims/fps/format
+- `start_prefetch()` / `stop_prefetch()` / `prefetch_buffered` / `is_prefetching` → runtime prefetch control
+- `supported_codecs()` → list of codecs the linked libavcodec can decode
 
 ---
 
@@ -164,25 +238,30 @@ VideoReader(
 
 ## Requirements
 
-- **Python**: 3.8+
-- **PyTorch**: 2.0+ (with CUDA support for GPU acceleration)
-- **CUDA**: 11.8+ (for NVDEC/NVENC)
-- **OS**: Windows 10/11, Linux (Ubuntu 20.04+)
+- **Python**: 3.13+ (see `pyproject.toml` `requires-python`)
+- **PyTorch**: 2.11+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
+- **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
+- **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 12+ (Apple Silicon, CPU only)
 
 ---
 
 ## Building from Source
 
+Build system is `scikit-build-core` + CMake + Ninja + vcpkg. There is no `setup.py`.
+
 ```bash
 git clone https://github.com/NevermindNilas/NeLux.git
 cd NeLux
 
-# Install dependencies
-pip install -r requirements.txt
+# Editable install — invokes scikit-build-core, which configures CMake + Ninja
+# and runs vcpkg under the hood. Set NELUX_ENABLE_CUDA=ON to build NVDEC/NVENC.
+NELUX_ENABLE_CUDA=ON pip install -e .
 
-# Build (requires CMake, CUDA toolkit, FFmpeg)
-python setup.py build_ext --inplace
+# Or build a wheel
+NELUX_ENABLE_CUDA=ON pip wheel . -w dist/
 ```
+
+On Windows the build needs MSVC 18 (or compatible), and FFmpeg headers/libs under `external/ffmpeg/` (see `tools/download_ffmpeg.ps1`).
 
 See [BUILD.md](docs/BUILD.md) for detailed build instructions.
 
@@ -198,6 +277,5 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 
 - **[FFmpeg](https://ffmpeg.org/)**: The backbone of video processing in NeLux
 - **[PyTorch](https://pytorch.org/)**: For tensor operations and CUDA integration
-- **[libyuv](https://chromium.googlesource.com/libyuv/libyuv/)**: For fast CPU color conversion
 - **Contributors**: Thanks to everyone who has contributed to NeLux!
 

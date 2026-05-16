@@ -211,6 +211,17 @@ class Decoder
     size_t maxQueueSize = 20;
     bool isFinished = false;
     std::atomic<bool> preconvertEnabled{false};
+    // When true (and syncConvertWorkerCount_>0), the async producer pushes
+    // raw Frames into syncConvertWorkQueue_ for parallel libswscale conversion
+    // instead of putting raw Frames on frameQueue. The consumer in
+    // decodeNextFrameTensor pulls next-in-order tensors from syncConvertOutMap_.
+    // Lets the async (prefetch=True) path benefit from the same parallel
+    // convert pool that the sync path already uses.
+    bool asyncFanoutEnabled_ = false;
+    // EOF latch for async-fanout: producer sets when receive_frame returns
+    // AVERROR_EOF; consumer drains remaining ordered outputs then returns
+    // undefined Tensor.
+    std::atomic<bool> fanoutProducerDone_{false};
     size_t convertedFrameBytes = 0;
 
     double lastFrameTimestamp_ = -1.0;
@@ -263,8 +274,14 @@ class Decoder
     };
     std::vector<std::thread> syncConvertWorkers_;
     std::queue<SyncConvertWorkItem> syncConvertWorkQueue_;
-    std::map<int64_t, torch::Tensor> syncConvertOutMap_;
-    std::map<int64_t, double> syncConvertOutTs_;
+    // One map entry holds tensor + its timestamp, so each converted frame
+    // costs one map allocation instead of two on the hot path.
+    struct SyncConvertOutEntry
+    {
+        torch::Tensor tensor;
+        double timestamp = 0.0;
+    };
+    std::map<int64_t, SyncConvertOutEntry> syncConvertOutMap_;
     std::mutex syncConvertWorkMu_;
     std::condition_variable syncConvertWorkCv_;
     std::mutex syncConvertOutMu_;

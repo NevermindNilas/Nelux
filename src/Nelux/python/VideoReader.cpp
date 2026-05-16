@@ -24,7 +24,7 @@ namespace py = pybind11;
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
                          int cuda_device_index, int resizeWidth, int resizeHeight,
-                         bool prefetch)
+                         bool prefetch, int convertWorkers)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -100,6 +100,12 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             NELUX_INFO("Main decoder created successfully with accelerator: {}",
                        decode_accelerator);
         }
+
+        // Apply user-supplied convert_workers override before any decode
+        // call spawns the worker pool (lazy-start in startSyncConvertWorkers).
+        // -1 sentinel = keep the ctor-time default (defaultConvertWorkers()).
+        if (convertWorkers >= 0 && decoder)
+            decoder->setSyncConvertWorkers(convertWorkers);
 
         // Random-access decoder is now lazy-loaded in ensureRandDecoder()
 

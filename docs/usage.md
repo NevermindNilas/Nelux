@@ -67,7 +67,7 @@ The `VideoReader` class provides high-performance video decoding with multiple b
 ```python
 VideoReader(
     input_path: str,
-    num_threads: int = cpu_count() // 2,
+    num_threads: int = 0,
     force_8bit: bool = False,
     backend: Literal["pytorch", "numpy"] = "pytorch",
     decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
@@ -78,7 +78,7 @@ VideoReader(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input_path` | `str` | Required | Path to the video file |
-| `num_threads` | `int` | Half CPU cores | Number of decoder threads |
+| `num_threads` | `int` | `0` (ffmpeg auto) | Number of decoder threads; 0 = auto-detect |
 | `force_8bit` | `bool` | `False` | Force 8-bit output regardless of source bit depth |
 | `backend` | `str` | `"pytorch"` | Output format: `"pytorch"` (torch.Tensor) or `"numpy"` (ndarray) |
 | `decode_accelerator` | `str` | `"cpu"` | Decode method: `"cpu"` (software) or `"nvdec"` (NVIDIA hardware) |

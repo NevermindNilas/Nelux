@@ -1,7 +1,7 @@
 """
 Software encoder coverage: libx264, libx265, libaom-av1, libsvtav1.
 
-For each codec, every supported pixel format (that the nelux libyuv CPU
+For each codec, every supported pixel format (that the nelux libswscale CPU
 converter handles) is exercised at 240p, 480p, 720p and 1080p.
 
 The test pattern is a static smooth grayscale gradient so:
@@ -68,7 +68,7 @@ RESOLUTIONS = {
 
 
 # Intersection of each codec's supported pixel formats with what nelux's
-# libyuv CPU converter implements (YUV420P/J, NV12, YUV422P/J, YUV444P/J).
+# libswscale CPU converter implements (YUV420P/J, NV12, YUV422P/J, YUV444P/J).
 CODEC_PIXFMTS = {
     "libx264": [
         "yuv420p", "yuvj420p", "nv12",

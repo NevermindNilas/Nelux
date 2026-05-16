@@ -193,7 +193,6 @@ endif()
 # --- Dependencies ---
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
-find_package(libyuv REQUIRED)
 
 # Support both exported names (fmt changed the hyphen/underscore in some builds)
 if(TARGET fmt::fmt-header-only)
@@ -432,7 +431,6 @@ target_link_libraries(NeluxLib PUBLIC
   ${NELUX_FFMPEG_LIBS}
   spdlog::spdlog_header_only
   ${FMT_HO_TARGET}
-  yuv
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
@@ -539,7 +537,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   # Bundle runtime DLLs into the wheel so self-built wheels import cleanly.
   set(NELUX_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
   
-  # vcpkg provides spdlog, fmt, libyuv
+  # vcpkg provides spdlog, fmt
   if(DEFINED ENV{VCPKG_TARGET_TRIPLET})
     set(_vcpkg_triplet "$ENV{VCPKG_TARGET_TRIPLET}")
   else()
@@ -560,7 +558,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   
   # Try installed directory first (classic mode)
   file(GLOB NELUX_DLLS
-    "${VCPKG_INSTALLED_BIN}/libyuv*.dll"
     "${VCPKG_INSTALLED_BIN}/spdlog*.dll"
     "${VCPKG_INSTALLED_BIN}/fmt*.dll"
     "${VCPKG_INSTALLED_BIN}/jpeg*.dll"
@@ -570,7 +567,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   # Also try manifest-mode vcpkg_installed locations in the current build tree
   # (common with scikit-build temp build directories).
   file(GLOB NELUX_DLLS_BUILD_TREE
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/libyuv*.dll"
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/spdlog*.dll"
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/fmt*.dll"
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/jpeg*.dll"
@@ -579,12 +575,11 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   if(NELUX_DLLS_BUILD_TREE)
     list(APPEND NELUX_DLLS ${NELUX_DLLS_BUILD_TREE})
   endif()
-  
+
   # If not found, try packages directory (manifest mode)
   if(NOT NELUX_DLLS)
     message(STATUS "DLLs not found in installed directory, checking packages directory...")
     file(GLOB NELUX_DLLS
-      "${VCPKG_PACKAGES_DIR}/libyuv_${_vcpkg_triplet}/bin/libyuv*.dll"
       "${VCPKG_PACKAGES_DIR}/spdlog_${_vcpkg_triplet}/bin/spdlog*.dll"
       "${VCPKG_PACKAGES_DIR}/fmt_${_vcpkg_triplet}/bin/fmt*.dll"
       "${VCPKG_PACKAGES_DIR}/libjpeg-turbo_${_vcpkg_triplet}/bin/jpeg*.dll"
@@ -667,13 +662,11 @@ if(UNIX AND NELUX_BUILD_PYTHON)
   if(APPLE)
     file(GLOB NELUX_SOS
       "${VCPKG_LIB}/libspdlog*.dylib"
-      "${VCPKG_LIB}/libyuv*.dylib"
       "${VCPKG_LIB}/libfmt*.dylib"
     )
   else()
     file(GLOB NELUX_SOS
       "${VCPKG_LIB}/libspdlog.so*"
-      "${VCPKG_LIB}/libyuv.so*"
       "${VCPKG_LIB}/libfmt.so*"
     )
   endif()

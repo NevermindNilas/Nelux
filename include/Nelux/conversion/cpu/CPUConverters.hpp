@@ -5,6 +5,5 @@
 
 #include <cpu/AutoToRGB.hpp>
 #include <cpu/RGBToAuto.hpp>
-#include <cpu/RGBToAutoLibyuv.hpp>
 
 #endif // CPU_CONVERTERS_HPP

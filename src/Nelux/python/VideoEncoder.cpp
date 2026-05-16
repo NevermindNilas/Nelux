@@ -4,7 +4,6 @@
 #include <stdexcept>
 #include <Factory.hpp>
 #include <cpu/RGBToAuto.hpp>
-#include <cpu/RGBToAutoLibyuv.hpp>
 
 extern "C"
 {
@@ -269,49 +268,13 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         frame = frame.contiguous();
     }
 
-    // libyuv provides fast paths only for the common 8-bit YUV planar/biplanar
-    // formats; anything else (gray*, 10/12-bit YUV, packed RGB, GBRP, ProRes
-    // targets like yuv422p10le) goes through swscale which supports the full
-    // pix_fmt matrix.
-    //
-    // libyuv's RAWTo* family hardcodes BT.601 (I-variants limited, J-variants
-    // full). It exposes no forward BT.709 / BT.2020 path. Routing those
-    // colorspaces through libyuv would silently produce BT.601 pixels under a
-    // BT.709 tag -> green/magenta cast on playback. Send them to swscale.
+    // All RGB→YUV conversion goes through libswscale. Covers the full pix_fmt
+    // matrix (gray*, 10/12-bit YUV, packed RGB, GBRP, planar 10le, ProRes
+    // targets) and honors props.colorspace / props.colorRange directly.
     if (!converter)
     {
-        bool libyuvFmtSupported = false;
-        switch (outputPixelFormat)
-        {
-            case AV_PIX_FMT_YUV420P:
-            case AV_PIX_FMT_YUVJ420P:
-            case AV_PIX_FMT_NV12:
-            case AV_PIX_FMT_YUV422P:
-            case AV_PIX_FMT_YUVJ422P:
-            case AV_PIX_FMT_YUV444P:
-            case AV_PIX_FMT_YUVJ444P:
-                libyuvFmtSupported = true;
-                break;
-            default:
-                libyuvFmtSupported = false;
-                break;
-        }
-
-        const AVColorSpace cs = props.colorspace;
-        const bool csIsBt601 = (cs == AVCOL_SPC_BT470BG ||
-                                cs == AVCOL_SPC_SMPTE170M ||
-                                cs == AVCOL_SPC_UNSPECIFIED);
-
-        if (libyuvFmtSupported && csIsBt601)
-        {
-            converter = std::make_unique<nelux::conversion::cpu::RGBToAutoLibyuvConverter>(
-                width, height, outputPixelFormat);
-        }
-        else
-        {
-            converter = std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
-                width, height, outputPixelFormat, props.colorspace, props.colorRange);
-        }
+        converter = std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
+            width, height, outputPixelFormat, props.colorspace, props.colorRange);
     }
 
     // Convert RGB24 → YUV (I420 or NV12)

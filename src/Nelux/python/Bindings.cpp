@@ -30,7 +30,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.10.1";
+    m.attr("__version__") = "0.11.0";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -60,7 +60,8 @@ PYBIND11_MODULE(_nelux, m)
                  [](const std::string& input_path, int num_threads, bool force_8bit,
                     const std::string& backend, const std::string& decode_accelerator,
                     int cuda_device_index,
-                    std::optional<std::pair<int, int>> resize, bool prefetch)
+                    std::optional<std::pair<int, int>> resize, bool prefetch,
+                    std::optional<int> convert_workers)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -74,16 +75,29 @@ PYBIND11_MODULE(_nelux, m)
                                  "values > 0, or None to disable");
                          }
                      }
+                     int cw = -1;  // sentinel: keep auto-tuned default
+                     if (convert_workers.has_value())
+                     {
+                         cw = *convert_workers;
+                         if (cw < 0)
+                         {
+                             throw std::invalid_argument(
+                                 "convert_workers must be a non-negative int "
+                                 "(0 = single-thread fallback) or None to use the "
+                                 "auto-tuned default");
+                         }
+                     }
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
-                         cuda_device_index, rw, rh, prefetch);
+                         cuda_device_index, rw, rh, prefetch, cw);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
              py::arg("force_8bit") = false, py::arg("backend") = "pytorch",
              py::arg("decode_accelerator") = "cpu", py::arg("cuda_device_index") = 0,
              py::arg("resize") = py::none(), py::arg("prefetch") = false,
+             py::arg("convert_workers") = py::none(),
              R"doc(Open a video file for reading.
 
 Args:
@@ -109,6 +123,12 @@ Args:
         Default False: producer/consumer queue handoff costs ~2.5x more than the
         parallelism saves at typical decode speeds. Enable only for workloads where
         per-frame consumer work is heavy enough to amortize the queue cost.
+    convert_workers (int | None, optional): Override the convert worker pool size
+        (YUV→RGB libswscale parallelism). None (default) uses min(hw_concurrency, 16)
+        for max throughput. Pass an explicit positive int to pin the pool size;
+        pass 0 to disable the worker pool entirely (single-threaded convert, polite
+        mode that matches torchcodec's CPU footprint at the cost of fanout fps).
+        Smaller values lower CPU usage with a corresponding fps drop.
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

@@ -1,0 +1,41 @@
+[
+  {
+    "clip": "720p_yuv420p",
+    "width": 1280,
+    "height": 720,
+    "frames": 30,
+    "psnr_db": Infinity,
+    "mad_r": 0.0,
+    "mad_g": 0.0,
+    "mad_b": 0.0,
+    "max_abs_diff": 0,
+    "decode_time_ff_s": 0.18764559997362085,
+    "decode_time_nx_s": 0.08155620002071373
+  },
+  {
+    "clip": "1080p_yuv420p",
+    "width": 1920,
+    "height": 1080,
+    "frames": 30,
+    "psnr_db": Infinity,
+    "mad_r": 0.0,
+    "mad_g": 0.0,
+    "mad_b": 0.0,
+    "max_abs_diff": 0,
+    "decode_time_ff_s": 0.40410549999796785,
+    "decode_time_nx_s": 0.08881070002098568
+  },
+  {
+    "clip": "4k_yuv420p",
+    "width": 3840,
+    "height": 2160,
+    "frames": 30,
+    "psnr_db": Infinity,
+    "mad_r": 0.0,
+    "mad_g": 0.0,
+    "mad_b": 0.0,
+    "max_abs_diff": 0,
+    "decode_time_ff_s": 2.1250833999947645,
+    "decode_time_nx_s": 0.3079667999991216
+  }
+]

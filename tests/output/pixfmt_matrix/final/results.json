@@ -1,0 +1,314 @@
+{
+  "tag": "final",
+  "nelux_version": "0.10.1",
+  "results": [
+    {
+      "label": "yuv420p-bt709-tv",
+      "pix_fmt": "yuv420p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p-bt709-tv.mp4",
+      "ffmpeg-null_fps": 1502.182671340634,
+      "ffmpeg-rgb24_fps": 821.9236629523517,
+      "nelux-sync_fps": 1866.4470069476238,
+      "nelux-fanout_fps": 1937.724130063529,
+      "torchcodec_fps": 1519.0288745104608,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.604091
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.604091
+        }
+      }
+    },
+    {
+      "label": "yuv420p-bt709-pc",
+      "pix_fmt": "yuvj420p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p-bt709-pc.mp4",
+      "ffmpeg-null_fps": 1502.6582023962064,
+      "ffmpeg-rgb24_fps": 850.8842388487094,
+      "nelux-sync_fps": 2076.5528115718403,
+      "nelux-fanout_fps": 2063.1488604837446,
+      "torchcodec_fps": 1428.7728177047504,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.619393
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.619393
+        }
+      }
+    },
+    {
+      "label": "yuv420p-bt601-tv",
+      "pix_fmt": "yuv420p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p-bt601-tv.mp4",
+      "ffmpeg-null_fps": 1377.2637626261192,
+      "ffmpeg-rgb24_fps": 840.7242335174942,
+      "nelux-sync_fps": 2136.3534725056547,
+      "nelux-fanout_fps": 2029.2262697232786,
+      "torchcodec_fps": 1476.1658267202924,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.59991
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.59991
+        }
+      }
+    },
+    {
+      "label": "yuv420p-untagged",
+      "pix_fmt": "yuv420p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p-untagged.mp4",
+      "ffmpeg-null_fps": 1373.465381141071,
+      "ffmpeg-rgb24_fps": 845.0409055715785,
+      "nelux-sync_fps": 2109.004605885074,
+      "nelux-fanout_fps": 2110.8149713721673,
+      "torchcodec_fps": 1341.41521118939,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.59991
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.59991
+        }
+      }
+    },
+    {
+      "label": "yuv420p-mistagged",
+      "pix_fmt": "yuv420p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p-mistagged.mp4",
+      "ffmpeg-null_fps": 1513.917443195541,
+      "ffmpeg-rgb24_fps": 822.7685282741362,
+      "nelux-sync_fps": 2152.3891518381524,
+      "nelux-fanout_fps": 2105.4404575329995,
+      "torchcodec_fps": 1522.3789710512563,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.78867
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.78867
+        }
+      }
+    },
+    {
+      "label": "yuv422p-bt709",
+      "pix_fmt": "yuv422p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv422p-bt709.mp4",
+      "ffmpeg-null_fps": 1349.2096329081405,
+      "ffmpeg-rgb24_fps": 735.170508106222,
+      "nelux-sync_fps": 1806.9023668010768,
+      "nelux-fanout_fps": 1771.1131444481787,
+      "torchcodec_fps": 1353.1482344741164,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.608051
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.608051
+        }
+      }
+    },
+    {
+      "label": "yuv444p-bt709",
+      "pix_fmt": "yuv444p",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv444p-bt709.mp4",
+      "ffmpeg-null_fps": 1226.3889467175366,
+      "ffmpeg-rgb24_fps": 663.370159159713,
+      "nelux-sync_fps": 1168.145149089973,
+      "nelux-fanout_fps": 1137.0527593751015,
+      "torchcodec_fps": 234.04897708124074,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.61112
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.61112
+        }
+      }
+    },
+    {
+      "label": "nv12-bt709",
+      "pix_fmt": "nv12",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\nv12-bt709.mp4",
+      "ffmpeg-null_fps": 1313.860173796718,
+      "ffmpeg-rgb24_fps": 845.648321931423,
+      "nelux-sync_fps": 2122.9829895182884,
+      "nelux-fanout_fps": 2253.2773921993494,
+      "torchcodec_fps": 1405.913459429717,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.622599
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.622599
+        }
+      }
+    },
+    {
+      "label": "yuv420p10le-bt709",
+      "pix_fmt": "yuv420p10le",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p10le-bt709.mp4",
+      "ffmpeg-null_fps": 715.4003761938898,
+      "ffmpeg-rgb24_fps": 593.565042652601,
+      "nelux-sync_fps": 667.5873437887766,
+      "nelux-fanout_fps": 649.1783782028077,
+      "torchcodec_fps": 202.82763355790323,
+      "quality": {
+        "nelux": {
+          "psnr": 47.93978,
+          "ssim": 0.998561,
+          "vmaf": 99.91746
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.608879
+        }
+      }
+    },
+    {
+      "label": "yuv444p10le-bt2020",
+      "pix_fmt": "yuv444p10le",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv444p10le-bt2020.mp4",
+      "ffmpeg-null_fps": 544.2214385766873,
+      "ffmpeg-rgb24_fps": 438.6522847292727,
+      "nelux-sync_fps": 496.94182005744517,
+      "nelux-fanout_fps": 484.6836728200269,
+      "torchcodec_fps": 200.37330882929135,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.604925
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.604925
+        }
+      }
+    },
+    {
+      "label": "yuv420p10le-bt2020",
+      "pix_fmt": "yuv420p10le",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\yuv420p10le-bt2020.mp4",
+      "ffmpeg-null_fps": 703.2292757591821,
+      "ffmpeg-rgb24_fps": 586.5779239666135,
+      "nelux-sync_fps": 642.581842466714,
+      "nelux-fanout_fps": 642.6859129889951,
+      "torchcodec_fps": 203.85738952418527,
+      "quality": {
+        "nelux": {
+          "psnr": 48.268794,
+          "ssim": 0.998576,
+          "vmaf": 99.845303
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.599476
+        }
+      }
+    },
+    {
+      "label": "rgb24-srgb",
+      "pix_fmt": "rgb24",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\rgb24-srgb.mp4",
+      "ffmpeg-null_fps": 1028.9194973879319,
+      "ffmpeg-rgb24_fps": 641.5479268341128,
+      "nelux-sync_fps": 1288.7760493157525,
+      "nelux-fanout_fps": 1216.3930862729394,
+      "torchcodec_fps": 894.7270157558158,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        }
+      }
+    },
+    {
+      "label": "bgr24-srgb",
+      "pix_fmt": "bgr24",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\bgr24-srgb.mp4",
+      "ffmpeg-null_fps": 1015.8974404783744,
+      "ffmpeg-rgb24_fps": 688.7779701776813,
+      "nelux-sync_fps": 1271.000099105964,
+      "nelux-fanout_fps": 1241.6930733758052,
+      "torchcodec_fps": 857.8825970337314,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        }
+      }
+    },
+    {
+      "label": "gbrp-srgb",
+      "pix_fmt": "gbrp",
+      "path": "D:\\Nelux\\tests\\data\\pixfmt_matrix\\gbrp-srgb.mp4",
+      "ffmpeg-null_fps": 1021.4455906896382,
+      "ffmpeg-rgb24_fps": 688.3481022229936,
+      "nelux-sync_fps": 1240.0240067396073,
+      "nelux-fanout_fps": 1230.0556723498544,
+      "torchcodec_fps": 936.5032094516449,
+      "quality": {
+        "nelux": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        },
+        "torchcodec": {
+          "psnr": Infinity,
+          "ssim": 1.0,
+          "vmaf": 99.615191
+        }
+      }
+    }
+  ]
+}

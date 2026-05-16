@@ -126,7 +126,6 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
             "swscale-9.dll",
             "avfilter-11.dll",
             "avdevice-62.dll",
-            "libyuv.dll",
             "fmt.dll",
             "spdlog.dll",
             "torch_cpu.dll",
@@ -208,7 +207,7 @@ except ImportError as e:
         raise ImportError(
             f"Failed to load Nelux C extension.\n\n"
             f"On Windows this is usually a missing runtime DLL dependency.\n"
-            f"Common missing DLLs: FFmpeg (avcodec/avformat/...) or libyuv.dll.\n\n"
+            f"Common missing DLLs: FFmpeg (avcodec/avformat/...) or fmt/spdlog.\n\n"
             f"{missing_block}\n"
             f"If FFmpeg is external, add this before importing nelux:\n"
             f"  import os\n"

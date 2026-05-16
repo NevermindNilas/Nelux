@@ -201,3 +201,8 @@ celux/_celux.pyd
 
 build_cuda/
 build_test/
+
+# Bench scratch outputs — raw video dumps are gigabytes and get regenerated
+tests/output/**/*.raw
+HANDOFF.md
+build_iter2.bat

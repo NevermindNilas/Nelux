@@ -79,7 +79,7 @@ jobs:
       - name: Install C++ deps via vcpkg
         shell: cmd
         run: |
-          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt libyuv --triplet x64-windows-release --recurse
+          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
 
       - name: Download FFmpeg for build (headers/libs only)
         shell: powershell
@@ -328,7 +328,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt libyuv \
+          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt \
             --triplet x64-linux-dynamic --recurse
 
       - name: Download FFmpeg
@@ -463,7 +463,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt libyuv \
+          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt \
             --triplet ${VCPKG_TARGET_TRIPLET} --recurse
 
       - name: Install FFmpeg

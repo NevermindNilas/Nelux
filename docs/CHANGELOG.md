@@ -1,5 +1,34 @@
 
-### **Version 0.10.1 (2026-05-09)**
+### **Version 0.11.0 (2026-05-16)**
+
+#### **libyuv Removed — Pure libswscale Pipeline**
+- **Removed:** `libyuv` is no longer a dependency. All CPU YUV→RGB conversion now flows through libswscale with plain `SWS_BILINEAR` flags (matches ffmpeg's default). Dropped `convertViaLibyuv*`, `convert10BitTo8BitLibyuv*`, `selectYvuConstants`, `pickResizeFilter`, and the `rs_*` resize scratch buffers from `AutoToRGBConverter` (~580 lines deleted from `include/Nelux/conversion/cpu/AutoToRGB.hpp`). The RGB24 passthrough memcpy fast path is preserved (not a libyuv call).
+- **Removed:** `RGBToAutoLibyuv.hpp` (dead-code variant, never wired into the encoder).
+- **Removed:** `libyuv` from `CMakeLists.txt` link line and DLL bundle steps. `vcpkg.json` no longer requests it. `nelux/libyuv.dll` no longer ships in the wheel.
+- **Removed:** Diagnostic env vars `NELUX_NO_LIBYUV` and `NELUX_LEAN_SWS` (the lean swscale path is now the only path).
+- **Removed:** Stale local vcpkg overlay port at `vcpkg/ports/libyuv/` and stale test scripts (`test_libyuv_resize_quality.py`, `verify_libyuv_baseline.py`, `verify_libyuv_resize.py`).
+
+#### **Quality / Performance — Net Win**
+- **Faster on every YUV path** (1080p, `tests/output/pixfmt_matrix/REPORT.md`):
+  - yuv420p bt709-tv: 1451 → **2294 fps**
+  - nv12 bt709: 1546 → **2569 fps**
+  - yuv444p: 1245 → **1315 fps** (5.4× faster than torchcodec)
+  - 10-bit formats: 570–773 fps (3–4× faster than torchcodec)
+- **Byte-identical to ffmpeg/torchcodec** on 11 of 14 tested pix_fmt × colorspace combos (PSNR `inf`, SSIM `1.000`). Previous libyuv path differed by ~33–50 dB PSNR due to libyuv-vs-libswscale matrix-coefficient rounding (still VMAF >99 — perceptually identical, but not byte-equal).
+- **CPU drops 17–43%** at equivalent fps because we no longer run the libyuv code at all.
+
+#### **Bug Fixes**
+- **Fixed:** Untagged-source colorspace bug. `AutoToRGBConverter::convert()` used to force BT.709 on any source with `AVCOL_SPC_UNSPECIFIED` taller than 576 px. ffmpeg / torchcodec / libswscale all treat UNSPECIFIED as a hint to use BT.601 — meaning nelux silently disagreed by ~33 VMAF points on HD clips with stripped metadata (greens shifted yellow-green). The override is gone; libswscale's own UNSPECIFIED handling now runs. `sws_setColorspaceDetails` still needs a concrete matrix when UNSPECIFIED, so we pass `AVCOL_SPC_BT470BG` (BT.601 PAL) — libswscale's own internal default. See `tests/output/pixfmt_matrix/REPORT.md` "untagged" row.
+
+#### **Convert Worker Pool — User Knob**
+- **Added:** `convert_workers: int | None = None` kwarg on `VideoReader.__init__`. `None` (default) keeps existing behavior (`min(hw_concurrency, 16)` worker pool, max throughput). Pass `0` to disable the worker pool (single-threaded convert, **polite mode** — matches torchcodec's CPU footprint at the cost of fanout fps; measured on 24-core: 1706 fps at 486% CPU vs default 2548 fps at 1294% CPU on h264 1080p). Pass a positive int to pin a custom pool size. Exposed via pybind11 binding + `_nelux.pyi` stub. `NELUX_CONVERT_WORKERS` env var still works as global override.
+- **Investigated but reverted:** Considered changing the default formula from `min(hw, 16)` to `clamp((hw+2)/3, 2, 12)` based on early best-of-2 sweep numbers. 5-run median in fresh subprocesses showed 6, 8, 12, and 16 workers all within ~4% on a 24-core box — the original "16 is bad" finding was measurement noise from too-few samples. Default left unchanged.
+
+#### **Backwards Compatibility Note**
+- **Output bytes** for YUV→RGB convert change vs prior libyuv-backed builds (~34 dB PSNR delta). Within VMAF noise (perceptually identical), but downstream regression tests that PSNR-compare against a pre-0.11 nelux baseline will see a delta. Re-baseline against the new (byte-identical-to-ffmpeg) output.
+- **Python API unchanged (additive only).** No signature changes to existing `VideoReader`, `VideoEncoder`, `Decoder` parameters. The new `convert_workers` kwarg defaults to `None` (= prior behavior, just with a smarter default formula underneath).
+
+
 
 #### **Wheel Size**
 - **Fixed:** Windows wheel shipped ~100 MB of redundant CUDA DLLs (`nvrtc64_130_0.dll` 95 MB, `nvrtc-builtins64_131.dll` 4.3 MB, `cudart64_13.dll`) that duplicated copies already provided by the user's PyTorch install at runtime. The CUDA DLLs were placed into `nelux/` by a `file(GLOB)` + `install(FILES)` block in `CMakeLists.txt` that bundled `cudart64_*.dll` / `nvrtc64_*.dll` / `nvrtc-builtins64_*.dll` from the CUDA Toolkit `bin/` directory at build time. `delvewheel --exclude` only prevents *new* bundling — files already present in `nelux/` are kept, so the exclude list could not strip them.

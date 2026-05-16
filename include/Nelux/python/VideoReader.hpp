@@ -32,6 +32,9 @@ class VideoReader
      * @param decode_accelerator Decode acceleration type ("cpu" or "nvdec"). Default is
      * "cpu".
      * @param cuda_device_index CUDA device index for NVDEC (default: 0).
+     * @param convertWorkers Override convert-worker pool size. -1 = use default
+     * (min(hw_concurrency, 16)), 0 = single-thread fallback (no fanout, polite
+     * mode that matches torchcodec's CPU footprint), positive = pin to N workers.
      */
     VideoReader(const std::string& filePath,
                 int numThreads = static_cast<int>(std::thread::hardware_concurrency() /
@@ -39,7 +42,8 @@ class VideoReader
                 bool force_8bit = false, Backend backend = Backend::PyTorch,
                 const std::string& decode_accelerator = "cpu",
                 int cuda_device_index = 0, int resizeWidth = 0,
-                int resizeHeight = 0, bool prefetch = true);
+                int resizeHeight = 0, bool prefetch = true,
+                int convertWorkers = -1);
 
     /**
      * @brief Destructor for VideoReader.

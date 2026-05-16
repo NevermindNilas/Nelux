@@ -72,7 +72,7 @@ jobs:
       - name: Install C++ deps via vcpkg
         shell: cmd
         run: |
-          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt libyuv --triplet x64-windows-release --recurse
+          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
 
       - name: Download FFmpeg 7.1 for build (headers/libs only)
         shell: powershell

@@ -223,6 +223,9 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
+    // Async fanout uses CPU libswscale convert workers; CUDA decoder produces
+    // AV_PIX_FMT_CUDA frames that cannot be fed to libswscale on the host. Disable.
+    asyncFanoutEnabled_ = false;
     NELUX_DEBUG("CUDA DECODER: Constructing with device index {}, resize={}x{}",
                 cudaDeviceIndex, resizeWidth, resizeHeight);
     NELUX_INFO("CUDA DECODER BUILD: 2026-02-06T22:49:00 RGB24-BYTE-BY-BYTE-FIX-ACTIVE");
@@ -680,7 +683,14 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     // The caller may have launched async GPU ops (e.g., frame.float(), conv2d, etc.)
     // on PyTorch's CUDA stream that are still reading from `buffer`. We must wait
     // for those to complete before we write new frame data into the same memory.
-    cudaDeviceSynchronize();
+    //
+    // Diagnostic / sweep override: set NELUX_NVDEC_SKIP_ENTRY_SYNC=1 to bypass
+    // this sync (UNSAFE — caller must guarantee no in-flight reads of buffer).
+    if (const char* env = std::getenv("NELUX_NVDEC_SKIP_ENTRY_SYNC");
+        !env || std::atoi(env) == 0)
+    {
+        cudaDeviceSynchronize();
+    }
 
     // Use the base class decoding thread infrastructure, but with our conversion
     if (!decodingThread.joinable())
@@ -770,11 +780,19 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         // buffer to the caller. CPU-blocks only on our stream (not the whole
         // device), and guarantees any torch read from any stream sees full
         // data. Cheap compared to the original cudaDeviceSynchronize at entry.
-        cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
-        if (sync_err != cudaSuccess)
+        //
+        // Diagnostic / sweep override: set NELUX_NVDEC_SKIP_EXIT_SYNC=1 to
+        // bypass this sync (UNSAFE — caller's reads on a different stream may
+        // see partial/old data).
+        if (const char* env = std::getenv("NELUX_NVDEC_SKIP_EXIT_SYNC");
+            !env || std::atoi(env) == 0)
         {
-            throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
-                              cudaGetErrorString(sync_err));
+            cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
+            if (sync_err != cudaSuccess)
+            {
+                throw CxException(std::string("CUDA DECODER: Stream sync failed: ") +
+                                  cudaGetErrorString(sync_err));
+            }
         }
     }
     else
