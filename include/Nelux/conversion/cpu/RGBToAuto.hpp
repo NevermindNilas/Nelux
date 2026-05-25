@@ -69,10 +69,13 @@ class RGBToAutoConverter : public ConverterBase
         if (!swsContext)
         {
 
+            // Plain SWS_BILINEAR matches ffmpeg's default flag set; the
+            // previous SWS_ACCURATE_RND combo was slower without quality
+            // benefit. See v0.11.0 decode-side change for the same reasoning
+            // (tests/output/pixfmt_matrix/REPORT.md).
             swsContext =
                 sws_getContext(width, height, AV_PIX_FMT_RGB24, width, height, dst_fmt,
-                               SWS_BILINEAR | SWS_ACCURATE_RND, nullptr, nullptr,
-                               nullptr);
+                               SWS_BILINEAR, nullptr, nullptr, nullptr);
 
             if (!swsContext)
                 throw std::runtime_error(

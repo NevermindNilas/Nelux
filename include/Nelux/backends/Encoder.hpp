@@ -6,6 +6,8 @@
 #include <Conversion.hpp>
 #include <Frame.hpp>
 #include <filesystem>
+#include <map>
+#include <string>
 
 namespace nelux
 {
@@ -42,6 +44,21 @@ class Encoder
         bool useHardwareEncoder = false;  // Auto-detected from codec name
         int preset = -1;  // NVENC preset (0=fastest, higher=better quality)
         int cq = -1;      // Constant quality mode (0-51, lower=better)
+
+        // String preset (preferred when set). Bypasses the integer-preset
+        // per-codec mapping table and passes the value straight to
+        // av_dict_set("preset", ...) — accepts whatever the underlying
+        // encoder understands (e.g. "medium" for libx264, "p4" for NVENC,
+        // "fast" for libsvtav1's named presets). Empty = fall back to the
+        // integer mapping above.
+        std::string presetStr;
+
+        // Extra AVOptions forwarded as av_dict_set() entries on
+        // avcodec_open2. Applied AFTER the built-in option block, so user
+        // entries override built-in choices for the same key. Lets callers
+        // reach codec-specific knobs (tune, cpu-used, x264-params, ...)
+        // without us having to enumerate every encoder.
+        std::map<std::string, std::string> extraOptions;
 
         // Color metadata. UNSPECIFIED = auto (BT.709 for HD, BT.601 for SD).
         AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED;

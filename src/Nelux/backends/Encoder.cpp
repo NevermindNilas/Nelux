@@ -427,12 +427,21 @@ void Encoder::initVideoStream()
         videoCodecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    // NVENC-specific options
+    // Codec options. Built-in choices first (preset, cq, codec-specific
+    // quirks); user-supplied properties.extraOptions applied last so they
+    // can override anything we set here.
     AVDictionary* opts = nullptr;
+    const bool hasPresetStr = !properties.presetStr.empty();
+
     if (isNvenc && hwDeviceCtx)
     {
-        // Set NVENC preset if specified
-        if (properties.preset >= 0)
+        // Set NVENC preset. String preset wins; otherwise translate the
+        // 1..7 int (clamped); otherwise default to p4 (balanced).
+        if (hasPresetStr)
+        {
+            av_dict_set(&opts, "preset", properties.presetStr.c_str(), 0);
+        }
+        else if (properties.preset >= 0)
         {
             // NVENC presets: p1 (fastest) to p7 (slowest/best quality)
             std::string presetStr = "p" + std::to_string(std::clamp(properties.preset, 1, 7));
@@ -440,17 +449,16 @@ void Encoder::initVideoStream()
         }
         else
         {
-            // Default to p4 (balanced)
             av_dict_set(&opts, "preset", "p4", 0);
         }
-        
+
         // Set constant quality mode if specified
         if (properties.cq >= 0 && properties.cq <= 51)
         {
             av_dict_set(&opts, "rc", "constqp", 0);
             av_dict_set_int(&opts, "qp", properties.cq, 0);
         }
-        
+
         // Enable B-frames for better compression (NVENC supports this)
         av_dict_set(&opts, "b_ref_mode", "middle", 0);
 
@@ -465,6 +473,13 @@ void Encoder::initVideoStream()
         const bool isSvtAv1 = codecName == "libsvtav1";
         const bool isAomAv1 = codecName == "libaom-av1";
 
+        if (hasPresetStr)
+        {
+            // User passed a string preset — forward as-is. Skips the int-table
+            // mapping so callers get exact parity with ffmpeg-cli semantics.
+            av_dict_set(&opts, "preset", properties.presetStr.c_str(), 0);
+        }
+
         if (isX264 || isX265)
         {
             // x264/x265 preset: 1=ultrafast ... 9=veryslow
@@ -472,7 +487,7 @@ void Encoder::initVideoStream()
                 "ultrafast", "superfast", "veryfast", "faster", "fast",
                 "medium",    "slow",      "slower",   "veryslow"
             };
-            if (properties.preset >= 1 && properties.preset <= 9)
+            if (!hasPresetStr && properties.preset >= 1 && properties.preset <= 9)
             {
                 av_dict_set(&opts, "preset", x26xPresets[properties.preset - 1], 0);
             }
@@ -490,7 +505,7 @@ void Encoder::initVideoStream()
         {
             // SVT-AV1 preset: higher = faster (0=slowest/best, 13=fastest)
             // Map our 1..9 to SVT 12..4 (9=slowest)
-            if (properties.preset >= 1 && properties.preset <= 9)
+            if (!hasPresetStr && properties.preset >= 1 && properties.preset <= 9)
             {
                 int svtPreset = 13 - properties.preset;
                 av_dict_set_int(&opts, "preset", svtPreset, 0);
@@ -508,8 +523,11 @@ void Encoder::initVideoStream()
         }
         else if (isAomAv1)
         {
-            // libaom-av1: cpu-used 0..8 (0=slowest/best, 8=fastest)
-            if (properties.preset >= 1 && properties.preset <= 9)
+            // libaom-av1: cpu-used 0..8 (0=slowest/best, 8=fastest). The int
+            // preset maps onto cpu-used; presetStr (e.g. user passing
+            // "cpu-used=8" by mistake) is just ignored here — explicit
+            // extraOptions{"cpu-used": "8"} is the supported override.
+            if (!hasPresetStr && properties.preset >= 1 && properties.preset <= 9)
             {
                 int cpuUsed = std::clamp(9 - properties.preset, 0, 8);
                 av_dict_set_int(&opts, "cpu-used", cpuUsed, 0);
@@ -520,6 +538,14 @@ void Encoder::initVideoStream()
                 videoCodecCtx->bit_rate = 0;
             }
         }
+    }
+
+    // Apply user-supplied extraOptions LAST so they can override any of
+    // the built-in choices above (or reach codec-specific knobs we don't
+    // wrap explicitly — tune, x264-params, cpu-used on libaom, etc.).
+    for (const auto& [key, value] : properties.extraOptions)
+    {
+        av_dict_set(&opts, key.c_str(), value.c_str(), 0);
     }
 
     int ret;
@@ -610,17 +636,27 @@ bool Encoder::encodeFrame(const Frame& frame)
     }
 
     // 3) Drain packets from the encoder
-    while (avcodec_receive_packet(videoCodecCtx.get(), pkt.get()) == 0)
+    while (true)
     {
+        int ret = avcodec_receive_packet(videoCodecCtx.get(), pkt.get());
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            break; // no more packets available right now
+        if (ret < 0)
+        {
+            NELUX_ERROR("avcodec_receive_packet failed: {}", errorToString(ret));
+            if (hwFrame)
+                av_frame_free(&hwFrame);
+            return false;
+        }
         writePacket(); // calls av_interleaved_write_frame()
     }
-    
+
     // Clean up the hardware frame
     if (hwFrame)
     {
         av_frame_free(&hwFrame);
     }
-    
+
     return true;
 }
 
@@ -630,7 +666,12 @@ void Encoder::writePacket()
     // ONLY video packets should ever reach this helper;
     // they already have pkt->stream_index == videoStream->index
     av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base, videoStream->time_base);
-    av_interleaved_write_frame(formatCtx.get(), pkt.get());
+    if (int ret = av_interleaved_write_frame(formatCtx.get(), pkt.get()); ret < 0)
+    {
+        // Surface muxing / I/O failures (disk full, broken pipe). Without this
+        // the write silently fails and encoding reports success.
+        NELUX_ERROR("av_interleaved_write_frame failed: {}", errorToString(ret));
+    }
 }
 
 void Encoder::close()
@@ -642,12 +683,28 @@ void Encoder::close()
     if (videoCodecCtx)
     {
         avcodec_send_frame(videoCodecCtx.get(), nullptr);
-        while (avcodec_receive_packet(videoCodecCtx.get(), pkt.get()) == 0)
+        while (true)
         {
+            int ret = avcodec_receive_packet(videoCodecCtx.get(), pkt.get());
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                break; // fully drained
+            if (ret < 0)
+            {
+                // A genuine error mid-drain would otherwise be silently
+                // swallowed, truncating the output stream.
+                NELUX_ERROR("Error draining encoder on close: {}", errorToString(ret));
+                break;
+            }
             pkt->stream_index = videoStream->index;
             av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base,
                                  videoStream->time_base);
-            av_interleaved_write_frame(formatCtx.get(), pkt.get());
+            if (int wret = av_interleaved_write_frame(formatCtx.get(), pkt.get());
+                wret < 0)
+            {
+                NELUX_ERROR("av_interleaved_write_frame failed on close: {}",
+                            errorToString(wret));
+                break;
+            }
         }
     }
 

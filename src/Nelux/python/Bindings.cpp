@@ -30,7 +30,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.11.0";
+    m.attr("__version__") = "0.11.1";
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -312,21 +312,55 @@ Example:
     // ---------- nelux::VideoEncoder -----------
     py::class_<nelux::VideoEncoder, std::shared_ptr<nelux::VideoEncoder>>(
         m, "VideoEncoder")
-        .def(py::init<const std::string&,         // output_path
-                      std::optional<std::string>, // codec
-                      std::optional<int>,         // width
-                      std::optional<int>,         // height
-                      std::optional<int>,         // bit_rate
-                      std::optional<float>,       // fps
-                      std::optional<int>,         // preset (NVENC)
-                      std::optional<int>,         // cq (NVENC)
-                      std::optional<std::string>  // pixel_format
-                      >(),
+        .def(py::init(
+                 [](const std::string& output_path,
+                    std::optional<std::string> codec,
+                    std::optional<int> width, std::optional<int> height,
+                    std::optional<int> bit_rate, std::optional<float> fps,
+                    py::object preset, std::optional<int> cq,
+                    std::optional<std::string> pixel_format,
+                    std::optional<std::map<std::string, std::string>> options)
+                 {
+                     // Dispatch `preset` on Python type: int → existing 1..N
+                     // mapping table per codec; str → forwarded straight to
+                     // av_dict_set("preset", ...); None → encoder picks default.
+                     std::optional<int> presetInt;
+                     std::optional<std::string> presetStr;
+                     if (!preset.is_none())
+                     {
+                         try
+                         {
+                             presetInt = preset.cast<int>();
+                         }
+                         catch (const py::cast_error&)
+                         {
+                             try
+                             {
+                                 presetStr = preset.cast<std::string>();
+                             }
+                             catch (const py::cast_error&)
+                             {
+                                 throw std::invalid_argument(
+                                     "preset must be int, str, or None");
+                             }
+                         }
+                     }
+
+                     std::map<std::string, std::string> extraOptions;
+                     if (options.has_value())
+                         extraOptions = std::move(*options);
+
+                     return std::make_shared<nelux::VideoEncoder>(
+                         output_path, codec, width, height, bit_rate, fps,
+                         presetInt, cq, pixel_format, presetStr,
+                         std::move(extraOptions));
+                 }),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
              py::arg("bit_rate") = py::none(), py::arg("fps") = py::none(),
              py::arg("preset") = py::none(),
              py::arg("cq") = py::none(), py::arg("pixel_format") = py::none(),
+             py::arg("options") = py::none(),
              R"doc(Create a video encoder.
 
 Args:
@@ -337,13 +371,27 @@ Args:
     height (int, optional): Frame height. Defaults to 1080.
     bit_rate (int, optional): Video bitrate in bps. Defaults to 4000000 (4 Mbps).
     fps (float, optional): Frames per second. Defaults to 30.
-    preset (int, optional): NVENC encoding preset (1-7). Higher = better quality.
-    cq (int, optional): NVENC constant quality mode (0-51). Lower = better quality.
+    preset (int | str, optional): Encoding preset.
+        - int: 1..N mapped through a per-codec table:
+            * libx264/libx265: 1=ultrafast..9=veryslow
+            * libsvtav1: 1=slowest..9=fastest (mapped to SVT 12..4)
+            * libaom-av1: maps to cpu-used 0..8
+            * NVENC: 1..7 mapped to p1..p7
+        - str: passed straight through to ``av_dict_set("preset", value)``,
+          accepts exact ffmpeg names ("medium", "veryfast", "p4", "8", ...).
+          Use this for parity with ``ffmpeg -preset <name>``.
+    cq (int, optional): Constant quality mode (0-51 / 0-63 depending on codec).
+        Lower = better quality. Disables bitrate mode where required.
     pixel_format (str, optional): Output pixel format (e.g., "yuv420p", "nv12",
         "yuv444p", "gray", "gray16le"). Grayscale formats ("gray", "gray16le",
         etc.) are supported natively only by software encoders such as
         "libx264"/"libx265"; with NVENC codecs the encoder falls back to NV12
         and emits a warning.
+    options (dict[str, str], optional): Extra AVOption key/value pairs forwarded
+        to ``avcodec_open2`` as ``av_dict_set(...)`` entries. Applied AFTER the
+        built-in options (preset, crf, ...), so entries here override any of
+        them. Lets you reach codec-specific knobs nelux doesn't wrap explicitly:
+        ``options={"tune": "film", "x264-params": "ref=3", "cpu-used": "8"}``.
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
              "Encode one video frame (H×W×3 torch.uint8 tensor).")

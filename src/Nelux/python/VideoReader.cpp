@@ -258,47 +258,53 @@ torch::Tensor VideoReader::decodeFrame()
     bool success = false;
     torch::Tensor outTensor;  // populated by zero-copy CPU path
 
-    try
+    // Retry loop. A one-shot NVDEC->CPU fallback re-runs the decode by looping
+    // rather than recursing: recursing would call decodeFrame() while this
+    // scope's gil_scoped_release is still active, constructing a second release
+    // with the GIL already dropped — undefined behavior (PyEval_SaveThread on a
+    // NULL thread state). After the fallback the accelerator is CPU, so a
+    // second failure rethrows and the loop cannot spin.
+    while (true)
     {
-        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        try
         {
-            outTensor = prefetch
-                            ? decoder->decodeNextFrameTensor(&frame_timestamp)
-                            : decoder->decodeNextFrameTensorSync(&frame_timestamp);
-            success = outTensor.defined();
+            if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+            {
+                outTensor = prefetch
+                                ? decoder->decodeNextFrameTensor(&frame_timestamp)
+                                : decoder->decodeNextFrameTensorSync(&frame_timestamp);
+                success = outTensor.defined();
+            }
+            else
+            {
+                // NVDEC / hardware path: in-place write into shared CUDA tensor.
+                success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+            }
+            break; // decode attempt finished (frame produced or clean EOF)
         }
-        else
+        catch (const std::exception& ex)
         {
-            // NVDEC / hardware path: in-place write into shared CUDA tensor.
-            success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
-        }
-    }
-    catch (const std::exception& ex)
-    {
-        std::cerr << "VideoReader: Exception caught: " << ex.what() << std::endl;
-        // If NVDEC fails mid-iteration, fall back to CPU.
-        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-        {
-            NELUX_WARN("decodeFrame(): NVDEC failed: {}. Falling back to CPU decoder.",
-                       ex.what());
+            std::cerr << "VideoReader: Exception caught: " << ex.what() << std::endl;
+            // If NVDEC fails mid-iteration, fall back to CPU.
+            if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+            {
+                NELUX_WARN("decodeFrame(): NVDEC failed: {}. Falling back to CPU decoder.",
+                           ex.what());
 
-            decodeAccelerator = nelux::DecodeAccelerator::CPU;
-            decoder = nelux::Factory::createDecoder(
-                torch::Device(torch::kCPU), filePath, numThreads, decodeAccelerator, 0,
-                resizeWidth_, resizeHeight_);
-            decoder->setForce8Bit(force_8bit);
+                decodeAccelerator = nelux::DecodeAccelerator::CPU;
+                decoder = nelux::Factory::createDecoder(
+                    torch::Device(torch::kCPU), filePath, numThreads, decodeAccelerator, 0,
+                    resizeWidth_, resizeHeight_);
+                decoder->setForce8Bit(force_8bit);
 
-            // Recreate output tensor on CPU with HWC format
-            torch::Dtype torchDataType = findTypeFromBitDepth();
-            tensor = torch::empty(
-                {properties.height, properties.width, 3},
-                torch::TensorOptions().dtype(torchDataType).device(torch::kCPU));
+                // Recreate output tensor on CPU with HWC format
+                torch::Dtype torchDataType = findTypeFromBitDepth();
+                tensor = torch::empty(
+                    {properties.height, properties.width, 3},
+                    torch::TensorOptions().dtype(torchDataType).device(torch::kCPU));
 
-            // Retry decode with CPU path (recursive call will use correct path)
-            return decodeFrame();
-        }
-        else
-        {
+                continue; // retry with CPU path, no recursion
+            }
             throw;
         }
     }

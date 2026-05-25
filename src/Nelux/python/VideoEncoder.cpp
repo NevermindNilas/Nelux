@@ -21,10 +21,13 @@ VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<float> fps,
                            std::optional<int> preset,
                            std::optional<int> cq,
-                           std::optional<std::string> pixelFormat)
+                           std::optional<std::string> pixelFormat,
+                           std::optional<std::string> presetStr,
+                           std::map<std::string, std::string> extraOptions)
 {
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
-                                              fps, preset, cq, pixelFormat);
+                                              fps, preset, cq, pixelFormat,
+                                              presetStr, std::move(extraOptions));
     this->props = properties;
     this->width = properties.width;
     this->height = properties.height;
@@ -41,7 +44,9 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
     std::optional<float> fps,
     std::optional<int> preset, std::optional<int> cq,
-    std::optional<std::string> pixelFormat)
+    std::optional<std::string> pixelFormat,
+    std::optional<std::string> presetStr,
+    std::map<std::string, std::string> extraOptions)
 {
     // Populate video encoding settings
     nelux::Encoder::EncodingProperties props;
@@ -49,7 +54,13 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     props.width = width.value_or(1920);
     props.height = height.value_or(1080);
     props.bitRate = bitRate.value_or(4000000); // 4 Mbps default
-    props.fps = static_cast<int>(std::round(fps.value_or(30.0f)));
+    // Round to an integer fps and clamp to >= 1. A zero/negative value would
+    // produce an invalid time_base {1,0} (division by zero downstream / muxer
+    // rejection).
+    {
+        int roundedFps = static_cast<int>(std::round(fps.value_or(30.0f)));
+        props.fps = roundedFps < 1 ? 1 : roundedFps;
+    }
     props.gopSize = 60;
     props.maxBFrames = 2;
 
@@ -74,6 +85,11 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     // NVENC-specific options
     props.preset = preset.value_or(-1);  // -1 means use default
     props.cq = cq.value_or(-1);          // -1 means use bitrate mode
+
+    // String preset (preferred when set) + arbitrary AVOptions
+    if (presetStr.has_value())
+        props.presetStr = *presetStr;
+    props.extraOptions = std::move(extraOptions);
 
     // Auto-pick colorspace from resolution. Mirrors decoder convention
     // (AutoToRGB: height>576 => BT.709, else BT.601).
@@ -275,6 +291,16 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     {
         converter = std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
             width, height, outputPixelFormat, props.colorspace, props.colorRange);
+    }
+
+    // cpuFrame is reused across calls. A software encoder with B-frames /
+    // multithreading keeps a reference to a previously submitted frame, so
+    // overwriting the buffer in place would corrupt an in-flight frame.
+    // av_frame_make_writable does a copy-on-write reallocation only when the
+    // buffer is still referenced.
+    if (av_frame_make_writable(convertedFrame.get()) < 0)
+    {
+        throw std::runtime_error("Failed to make encoder frame writable");
     }
 
     // Convert RGB24 → YUV (I420 or NV12)

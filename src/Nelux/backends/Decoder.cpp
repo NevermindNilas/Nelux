@@ -1001,15 +1001,28 @@ bool Decoder::seekFrame(int frameIndex)
 {
     NELUX_TRACE("Seeking to frame index: {}", frameIndex);
 
-    if (frameIndex < 0 || frameIndex > properties.totalFrames)
+    // Valid indices are [0, totalFrames). totalFrames may be 0 (unknown) in
+    // which case we only reject negatives.
+    if (frameIndex < 0 ||
+        (properties.totalFrames > 0 && frameIndex >= properties.totalFrames))
     {
         NELUX_WARN("Frame index out of bounds: {}", frameIndex);
         return false;
     }
 
-    int64_t target_pts = av_rescale_q(frameIndex, {1, static_cast<int>(properties.fps)},
-                                      formatCtx->streams[videoStreamIndex]->time_base);
-    return seek(target_pts * av_q2d(formatCtx->streams[videoStreamIndex]->time_base));
+    // Use the exact frame-rate rational rather than a truncated integer fps.
+    // static_cast<int>(29.97) == 29 would land the seek on the wrong frame.
+    AVStream* stream = formatCtx->streams[videoStreamIndex];
+    AVRational frameRate = stream->avg_frame_rate;
+    if (frameRate.num <= 0 || frameRate.den <= 0)
+        frameRate = stream->r_frame_rate;
+    if (frameRate.num <= 0 || frameRate.den <= 0)
+        frameRate = av_d2q(properties.fps > 0 ? properties.fps : 30.0, 1000000);
+
+    // target_pts = frameIndex * (1 / frameRate), expressed in stream time_base.
+    int64_t target_pts =
+        av_rescale_q(frameIndex, av_inv_q(frameRate), stream->time_base);
+    return seek(target_pts * av_q2d(stream->time_base));
 }
 
 bool Decoder::seek(double timestamp)

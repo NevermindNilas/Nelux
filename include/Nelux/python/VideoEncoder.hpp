@@ -4,7 +4,9 @@
 
 #include "Encoder.hpp"
 #include <filesystem>
+#include <map>
 #include <optional>
+#include <string>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <cuda_runtime.h>
@@ -17,17 +19,23 @@ namespace nelux
 class VideoEncoder
 {
   public:
-    // Constructor with optional arguments including NVENC options
+    // Constructor with optional arguments including NVENC options.
+    // `preset` accepts either an int (uses per-codec mapping table) or a
+    // string (forwarded straight to av_dict_set("preset", ...) so callers
+    // can pass exact ffmpeg-cli preset names like "medium" or "p4").
+    // `extraOptions` are arbitrary AVOption key/value pairs forwarded to
+    // avcodec_open2 — applied AFTER built-in options so they override.
     VideoEncoder(const std::string& filename,
                  std::optional<std::string> codec = std::nullopt,
                  std::optional<int> width = std::nullopt,
                  std::optional<int> height = std::nullopt,
                  std::optional<int> bitRate = std::nullopt,
                  std::optional<float> fps = std::nullopt,
-                 // NVENC options
-                 std::optional<int> preset = std::nullopt,   // 1-7, higher=better quality
-                 std::optional<int> cq = std::nullopt,       // Constant quality (0-51)
-                 std::optional<std::string> pixelFormat = std::nullopt);
+                 std::optional<int> preset = std::nullopt,
+                 std::optional<int> cq = std::nullopt,
+                 std::optional<std::string> pixelFormat = std::nullopt,
+                 std::optional<std::string> presetStr = std::nullopt,
+                 std::map<std::string, std::string> extraOptions = {});
 
     ~VideoEncoder();
 
@@ -58,7 +66,9 @@ class VideoEncoder
         std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
         std::optional<float> fps,
         std::optional<int> preset, std::optional<int> cq,
-        std::optional<std::string> pixelFormat);
+        std::optional<std::string> pixelFormat,
+        std::optional<std::string> presetStr,
+        std::map<std::string, std::string> extraOptions);
 };
 
 } // namespace nelux

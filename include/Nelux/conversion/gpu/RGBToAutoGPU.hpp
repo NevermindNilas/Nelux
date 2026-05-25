@@ -311,6 +311,29 @@ private:
         }
     }
 
+    // Checked device-to-host helpers. Unchecked cudaMemcpy/cudaMemcpy2D would
+    // let a failed copy (bad pitch, unmapped frame) silently yield a corrupt
+    // frame instead of surfacing the error.
+    void copyPlane2DToHost(uint8_t* dst, int dstPitch, const uint8_t* src, int srcPitch,
+                           size_t widthBytes, size_t copyHeight)
+    {
+        cudaError_t err = cudaMemcpy2D(dst, dstPitch, src, srcPitch,
+                                       widthBytes, copyHeight, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("RGBToAutoGPUConverter: CUDA D2H copy failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+    }
+
+    void copyPlaneToHost(uint8_t* dst, const uint8_t* src, size_t bytes)
+    {
+        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("RGBToAutoGPUConverter: CUDA D2H copy failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+    }
+
     void allocateNv12Buffer()
     {
         // NV12: Y plane (width * height) + UV plane (width * height/2)
@@ -492,18 +515,13 @@ private:
     void copyNv12ToCpuFrame(AVFrame* frame)
     {
         // Copy Y plane
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToHost);
-        
+        copyPlane2DToHost(frame->data[0], frame->linesize[0],
+                          cudaNv12Buffer, nv12Pitch, width, height);
+
         // Copy UV plane
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width, height / 2,
-            cudaMemcpyDeviceToHost);
+        copyPlane2DToHost(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width, height / 2);
     }
 
     void copyNv12ToCudaFrame(AVFrame* frame)
@@ -519,18 +537,13 @@ private:
     void copyP010ToCpuFrame(AVFrame* frame)
     {
         // Copy Y plane (16-bit)
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width * 2, height,
-            cudaMemcpyDeviceToHost);
-        
+        copyPlane2DToHost(frame->data[0], frame->linesize[0],
+                          cudaNv12Buffer, nv12Pitch, width * 2, height);
+
         // Copy UV plane
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width * 2, height / 2,
-            cudaMemcpyDeviceToHost);
+        copyPlane2DToHost(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width * 2, height / 2);
     }
 
     void copyP010ToCudaFrame(AVFrame* frame)
@@ -568,50 +581,36 @@ private:
     void copyYuv444ToCpuFrame(AVFrame* frame)
     {
         size_t planeSize = static_cast<size_t>(width) * height;
-        cudaMemcpy(frame->data[0], cudaYBuffer, planeSize, cudaMemcpyDeviceToHost);
-        cudaMemcpy(frame->data[1], cudaUBuffer, planeSize, cudaMemcpyDeviceToHost);
-        cudaMemcpy(frame->data[2], cudaVBuffer, planeSize, cudaMemcpyDeviceToHost);
+        copyPlaneToHost(frame->data[0], cudaYBuffer, planeSize);
+        copyPlaneToHost(frame->data[1], cudaUBuffer, planeSize);
+        copyPlaneToHost(frame->data[2], cudaVBuffer, planeSize);
     }
     
     void copyNv16ToCpuFrame(AVFrame* frame)
     {
         // Copy Y plane
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaNv12Buffer, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToHost);
-        
+        copyPlane2DToHost(frame->data[0], frame->linesize[0],
+                          cudaNv12Buffer, nv12Pitch, width, height);
+
         // Copy UV plane (same height as Y for 4:2:2)
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
-            width, height,
-            cudaMemcpyDeviceToHost);
+        copyPlane2DToHost(frame->data[1], frame->linesize[1],
+                          cudaNv12Buffer + nv12Pitch * surfaceHeight, nv12Pitch,
+                          width, height);
     }
     
     void copyYuv420pToCpuFrame(AVFrame* frame)
     {
         // Copy Y plane (full resolution)
-        cudaMemcpy2D(
-            frame->data[0], frame->linesize[0],
-            cudaYBuffer, width,
-            width, height,
-            cudaMemcpyDeviceToHost);
-        
+        copyPlane2DToHost(frame->data[0], frame->linesize[0],
+                          cudaYBuffer, width, width, height);
+
         // Copy U plane (quarter resolution)
-        cudaMemcpy2D(
-            frame->data[1], frame->linesize[1],
-            cudaUBuffer, width / 2,
-            width / 2, height / 2,
-            cudaMemcpyDeviceToHost);
-        
+        copyPlane2DToHost(frame->data[1], frame->linesize[1],
+                          cudaUBuffer, width / 2, width / 2, height / 2);
+
         // Copy V plane (quarter resolution)
-        cudaMemcpy2D(
-            frame->data[2], frame->linesize[2],
-            cudaVBuffer, width / 2,
-            width / 2, height / 2,
-            cudaMemcpyDeviceToHost);
+        copyPlane2DToHost(frame->data[2], frame->linesize[2],
+                          cudaVBuffer, width / 2, width / 2, height / 2);
     }
     
     void copyYuv420pToCudaFrame(AVFrame* frame)

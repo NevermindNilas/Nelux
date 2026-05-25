@@ -107,6 +107,30 @@ bool BatchDecoder::decodeUntilFrame(
         av_packet_unref(pkt);
     }
 
+    // EOF reached. Flush the decoder to drain frames still buffered behind
+    // codec delay (B-frame reordering). Without this the final GOP — including
+    // the last frames of the file — is never emitted, so requesting a frame
+    // near the end fails with "Failed to decode frame".
+    avcodec_send_packet(codec_ctx, nullptr);
+    decoderDrained_ = true;
+    int flush_ret;
+    while ((flush_ret = avcodec_receive_frame(codec_ctx, frame)) >= 0) {
+        int64_t frame_pts = frame->pts;
+        if (frame_pts != AV_NOPTS_VALUE) {
+            double timestamp = frame_pts * av_q2d(stream->time_base);
+            current_frame = static_cast<int64_t>(timestamp * fps + 0.5);
+        } else {
+            current_frame++;
+        }
+
+        NELUX_TRACE("Drained frame {}, target is {}", current_frame, target_frame);
+
+        if (current_frame >= target_frame) {
+            av_packet_free(&pkt);
+            return true;
+        }
+    }
+
     av_packet_free(&pkt);
     return success;
 }
@@ -240,11 +264,12 @@ torch::Tensor BatchDecoder::decode_batch(
             NELUX_TRACE("Processing target frame {}, current={}", target_frame, current_frame);
 
             // Decide if we need to seek
-            if (need_seek || target_frame < current_frame || 
+            if (need_seek || decoderDrained_ || target_frame < current_frame ||
                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD) {
                 seekToFrame(fmt_ctx, codec_ctx, stream_idx, target_frame, fps);
                 current_frame = -1;
                 need_seek = false;
+                decoderDrained_ = false; // seekToFrame flushed the decoder
             }
 
             // Decode until we reach target frame

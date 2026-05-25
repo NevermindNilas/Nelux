@@ -65,6 +65,12 @@ private:
     // If the gap between current position and target is > this, we seek
     static constexpr int64_t SEQUENTIAL_THRESHOLD = 30;
 
+    // Set when decodeUntilFrame had to flush the decoder at EOF to drain
+    // frames buffered behind codec delay. A drained decoder cannot accept new
+    // packets until it is re-seeked (which flushes its buffers), so decode_batch
+    // must force a seek before the next target.
+    bool decoderDrained_ = false;
+
     /**
      * @brief Seek to a specific frame index
      * @param fmt_ctx Format context
