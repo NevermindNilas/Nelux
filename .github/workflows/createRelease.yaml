@@ -243,6 +243,12 @@ jobs:
           $env:PATH = "$FFmpegBin;$env:PATH"
           $env:FFMPEG_BIN = $FFmpegBin
 
+          # GitHub's powershell shell runs with $ErrorActionPreference='Stop',
+          # which turns ANY native stderr line (e.g. torch's harmless
+          # "cudaGetDeviceCount() returned cudaErrorNotSupported" warning on a
+          # GPU-less runner) into a terminating NativeCommandError. Relax it so
+          # stderr is captured as text and our exit-code/marker logic can run.
+          $ErrorActionPreference = 'Continue'
           # The CUDA-linked extension cannot initialize on a GPU-less CI runner.
           # The smoke test prints a "[smoke] SKIP:" marker in that case, but the
           # process can still exit non-zero during interpreter shutdown after the
