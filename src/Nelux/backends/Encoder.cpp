@@ -198,6 +198,12 @@ void Encoder::addInputStreams(const std::string& source, bool wantAudio,
     if (headerWritten)
         throw std::runtime_error(
             "addInputStreams must be called before the first encoded frame");
+    // A second call would append duplicate output streams and overwrite
+    // inputFormatCtx (so pumpPassthrough would only ever read the latest
+    // source). Allow exactly one passthrough source.
+    if (hasPassthrough || inputFormatCtx)
+        throw std::runtime_error(
+            "add_passthrough may only be called once per encoder");
     if (!wantAudio && !wantSubtitles)
         return;
 

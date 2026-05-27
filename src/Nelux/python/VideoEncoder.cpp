@@ -454,6 +454,7 @@ void VideoEncoder::convertWorkerLoop(int workerId)
             convertQueue.pop_front();
         }
 
+        bool converted = true;
         try
         {
             // Each YUV frame is recycled; the encoder may still reference a prior
@@ -466,9 +467,22 @@ void VideoEncoder::convertWorkerLoop(int workerId)
         }
         catch (...)
         {
+            converted = false;
             std::lock_guard<std::mutex> lk(mu);
             if (!workerError)
                 workerError = std::current_exception();
+            // Conversion failed: recycle the buffers and do NOT hand a partial
+            // frame to the submit thread (it would encode garbage). The submit
+            // thread observes workerError via cvReady and tears down.
+            freeStaging.push_back(job.staging);
+            freeYuv.push_back(job.yuv);
+            --inFlight;
+        }
+        if (!converted)
+        {
+            cvReady.notify_one();
+            cvFree.notify_all();
+            continue;
         }
 
         {
@@ -503,7 +517,24 @@ void VideoEncoder::encodeSubmitLoop()
                 // Nothing ready for the next slot. Exit only once stopping AND we
                 // have submitted everything admitted; otherwise (e.g. error) bail.
                 if (workerError || (stopping && nextSubmitSeq >= enqueueSeq))
+                {
+                    // Dispose anything still pending so CUDA events and GPU
+                    // tensors don't leak when we exit early on error. (Holding mu.)
+                    for (auto& kv : readyMap)
+                    {
+#ifdef NELUX_ENABLE_CUDA
+                        if (kv.second.readyEvent)
+                            cudaEventDestroy(kv.second.readyEvent);
+                        if (kv.second.gpuTensor.defined())
+                            retiredTensors.push_back(std::move(kv.second.gpuTensor));
+#endif
+                        if (kv.second.yuv)
+                            freeYuv.push_back(kv.second.yuv);
+                    }
+                    readyMap.clear();
+                    inFlight = 0;
                     break;
+                }
                 continue;
             }
             entry = std::move(it->second);
@@ -549,6 +580,16 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
         deviceIndex = 0;
     cudaSetDevice(deviceIndex);  // bind this worker thread to the tensor's device
 
+    // Destroy the producer-ready event on every exit path (any of the GPU calls
+    // below can throw). Set non-owning to null first so nothing double-frees it.
+    struct EventGuard
+    {
+        cudaEvent_t e;
+        ~EventGuard() { if (e) cudaEventDestroy(e); }
+    } eventGuard{readyEvent};
+    readyEvent = nullptr;
+    const cudaEvent_t producerReady = eventGuard.e;
+
     // Lazy one-time init of the encode stream + GPU converter, owned by the
     // worker thread that exclusively uses them.
     if (!encoderStream)
@@ -587,8 +628,8 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
 
     // Make the encode stream wait until the producer (decode + dtype ops) has
     // finished writing the tensor, so the convert below never reads stale data.
-    if (readyEvent)
-        cudaStreamWaitEvent(encoderStream, readyEvent, 0);
+    if (producerReady)
+        cudaStreamWaitEvent(encoderStream, producerReady, 0);
 
     // RGB24 -> NV12/YUV on the GPU (writes into the converter's CUDA buffer).
     gpuConverter->convert(
@@ -597,10 +638,7 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
 
     AVBufferRef* hwFramesCtx = encoder->getHwFramesCtx();
     if (!hwFramesCtx)
-    {
-        if (readyEvent) cudaEventDestroy(readyEvent);
         throw std::runtime_error("NVENC hardware frames context not initialized");
-    }
 
     nelux::Frame hwFrame(hwFramesCtx);
     hwFrame.get()->format = AV_PIX_FMT_CUDA;
@@ -612,10 +650,7 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
     gpuConverter->copyToCudaFrame(hwFrame.get());
     gpuConverter->synchronize();
 
-    if (readyEvent)
-        cudaEventDestroy(readyEvent);
-
-    encoder->encodeFrame(hwFrame);
+    encoder->encodeFrame(hwFrame);  // eventGuard frees producerReady on return/throw
 }
 #endif
 

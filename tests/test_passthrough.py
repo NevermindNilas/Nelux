@@ -115,8 +115,13 @@ def check(out: Path, start: float, end: float, src: str):
     return ok
 
 
-def test_guard(src: str, out: Path):
-    """add_passthrough after the first frame must raise."""
+def guard_case(src: str, out: Path):
+    """add_passthrough after the first frame must raise.
+
+    Named without a ``test_`` prefix so pytest does not collect it as a test
+    (it takes positional args, not fixtures); this module is a manual CLI
+    script run via ``python tests/test_passthrough.py``.
+    """
     import torch
     import nelux
     r = nelux.VideoReader(src, backend="pytorch", decode_accelerator="cpu")
@@ -158,7 +163,7 @@ def main():
     print()
 
     print("[case 3] guard: add_passthrough after encode_frame must raise")
-    allok &= test_guard(args.src, wd / "c3.mp4")
+    allok &= guard_case(args.src, wd / "c3.mp4")
     print()
 
     print("ALL PASS" if allok else "SOME CHECKS FAILED")
