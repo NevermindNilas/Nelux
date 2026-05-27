@@ -3,10 +3,17 @@
 #define VIDEO_ENCODER_HPP
 
 #include "Encoder.hpp"
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <cuda_runtime.h>
@@ -41,6 +48,15 @@ class VideoEncoder
 
     void encodeFrame(torch::Tensor frame);
     void close();
+
+    // Copy audio and/or subtitle streams from `source` into the output
+    // (ffmpeg `-c:a copy -c:s copy`). Must be called before the first
+    // encodeFrame. `start`/`end` (seconds) trim the copied streams; end < 0
+    // means "to end of source". When `allowTranscode` is true, streams whose
+    // codec cannot be copied into the output container are re-encoded to the
+    // container default instead of being dropped.
+    void addPassthrough(const std::string& source, bool audio, bool subtitles,
+                        double start, double end, bool allowTranscode);
     
     // Check if using hardware encoder
     bool isHardwareEncoder() const { return encoder && encoder->isHardwareEncoder(); }
@@ -58,9 +74,85 @@ class VideoEncoder
     cudaStream_t encoderStream = nullptr;
 #endif
     
-    // Reusable CPU frame to avoid allocation churn
+    // Reusable CPU frame to avoid allocation churn (owned by the encode worker
+    // once async encoding starts; only ever touched by one thread at a time).
     nelux::Frame cpuFrame;
-    
+
+    // --- Async encode pipeline (fan-out convert -> in-order submit) ----------
+    // RGB->YUV swscale is single-threaded and dominates the worker (~80% at 4K),
+    // so it is fanned out across K convert workers (mirrors the decoder's
+    // convert pool). Each converts a frame in parallel, tags it with a sequence
+    // number, and drops it in a reorder map. ONE encode thread pulls frames in
+    // sequence order and calls avcodec_send_frame (x264 is a single stateful
+    // context -> submit must stay sequential). GPU/NVENC input skips the convert
+    // workers: the convert is cheap on the GPU, so those jobs go straight to the
+    // submit thread (which does the GPU convert there).
+    void startEncodeWorkersIfNeeded();    // spawns the single submit thread
+    void ensureConvertPipeline();         // lazily spawns convert pool (CPU path only)
+    void stopEncodeWorkers();             // drains all queued frames, then joins
+    void convertWorkerLoop(int workerId);
+    void encodeSubmitLoop();
+    void submitYuvFrame(nelux::Frame* yuv);  // submit thread: make-writable + send + drain
+#ifdef NELUX_ENABLE_CUDA
+    // GPU: wait input-ready, RGB->NV12 on stream, copy into CUDA AVFrame, send.
+    void submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent);
+#endif
+
+    // RGB frame awaiting conversion (CPU path), assigned a target YUV frame.
+    struct ConvertJob
+    {
+        std::vector<uint8_t>* staging = nullptr;  // recycled RGB24 buffer
+        nelux::Frame* yuv = nullptr;              // recycled YUV frame to fill
+        int64_t seq = 0;
+    };
+
+    // A frame ready for the submit thread, in `readyMap` keyed by seq.
+    struct ReadyEntry
+    {
+        nelux::Frame* yuv = nullptr;   // CPU path: already converted, ready to send
+#ifdef NELUX_ENABLE_CUDA
+        torch::Tensor gpuTensor;       // GPU path: converted on the submit thread
+        cudaEvent_t readyEvent = nullptr;
+        bool isGpu = false;
+#endif
+    };
+
+    std::vector<std::thread> convertWorkers;
+    std::thread encodeThread;
+    // One converter (own SwsContext — not thread-safe to share) per convert worker.
+    std::vector<std::unique_ptr<nelux::conversion::IConverter>> converters;
+
+    // Recyclable buffers / frames (sized to cover max frames in flight).
+    std::vector<std::unique_ptr<std::vector<uint8_t>>> stagingPool;
+    std::deque<std::vector<uint8_t>*> freeStaging;
+    std::vector<std::unique_ptr<nelux::Frame>> yuvPool;
+    std::deque<nelux::Frame*> freeYuv;
+
+    std::deque<ConvertJob> convertQueue;     // RGB awaiting convert (CPU path)
+    std::map<int64_t, ReadyEntry> readyMap;  // seq -> ready frame, drained in order
+#ifdef NELUX_ENABLE_CUDA
+    // GPU tensors the submit thread is done with. The submit thread only MOVES
+    // them here (no refcount op, no GIL); the caller frees them at encode_frame
+    // entry while it still holds the GIL. This avoids the submit thread taking
+    // the GIL per frame, which stalled it behind the GIL-heavy host pipeline.
+    std::deque<torch::Tensor> retiredTensors;
+#endif
+    int64_t enqueueSeq = 0;     // caller-assigned, monotonic
+    int64_t nextSubmitSeq = 0;  // submit thread cursor
+    int64_t inFlight = 0;       // admitted but not yet submitted (backpressure)
+
+    std::mutex mu;
+    std::condition_variable cvConvert;  // convert workers wait for convertQueue
+    std::condition_variable cvReady;    // submit thread waits for readyMap[nextSubmitSeq]
+    std::condition_variable cvFree;     // caller waits for in-flight capacity
+
+    int numConvertWorkers = 0;       // resolved at start (<=0 => auto)
+    size_t maxFramesInFlight = 8;    // bounded == backpressure
+    std::exception_ptr workerError;  // first error from any worker, re-raised
+    bool workersStarted = false;     // submit thread up
+    bool convertStarted = false;     // convert pool up (CPU path only)
+    bool stopping = false;
+
     nelux::Encoder::EncodingProperties inferEncodingProperties(
         const std::string& filename, std::optional<std::string> codec,
         std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,

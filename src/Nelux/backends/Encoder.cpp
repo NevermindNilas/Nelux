@@ -1,9 +1,13 @@
 ﻿#include "Encoder.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -14,8 +18,16 @@
 #endif
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/log.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
 }
 
 namespace
@@ -87,7 +99,15 @@ Encoder::Encoder(const std::string& filename, const EncodingProperties& properti
 
 Encoder::~Encoder()
 {
-    close();
+    // close() can now throw (lazy header write); a throwing destructor would
+    // terminate. Swallow here — explicit close() still surfaces errors.
+    try
+    {
+        close();
+    }
+    catch (...)
+    {
+    }
 }
 
 void Encoder::initialize()
@@ -154,9 +174,601 @@ void Encoder::openOutputFile()
         }
     }
 
+    // NOTE: the container header is written lazily by ensureHeaderWritten()
+    // (on the first frame / close), not here. addInputStreams() may register
+    // copied audio/subtitle streams between construction and the first frame,
+    // and all output streams must exist before avformat_write_header.
+}
+
+void Encoder::ensureHeaderWritten()
+{
+    if (headerWritten)
+        return;
     if (avformat_write_header(formatCtx.get(), nullptr) < 0)
     {
         throw std::runtime_error("Error occurred when writing header");
+    }
+    headerWritten = true;
+}
+
+void Encoder::addInputStreams(const std::string& source, bool wantAudio,
+                              bool wantSubtitles, double startSec, double endSec,
+                              bool allowTranscodeArg)
+{
+    if (headerWritten)
+        throw std::runtime_error(
+            "addInputStreams must be called before the first encoded frame");
+    // A second call would append duplicate output streams and overwrite
+    // inputFormatCtx (so pumpPassthrough would only ever read the latest
+    // source). Allow exactly one passthrough source.
+    if (hasPassthrough || inputFormatCtx)
+        throw std::runtime_error(
+            "add_passthrough may only be called once per encoder");
+    if (!wantAudio && !wantSubtitles)
+        return;
+
+    this->allowTranscode = allowTranscodeArg;
+
+    std::string src = normalizePath(source);
+    AVFormatContext* ic = nullptr;
+    if (avformat_open_input(&ic, src.c_str(), nullptr, nullptr) < 0)
+        throw std::runtime_error("Failed to open passthrough source: " + source);
+    inputFormatCtx.reset(ic);
+
+    if (avformat_find_stream_info(ic, nullptr) < 0)
+        throw std::runtime_error("Failed to read stream info from: " + source);
+
+    for (unsigned i = 0; i < ic->nb_streams; ++i)
+    {
+        AVStream* in = ic->streams[i];
+        const AVMediaType type = in->codecpar->codec_type;
+        const bool take = (type == AVMEDIA_TYPE_AUDIO && wantAudio) ||
+                          (type == AVMEDIA_TYPE_SUBTITLE && wantSubtitles);
+        if (!take)
+            continue;
+
+        // Prefer stream copy when the output container accepts the codec as-is
+        // (e.g. AAC into mp4). Otherwise, if transcoding is allowed, decode +
+        // re-encode to the container's default codec; else skip + warn.
+        const bool copyable = avformat_query_codec(
+            formatCtx->oformat, in->codecpar->codec_id, FF_COMPLIANCE_NORMAL);
+
+        bool ok = false;
+        if (copyable)
+            ok = setupCopyStream(in);
+        else if (allowTranscode && type == AVMEDIA_TYPE_AUDIO)
+            ok = setupAudioTranscode(in);
+        else if (allowTranscode && type == AVMEDIA_TYPE_SUBTITLE)
+            ok = setupSubtitleTranscode(in);
+
+        if (!ok)
+        {
+            const char* cn = avcodec_get_name(in->codecpar->codec_id);
+            NELUX_WARN("Cannot {} {} codec '{}' (source stream {}) into '{}'; "
+                       "skipping.",
+                       copyable ? "copy" : "transcode",
+                       av_get_media_type_string(type), cn ? cn : "?", i,
+                       formatCtx->oformat->name);
+        }
+    }
+
+    if (passMap.empty())
+    {
+        NELUX_WARN("No copyable/transcodable audio/subtitle streams in '{}'.",
+                   source);
+        inputFormatCtx.reset();
+        return;
+    }
+
+    passStartSec = startSec < 0.0 ? 0.0 : startSec;
+    passEndSec = endSec;
+    hasPassthrough = true;
+    inPkt.reset(av_packet_alloc());
+
+    // Seek the source near startSec (lands on/before the preceding keyframe;
+    // pumpPassthrough drops the residual packets with pts < startSec). A failed
+    // seek (non-seekable source, etc.) is not fatal: pumpPassthrough still drops
+    // every packet before startSec, so we fall back to reading from the start.
+    if (passStartSec > 0.0)
+    {
+        int64_t ts = static_cast<int64_t>(passStartSec * AV_TIME_BASE);
+        if (av_seek_frame(ic, -1, ts, AVSEEK_FLAG_BACKWARD) < 0)
+            NELUX_WARN("Passthrough seek to {:.3f}s failed; copying from the "
+                       "start and dropping pre-start packets instead.",
+                       passStartSec);
+    }
+}
+
+bool Encoder::setupCopyStream(AVStream* in)
+{
+    AVStream* out = avformat_new_stream(formatCtx.get(), nullptr);
+    if (!out)
+        return false;
+    if (avcodec_parameters_copy(out->codecpar, in->codecpar) < 0)
+        return false;
+    // codec_tag is container-specific; clearing lets the muxer assign one valid
+    // for the output container.
+    out->codecpar->codec_tag = 0;
+    out->time_base = in->time_base;
+
+    PassStream ps;
+    ps.srcIndex = in->index;
+    ps.outStream = out;
+    ps.mode = PassMode::Copy;
+    passMap.emplace(in->index, std::move(ps));
+    return true;
+}
+
+bool Encoder::setupAudioTranscode(AVStream* in)
+{
+    const AVCodec* decC = avcodec_find_decoder(in->codecpar->codec_id);
+    if (!decC)
+        return false;
+    AVCodecContextPtr dec(avcodec_alloc_context3(decC));
+    if (!dec || avcodec_parameters_to_context(dec.get(), in->codecpar) < 0)
+        return false;
+    dec->pkt_timebase = in->time_base;
+    if (avcodec_open2(dec.get(), decC, nullptr) < 0)
+        return false;
+
+    // Pick the container's default audio encoder (mp4 -> aac, webm -> opus...).
+    AVCodecID outId = av_guess_codec(formatCtx->oformat, nullptr,
+                                     filename.c_str(), nullptr,
+                                     AVMEDIA_TYPE_AUDIO);
+    if (outId == AV_CODEC_ID_NONE || !avcodec_find_encoder(outId))
+    {
+        const AVCodecID cands[] = {AV_CODEC_ID_AAC,  AV_CODEC_ID_OPUS,
+                                   AV_CODEC_ID_VORBIS, AV_CODEC_ID_MP3,
+                                   AV_CODEC_ID_AC3,  AV_CODEC_ID_FLAC};
+        outId = AV_CODEC_ID_NONE;
+        for (AVCodecID c : cands)
+        {
+            if (avformat_query_codec(formatCtx->oformat, c, FF_COMPLIANCE_NORMAL) &&
+                avcodec_find_encoder(c))
+            {
+                outId = c;
+                break;
+            }
+        }
+    }
+    const AVCodec* encC = avcodec_find_encoder(outId);
+    if (!encC)
+        return false;
+
+    AVCodecContextPtr enc(avcodec_alloc_context3(encC));
+    if (!enc)
+        return false;
+
+    enc->sample_fmt = (encC->sample_fmts) ? encC->sample_fmts[0]
+                                          : AV_SAMPLE_FMT_FLTP;
+
+    int rate = dec->sample_rate > 0 ? dec->sample_rate : 48000;
+    if (encC->supported_samplerates)
+    {
+        bool found = false;
+        for (int i = 0; encC->supported_samplerates[i]; ++i)
+            if (encC->supported_samplerates[i] == rate) { found = true; break; }
+        if (!found)
+            rate = encC->supported_samplerates[0];
+    }
+    enc->sample_rate = rate;
+
+    if (dec->ch_layout.nb_channels > 0)
+        av_channel_layout_copy(&enc->ch_layout, &dec->ch_layout);
+    else
+        av_channel_layout_default(&enc->ch_layout, 2);
+
+    enc->bit_rate = 64000LL * enc->ch_layout.nb_channels;
+    enc->time_base = AVRational{1, enc->sample_rate};
+    if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER)
+        enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    if (avcodec_open2(enc.get(), encC, nullptr) < 0)
+        return false;
+
+    AVStream* out = avformat_new_stream(formatCtx.get(), nullptr);
+    if (!out || avcodec_parameters_from_context(out->codecpar, enc.get()) < 0)
+        return false;
+    out->time_base = enc->time_base;
+
+    SwrContext* swr = nullptr;
+    if (swr_alloc_set_opts2(&swr, &enc->ch_layout, enc->sample_fmt,
+                            enc->sample_rate, &dec->ch_layout, dec->sample_fmt,
+                            dec->sample_rate, 0, nullptr) < 0 ||
+        swr_init(swr) < 0)
+    {
+        if (swr) swr_free(&swr);
+        return false;
+    }
+
+    AVAudioFifo* fifo = av_audio_fifo_alloc(enc->sample_fmt,
+                                            enc->ch_layout.nb_channels, 1);
+    if (!fifo)
+    {
+        swr_free(&swr);
+        return false;
+    }
+
+    PassStream ps;
+    ps.srcIndex = in->index;
+    ps.outStream = out;
+    ps.mode = PassMode::TranscodeAudio;
+    ps.dec = std::move(dec);
+    ps.enc = std::move(enc);
+    ps.swr = swr;
+    ps.fifo = fifo;
+    // emplace can throw (node allocation). PassStream has no destructor, so on
+    // failure the raw swr/fifo would leak — free them explicitly. (On success
+    // they are owned by the map entry and freed in close().)
+    try
+    {
+        passMap.emplace(in->index, std::move(ps));
+    }
+    catch (...)
+    {
+        swr_free(&swr);
+        av_audio_fifo_free(fifo);
+        throw;
+    }
+
+    NELUX_INFO("Transcoding audio stream {} -> {}", in->index, encC->name);
+    return true;
+}
+
+bool Encoder::setupSubtitleTranscode(AVStream* in)
+{
+    // Only text subtitles can be transcoded to a text format. Bitmap subs
+    // (DVD/PGS/DVB) would need OCR — skip those.
+    const AVCodecID sid = in->codecpar->codec_id;
+    const bool textSrc =
+        sid == AV_CODEC_ID_SUBRIP || sid == AV_CODEC_ID_TEXT ||
+        sid == AV_CODEC_ID_ASS || sid == AV_CODEC_ID_SSA ||
+        sid == AV_CODEC_ID_WEBVTT || sid == AV_CODEC_ID_MOV_TEXT;
+    if (!textSrc)
+        return false;
+
+    const AVCodec* decC = avcodec_find_decoder(sid);
+    if (!decC)
+        return false;
+    AVCodecContextPtr dec(avcodec_alloc_context3(decC));
+    if (!dec || avcodec_parameters_to_context(dec.get(), in->codecpar) < 0)
+        return false;
+    if (avcodec_open2(dec.get(), decC, nullptr) < 0)
+        return false;
+
+    // av_guess_codec returns NONE for subtitles on several muxers (e.g. mp4),
+    // so fall back to the first text-subtitle codec the container accepts.
+    AVCodecID outId = av_guess_codec(formatCtx->oformat, nullptr,
+                                     filename.c_str(), nullptr,
+                                     AVMEDIA_TYPE_SUBTITLE);
+    if (outId == AV_CODEC_ID_NONE || !avcodec_find_encoder(outId))
+    {
+        const AVCodecID cands[] = {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_WEBVTT,
+                                   AV_CODEC_ID_ASS, AV_CODEC_ID_SUBRIP,
+                                   AV_CODEC_ID_TEXT};
+        outId = AV_CODEC_ID_NONE;
+        for (AVCodecID c : cands)
+        {
+            if (avformat_query_codec(formatCtx->oformat, c, FF_COMPLIANCE_NORMAL) &&
+                avcodec_find_encoder(c))
+            {
+                outId = c;
+                break;
+            }
+        }
+    }
+    const AVCodec* encC = avcodec_find_encoder(outId);
+    if (!encC)
+        return false;
+
+    AVCodecContextPtr enc(avcodec_alloc_context3(encC));
+    if (!enc)
+        return false;
+    enc->time_base = AVRational{1, 1000};  // ms — what text muxers expect
+
+    // ASS/SSA carry a header (styles) the encoder needs.
+    if (dec->subtitle_header && dec->subtitle_header_size > 0)
+    {
+        enc->subtitle_header =
+            (uint8_t*)av_mallocz(dec->subtitle_header_size + 1);
+        if (enc->subtitle_header)
+        {
+            memcpy(enc->subtitle_header, dec->subtitle_header,
+                   dec->subtitle_header_size);
+            enc->subtitle_header_size = dec->subtitle_header_size;
+        }
+    }
+    if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER)
+        enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    if (avcodec_open2(enc.get(), encC, nullptr) < 0)
+        return false;
+
+    AVStream* out = avformat_new_stream(formatCtx.get(), nullptr);
+    if (!out || avcodec_parameters_from_context(out->codecpar, enc.get()) < 0)
+        return false;
+    out->time_base = enc->time_base;
+
+    PassStream ps;
+    ps.srcIndex = in->index;
+    ps.outStream = out;
+    ps.mode = PassMode::TranscodeSubtitle;
+    ps.dec = std::move(dec);
+    ps.enc = std::move(enc);
+    passMap.emplace(in->index, std::move(ps));
+
+    NELUX_INFO("Transcoding subtitle stream {} -> {}", in->index, encC->name);
+    return true;
+}
+
+double Encoder::packetTimeSec(const AVPacket* p) const
+{
+    AVStream* in = inputFormatCtx->streams[p->stream_index];
+    int64_t ts = (p->pts != AV_NOPTS_VALUE) ? p->pts : p->dts;
+    if (ts == AV_NOPTS_VALUE)
+        return 0.0;
+    return static_cast<double>(ts) * av_q2d(in->time_base);
+}
+
+void Encoder::writeCopyPacket(PassStream& ps, AVPacket* p)
+{
+    AVStream* in = inputFormatCtx->streams[ps.srcIndex];
+    AVStream* out = ps.outStream;
+
+    // Rebase so startSec maps to t=0, aligning copied audio/subs with video
+    // frame 0. Expressed in the source stream time_base before rescaling.
+    int64_t startOff =
+        passStartSec > 0.0
+            ? av_rescale_q(static_cast<int64_t>(passStartSec * AV_TIME_BASE),
+                           AVRational{1, AV_TIME_BASE}, in->time_base)
+            : 0;
+    if (p->pts != AV_NOPTS_VALUE)
+        p->pts = std::max<int64_t>(0, p->pts - startOff);
+    if (p->dts != AV_NOPTS_VALUE)
+        p->dts = std::max<int64_t>(0, p->dts - startOff);
+
+    p->stream_index = out->index;
+    av_packet_rescale_ts(p, in->time_base, out->time_base);
+    p->pos = -1;
+
+    // Takes ownership of p and resets it on return; do not unref afterwards.
+    if (int ret = av_interleaved_write_frame(formatCtx.get(), p); ret < 0)
+        NELUX_ERROR("Passthrough write failed: {}", errorToString(ret));
+}
+
+void Encoder::encodeAudioFromFifo(PassStream& ps, bool flush)
+{
+    AVCodecContext* enc = ps.enc.get();
+    const int frameSize = enc->frame_size > 0 ? enc->frame_size : 1024;
+
+    AVPacketPtr op(av_packet_alloc());
+    auto drain = [&]() {
+        for (;;)
+        {
+            int r = avcodec_receive_packet(enc, op.get());
+            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF)
+                break;
+            if (r < 0)
+            {
+                NELUX_ERROR("Audio encode failed: {}", errorToString(r));
+                break;
+            }
+            op->stream_index = ps.outStream->index;
+            av_packet_rescale_ts(op.get(), enc->time_base,
+                                 ps.outStream->time_base);
+            if (int wret = av_interleaved_write_frame(formatCtx.get(), op.get());
+                wret < 0)  // resets op
+                NELUX_ERROR("Audio passthrough write failed: {}",
+                            errorToString(wret));
+        }
+    };
+
+    auto sendFrame = [&](int n) {
+        AVFrame* ef = av_frame_alloc();
+        if (!ef)
+        {
+            NELUX_ERROR("Audio transcode: failed to allocate frame");
+            return;
+        }
+        ef->nb_samples = n;
+        ef->format = enc->sample_fmt;
+        av_channel_layout_copy(&ef->ch_layout, &enc->ch_layout);
+        ef->sample_rate = enc->sample_rate;
+        if (av_frame_get_buffer(ef, 0) < 0)
+        {
+            av_frame_free(&ef);
+            return;
+        }
+        if (int rd = av_audio_fifo_read(ps.fifo, (void**)ef->data, n); rd < n)
+        {
+            // Short read means the FIFO held fewer samples than expected; skip
+            // this frame rather than encode uninitialised tail samples.
+            NELUX_ERROR("Audio transcode: FIFO read {} of {} samples", rd, n);
+            av_frame_free(&ef);
+            return;
+        }
+        ef->pts = ps.nextPts;
+        ps.nextPts += n;
+        if (int sret = avcodec_send_frame(enc, ef); sret < 0)
+            NELUX_ERROR("Audio transcode: send_frame failed: {}",
+                        errorToString(sret));
+        av_frame_free(&ef);
+        drain();
+    };
+
+    while (av_audio_fifo_size(ps.fifo) >= frameSize)
+        sendFrame(frameSize);
+
+    if (flush)
+    {
+        int rem = av_audio_fifo_size(ps.fifo);
+        if (rem > 0)
+            sendFrame(rem);
+        avcodec_send_frame(enc, nullptr);  // flush encoder
+        drain();
+    }
+}
+
+void Encoder::transcodeAudioPacket(PassStream& ps, AVPacket* p)
+{
+    AVCodecContext* dec = ps.dec.get();
+    if (avcodec_send_packet(dec, p) < 0)  // p==null => start decoder flush
+        return;
+
+    AVFrame* frame = av_frame_alloc();
+    for (;;)
+    {
+        int r = avcodec_receive_frame(dec, frame);
+        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF)
+            break;
+        if (r < 0)
+        {
+            NELUX_ERROR("Audio decode failed: {}", errorToString(r));
+            break;
+        }
+
+        // Resample the decoded frame into the encoder's format and stage it in
+        // the FIFO (which lets us cut exact encoder-frame-sized chunks).
+        int dstNb = (int)swr_get_out_samples(ps.swr, frame->nb_samples);
+        if (dstNb > 0)
+        {
+            uint8_t** dst = nullptr;
+            if (av_samples_alloc_array_and_samples(
+                    &dst, nullptr, ps.enc->ch_layout.nb_channels, dstNb,
+                    ps.enc->sample_fmt, 0) >= 0)
+            {
+                int conv = swr_convert(ps.swr, dst, dstNb,
+                                       (const uint8_t**)frame->data,
+                                       frame->nb_samples);
+                if (conv > 0)
+                    av_audio_fifo_write(ps.fifo, (void**)dst, conv);
+                if (dst)
+                {
+                    av_freep(&dst[0]);
+                    av_freep(&dst);
+                }
+            }
+        }
+        av_frame_unref(frame);
+        encodeAudioFromFifo(ps, false);
+    }
+    av_frame_free(&frame);
+}
+
+void Encoder::transcodeSubtitlePacket(PassStream& ps, AVPacket* p)
+{
+    if (!p)
+        return;  // text subtitle encoders buffer nothing — no flush needed
+
+    AVSubtitle sub;
+    int got = 0;
+    int ret = avcodec_decode_subtitle2(ps.dec.get(), &sub, &got, p);
+    if (ret < 0 || !got)
+    {
+        if (got)
+            avsubtitle_free(&sub);
+        return;
+    }
+
+    AVStream* in = inputFormatCtx->streams[ps.srcIndex];
+    int64_t startOff =
+        passStartSec > 0.0
+            ? av_rescale_q(static_cast<int64_t>(passStartSec * AV_TIME_BASE),
+                           AVRational{1, AV_TIME_BASE}, in->time_base)
+            : 0;
+
+    std::vector<uint8_t> buf(1 << 16);
+    int size = avcodec_encode_subtitle(ps.enc.get(), buf.data(),
+                                       (int)buf.size(), &sub);
+    avsubtitle_free(&sub);
+    if (size <= 0)
+        return;
+
+    AVPacketPtr op(av_packet_alloc());
+    if (av_new_packet(op.get(), size) < 0)
+        return;
+    memcpy(op->data, buf.data(), size);
+    op->stream_index = ps.outStream->index;
+    int64_t pts =
+        (p->pts != AV_NOPTS_VALUE) ? std::max<int64_t>(0, p->pts - startOff) : 0;
+    op->pts = av_rescale_q(pts, in->time_base, ps.outStream->time_base);
+    op->dts = op->pts;
+    op->duration = av_rescale_q(p->duration, in->time_base,
+                                ps.outStream->time_base);
+    av_interleaved_write_frame(formatCtx.get(), op.get());
+}
+
+void Encoder::flushTranscoders()
+{
+    for (auto& [idx, ps] : passMap)
+    {
+        if (ps.mode == PassMode::TranscodeAudio)
+        {
+            transcodeAudioPacket(ps, nullptr);  // drain decoder
+            encodeAudioFromFifo(ps, true);       // empty FIFO + flush encoder
+        }
+        // Subtitle encoders hold no internal buffer — nothing to flush.
+    }
+}
+
+void Encoder::pumpPassthrough(double uptoSec)
+{
+    if (!hasPassthrough)
+        return;
+
+    AVFormatContext* ic = inputFormatCtx.get();
+    while (true)
+    {
+        if (!hasPending)
+        {
+            if (passDone)
+                return;
+            int ret = av_read_frame(ic, inPkt.get());
+            if (ret < 0)
+            {
+                passDone = true;  // EOF or read error -> nothing more to copy
+                return;
+            }
+            if (passMap.find(inPkt->stream_index) == passMap.end())
+            {
+                av_packet_unref(inPkt.get());  // unmapped stream
+                continue;
+            }
+            double t = packetTimeSec(inPkt.get());
+            if (t < passStartSec)
+            {
+                av_packet_unref(inPkt.get());  // residual pre-start after seek
+                continue;
+            }
+            if (passEndSec >= 0.0 && t >= passEndSec)
+            {
+                av_packet_unref(inPkt.get());
+                passDone = true;  // reached -to
+                return;
+            }
+            hasPending = true;  // inPkt now holds a valid, in-range packet
+        }
+
+        // Hold the pending packet until video has advanced past its time, so
+        // audio/subs stay tightly interleaved with the video track.
+        if (packetTimeSec(inPkt.get()) > uptoSec)
+            return;
+
+        PassStream& ps = passMap.at(inPkt->stream_index);
+        switch (ps.mode)
+        {
+        case PassMode::Copy:
+            writeCopyPacket(ps, inPkt.get());  // consumes (resets) inPkt
+            break;
+        case PassMode::TranscodeAudio:
+            transcodeAudioPacket(ps, inPkt.get());
+            break;
+        case PassMode::TranscodeSubtitle:
+            transcodeSubtitlePacket(ps, inPkt.get());
+            break;
+        }
+        av_packet_unref(inPkt.get());  // no-op if writeCopyPacket already reset
+        hasPending = false;
     }
 }
 
@@ -412,8 +1024,14 @@ void Encoder::initVideoStream()
 
         videoCodecCtx->pix_fmt = properties.pixelFormat;
 
-        // Ensure multithreading for software encoders (e.g., libx264)
-        if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
+        // Ensure multithreading for software encoders. FFmpeg's frame-threaded
+        // codecs advertise FRAME_THREADS; libx264/libx265/libvpx manage their
+        // OWN thread pool and advertise OTHER_THREADS instead. Both want
+        // thread_count=0 (auto). Without this, libx264 was left at the default
+        // thread_count=1 -> near single-threaded x264 (much lower CPU AND fps
+        // than ffmpeg-cli's default -threads 0).
+        if (codec->capabilities &
+            (AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_OTHER_THREADS))
         {
             videoCodecCtx->thread_count = 0; // 0 = auto-detect number of threads
         }
@@ -573,6 +1191,10 @@ bool Encoder::encodeFrame(const Frame& frame)
     if (!videoCodecCtx)
         return false;
 
+    // Header must be written before the first packet; any passthrough streams
+    // were registered via addInputStreams before now.
+    ensureHeaderWritten();
+
     // 1) Optionally check if PTS is unset (or negative).
     // 1) Optionally check if PTS is unset (or negative).
     AVFrame* avf = frame.get();
@@ -665,6 +1287,18 @@ void Encoder::writePacket()
 {
     // ONLY video packets should ever reach this helper;
     // they already have pkt->stream_index == videoStream->index
+
+    // Flush any copied audio/subtitle packets whose time precedes this video
+    // packet, keeping all tracks interleaved as video advances.
+    if (hasPassthrough)
+    {
+        double vt = (pkt->pts != AV_NOPTS_VALUE)
+                        ? static_cast<double>(pkt->pts) *
+                              av_q2d(videoCodecCtx->time_base)
+                        : 0.0;
+        pumpPassthrough(vt);
+    }
+
     av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base, videoStream->time_base);
     if (int ret = av_interleaved_write_frame(formatCtx.get(), pkt.get()); ret < 0)
     {
@@ -678,6 +1312,10 @@ void Encoder::close()
 {
     if (!formatCtx)
         return;
+
+    // Write the header even if no frame was ever encoded, so the trailer and
+    // any copied streams still produce a valid container.
+    ensureHeaderWritten();
 
     // Flush video
     if (videoCodecCtx)
@@ -708,8 +1346,32 @@ void Encoder::close()
         }
     }
 
+    // Flush remaining copied audio/subtitle packets through endSec before the
+    // trailer (video may have ended before the trimmed audio range did), then
+    // drain any decoders/encoders used for transcoded streams.
+    if (hasPassthrough)
+    {
+        pumpPassthrough(passEndSec >= 0.0 ? passEndSec
+                                          : std::numeric_limits<double>::max());
+        flushTranscoders();
+    }
+
     // Trailer finalizes moov box in .mp4
     av_write_trailer(formatCtx.get());
+
+    // Release per-stream transcode resources (swresample / FIFO are not owned
+    // by the codec context, so free them explicitly; the codec contexts
+    // themselves are freed by their AVCodecContextPtr deleters).
+    for (auto& [idx, ps] : passMap)
+    {
+        if (ps.swr)
+            swr_free(&ps.swr);
+        if (ps.fifo)
+            av_audio_fifo_free(ps.fifo);
+    }
+    passMap.clear();
+    inPkt.reset();
+    inputFormatCtx.reset();
 
     // If not NOFILE, close I/O
     if (!(formatCtx->oformat->flags & AVFMT_NOFILE) && formatCtx->pb)

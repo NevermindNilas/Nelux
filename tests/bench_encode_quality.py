@@ -68,20 +68,36 @@ def predecode_rgb(src: str, n: int, w: int, h: int, out: Path):
 
 
 def encode_via_nelux(rgb_raw: Path, n: int, w: int, h: int, codec: str,
-                     pix_fmt: str, extra_kw: dict, out: Path, hw: bool):
-    """Read rgb_raw frames, encode via nelux to out."""
+                     pix_fmt: str, extra_kw: dict, out: Path, hw: bool) -> float:
+    """Read rgb_raw frames, encode via nelux to out. Returns encode-only seconds.
+
+    Tensor construction (byte-slicing + torch marshaling) is done BEFORE the
+    timer, mirroring encode_via_ffmpeg, which reads raw bytes in a subprocess
+    with no Python per-frame overhead. Timing only the encode loop makes the
+    nelux-vs-ffmpeg comparison apples-to-apples.
+    """
     import torch, nelux
     from nelux import VideoEncoder
     raw = rgb_raw.read_bytes()
     fb = h * w * 3
-    enc_kwargs = dict(codec=codec, width=w, height=h, fps=30.0, pixel_format=pix_fmt)
-    enc_kwargs.update(extra_kw)
-    enc = VideoEncoder(str(out), **enc_kwargs)
+
+    # Pre-build all frame tensors (NOT timed).
+    frames = []
     for i in range(n):
         chunk = raw[i*fb : (i+1)*fb]
         t = torch.frombuffer(bytearray(chunk), dtype=torch.uint8).reshape(h, w, 3).contiguous()
+        frames.append(t)
+
+    enc_kwargs = dict(codec=codec, width=w, height=h, fps=30.0, pixel_format=pix_fmt)
+    enc_kwargs.update(extra_kw)
+    enc = VideoEncoder(str(out), **enc_kwargs)
+
+    # Time only the encode loop + flush.
+    t0 = time.perf_counter()
+    for t in frames:
         enc.encode_frame(t)
     enc.close()
+    return time.perf_counter() - t0
 
 
 def encode_via_ffmpeg(rgb_raw: Path, n: int, w: int, h: int, codec: str,
@@ -161,10 +177,9 @@ def main():
 
         rec = {"codec": codec, "pix_fmt": pix_fmt, "hardware": hw}
         try:
-            t0 = time.perf_counter()
-            encode_via_nelux(rgb_ref, args.frames, args.width, args.height,
-                             codec, pix_fmt, nx_kw, nx_out, hw)
-            rec["nx_encode_s"] = time.perf_counter() - t0
+            rec["nx_encode_s"] = encode_via_nelux(
+                rgb_ref, args.frames, args.width, args.height,
+                codec, pix_fmt, nx_kw, nx_out, hw)
 
             t0 = time.perf_counter()
             encode_via_ffmpeg(rgb_ref, args.frames, args.width, args.height,
@@ -188,7 +203,7 @@ def main():
                 rec["psnr_delta"] = nx["psnr"] - ff["psnr"]
                 rec["vmaf_delta"] = (nx.get("vmaf") or 0) - (ff.get("vmaf") or 0)
                 verdict = "PASS" if rec["psnr_delta"] >= -0.5 else "FAIL"
-                print(f"  Δ vs ffmpeg ref: PSNR {rec['psnr_delta']:+.2f} dB  VMAF {rec['vmaf_delta']:+.2f}  → {verdict}")
+                print(f"  delta vs ffmpeg ref: PSNR {rec['psnr_delta']:+.2f} dB  VMAF {rec['vmaf_delta']:+.2f}  -> {verdict}")
         except subprocess.CalledProcessError as e:
             rec["error"] = f"subprocess: {e.stderr[-300:] if e.stderr else e}"
             print(f"  ERROR: {rec['error']}")

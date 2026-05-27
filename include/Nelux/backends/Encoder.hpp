@@ -9,6 +9,11 @@
 #include <map>
 #include <string>
 
+// Forward declarations for audio-transcode types (full defs pulled into the
+// .cpp from libswresample/swresample.h and libavutil/audio_fifo.h).
+struct SwrContext;
+struct AVAudioFifo;
+
 namespace nelux
 {
 
@@ -76,6 +81,23 @@ class Encoder
     void writePacket();
     void close();
 
+    // Copy (remux) audio and/or subtitle streams from `source` into the output
+    // container, equivalent to ffmpeg `-c:a copy -c:s copy`. Must be called
+    // before the first encodeFrame (i.e. before the container header is
+    // written). `startSec`/`endSec` packet-gate the streams: only source
+    // packets with pts in [startSec, endSec) are written, rebased so startSec
+    // maps to output t=0 (aligned with video frame 0). endSec < 0 = no limit.
+    //
+    // When a source stream's codec cannot be stream-copied into the output
+    // container (e.g. AC3 into webm, subrip into mp4) and `allowTranscode` is
+    // true, the stream is decoded and re-encoded to the container's default
+    // codec instead of being skipped (audio -> e.g. aac/opus; text subtitles ->
+    // e.g. mov_text/webvtt). Bitmap subtitles and undecodable streams are still
+    // skipped with a warning.
+    void addInputStreams(const std::string& source, bool wantAudio,
+                         bool wantSubtitles, double startSec, double endSec,
+                         bool allowTranscode);
+
     // Check if hardware encoding is active
     bool isHardwareEncoder() const { return hwDeviceCtx != nullptr; }
 
@@ -98,6 +120,37 @@ class Encoder
     std::string
     inferContainerFormat(const std::string& filename) const;
 
+    // --- Audio/subtitle passthrough (copy or transcode) ----------------------
+    void ensureHeaderWritten();          // writes container header once, lazily
+    void pumpPassthrough(double uptoSec);// drain source pkts up to a video time
+    double packetTimeSec(const AVPacket* p) const;
+
+    // How one copied/transcoded source stream is handled.
+    enum class PassMode { Copy, TranscodeAudio, TranscodeSubtitle };
+
+    struct PassStream
+    {
+        int srcIndex = -1;
+        AVStream* outStream = nullptr;
+        PassMode mode = PassMode::Copy;
+
+        // Transcode-only (null/zero for Copy):
+        AVCodecContextPtr dec;       // source decoder
+        AVCodecContextPtr enc;       // output encoder
+        SwrContext* swr = nullptr;   // audio resampler (dec fmt -> enc fmt)
+        AVAudioFifo* fifo = nullptr; // buffers resampled samples to frame_size
+        int64_t nextPts = 0;         // audio: running output sample counter
+    };
+
+    bool setupCopyStream(AVStream* in);          // create copy output stream
+    bool setupAudioTranscode(AVStream* in);      // decode+resample+encode setup
+    bool setupSubtitleTranscode(AVStream* in);   // text-subtitle transcode setup
+    void writeCopyPacket(PassStream& ps, AVPacket* p);     // rebase ts + write
+    void transcodeAudioPacket(PassStream& ps, AVPacket* p);// p==null => flush
+    void encodeAudioFromFifo(PassStream& ps, bool flush);  // fifo -> enc -> mux
+    void transcodeSubtitlePacket(PassStream& ps, AVPacket* p);
+    void flushTranscoders();                     // drain all transcode streams
+
     EncodingProperties properties;
     std::string filename;
     AVFormatContextPtr formatCtx;
@@ -109,6 +162,20 @@ class Encoder
     // Hardware encoding context (NVENC)
     AVBufferRef* hwDeviceCtx = nullptr;   // CUDA device context
     AVBufferRef* hwFramesCtx = nullptr;   // Hardware frames context
+
+    // Audio/subtitle passthrough state. The container header is written lazily
+    // (ensureHeaderWritten) so addInputStreams can register copied streams
+    // after construction but before the first frame.
+    bool headerWritten = false;
+    AVFormatContextPtr inputFormatCtx;        // source demuxer (audio/sub copy)
+    std::map<int, PassStream> passMap;        // source stream idx -> handling
+    AVPacketPtr inPkt;                        // reusable read buffer for source
+    bool allowTranscode = false;             // re-encode streams that can't copy
+    double passStartSec = 0.0;                // trim start (seconds)
+    double passEndSec = -1.0;                 // trim end (<0 = no limit)
+    bool hasPassthrough = false;              // any stream copied/transcoded?
+    bool hasPending = false;                  // inPkt holds an un-written packet
+    bool passDone = false;                    // source exhausted / past endSec
 };
 
 } // namespace nelux
