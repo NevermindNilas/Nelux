@@ -412,7 +412,10 @@ jobs:
     env:
       SKBUILD_CONFIG: Release
       VCPKG_TARGET_TRIPLET: arm64-osx-dynamic
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      # 14.0: vcpkg openssl (libssl/libcrypto) and libswresample built on the
+      # macos-14 runner carry a min-target of 14.0, so delocate rejects a 12.0
+      # wheel. Match the floor to what the bundled dylibs actually require.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -477,7 +480,7 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "OFF"
           NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
-          CMAKE_OSX_DEPLOYMENT_TARGET: "12.0"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
           export VCPKG_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -489,7 +492,7 @@ jobs:
             -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} \
             -DNELUX_ENABLE_CUDA=OFF \
             -DNELUX_BUNDLE_FFMPEG_DLLS=OFF \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
 
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 

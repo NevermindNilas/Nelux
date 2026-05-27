@@ -5,7 +5,9 @@ on:
 
 env:
   VCPKG_LIBRARY_LINKAGE: dynamic
-  MACOSX_DEPLOYMENT_TARGET: "12.0"
+  # 14.0: bundled vcpkg openssl + libswresample carry a 14.0 min-target on the
+  # macos-14 runner; delocate rejects a 12.0 wheel otherwise.
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 jobs:
   build-macos:
@@ -84,7 +86,7 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "OFF"
           NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
-          CMAKE_OSX_DEPLOYMENT_TARGET: "12.0"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
           export VCPKG_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -96,7 +98,7 @@ jobs:
             -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} \
             -DNELUX_ENABLE_CUDA=OFF \
             -DNELUX_BUNDLE_FFMPEG_DLLS=OFF \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v

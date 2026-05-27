@@ -1,4 +1,21 @@
 
+### **Version 0.12.0 (2026-05-27)**
+
+#### **Async Fan-out Encode Pipeline**
+- **Added:** RGB→YUV swscale conversion is fanned out across a pool of convert workers; a single submit thread sends frames to the codec in sequence order via a seq-keyed reorder map. GPU/NVENC jobs skip the convert pool and convert on the submit thread (zero-copy). Bounded in-flight backpressure, recycled staging/YUV pools, and a clean drain/join teardown that re-raises the first worker error at `close()`.
+
+#### **Audio / Subtitle Passthrough + Transcode**
+- **Added:** `VideoEncoder.add_passthrough(source, audio, subtitles, start, end, allow_transcode)` copies audio/subtitle streams from a source into the output with `[start, end)` trim + rebase. With `allow_transcode=True`, streams the container cannot stream-copy (e.g. AAC→WebM, SubRip→MP4) are re-encoded to the container default instead of being dropped. One passthrough source per encoder (a second call raises).
+
+#### **Robustness**
+- **Fixed:** `encode_frame` now validates input size up front (`numel == width*height*3`) and raises `ValueError` instead of reading out of bounds on an undersized tensor.
+- **Added:** error-path test suite (frame-count + order integrity, PSNR floor, shape-guard, mid-stream-error teardown, nvdec→nvenc smoke) covering both CPU and CUDA paths.
+
+#### **Removed**
+- **Removed:** temporary `[encstat]` convert/encode timing instrumentation.
+
+---
+
 ### **Version 0.11.0 (2026-05-16)**
 
 #### **libyuv Removed — Pure libswscale Pipeline**
