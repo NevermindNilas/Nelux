@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 import os
 import torch
 import numpy as np
@@ -212,18 +212,41 @@ class VideoEncoder:
         height: Optional[int] = None,
         bit_rate: Optional[int] = None,
         fps: Optional[float] = None,
-        preset: Optional[int] = None,
+        preset: Optional[Union[int, str]] = None,
         cq: Optional[int] = None,
         pixel_format: Optional[str] = None,
+        options: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Create a VideoEncoder; pass None for defaults.
+
+        preset accepts an int (mapped per codec) or a str forwarded straight to
+        ffmpeg (e.g. "veryfast", "p4", "medium"). options is a dict of extra
+        AVOption key/value pairs applied after the built-in options.
         """
         ...
 
     def encode_frame(self, frame: torch.Tensor) -> None:
         """
         Encode one video frame HWC, 3-channel, uint8 tensor).
+        """
+        ...
+
+    def add_passthrough(
+        self,
+        source: str,
+        audio: bool = True,
+        subtitles: bool = True,
+        start: float = 0.0,
+        end: Optional[float] = None,
+        allow_transcode: bool = True,
+    ) -> None:
+        """
+        Copy (or transcode) audio/subtitle streams from a source file into the
+        output, with optional [start, end) trim in seconds. Must be called
+        before the first encode_frame. When allow_transcode is True, streams
+        whose codec cannot be stream-copied into the output container are
+        re-encoded to the container default instead of being dropped.
         """
         ...
 

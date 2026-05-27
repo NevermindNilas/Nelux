@@ -221,7 +221,7 @@ set(NELUX_FFMPEG_INCS "${NELUX_FFMPEG_DIR}/include")
 
 # Find import libraries
 set(_ffmpeg_lib_dir "${NELUX_FFMPEG_DIR}/lib")
-set(_ffmpeg_components avcodec avformat avutil avfilter swscale avdevice)
+set(_ffmpeg_components avcodec avformat avutil avfilter swscale swresample avdevice)
 
 if(WIN32)
   set(NELUX_FFMPEG_LIBS)
@@ -480,6 +480,7 @@ if(NELUX_BUILD_PYTHON)
       "/DELAYLOAD:avformat-62.dll"
       "/DELAYLOAD:avutil-60.dll"
       "/DELAYLOAD:swscale-9.dll"
+      "/DELAYLOAD:swresample-6.dll"
       "/DELAYLOAD:avfilter-11.dll"
       "/DELAYLOAD:avdevice-62.dll"
     )
@@ -600,6 +601,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
       "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/swscale-*.dll"
+      "${NELUX_FFMPEG_DIR}/bin/swresample-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
     )

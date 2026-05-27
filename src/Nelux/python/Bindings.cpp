@@ -395,6 +395,59 @@ Args:
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
              "Encode one video frame (H×W×3 torch.uint8 tensor).")
+        .def(
+            "add_passthrough",
+            [](nelux::VideoEncoder& e, const std::string& source, bool audio,
+               bool subtitles, double start, std::optional<double> end,
+               bool allow_transcode)
+            {
+                e.addPassthrough(source, audio, subtitles, start,
+                                 end.value_or(-1.0), allow_transcode);
+            },
+            py::arg("source"), py::arg("audio") = true,
+            py::arg("subtitles") = true, py::arg("start") = 0.0,
+            py::arg("end") = py::none(), py::arg("allow_transcode") = true,
+            R"doc(Copy audio and/or subtitle streams from a source file into the output.
+
+Equivalent to ffmpeg ``-c:a copy -c:s copy`` (stream copy / remux, no
+re-encode). Must be called BEFORE the first ``encode_frame`` — the container
+header is written on the first frame and all streams must exist by then.
+
+The copied streams are packet-gated by ``start``/``end`` (seconds) and rebased
+so ``start`` maps to output t=0, aligning with the first video frame you push.
+Trim is packet-granular (cut at the nearest packet boundary), matching
+``ffmpeg -c:a copy -ss``. You remain responsible for pushing only the video
+frames in the desired range.
+
+Args:
+    source (str): Path to the file to copy audio/subtitle streams from.
+    audio (bool): Copy audio streams. Defaults to True.
+    subtitles (bool): Copy subtitle streams. Defaults to True.
+    start (float): Trim start in seconds (the ``-ss`` value). Defaults to 0.
+    end (float, optional): Trim end in seconds (the ``-to`` value). None =
+        copy through the end of the source.
+    allow_transcode (bool): When True (default), a stream whose codec cannot be
+        stream-copied into the output container is decoded and re-encoded to
+        the container's default codec (audio -> e.g. aac/opus; text subtitles
+        -> e.g. mov_text/webvtt) instead of being dropped. Set False to force
+        copy-only (drop incompatible streams), matching ffmpeg ``-c copy``.
+
+Notes:
+    With allow_transcode=False the output container must accept the source
+    codec for stream copy (AAC into mp4 ok; AC3 into webm not) — incompatible
+    streams are skipped with a warning. With allow_transcode=True they are
+    re-encoded instead. Bitmap subtitles (PGS/DVD/DVB) cannot be turned into
+    text and are always skipped (would require OCR).
+
+Example:
+    >>> enc = nelux.VideoEncoder("out.mp4", codec="libx264", width=3840,
+    ...                          height=2160, fps=23.98, preset="veryfast",
+    ...                          cq=15, pixel_format="yuv420p")
+    >>> enc.add_passthrough("input.mp4", start=0.0, end=10.0)
+    >>> for f in frames:  # push only the 0-10s frames
+    ...     enc.encode_frame(f)
+    >>> enc.close()
+)doc")
         .def("close", &nelux::VideoEncoder::close,
              "Finalize file and flush video streams.")
         .def_property_readonly("is_hardware_encoder",
