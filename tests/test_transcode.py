@@ -13,7 +13,7 @@ Usage:
       --submkv <path-to-mkv-with-subrip>
 """
 from __future__ import annotations
-import argparse, json, os, subprocess, sys, tempfile
+import argparse, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -21,7 +21,15 @@ sys.path.insert(0, str(HERE.parent))
 FFBIN = HERE.parent / "external" / "ffmpeg" / "bin"
 if FFBIN.exists() and hasattr(os, "add_dll_directory"):
     os.add_dll_directory(str(FFBIN))
-FFPROBE = str(FFBIN / "ffprobe.exe")
+
+
+def _find_ffprobe() -> str:
+    exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    bundled = FFBIN / exe
+    return str(bundled) if bundled.exists() else (shutil.which("ffprobe") or exe)
+
+
+FFPROBE = _find_ffprobe()
 
 
 def streams_by_type(path: Path) -> dict[str, list[dict]]:

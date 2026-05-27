@@ -247,6 +247,9 @@ class VideoEncoder:
         before the first encode_frame. When allow_transcode is True, streams
         whose codec cannot be stream-copied into the output container are
         re-encoded to the container default instead of being dropped.
+
+        Only one passthrough source is supported per encoder; a second call
+        raises RuntimeError.
         """
         ...
 

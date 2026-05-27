@@ -575,13 +575,9 @@ void VideoEncoder::encodeSubmitLoop()
 #ifdef NELUX_ENABLE_CUDA
 void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent)
 {
-    int deviceIndex = gpuTensor.device().index();
-    if (deviceIndex < 0)
-        deviceIndex = 0;
-    cudaSetDevice(deviceIndex);  // bind this worker thread to the tensor's device
-
-    // Destroy the producer-ready event on every exit path (any of the GPU calls
-    // below can throw). Set non-owning to null first so nothing double-frees it.
+    // Destroy the producer-ready event on every exit path (any call below can
+    // throw). Declared first so it also covers a cudaSetDevice failure; the
+    // parameter is nulled so nothing double-frees it.
     struct EventGuard
     {
         cudaEvent_t e;
@@ -589,6 +585,13 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
     } eventGuard{readyEvent};
     readyEvent = nullptr;
     const cudaEvent_t producerReady = eventGuard.e;
+
+    int deviceIndex = gpuTensor.device().index();
+    if (deviceIndex < 0)
+        deviceIndex = 0;
+    if (cudaError_t cerr = cudaSetDevice(deviceIndex); cerr != cudaSuccess)
+        throw std::runtime_error("Failed to select CUDA device for NVENC encode: " +
+                                 std::string(cudaGetErrorString(cerr)));
 
     // Lazy one-time init of the encode stream + GPU converter, owned by the
     // worker thread that exclusively uses them.

@@ -266,11 +266,16 @@ void Encoder::addInputStreams(const std::string& source, bool wantAudio,
     inPkt.reset(av_packet_alloc());
 
     // Seek the source near startSec (lands on/before the preceding keyframe;
-    // pumpPassthrough drops the residual packets with pts < startSec).
+    // pumpPassthrough drops the residual packets with pts < startSec). A failed
+    // seek (non-seekable source, etc.) is not fatal: pumpPassthrough still drops
+    // every packet before startSec, so we fall back to reading from the start.
     if (passStartSec > 0.0)
     {
         int64_t ts = static_cast<int64_t>(passStartSec * AV_TIME_BASE);
-        av_seek_frame(ic, -1, ts, AVSEEK_FLAG_BACKWARD);
+        if (av_seek_frame(ic, -1, ts, AVSEEK_FLAG_BACKWARD) < 0)
+            NELUX_WARN("Passthrough seek to {:.3f}s failed; copying from the "
+                       "start and dropping pre-start packets instead.",
+                       passStartSec);
     }
 }
 
@@ -392,7 +397,19 @@ bool Encoder::setupAudioTranscode(AVStream* in)
     ps.enc = std::move(enc);
     ps.swr = swr;
     ps.fifo = fifo;
-    passMap.emplace(in->index, std::move(ps));
+    // emplace can throw (node allocation). PassStream has no destructor, so on
+    // failure the raw swr/fifo would leak — free them explicitly. (On success
+    // they are owned by the map entry and freed in close().)
+    try
+    {
+        passMap.emplace(in->index, std::move(ps));
+    }
+    catch (...)
+    {
+        swr_free(&swr);
+        av_audio_fifo_free(fifo);
+        throw;
+    }
 
     NELUX_INFO("Transcoding audio stream {} -> {}", in->index, encC->name);
     return true;
@@ -539,12 +556,20 @@ void Encoder::encodeAudioFromFifo(PassStream& ps, bool flush)
             op->stream_index = ps.outStream->index;
             av_packet_rescale_ts(op.get(), enc->time_base,
                                  ps.outStream->time_base);
-            av_interleaved_write_frame(formatCtx.get(), op.get());  // resets op
+            if (int wret = av_interleaved_write_frame(formatCtx.get(), op.get());
+                wret < 0)  // resets op
+                NELUX_ERROR("Audio passthrough write failed: {}",
+                            errorToString(wret));
         }
     };
 
     auto sendFrame = [&](int n) {
         AVFrame* ef = av_frame_alloc();
+        if (!ef)
+        {
+            NELUX_ERROR("Audio transcode: failed to allocate frame");
+            return;
+        }
         ef->nb_samples = n;
         ef->format = enc->sample_fmt;
         av_channel_layout_copy(&ef->ch_layout, &enc->ch_layout);
@@ -554,10 +579,19 @@ void Encoder::encodeAudioFromFifo(PassStream& ps, bool flush)
             av_frame_free(&ef);
             return;
         }
-        av_audio_fifo_read(ps.fifo, (void**)ef->data, n);
+        if (int rd = av_audio_fifo_read(ps.fifo, (void**)ef->data, n); rd < n)
+        {
+            // Short read means the FIFO held fewer samples than expected; skip
+            // this frame rather than encode uninitialised tail samples.
+            NELUX_ERROR("Audio transcode: FIFO read {} of {} samples", rd, n);
+            av_frame_free(&ef);
+            return;
+        }
         ef->pts = ps.nextPts;
         ps.nextPts += n;
-        avcodec_send_frame(enc, ef);
+        if (int sret = avcodec_send_frame(enc, ef); sret < 0)
+            NELUX_ERROR("Audio transcode: send_frame failed: {}",
+                        errorToString(sret));
         av_frame_free(&ef);
         drain();
     };

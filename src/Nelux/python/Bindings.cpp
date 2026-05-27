@@ -439,6 +439,10 @@ Notes:
     re-encoded instead. Bitmap subtitles (PGS/DVD/DVB) cannot be turned into
     text and are always skipped (would require OCR).
 
+    Only one passthrough source is supported per encoder: calling
+    add_passthrough a second time raises RuntimeError. Pass a single source
+    that carries all the audio/subtitle streams you want copied.
+
 Example:
     >>> enc = nelux.VideoEncoder("out.mp4", codec="libx264", width=3840,
     ...                          height=2160, fps=23.98, preset="veryfast",
