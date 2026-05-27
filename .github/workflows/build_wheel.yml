@@ -285,8 +285,8 @@ jobs:
           $output = python tests/wheel_smoke_test.py 2>&1 | Out-String
           Write-Host $output
           if ($output -match '\[smoke\] SKIP:') {
-            Write-Host "Smoke test skipped on GPU-less runner — wheel build + DLL bundling validated."
-            exit 0  # override any lingering non-zero $LASTEXITCODE from the skip
+            Write-Host "Smoke test skipped on GPU-less runner - wheel build + DLL bundling validated."
+            exit 0  # override any lingering non-zero LASTEXITCODE from the skip
           } elseif ($LASTEXITCODE -ne 0) {
             Write-Error "Smoke test failed (exit $LASTEXITCODE)"
             exit 1
