@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Async fan-out encode pipeline.** RGB→YUV swscale (single-threaded, the bulk
+  of CPU encode cost) is now fanned out across a pool of convert workers; a
+  single submit thread pulls frames in sequence order via a seq-keyed reorder
+  map and calls `avcodec_send_frame` (x264 is one stateful context, so submit
+  must stay sequential). GPU/NVENC jobs skip the convert pool and convert on the
+  submit thread (zero-copy). Bounded in-flight backpressure + recycled
+  staging/YUV pools; teardown drains and joins all workers, re-raising the first
+  worker error at `close()`.
+- **`add_passthrough(allow_transcode=...)`.** Streams the output container
+  cannot stream-copy (e.g. AAC into WebM, SubRip into MP4) are re-encoded to the
+  container default instead of being silently dropped.
+- **Encode pipeline test suite** (`tests/test_async_encode_pipeline.py`):
+  frame-count + order integrity, PSNR floor, input-shape rejection, mid-stream
+  error teardown, and an nvdec→nvenc smoke test (CPU + CUDA; CUDA variants skip
+  without hardware). Manual scripts `test_passthrough.py` / `test_transcode.py`
+  cover the trim + transcode-fallback paths.
+
+### Fixed
+
+- **Encoder: out-of-bounds read on an undersized `encode_frame` tensor.**
+  `encode_frame` copied exactly `width*height*3` bytes from the tensor without
+  checking its size, so a smaller tensor read past the end of its storage. The
+  element count is now validated up front (while the GIL is held) and a
+  mismatch raises `ValueError` instead of reading out of bounds.
+
+### Removed
+
+- **Temporary `[encstat]` convert/encode timing instrumentation** (and its
+  per-frame atomics) used to profile the fan-out split; no longer needed.
+
 ## [0.11.1] - 2026-05-26
 
 ### Fixed
