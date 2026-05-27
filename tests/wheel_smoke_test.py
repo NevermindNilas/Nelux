@@ -101,7 +101,12 @@ def main() -> int:
                   flush=True)
             print("[smoke] Build + DLL bundling succeeded; CUDA-path validation "
                   "requires a GPU and is skipped on CI.", flush=True)
-            return 0
+            # Hard-exit 0: after the failed CUDA DLL load the interpreter's
+            # normal shutdown returns a non-zero code, so os._exit bypasses
+            # finalizers to guarantee a clean success exit.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         raise
 
     print(
