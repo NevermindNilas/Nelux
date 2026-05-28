@@ -1,0 +1,497 @@
+# Nelux LLM Documentation (llms.txt)
+
+> **Purpose**: Enable AI assistants to understand and correctly use Nelux instantly.
+> **Library**: Nelux — High-performance Python video decoding/encoding with GPU acceleration
+> **Version**: 0.12.0
+> **License**: AGPL-3.0
+> **Source**: https://github.com/NevermindNilas/NeLux
+
+---
+
+## Quick Reference
+
+```python
+import torch  # MUST be imported before nelux
+from nelux import VideoReader, VideoEncoder
+
+# READ: Iterate frames (NVDEC GPU decode)
+# Returns HWC tensor: [H, W, 3] with native dtype (uint8 for 8-bit, uint16 for 10/12/16-bit)
+reader = VideoReader("input.mp4", decode_accelerator="nvdec")
+for frame in reader:
+    output = model(frame)
+
+# READ: Batch access — returns [B, H, W, 3]
+batch = reader.get_batch([0, 10, 20])
+batch = reader[0:100:10]
+
+# READ: Random access — returns [H, W, 3]
+frame = reader.frame_at(100)       # by index
+frame = reader.frame_at(2.5)       # by timestamp (seconds)
+frame = reader[100]                # by index
+frame = reader[2.5]                # by timestamp
+```
+
+---
+
+## Installation
+
+```bash
+pip install nelux
+```
+
+Official wheels (v0.9.0+):
+- **Windows x64** — CPU + CUDA (NVDEC/NVENC)
+- **Linux x86_64** (manylinux_2_28+) — CPU + CUDA
+- **macOS arm64** (Apple Silicon, ≥12.0) — CPU + PyTorch MPS (no CUDA on macOS)
+
+**Critical Requirement**: Import `torch` BEFORE `nelux`:
+```python
+import torch                        # ← FIRST
+from nelux import VideoReader       # ← SECOND
+```
+
+**FFmpeg shared libraries required on the system**:
+- Windows: FFmpeg DLLs on `PATH` (or use `os.add_dll_directory(...)`); self-built wheels bundle runtime DLLs.
+- Linux: system FFmpeg (e.g., `apt install ffmpeg` or distro equivalent).
+- macOS: Homebrew FFmpeg (`brew install ffmpeg`).
+
+---
+
+## VideoReader API
+
+### Constructor
+
+```python
+VideoReader(
+    input_path: str,
+    num_threads: int = os.cpu_count() // 2,
+    force_8bit: bool = False,
+    backend: Literal["pytorch", "numpy"] = "pytorch",
+    decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
+    cuda_device_index: int = 0,
+)
+```
+
+- `backend="pytorch"` → `torch.Tensor`; `backend="numpy"` → `numpy.ndarray` (always CPU, memory-owned copy).
+- `decode_accelerator="nvdec"` → frames stay on GPU as CUDA tensors. Auto-falls back to CPU on NVDEC failure.
+- `force_8bit=True` → output always `uint8` regardless of source bit depth.
+
+### Properties (read-only)
+
+| Property | Type | Description |
+|---|---|---|
+| `width`, `height` | int | Dimensions in pixels |
+| `fps` | float | Nominal frames per second |
+| `min_fps`, `max_fps` | float | VFR bounds |
+| `duration` | float | Total duration (seconds) |
+| `total_frames` | int | Total frame count |
+| `frame_count` | int | Alias of `total_frames` (BatchMixin) |
+| `shape` | tuple | `(frame_count, H, W, 3)` |
+| `pixel_format` | str | Source pixel format (e.g., `"yuv420p"`) |
+| `bit_depth` | int | Bit depth (8, 10, 12, 16) |
+| `aspect_ratio` | float | `width / height` |
+| `codec` | str | Video codec name |
+| `has_audio` | bool | Audio track present |
+| `file_path` | str | Currently loaded file |
+| `properties` | dict | All props as dictionary |
+| `is_prefetching` | bool | Prefetch thread active |
+| `prefetch_buffered` | int | Frames in buffer |
+| `prefetch_size` | int | Buffer capacity |
+
+### Reading Methods
+
+```python
+# Sequential
+for frame in reader:                 # [H, W, 3]
+    ...
+frame = reader.read_frame()          # [H, W, 3]
+reader.reset()                       # back to start (or start of range)
+
+# Random access — does not disturb iterator state
+frame = reader.frame_at(100)         # by int index
+frame = reader.frame_at(2.5)         # by float timestamp (seconds)
+frame = reader[100]                  # by int
+frame = reader[2.5]                  # by float
+
+# Batch access — returns [B, H, W, 3] torch.Tensor
+batch = reader.get_batch([0, 10, 20])
+batch = reader.get_batch_range(0, 100, 10)
+batch = reader[0:100:10]             # slice
+batch = reader[[0, 10, 20]]          # list
+batch = reader[range(0, 100, 10)]    # range
+batch = reader[torch.tensor([0,5,9])]
+
+len(reader)                          # respects set_range
+```
+
+`get_batch` deduplicates indices, sorts for sequential decode, and supports negative indices.
+
+### Frame Ranges
+
+```python
+reader.set_range(100, 200)           # frames 100..199 (both int → indices)
+reader.set_range(5.0, 10.0)          # both float → seconds
+reader([100, 200])                   # shorthand for set_range(100, 200); returns self
+reader.reset()                       # back to start of active range
+```
+
+Mixing int and float in `set_range` is an error. Negative indices are supported.
+
+### Prefetch API (Background Buffering)
+
+```python
+reader.start_prefetch(buffer_size=16, start_immediately=True)
+reader.is_prefetching                # bool
+reader.prefetch_buffered             # frames currently buffered
+reader.prefetch_size                 # buffer capacity
+reader.stop_prefetch()               # stop and free resources
+```
+
+Stop prefetch before switching to random access or seeking.
+
+### Decoder Reconfiguration
+
+```python
+# Reuse decoder for a different file — 10–50× faster than constructing a new VideoReader
+reader.reconfigure("video2.mp4")     # updates all properties, clears range, restarts prefetch
+```
+
+### Context Manager / Iteration
+
+```python
+with VideoReader("v.mp4") as r:
+    for frame in r:
+        ...
+```
+
+### Encoder Creation
+
+```python
+enc = reader.create_encoder("out.mp4")   # matches resolution and fps to source
+```
+
+---
+
+## VideoEncoder API
+
+### Constructor
+
+```python
+VideoEncoder(
+    output_path: str,
+    codec: Optional[str] = None,          # default: "h264_mf" (Windows Media Foundation H.264)
+    width: Optional[int] = None,          # default: 1920
+    height: Optional[int] = None,         # default: 1080
+    bit_rate: Optional[int] = None,       # default: 4_000_000 (4 Mbps)
+    fps: Optional[float] = None,          # default: 30.0
+    preset: Optional[int] = None,         # NVENC preset (1–7)
+    cq: Optional[int] = None,             # NVENC constant quality (0–51, lower = better); overrides bitrate if set
+    pixel_format: Optional[str] = None,   # default: "yuv420p"
+)
+```
+
+Supported `pixel_format` values include `"yuv420p"`, `"nv12"`, `"yuv444p"`, `"p010"`, `"gray"`, `"gray16le"`. Grayscale formats are software-only; NVENC falls back to NV12 with a warning.
+
+### Methods & Properties
+
+```python
+encoder.encode_frame(frame)          # [H, W, 3] uint8 tensor (CPU or CUDA)
+encoder.close()                      # finalize file
+encoder.is_hardware_encoder          # True if NVENC
+```
+
+### Audio / Subtitle Passthrough
+
+Copy (or transcode) audio and subtitle streams from a source file into the
+encoded output, with optional `[start, end)` trim in seconds.
+
+```python
+encoder.add_passthrough(
+    source: str,                     # file to copy audio/subtitle streams from
+    audio: bool = True,              # copy audio streams
+    subtitles: bool = True,          # copy subtitle streams
+    start: float = 0.0,              # trim window start (seconds); rebased to t=0
+    end: Optional[float] = None,     # trim window end (seconds); None = to source end
+    allow_transcode: bool = True,    # re-encode streams the container can't stream-copy
+)
+```
+
+- **Must be called before the first `encode_frame`.** Calling it after the first
+  frame raises `RuntimeError`.
+- **One passthrough source per encoder.** A second `add_passthrough` call raises `RuntimeError`.
+- `start`/`end` trim the copied streams and rebase them to `t=0` (no leading
+  silence/offset). Match this window to the video frames you push.
+- `allow_transcode=True` re-encodes streams whose codec cannot be stream-copied
+  into the output container (e.g. AAC→WebM, SubRip→MP4) to the container default
+  instead of dropping them. `False` drops un-copyable streams.
+
+```python
+reader = VideoReader("input.mp4")
+enc = VideoEncoder("clip.mp4", codec="libx264", width=reader.width,
+                   height=reader.height, fps=float(reader.fps))
+enc.add_passthrough("input.mp4", audio=True, subtitles=True, start=2.0, end=6.0)
+# push only the frames for [2.0, 6.0) seconds, then:
+enc.close()
+```
+
+### Context Manager (recommended)
+
+```python
+with VideoEncoder("out.mp4", width=1920, height=1080, fps=30) as enc:
+    for frame in frames:
+        enc.encode_frame(frame)
+```
+
+### Create from Reader (matched settings)
+
+```python
+with reader.create_encoder("output.mp4") as enc:
+    for frame in reader:
+        enc.encode_frame(frame)
+```
+
+---
+
+## Hardware Acceleration
+
+### NVDEC (GPU Decode)
+
+```python
+reader = VideoReader("video.mp4", decode_accelerator="nvdec")
+for frame in reader:
+    print(frame.device)              # cuda:N — stays on GPU
+    result = model(frame)
+```
+
+**NVDEC Codecs**: H.264, HEVC (4:4:4 on Ampere+), VP8, VP9, AV1, MPEG-1/2/4, VC1
+**NVDEC Formats**: NV12, P010/P016, NV16, P216, YUV444P (8/10/12/16-bit) — all converted to RGB on GPU via custom CUDA kernels.
+
+### NVENC (GPU Encode)
+
+```python
+encoder = VideoEncoder("out.mp4", codec="hevc_nvenc")
+encoder.is_hardware_encoder          # True
+```
+
+**NVENC Codecs**: `h264_nvenc`, `hevc_nvenc`, `av1_nvenc`
+
+### Zero-Copy GPU Pipeline
+
+NVDEC → CUDA tensor → (model) → NVENC without leaving GPU:
+
+```python
+reader = VideoReader("in.mp4", decode_accelerator="nvdec")
+with reader.create_encoder("out.mp4") as enc:   # auto-picks NVENC when available
+    for frame in reader:
+        enc.encode_frame(model(frame))
+```
+
+---
+
+## Logging
+
+```python
+from nelux import LogLevel, set_log_level
+
+set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical, off
+```
+
+---
+
+## Module Attributes & Helpers
+
+```python
+import nelux
+nelux.__version__                    # "0.12.0"
+nelux.__cuda_support__               # True if compiled with CUDA
+
+from nelux import get_available_encoders, get_nvenc_encoders, diagnose_runtime_dlls
+
+get_available_encoders()             # [{"name", "long_name", "is_hardware"}, ...]
+get_nvenc_encoders()                 # NVENC-only subset
+diagnose_runtime_dlls()              # Windows: report missing runtime DLLs
+```
+
+---
+
+## Public Exports
+
+```python
+__all__ = [
+    "__version__", "__cuda_support__",
+    "VideoReader", "VideoEncoder",
+    "set_log_level", "LogLevel",
+    "get_available_encoders", "get_nvenc_encoders",
+    "diagnose_runtime_dlls",
+]
+```
+
+---
+
+## Frame Format Reference
+
+| Component | Value |
+|---|---|
+| Shape (single) | `[H, W, 3]` (HWC, RGB) |
+| Shape (batch) | `[B, H, W, 3]` |
+| dtype (8-bit source) | `uint8` |
+| dtype (10/12/16-bit source) | `uint16` |
+| dtype (with `force_8bit=True`) | `uint8` |
+| Device (CPU decode) | `cpu` |
+| Device (NVDEC) | `cuda:N` |
+| NumPy backend | always CPU, `numpy.ndarray`, owned memory |
+
+No BCHW, no FP16/FP32, no normalization. Convert explicitly for ML:
+
+```python
+frame = reader.read_frame()                         # [H, W, 3] uint8
+model_input = frame.permute(2, 0, 1).unsqueeze(0).float() / 255.0   # [1, 3, H, W] float32
+```
+
+---
+
+## Best Practices
+
+1. **Import `torch` first.**
+2. **Use NVDEC for ML pipelines** — zero CPU/GPU transfer.
+3. **Prefetch for steady timing** — `reader.start_prefetch(16)` during GPU-bound inference.
+4. **Use `reconfigure()` for batch file processing** — 10–50× faster than new instance.
+5. **Use `create_encoder()` for transcoding** — source-matched settings.
+6. **Use `get_batch()` for random-access workloads** — smart seek + dedup.
+7. **Always context-manage the encoder** — otherwise file is not finalized.
+
+---
+
+## Common Pitfalls
+
+### Importing nelux before torch
+```python
+from nelux import VideoReader   # ImportError — torch must be imported first
+```
+
+### Expecting CPU tensor from NVDEC
+```python
+reader = VideoReader("v.mp4", decode_accelerator="nvdec")
+frame = next(reader)
+frame.numpy()         # Error — frame is on CUDA
+frame.cpu().numpy()   # OK
+```
+
+### Not closing the encoder
+```python
+enc = VideoEncoder("out.mp4", ...)
+enc.encode_frame(frame)
+# file left un-finalized → corrupt
+
+with VideoEncoder("out.mp4", ...) as enc:
+    enc.encode_frame(frame)       # properly closed
+```
+
+### Mixing int and float in set_range
+```python
+reader.set_range(100, 10.0)       # Error: int + float
+reader.set_range(5.0, 10.0)       # OK (seconds)
+reader.set_range(100, 200)        # OK (frame indices)
+```
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Python API                              │
+│  VideoReader   VideoEncoder   BatchMixin                     │
+├─────────────────────────────────────────────────────────────┤
+│                    C++ Backend (_nelux)                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │ CPU Decoder │  │CUDA Decoder │  │   Encoder   │         │
+│  │  (libyuv)   │  │   (NVDEC)   │  │(CPU / NVENC)│         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
+├─────────┼────────────────┼────────────────┼─────────────────┤
+│         │     CUDA Kernels (NV12/P010/NV16/YUV444 ↔ RGB)   │
+│         │     Color-space conversion on GPU                  │
+├─────────┼────────────────┼────────────────┼─────────────────┤
+│         └────────────────┼────────────────┘                  │
+│                        FFmpeg                                │
+│         Format/codec handling, muxing/demuxing               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Color spaces supported: BT.709, BT.601/SMPTE170M, BT.2020, SMPTE 240M, FCC — both limited (TV: 16–235) and full range (PC: 0–255).
+
+---
+
+## Supported Codecs
+
+### Decode
+| Codec | CPU | NVDEC |
+|---|---|---|
+| H.264/AVC | ✓ | ✓ |
+| H.265/HEVC | ✓ | ✓ |
+| VP8 | ✓ | ✓ |
+| VP9 | ✓ | ✓ |
+| AV1 | ✓ | ✓ |
+| MPEG-1/2/4 | ✓ | ✓ |
+| VC1 | ✓ | ✓ |
+| ProRes, DNxHD/HR, DV | ✓ | ✗ |
+
+### Encode
+| Codec | Software | NVENC |
+|---|---|---|
+| H.264 | libx264 | h264_nvenc |
+| H.265 | libx265 | hevc_nvenc |
+| AV1 | libsvtav1, libaom-av1 | av1_nvenc |
+
+### Containers
+MP4, MKV, MOV, WebM, AVI (default: MP4)
+
+---
+
+## Complete Example: ML Video Processing
+
+```python
+import torch
+from nelux import VideoReader
+
+def process_video(input_path, output_path, model):
+    reader = VideoReader(
+        input_path,
+        decode_accelerator="nvdec" if torch.cuda.is_available() else "cpu",
+    )
+    reader.start_prefetch(buffer_size=16)
+
+    with reader.create_encoder(output_path) as encoder:
+        for frame in reader:                                # [H, W, 3] on GPU (NVDEC)
+            x = frame.permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            y = model(x)
+            out = (y.squeeze(0).permute(1, 2, 0) * 255).to(torch.uint8)
+            encoder.encode_frame(out)
+
+    reader.stop_prefetch()
+    print(f"Processed {len(reader)} frames")
+```
+
+---
+
+## Version History Highlights
+
+- **0.12.0** (2026-05-27): `VideoEncoder.add_passthrough(source, audio, subtitles, start, end, allow_transcode)` — copy/transcode audio + subtitle streams from a source into the output with `[start, end)` trim + rebase; one source per encoder, must precede first `encode_frame`. Async fan-out encode pipeline (RGB→YUV convert workers + seq-keyed reorder). `encode_frame` validates input size up front (`ValueError` on mismatch).
+- **0.11.0** (2026-05-16): `libyuv` dependency removed — pure libswscale CPU pipeline (`SWS_BILINEAR`, byte-identical to `ffmpeg -vf format=rgb24`); faster on every YUV path.
+- **0.9.1** (2026-04-22): Suppressed libx264/libx265/libsvtav1 banner and per-frame info noise from encoder output (av_log level + `x265-params=log-level=none` + fd-2 redirect around SVT-AV1 init/teardown).
+- **0.9.0** (2026-04-18): Official Linux x86_64 and macOS arm64 wheels; per-platform FFmpeg resolution; LTO/AVX2 extended to CUDA compilation; `NELUX_ENABLE_CUDA_FAST_MATH` option; real post-install smoke test.
+- **0.8.10**: PyTorch 2.11.0 / TorchVision 0.26.0 baseline.
+- **0.8.9**: Fixed NumPy backend memory-aliasing bug (arrays now own their memory); Windows wheels bundle FFmpeg + libyuv + fmt + spdlog + turbojpeg DLLs; `diagnose_runtime_dlls()` helper.
+- **0.8.8**: Full NVENC hardware-encoding support; improved color accuracy.
+- **0.8.7**: `import torch` before `nelux` became mandatory; HWC uint8/uint16 standardized (no BCHW, no FP16/FP32).
+- **0.8.6**: Zero-copy GPU encoding (CUDA ↔ NVENC); custom CUDA conversion kernels; 1080p NVENC ≈ 410 FPS.
+
+---
+
+## Requirements
+
+- Python **3.13+**
+- PyTorch 2.0+ (2.11.0 recommended; CUDA build required for NVDEC/NVENC)
+- CUDA 11.8+ (for NVDEC/NVENC on Windows/Linux)
+- FFmpeg shared libraries available to the process
+- Windows 10/11, Linux (manylinux_2_28+), or macOS 12.0+ (arm64)

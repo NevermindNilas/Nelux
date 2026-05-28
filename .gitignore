@@ -19,9 +19,7 @@ vcpkg.json
 
 TheAnimeScripter/
 
-llms.txt
-
-# For me 
+# For me
 setup_dev.ps1
 external/ffmpeg/
 tests/generated_formats
