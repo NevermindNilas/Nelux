@@ -2,7 +2,7 @@
 
 > **Purpose**: Enable AI assistants to understand and correctly use Nelux instantly.
 > **Library**: Nelux — High-performance Python video decoding/encoding with GPU acceleration
-> **Version**: 0.12.1
+> **Version**: 0.12.2
 > **License**: AGPL-3.0
 > **Source**: https://github.com/NevermindNilas/NeLux
 
@@ -302,7 +302,7 @@ set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical
 
 ```python
 import nelux
-nelux.__version__                    # "0.12.1"
+nelux.__version__                    # "0.12.2"
 nelux.__cuda_support__               # True if compiled with CUDA
 
 from nelux import get_available_encoders, get_nvenc_encoders, diagnose_runtime_dlls
@@ -476,6 +476,7 @@ def process_video(input_path, output_path, model):
 
 ## Version History Highlights
 
+- **0.12.2** (2026-05-28): Fixed Windows CUDA wheels failing to import (`ImportError: DLL load failed ... WinError 1114`) — the release `delvewheel` repair step now excludes `c10_cuda.dll` so it is no longer double-vendored alongside torch's copy. No API or runtime behavior change.
 - **0.12.1** (2026-05-28): Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux build against the CUDA 13.2 `cu132` wheel index). Runtime `torch` stays unpinned — wheels exclude torch and use the installed copy.
 - **0.12.0** (2026-05-27): `VideoEncoder.add_passthrough(source, audio, subtitles, start, end, allow_transcode)` — copy/transcode audio + subtitle streams from a source into the output with `[start, end)` trim + rebase; one source per encoder, must precede first `encode_frame`. Async fan-out encode pipeline (RGB→YUV convert workers + seq-keyed reorder). `encode_frame` validates input size up front (`ValueError` on mismatch).
 - **0.11.0** (2026-05-16): `libyuv` dependency removed — pure libswscale CPU pipeline (`SWS_BILINEAR`, byte-identical to `ffmpeg -vf format=rgb24`); faster on every YUV path.

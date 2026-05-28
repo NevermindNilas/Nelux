@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-05-28
+
+### Fixed
+
+- **Windows CUDA wheels failed to import** with `ImportError: DLL load failed
+  while importing _nelux` (`WinError 1114`, DllMain initialization failure). The
+  release `delvewheel` repair step was missing `c10_cuda.dll` from its
+  `--exclude` list, so a second copy of `c10_cuda` was vendored into the wheel
+  and conflicted with the `c10_cuda.dll` already loaded by the user's torch.
+  Added `c10_cuda.dll` to the exclude list (matching the existing
+  `build_wheel.yml` and the Linux/macOS repair steps). No API or runtime
+  behavior change.
+
 ## [0.12.1] - 2026-05-28
 
 ### Changed

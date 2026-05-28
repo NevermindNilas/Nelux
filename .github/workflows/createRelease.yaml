@@ -218,7 +218,7 @@ jobs:
             --add-path "$VcpkgBin" `
             --add-path "$TorchLib" `
             --add-path "$FFmpegBin" `
-            --exclude "torch_cpu.dll;c10.dll;torch_python.dll;torch.dll;torch_cuda.dll;cudart64*.dll;nvrtc64*.dll;nvrtc-builtins64*.dll;cufft64*.dll;curand64*.dll;cusolver64*.dll;cusparse64*.dll;cudnn64*.dll;nvToolsExt64*.dll;$FFmpegExclude" `
+            --exclude "torch_cpu.dll;c10.dll;c10_cuda.dll;torch_python.dll;torch.dll;torch_cuda.dll;cudart64*.dll;nvrtc64*.dll;nvrtc-builtins64*.dll;cufft64*.dll;curand64*.dll;cusolver64*.dll;cusparse64*.dll;cudnn64*.dll;nvToolsExt64*.dll;$FFmpegExclude" `
             --wheel-dir dist_repaired `
             -v
 

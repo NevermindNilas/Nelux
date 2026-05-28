@@ -1,4 +1,11 @@
 
+### **Version 0.12.2 (2026-05-28)**
+
+#### **Fix: Windows CUDA wheel import failure**
+- **Fixed:** Windows CUDA wheels failed to import with `ImportError: DLL load failed while importing _nelux` (`WinError 1114`). The release `delvewheel` repair step was missing `c10_cuda.dll` from its `--exclude` list, so a duplicate `c10_cuda` was vendored into the wheel and clashed with the copy already loaded by the user's torch. Added `c10_cuda.dll` to the exclude list. No API or runtime behavior change.
+
+---
+
 ### **Version 0.12.1 (2026-05-28)**
 
 #### **Dependency: PyTorch 2.12.0**
