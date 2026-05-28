@@ -99,6 +99,29 @@ with reader.create_encoder("output.mp4") as enc:
 print("Done!")
 ```
 
+#### Carrying audio / subtitles across
+
+`add_passthrough` copies (or transcodes) the source's audio and subtitle
+streams into the encoded output. Call it **before** the first `encode_frame`:
+
+```python
+with reader.create_encoder("output.mp4") as enc:
+    enc.add_passthrough("input.mp4")       # copy audio + subtitle streams
+    for frame in reader:
+        enc.encode_frame(frame)
+
+# Trim a window + keep audio only (rebased to t=0):
+reader.set_range(2.0, 6.0)                 # both float → seconds
+with reader.create_encoder("clip.mp4") as enc:
+    enc.add_passthrough("input.mp4", audio=True, subtitles=False, start=2.0, end=6.0)
+    for frame in reader:
+        enc.encode_frame(frame)
+```
+
+`allow_transcode=True` (default) re-encodes streams the output container can't
+stream-copy (e.g. AAC→WebM) instead of dropping them. One passthrough source
+per encoder; a second call raises.
+
 ---
 
 ## Features
@@ -109,6 +132,7 @@ print("Done!")
 - **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, 3]` (or `[H, W, 3]` `int16` for >8-bit sources; force_8bit=True clamps to uint8 always). No implicit float conversion — you cast/normalize on your side based on your model's expected input
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
+- **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
 
 ### Performance Knobs
 

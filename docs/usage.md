@@ -17,6 +17,7 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
   - [Decoder Reconfiguration](#decoder-reconfiguration)
   - [Hardware Acceleration (NVDEC)](#hardware-acceleration-nvdec)
 - [VideoEncoder](#videoencoder)
+  - [Audio / Subtitle Passthrough](#audio--subtitle-passthrough)
 - [Logging](#logging)
 - [Module Attributes](#module-attributes)
 
@@ -461,6 +462,57 @@ with reader.create_encoder("output.mp4") as encoder:
         # Process frame
         processed = some_filter(frame)
         encoder.encode_frame(processed)
+```
+
+### Audio / Subtitle Passthrough
+
+`add_passthrough` copies (or transcodes) audio and subtitle streams from a
+source file into the encoded output, with an optional `[start, end)` trim.
+
+```python
+encoder.add_passthrough(
+    source: str,                     # file to copy audio/subtitle streams from
+    audio: bool = True,              # copy audio streams
+    subtitles: bool = True,          # copy subtitle streams
+    start: float = 0.0,              # trim window start (seconds), rebased to t=0
+    end: Optional[float] = None,     # trim window end (seconds); None = source end
+    allow_transcode: bool = True,    # re-encode streams the container can't stream-copy
+)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `source` | `str` | Required | File to copy audio/subtitle streams from |
+| `audio` | `bool` | `True` | Copy audio streams |
+| `subtitles` | `bool` | `True` | Copy subtitle streams |
+| `start` | `float` | `0.0` | Trim window start in seconds; copied streams rebase to `t=0` |
+| `end` | `float` | `None` | Trim window end in seconds (`None` = to source end) |
+| `allow_transcode` | `bool` | `True` | Re-encode streams the output container cannot stream-copy (e.g. AAC→WebM, SubRip→MP4) instead of dropping them |
+
+**Rules:**
+- Must be called **before** the first `encode_frame`. Calling it afterward raises `RuntimeError`.
+- Only **one** passthrough source per encoder; a second call raises `RuntimeError`.
+- Match the `[start, end)` window to the video frames you actually push.
+
+```python
+import torch
+from nelux import VideoReader
+
+reader = VideoReader("input.mp4")
+
+# Copy all audio + subtitle streams unchanged:
+with reader.create_encoder("output.mp4") as encoder:
+    encoder.add_passthrough("input.mp4")
+    for frame in reader:
+        encoder.encode_frame(frame)
+
+# Trim 2..6s, keep audio only, rebased to t=0:
+reader.set_range(2.0, 6.0)                 # both float → seconds
+with reader.create_encoder("clip.mp4") as encoder:
+    encoder.add_passthrough("input.mp4", audio=True, subtitles=False,
+                            start=2.0, end=6.0)
+    for frame in reader:
+        encoder.encode_frame(frame)
 ```
 
 ---
