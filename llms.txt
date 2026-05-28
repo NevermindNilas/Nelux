@@ -476,7 +476,7 @@ def process_video(input_path, output_path, model):
 
 ## Version History Highlights
 
-- **0.12.1** (2026-05-28): Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux build against the CUDA 13.0 `cu130` wheel index). Runtime `torch` stays unpinned — wheels exclude torch and use the installed copy.
+- **0.12.1** (2026-05-28): Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux build against the CUDA 13.2 `cu132` wheel index). Runtime `torch` stays unpinned — wheels exclude torch and use the installed copy.
 - **0.12.0** (2026-05-27): `VideoEncoder.add_passthrough(source, audio, subtitles, start, end, allow_transcode)` — copy/transcode audio + subtitle streams from a source into the output with `[start, end)` trim + rebase; one source per encoder, must precede first `encode_frame`. Async fan-out encode pipeline (RGB→YUV convert workers + seq-keyed reorder). `encode_frame` validates input size up front (`ValueError` on mismatch).
 - **0.11.0** (2026-05-16): `libyuv` dependency removed — pure libswscale CPU pipeline (`SWS_BILINEAR`, byte-identical to `ffmpeg -vf format=rgb24`); faster on every YUV path.
 - **0.9.1** (2026-04-22): Suppressed libx264/libx265/libsvtav1 banner and per-frame info noise from encoder output (av_log level + `x265-params=log-level=none` + fd-2 redirect around SVT-AV1 init/teardown).

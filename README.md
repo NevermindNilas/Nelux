@@ -31,7 +31,7 @@ PyTorch must be importable **before** `nelux` — the package uses torch's C++ r
 
 ```bash
 # Linux CUDA
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 
 # macOS / Linux CPU
 pip install torch torchvision

@@ -2,7 +2,7 @@
 ### **Version 0.12.1 (2026-05-28)**
 
 #### **Dependency: PyTorch 2.12.0**
-- **Changed:** CI/build workflows (Windows, Linux, macOS) now build against PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux use the CUDA 13.0 `cu130` wheel index). Previous: 2.11.0 / 0.26.0. Runtime `torch` remains unpinned — the wheel excludes torch and links against the user's installed version.
+- **Changed:** CI/build workflows (Windows, Linux, macOS) now build against PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux use the CUDA 13.2 `cu132` wheel index). Previous: 2.11.0 / 0.26.0 (cu130). Runtime `torch` remains unpinned — the wheel excludes torch and links against the user's installed version.
 - **Changed:** Recommended PyTorch updated to 2.12.0 in `README.md` + `llms.txt`.
 
 ---

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0** across the
   Windows, Linux, and macOS release workflows (Windows + Linux build against the
-  CUDA 13.0 `cu130` wheel index). The runtime `torch` requirement stays unpinned;
+  CUDA 13.2 `cu132` wheel index). The runtime `torch` requirement stays unpinned;
   published wheels exclude torch and link against the user's installed copy.
 - **Docs:** recommended PyTorch updated to 2.12 in `README.md` and `llms.txt`.
 
