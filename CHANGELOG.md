@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-05-28
+
+### Changed
+
+- **Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0** across the
+  Windows, Linux, and macOS release workflows (Windows + Linux build against the
+  CUDA 13.0 `cu130` wheel index). The runtime `torch` requirement stays unpinned;
+  published wheels exclude torch and link against the user's installed copy.
+- **Docs:** recommended PyTorch updated to 2.12 in `README.md` and `llms.txt`.
+
 ## [0.12.0] - 2026-05-27
 
 ### Added

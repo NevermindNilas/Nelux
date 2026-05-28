@@ -43,7 +43,7 @@ jobs:
       - name: Install PyTorch (CPU, arm64)
         run: |
           # Apple Silicon torch wheels live on PyPI (CPU / MPS backend only — no CUDA on mac).
-          python -m pip install torch==2.11.0 torchvision==0.26.0
+          python -m pip install torch==2.12.0 torchvision==0.27.0
 
       - name: Cache vcpkg
         uses: actions/cache@v4
