@@ -33,10 +33,11 @@ linux_fetch_btbn() {
   local url tmp extracted_root
   case "${arch_name}" in
     x86_64|amd64)
-      url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl-shared.tar.xz"
+      # Pinned to FFmpeg 8.1 (BtbN n8.1 tracks the 8.1 branch, not git master).
+      url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
       ;;
     aarch64|arm64)
-      url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl-shared.tar.xz"
+      url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
       ;;
     *)
       die "Unsupported Linux arch: ${arch_name}"
@@ -76,16 +77,36 @@ linux_fetch_btbn() {
 macos_from_brew() {
   command -v brew >/dev/null 2>&1 || die "Homebrew is required on macOS. Install from https://brew.sh"
 
-  if ! brew list --versions ffmpeg >/dev/null 2>&1; then
-    say "Installing ffmpeg via Homebrew"
-    brew install ffmpeg
+  # Pin to FFmpeg 8.x. Homebrew only ships a versioned ffmpeg@N formula once N
+  # is no longer the default `ffmpeg`. Today `ffmpeg` IS 8.x and `ffmpeg@8` does
+  # not exist yet; once FFmpeg 9 becomes the default, `ffmpeg@8` will appear and
+  # we prefer it automatically. The major-version assertion below fails the
+  # build loudly if neither path yields 8.x (rather than silently linking 9.x).
+  local formula="ffmpeg"
+  if brew info ffmpeg@8 >/dev/null 2>&1; then
+    formula="ffmpeg@8"
+  fi
+  say "Using Homebrew formula: ${formula}"
+
+  if ! brew list --versions "${formula}" >/dev/null 2>&1; then
+    say "Installing ${formula} via Homebrew"
+    brew install "${formula}"
   else
-    ok "Homebrew already has ffmpeg ($(brew list --versions ffmpeg))"
+    ok "Homebrew already has ${formula} ($(brew list --versions "${formula}"))"
   fi
 
   local prefix
-  prefix="$(brew --prefix ffmpeg)"
-  [[ -d "${prefix}/include/libavcodec" ]] || die "Homebrew ffmpeg prefix missing headers: ${prefix}"
+  prefix="$(brew --prefix "${formula}")"
+  [[ -d "${prefix}/include/libavcodec" ]] || die "Homebrew ${formula} prefix missing headers: ${prefix}"
+
+  # Assert major version is 8 — guard against brew serving a newer major.
+  local major=""
+  if [[ -x "${prefix}/bin/ffmpeg" ]]; then
+    major="$("${prefix}/bin/ffmpeg" -version 2>/dev/null | sed -n '1s/^ffmpeg version \([0-9][0-9]*\).*/\1/p')"
+  fi
+  [[ -n "${major}" ]] || major="$(brew list --versions "${formula}" | awk '{print $2}' | cut -d. -f1)"
+  [[ "${major}" == "8" ]] || die "Expected FFmpeg 8.x but ${formula} resolved to major '${major}'. Pin a versioned formula (e.g. ffmpeg@8) in download_ffmpeg.sh."
+  ok "FFmpeg major version ${major} (8.x pin satisfied)"
 
   rm -rf "${OUTPUT_DIR}"
   mkdir -p "${OUTPUT_DIR}/bin" "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"

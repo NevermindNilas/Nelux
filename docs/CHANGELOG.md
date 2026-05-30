@@ -1,4 +1,11 @@
 
+### **Version 0.12.3 (2026-05-30)**
+
+#### **Build: pin FFmpeg 8.x toolchain**
+- **Changed:** All build/release workflows now pin the build-time FFmpeg to 8.x (previously floated to "latest"). Windows + Linux use BtbN `n8.1` gpl-shared builds; macOS prefers Homebrew `ffmpeg@8`, falls back to `ffmpeg`, then asserts the resolved major version is 8 (fails the build loudly on a newer major). Previously the Linux build linked against FFmpeg **git master**, risking compilation against pre-9 symbols absent from users' 8.x runtimes. Headers/import libs only — FFmpeg DLLs are still not bundled, and the delay-load runtime continues to accept user-provided FFmpeg 6.x/7.x/8.x unchanged.
+
+---
+
 ### **Version 0.12.2 (2026-05-28)**
 
 #### **Fix: Windows CUDA wheel import failure**

@@ -74,23 +74,24 @@ jobs:
         run: |
           "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
 
-      - name: Download FFmpeg 7.1 for build (headers/libs only)
+      - name: Download FFmpeg 8.x for build (headers/libs only)
         shell: powershell
         run: |
-          # Latest FFmpeg is needed for headers/import libs at build time
-          # The DLLs are NOT bundled - users must have FFmpeg in their PATH
-          $FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"
+          # Pinned to FFmpeg 8.1 (BtbN gpl-shared) — same source/version as the
+          # Linux build for ABI consistency. Build needs headers + import libs
+          # only; DLLs are NOT bundled — users must have FFmpeg in their PATH.
+          $FFmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
           $OutputDir = "${{ github.workspace }}/external/ffmpeg"
           $TempDir = "${{ runner.temp }}/ffmpeg_download"
 
           New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
           New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-          Write-Host "Downloading latest FFmpeg (for build-time headers/libs only)..."
-          Start-BitsTransfer -Source $FFmpegUrl -Destination "$TempDir/ffmpeg.7z"
+          Write-Host "Downloading FFmpeg 8.1 (for build-time headers/libs only)..."
+          curl.exe -L --retry 3 --retry-delay 2 -o "$TempDir/ffmpeg.zip" $FFmpegUrl
 
           Write-Host "Extracting FFmpeg..."
-          7z x "$TempDir/ffmpeg.7z" -o"$TempDir/extracted" -y
+          Expand-Archive -Path "$TempDir/ffmpeg.zip" -DestinationPath "$TempDir/extracted" -Force
 
           $FFmpegDir = Get-ChildItem -Path "$TempDir/extracted" -Directory | Select-Object -First 1
           # Copy all directories including bin (needed for running tests, but NOT bundled by CMake)
