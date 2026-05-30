@@ -427,6 +427,7 @@ jobs:
           . /tmp/cpuenv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy  # nelux/batch.py imports numpy; the torch CPU index doesn't carry it
           python -m pip install dist/*.whl
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/external/ffmpeg/lib:${LD_LIBRARY_PATH:-}"
           export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
