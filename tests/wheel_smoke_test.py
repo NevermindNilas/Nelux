@@ -79,35 +79,13 @@ def main() -> int:
     # torch must be imported before nelux (enforced inside nelux).
     import torch  # noqa: F401
 
-    # A CUDA-enabled extension links the CUDA runtime; on Windows the c10_cuda
-    # DLL's init routine fails to load on a runner with no NVIDIA GPU (Linux's
-    # .so tolerates it). GitHub CI runners have no GPU, so a CUDA-init import
-    # failure there is expected, not a wheel defect — skip rather than fail.
-    # The build + dependency-bundling steps already ran; CUDA paths simply can't
-    # be exercised without a device. On a real GPU machine the import succeeds
-    # and the full decode test below runs.
-    try:
-        import nelux
-    except ImportError as exc:
-        msg = str(exc)
-        cuda_init_failure = any(
-            s in msg
-            for s in ("c10_cuda", "cudart", "initialization routine failed",
-                      "DLL load failed")
-        )
-        if cuda_init_failure and not torch.cuda.is_available():
-            print(f"[smoke] SKIP: CUDA-enabled extension cannot initialize on a "
-                  f"GPU-less runner (no NVIDIA device). Import error: {msg}",
-                  flush=True)
-            print("[smoke] Build + DLL bundling succeeded; CUDA-path validation "
-                  "requires a GPU and is skipped on CI.", flush=True)
-            # Hard-exit 0: after the failed CUDA DLL load the interpreter's
-            # normal shutdown returns a non-zero code, so os._exit bypasses
-            # finalizers to guarantee a clean success exit.
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-        raise
+    # nelux must import on ANY PyTorch — CPU-only or CUDA, GPU present or not.
+    # The CUDA runtime (c10_cuda.dll / torch_cuda.dll) is delay-loaded on
+    # Windows, so a missing or uninitializable CUDA library must NOT block
+    # import; it only surfaces if a GPU op is actually requested. GitHub CI
+    # runners have no GPU, yet this import must still succeed — a failure here
+    # is a real regression of that contract, so do not skip it.
+    import nelux
 
     print(
         f"[smoke] nelux={nelux.__version__} "

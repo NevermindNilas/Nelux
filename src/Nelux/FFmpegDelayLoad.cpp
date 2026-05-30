@@ -8,6 +8,7 @@
 // Allow writable delay-load hook variables on MSVC
 #define DELAYIMP_INSECURE_WRITABLE_HOOKS
 #include <delayimp.h>
+#include <stdexcept>
 #include <string>
 
 // FFmpeg DLL versions to try in order of preference (newest first)
@@ -82,5 +83,27 @@ FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
 
 ExternC PfnDliHook __pfnDliNotifyHook2 = FFmpegDelayLoadHook;
 ExternC PfnDliHook __pfnDliFailureHook2 = FFmpegDelayLoadHook;
+
+// ── CUDA runtime guard ──────────────────────────────────────────────────────
+// c10_cuda.dll is delay-loaded (see /DELAYLOAD in CMakeLists.txt) so the module
+// imports on a CPU-only PyTorch. If a GPU-only code path is reached without it
+// (e.g. NVDEC explicitly requested on a CPU-only torch), surface a clear error
+// here instead of a raw delay-load failure. Only touches KERNEL32, so it adds
+// no torch import of its own and cannot re-introduce the eager dependency.
+#ifdef NELUX_ENABLE_CUDA
+namespace nelux {
+void requireCudaRuntime()
+{
+    if (::GetModuleHandleA("c10_cuda.dll") != nullptr)
+        return;
+    if (::LoadLibraryA("c10_cuda.dll") != nullptr)
+        return;
+    throw std::runtime_error(
+        "GPU operation requires a CUDA build of PyTorch, but c10_cuda.dll is "
+        "missing (your PyTorch is CPU-only). Install a CUDA build of PyTorch to "
+        "use NVDEC/NVENC, or use CPU decoding and software encoders.");
+}
+}  // namespace nelux
+#endif  // NELUX_ENABLE_CUDA
 
 #endif // _WIN32

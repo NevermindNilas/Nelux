@@ -7,6 +7,8 @@
 
 #include <c10/cuda/CUDAStream.h>
 
+#include <CudaRuntimeGuard.hpp>
+
 #include <BatchDecoder.hpp>
 #include <Logger.hpp>
 #include <chrono>
@@ -223,6 +225,10 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
+    // c10_cuda.dll is delay-loaded on Windows so the module imports on a
+    // CPU-only PyTorch; fail clearly here if NVDEC is reached without it.
+    nelux::requireCudaRuntime();
+
     // Async fanout uses CPU libswscale convert workers; CUDA decoder produces
     // AV_PIX_FMT_CUDA frames that cannot be fed to libswscale on the host. Disable.
     asyncFanoutEnabled_ = false;
