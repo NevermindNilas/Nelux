@@ -484,8 +484,12 @@ if(NELUX_BUILD_PYTHON)
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
+    # Windows ONLY (mirrors NeluxLib above): linked so the /DELAYLOAD thunk has
+    # its import lib. On Linux a plain -lc10_cuda/-ltorch_cuda becomes a
+    # DT_NEEDED even when unused and breaks import on CPU-only torch; the symbol
+    # is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
+    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
+    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
   )
 
   # Delay-load FFmpeg DLLs on Windows for version flexibility
