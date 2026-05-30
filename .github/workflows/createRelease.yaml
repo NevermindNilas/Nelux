@@ -433,7 +433,9 @@ jobs:
           export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__)"
-          SO=$(python -c "import nelux,glob,os;print(glob.glob(os.path.join(os.path.dirname(nelux.__file__),'_nelux*.so'))[0])")
+          # Locate the .so via find_spec (does NOT execute nelux/__init__.py, so it
+          # avoids the "import torch first" guard) for the NEEDED assertion.
+          SO=$(python -c "import importlib.util,glob,os; s=importlib.util.find_spec('nelux'); print(glob.glob(os.path.join(os.path.dirname(s.origin),'_nelux*.so'))[0])")
           echo "== NEEDED of $SO =="; readelf -d "$SO" | grep NEEDED || true
           if readelf -d "$SO" | grep -qE 'NEEDED.*(libc10_cuda|libcudart|libtorch_cuda)'; then
             echo "FAIL: eager CUDA lib still in NEEDED (import would break on CPU-only torch)"; exit 1
