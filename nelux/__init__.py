@@ -226,7 +226,26 @@ from .batch import BatchMixin
 class VideoReader(BatchMixin, _VideoReaderBase):
     """VideoReader with batch frame reading support."""
 
-    pass
+    def __init__(self, *args, **kwargs):
+        # NVDEC needs a CUDA-capable, *active* PyTorch. The CUDA runtime is
+        # delay-loaded so the module imports on CPU-only torch; guard here so
+        # requesting nvdec on a CPU/GPU-less torch raises a clear error up front
+        # instead of failing deep in the decoder. torch.cuda.is_available() is
+        # safe on CPU torch (returns False without needing c10_cuda).
+        accel = kwargs.get("decode_accelerator")
+        if accel is None and len(args) >= 5:
+            accel = args[4]  # input_path, num_threads, force_8bit, backend, decode_accelerator
+        if isinstance(accel, str) and accel.lower() == "nvdec":
+            import torch
+
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "decode_accelerator='nvdec' requires a CUDA-enabled PyTorch "
+                    "with an available GPU, but torch.cuda.is_available() is False "
+                    "(CPU-only PyTorch or no NVIDIA GPU). Use "
+                    "decode_accelerator='cpu', or install a CUDA build of PyTorch."
+                )
+        super().__init__(*args, **kwargs)
 
 
 __all__ = [

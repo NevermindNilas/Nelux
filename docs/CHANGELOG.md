@@ -1,4 +1,11 @@
 
+### **Version 0.12.4 (2026-05-30)**
+
+#### **Fix: nelux imports on CPU-only PyTorch (Windows)**
+- **Fixed:** `import nelux` failed with `ImportError: DLL load failed while importing _nelux` (`WinError 126`) whenever the installed PyTorch was a CPU-only build. The CUDA-enabled wheel statically imported `c10_cuda.dll`, which ships only with CUDA PyTorch, so every nelux operation — including pure-CPU decode/encode — was unreachable on a CPU torch. CUDA is now **optional, never required to import**, on both Windows and Linux. The single torch-CUDA symbol nelux uses (`getCurrentCUDAStream`) is no longer linked eagerly: on **Windows** `c10_cuda.dll`/`torch_cuda.dll` are delay-loaded; on **Linux** the symbol is resolved via `dlsym` so `libc10_cuda.so` is not a `DT_NEEDED` dependency. The CUDA runtime is static-linked (Windows already did this; Linux now does too) so `libcudart.so` is not `NEEDED` either. The module therefore imports on any PyTorch and only touches the CUDA runtime when a GPU code path actually runs — NVENC/NVDEC are unchanged when CUDA PyTorch is present; requesting a GPU op without it now raises a clear error instead of a load-time crash. The post-install smoke test asserts import on a GPU-less runner, and the Linux release job additionally verifies import under CPU-only torch and asserts the built `.so` has no eager CUDA `NEEDED` entries — permanent regression guards. (macOS already builds CPU-only.)
+
+---
+
 ### **Version 0.12.3 (2026-05-30)**
 
 #### **Build: pin FFmpeg 8.x toolchain**

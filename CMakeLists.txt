@@ -363,11 +363,17 @@ if(NELUX_ENABLE_CUDA)
   
   if(NELUX_CUDA_CU_SOURCES)
     add_library(NeluxCuda STATIC ${NELUX_CUDA_CU_SOURCES})
+    # Static-link the CUDA runtime on every platform so cudart is not an eager
+    # dependency of _nelux (libcudart.so / cudart64_*.dll). CPU-only torch ships
+    # no CUDA runtime and the GPU paths that use it are runtime-gated, so the
+    # module must load without it. Windows was already de-facto static (no cudart
+    # in the import table); making it explicit closes the gap if a future
+    # toolchain default changes.
     set_target_properties(NeluxCuda PROPERTIES
       CUDA_SEPARABLE_COMPILATION OFF
       POSITION_INDEPENDENT_CODE ON
       CUDA_STANDARD 17
-      CUDA_RUNTIME_LIBRARY Shared
+      CUDA_RUNTIME_LIBRARY Static
     )
     target_include_directories(NeluxCuda PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -409,6 +415,14 @@ if(NELUX_ENABLE_CUDA)
   if(TARGET NeluxCuda)
     target_link_libraries(NeluxLib PUBLIC NeluxCuda)
   endif()
+  # Static cudart so _nelux does not list a CUDA runtime as an eager dependency
+  # (libcudart.so / cudart64_*.dll — absent on CPU-only torch). Covers cudart
+  # calls from CXX TUs such as the NVDEC Decoder; pairs with NeluxCuda's
+  # CUDA_RUNTIME_LIBRARY=Static. (cudart_static pulls -ldl/-lrt/-lpthread on
+  # Linux via CMake.)
+  if(TARGET CUDA::cudart_static)
+    target_link_libraries(NeluxLib PUBLIC CUDA::cudart_static)
+  endif()
 endif()
 
 target_include_directories(NeluxLib
@@ -435,8 +449,13 @@ target_link_libraries(NeluxLib PUBLIC
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
+  # Windows ONLY: c10_cuda/torch_cuda are delay-loaded (see /DELAYLOAD) so they
+  # stay out of the eager import table while the import lib is present for the
+  # delay-load thunk. On Linux a plain -lc10_cuda becomes a DT_NEEDED even when
+  # unused (no --as-needed), which would break import on CPU-only torch; there
+  # the symbol is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
 )
 if(WIN32)
   target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
@@ -495,6 +514,24 @@ if(NELUX_BUILD_PYTHON)
         "/WHOLEARCHIVE:$<TARGET_FILE:NeluxCuda>"
       )
       message(STATUS "MSVC: Using /WHOLEARCHIVE for NeluxCuda to include all CUDA kernels in nelux")
+    endif()
+
+    if(WIN32 AND MSVC)
+      # Delay-load the CUDA PyTorch runtime so the module still IMPORTS on a
+      # CPU-only PyTorch (where c10_cuda.dll is absent). Every c10::cuda / CUDA
+      # code path is runtime-gated (frame.is_cuda(), NVDEC accelerator), so
+      # c10_cuda is only resolved when a GPU op actually runs. cudart is
+      # static-linked and the NVDEC driver DLLs are LoadLibrary'd at runtime, so
+      # neither appears in the import table. Without this, the eager c10_cuda
+      # import makes `import nelux` fail with WinError 126 on CPU-only torch.
+      # (torch_cuda.dll is listed defensively; if a build doesn't import it the
+      #  linker emits a benign LNK4199 and ignores the directive.)
+      # delayimp.lib is already linked above (FFmpeg delay-load block).
+      target_link_options(nelux PRIVATE
+        "/DELAYLOAD:c10_cuda.dll"
+        "/DELAYLOAD:torch_cuda.dll"
+      )
+      message(STATUS "MSVC: c10_cuda.dll/torch_cuda.dll delay-loaded — import works on CPU-only PyTorch")
     endif()
   endif()
 

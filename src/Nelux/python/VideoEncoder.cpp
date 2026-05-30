@@ -7,7 +7,7 @@
 #include <cpu/RGBToAuto.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
-#include <c10/cuda/CUDAStream.h>  // c10::cuda::getCurrentCUDAStream
+#include <CudaStream.hpp>  // nelux::currentCudaStream (no eager c10_cuda link)
 #endif
 
 extern "C"
@@ -222,8 +222,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
             readyEvent = nullptr;
         if (readyEvent)
         {
-            cudaStream_t producerStream =
-                c10::cuda::getCurrentCUDAStream(deviceIndex).stream();
+            cudaStream_t producerStream = nelux::currentCudaStream(deviceIndex);
             cudaEventRecord(readyEvent, producerStream);
         }
 
@@ -336,7 +335,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
 #ifdef NELUX_ENABLE_CUDA
         int dev = frame.device().index();
         if (dev < 0) dev = 0;
-        cudaStream_t s = c10::cuda::getCurrentCUDAStream(dev).stream();
+        cudaStream_t s = nelux::currentCudaStream(dev);
         cudaError_t cerr = cudaMemcpyAsync(staging->data(), frame.data_ptr<uint8_t>(),
                                            rgbBytes, cudaMemcpyDeviceToHost, s);
         if (cerr == cudaSuccess)

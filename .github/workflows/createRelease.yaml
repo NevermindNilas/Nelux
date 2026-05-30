@@ -416,6 +416,31 @@ jobs:
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python tests/wheel_smoke_test.py
 
+      - name: Verify import on CPU-only torch (lite-profile regression guard)
+        run: |
+          set -euo pipefail
+          # Fresh env with CPU-only torch — the previously-broken "lite" profile.
+          # The wheel MUST import here: no eager libc10_cuda.so (resolved via
+          # dlsym) and no eager libcudart.so (static-linked). A failure means the
+          # CPU-torch import regression is back.
+          python -m venv /tmp/cpuenv
+          . /tmp/cpuenv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install dist/*.whl
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/external/ffmpeg/lib:${LD_LIBRARY_PATH:-}"
+          export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
+          export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
+          python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__)"
+          SO=$(python -c "import nelux,glob,os;print(glob.glob(os.path.join(os.path.dirname(nelux.__file__),'_nelux*.so'))[0])")
+          echo "== NEEDED of $SO =="; readelf -d "$SO" | grep NEEDED || true
+          if readelf -d "$SO" | grep -qE 'NEEDED.*(libc10_cuda|libcudart|libtorch_cuda)'; then
+            echo "FAIL: eager CUDA lib still in NEEDED (import would break on CPU-only torch)"; exit 1
+          fi
+          echo "OK: no eager CUDA libs in NEEDED"
+          python tests/wheel_smoke_test.py
+          deactivate
+
       - name: Upload Linux wheel
         uses: actions/upload-artifact@v4
         with:
