@@ -363,21 +363,17 @@ if(NELUX_ENABLE_CUDA)
   
   if(NELUX_CUDA_CU_SOURCES)
     add_library(NeluxCuda STATIC ${NELUX_CUDA_CU_SOURCES})
-    # Static-link the CUDA runtime on Linux so libcudart.so is not an eager
-    # DT_NEEDED of _nelux.so: CPU-only torch ships no libcudart.so, and the GPU
-    # paths that use it are runtime-gated. Windows keeps its existing behaviour
-    # (the runtime is already resolved statically into the .pyd — no cudart in
-    # the import table).
-    if(WIN32)
-      set(_NELUX_CUDA_RT Shared)
-    else()
-      set(_NELUX_CUDA_RT Static)
-    endif()
+    # Static-link the CUDA runtime on every platform so cudart is not an eager
+    # dependency of _nelux (libcudart.so / cudart64_*.dll). CPU-only torch ships
+    # no CUDA runtime and the GPU paths that use it are runtime-gated, so the
+    # module must load without it. Windows was already de-facto static (no cudart
+    # in the import table); making it explicit closes the gap if a future
+    # toolchain default changes.
     set_target_properties(NeluxCuda PROPERTIES
       CUDA_SEPARABLE_COMPILATION OFF
       POSITION_INDEPENDENT_CODE ON
       CUDA_STANDARD 17
-      CUDA_RUNTIME_LIBRARY ${_NELUX_CUDA_RT}
+      CUDA_RUNTIME_LIBRARY Static
     )
     target_include_directories(NeluxCuda PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -419,11 +415,12 @@ if(NELUX_ENABLE_CUDA)
   if(TARGET NeluxCuda)
     target_link_libraries(NeluxLib PUBLIC NeluxCuda)
   endif()
-  # Linux: static cudart so _nelux.so does not list libcudart.so as NEEDED
-  # (absent on CPU-only torch). Covers cudart calls from CXX TUs such as the
-  # NVDEC Decoder; cudart_static pulls its own -ldl/-lrt/-lpthread via CMake.
-  # Pairs with NeluxCuda's CUDA_RUNTIME_LIBRARY=Static above.
-  if(UNIX AND NOT APPLE)
+  # Static cudart so _nelux does not list a CUDA runtime as an eager dependency
+  # (libcudart.so / cudart64_*.dll — absent on CPU-only torch). Covers cudart
+  # calls from CXX TUs such as the NVDEC Decoder; pairs with NeluxCuda's
+  # CUDA_RUNTIME_LIBRARY=Static. (cudart_static pulls -ldl/-lrt/-lpthread on
+  # Linux via CMake.)
+  if(TARGET CUDA::cudart_static)
     target_link_libraries(NeluxLib PUBLIC CUDA::cudart_static)
   endif()
 endif()
@@ -452,8 +449,13 @@ target_link_libraries(NeluxLib PUBLIC
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:torch_cuda>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>>:c10_cuda>
+  # Windows ONLY: c10_cuda/torch_cuda are delay-loaded (see /DELAYLOAD) so they
+  # stay out of the eager import table while the import lib is present for the
+  # delay-load thunk. On Linux a plain -lc10_cuda becomes a DT_NEEDED even when
+  # unused (no --as-needed), which would break import on CPU-only torch; there
+  # the symbol is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
+  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
 )
 if(WIN32)
   target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
