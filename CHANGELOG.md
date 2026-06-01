@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.6] - 2026-06-01
+
+### Fixed
+
+- **`set_range()` + iteration crashed the CPU decoder** for every frame-threaded
+  codec (h264/hevc/prores, etc.) — `Assertion fctx->async_lock failed` in
+  libavcodec/pthread_frame.c, or a segfault. Plain `for f in reader` (no range)
+  was unaffected. Root cause: `set_range(0, N)` issued a redundant seek to the
+  stream start, which flushes the frame-threaded codec context — an operation
+  that is unsafe on such a context (the no-range iteration path already
+  documented and avoided this). The frame-range and timestamp-range paths now
+  skip the seek when the range begins at the start of the stream
+  (`start_frame == 0` / `start_time <= 0`) on the CPU sync decoder, decoding
+  straight from the beginning. `set_range(start > 0, …)` on CPU is a separate,
+  still-open seek issue and is unchanged.
+- **Frame-range off-by-one**: `set_range(start, end)` dropped the last in-range
+  frame (e.g. `set_range(0, N)` yielded `N - 1` frames). The end check stopped
+  one frame too early; `set_range(start, end)` now yields the full `end - start`
+  frames. Affects all decoders (CPU and NVDEC); frame data is byte-identical to
+  plain decoding.
+
 ## [0.12.5] - 2026-06-01
 
 ### Fixed

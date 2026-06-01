@@ -833,6 +833,14 @@ VideoReader& VideoReader::iter()
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
         }
+        else if (start_time <= 0.0 &&
+                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        {
+            // CPU sync path: seeking flushes a frame-threaded codec context and
+            // trips an internal FFmpeg assertion (see the no-range branch). The
+            // reader is already at the start, so skip the redundant seek; the
+            // discard loop below still buffers the first in-range frame.
+        }
         else
         {
             bool success = seek(start_time);
@@ -887,6 +895,17 @@ VideoReader& VideoReader::iter()
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
+            currentIndex = 0;
+            current_timestamp = 0.0;
+        }
+        else if (start_frame == 0 &&
+                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        {
+            // The CPU sync path uses a frame-threaded codec context; seeking it
+            // (which flushes the decoder) trips an internal FFmpeg assertion --
+            // the no-range branch below documents and avoids the same hazard.
+            // A freshly prepared reader is already positioned at frame 0, so the
+            // seek is redundant: skip it and decode straight from the start.
             currentIndex = 0;
             current_timestamp = 0.0;
         }
@@ -972,7 +991,12 @@ py::object VideoReader::next()
     }
     else if (start_frame >= 0 && end_frame >= 0)
     {
-        if (currentIndex > end_frame)
+        // currentIndex has already been advanced past the frame just decoded
+        // (the emitted frame's index is currentIndex - 1). end_frame is the last
+        // index to INCLUDE, so stop only once the decoded frame's index exceeds
+        // it. Using `currentIndex > end_frame` here dropped the final in-range
+        // frame (off-by-one).
+        if (currentIndex - 1 > end_frame)
         {
             NELUX_DEBUG("Frame range exhausted: currentIndex={}, end_frame={}",
                         currentIndex, end_frame);
