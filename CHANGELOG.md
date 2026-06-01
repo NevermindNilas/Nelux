@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.5] - 2026-06-01
+
+### Fixed
+
+- **Host-RAM leak in CPU decoding (~one frame per frame)** when the convert
+  worker pool was active — i.e. the default, since `convert_workers=None`
+  resolves to `min(hw_concurrency, 16)`. A long CPU-decode run grew unbounded
+  (e.g. 1080p climbed to >10 GB RSS), independent of the output backend
+  (`pytorch`/`numpy`) and of `prefetch`. Root cause: each convert worker
+  allocated the output `torch::Tensor` on its own thread, but the tensor's last
+  reference is dropped on the consumer (main) thread when Python frees the
+  frame. torch's CPU allocator retains the freed block on the main thread's pool
+  while the worker that owned the allocation never reclaims it, so ~6 MB leaked
+  per 1080p frame. Workers now convert into a plain `std::vector<uint8_t>` and
+  the consumer thread builds the `torch::Tensor`, keeping torch alloc+free on the
+  same thread. Output is byte-identical to the single-threaded convert path;
+  `convert_workers=0` was never affected. (Decoder convert worker pool.)
+
 ## [0.12.2] - 2026-05-28
 
 ### Fixed

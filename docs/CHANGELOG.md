@@ -1,4 +1,11 @@
 
+### **Version 0.12.5 (2026-06-01)**
+
+#### **Fix: host-RAM leak in CPU decoding with the convert worker pool**
+- **Fixed:** Long CPU-decode runs leaked host RAM at a rate of roughly one decoded frame per frame (~6 MB/frame at 1080p; a full run climbed past 10 GB RSS and only released on process exit). The leak was present by default: `convert_workers=None` resolves to `min(hw_concurrency, 16)`, enabling the parallel libswscale convert worker pool, and it occurred regardless of output backend (`pytorch`/`numpy`) and of `prefetch`. It was **not** an FFmpeg/decoder, encoder, or DirectML/TensorRT issue — those just made it visible by running long enough; `decode_accelerator="nvdec"` and `convert_workers=0` (single-threaded convert) were never affected. **Root cause:** each convert worker allocated the output `torch::Tensor` on its own thread (`syncConvertWorkerLoop`), but the tensor's last reference is dropped on the consumer (main) thread when Python frees the returned frame. torch's CPU allocator retains the freed block on the freeing thread's pool while the allocating worker never reclaims it, so the memory accumulated. **Fix:** workers now convert into a plain `std::vector<uint8_t>`; the consumer thread builds the `torch::Tensor` (one `memcpy`), keeping torch alloc+free on the same thread. Output is byte-identical to the single-threaded convert path and the parallel convert throughput is retained. Verified: 1080p worker-pool decode went from +6060 KB/frame to ~0, frames byte-identical across all `convert_workers`/`prefetch` combinations.
+
+---
+
 ### **Version 0.12.4 (2026-05-30)**
 
 #### **Fix: nelux imports on CPU-only PyTorch (Windows)**

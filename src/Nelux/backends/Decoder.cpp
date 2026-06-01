@@ -593,15 +593,16 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
             auto it = syncConvertOutMap_.find(syncConsumeSeq_);
             if (it != syncConvertOutMap_.end())
             {
-                torch::Tensor t = std::move(it->second.tensor);
+                SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
-                    *frame_timestamp = it->second.timestamp;
+                    *frame_timestamp = e.timestamp;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
                 // Wake producer in case it was throttled on in-flight cap.
                 olk.unlock();
                 syncConvertWorkCv_.notify_all();
-                return t;
+                // Build the tensor on this (consumer/main) thread, not the worker.
+                return tensorFromConvertBuffer(e.buffer);
             }
             const bool producer_done =
                 fanoutProducerDone_.load(std::memory_order_acquire);
@@ -728,15 +729,20 @@ void Decoder::syncConvertWorkerLoop()
             syncConvertWorkQueue_.pop();
         }
 
+        // Convert into a plain heap buffer on this worker thread. The output
+        // torch::Tensor is built by the consumer (main) thread from this buffer
+        // -- never allocated here -- so torch's CPU allocator never sees an
+        // alloc-on-worker / free-on-main split, which leaks ~one frame of host
+        // RAM per frame. std::vector cross-thread free is fine.
         const int elemSize =
             (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
-        const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+        const size_t nbytes = static_cast<size_t>(properties.width) *
+                              static_cast<size_t>(properties.height) * 3 *
+                              static_cast<size_t>(elemSize);
         SyncConvertOutEntry entry;
-        entry.tensor = torch::empty(
-            {properties.height, properties.width, 3},
-            torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+        entry.buffer.resize(nbytes);
         entry.timestamp = getFrameTimestamp(w.frame.get());
-        local_converter->convert(w.frame, entry.tensor.data_ptr());
+        local_converter->convert(w.frame, entry.buffer.data());
 
         {
             std::lock_guard<std::mutex> lk(syncConvertOutMu_);
@@ -781,6 +787,17 @@ void Decoder::stopSyncConvertWorkers()
         std::lock_guard<std::mutex> lk(syncConvertOutMu_);
         syncConvertOutMap_.clear();
     }
+}
+
+torch::Tensor Decoder::tensorFromConvertBuffer(const std::vector<uint8_t>& buf) const
+{
+    const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
+    const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+    torch::Tensor t = torch::empty(
+        {properties.height, properties.width, 3},
+        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+    std::memcpy(t.data_ptr(), buf.data(), buf.size());
+    return t;
 }
 
 torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
@@ -864,12 +881,14 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             auto it = syncConvertOutMap_.find(syncConsumeSeq_);
             if (it != syncConvertOutMap_.end())
             {
-                torch::Tensor t = std::move(it->second.tensor);
+                SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
-                    *frame_timestamp = it->second.timestamp;
+                    *frame_timestamp = e.timestamp;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
-                return t;
+                lk.unlock();
+                // Build the tensor on this (consumer/main) thread, not the worker.
+                return tensorFromConvertBuffer(e.buffer);
             }
         }
 

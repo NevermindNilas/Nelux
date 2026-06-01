@@ -278,7 +278,14 @@ class Decoder
     // costs one map allocation instead of two on the hot path.
     struct SyncConvertOutEntry
     {
-        torch::Tensor tensor;
+        // Converted RGB bytes, filled by a worker thread. We deliberately do
+        // NOT store a torch::Tensor here: allocating a CPU tensor on a convert
+        // worker and freeing it on the consumer (main) thread leaks ~one frame
+        // of host RAM per frame, because torch's CPU allocator retains the
+        // freed block on the main thread's pool while the worker that owned the
+        // allocation never reclaims it. The consumer builds the tensor from
+        // this buffer so torch alloc+free both happen on the main thread.
+        std::vector<uint8_t> buffer;
         double timestamp = 0.0;
     };
     std::map<int64_t, SyncConvertOutEntry> syncConvertOutMap_;
@@ -295,6 +302,10 @@ class Decoder
     void startSyncConvertWorkers();
     void stopSyncConvertWorkers();
     void syncConvertWorkerLoop();
+    // Build the output tensor from a worker-filled convert buffer. MUST be
+    // called on the consumer (main) thread so the torch CPU allocation is
+    // freed on the same thread it is allocated on (see SyncConvertOutEntry).
+    torch::Tensor tensorFromConvertBuffer(const std::vector<uint8_t>& buf) const;
 
   public:
     /**
