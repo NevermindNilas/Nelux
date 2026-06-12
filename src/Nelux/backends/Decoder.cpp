@@ -65,6 +65,7 @@ Decoder::Decoder(int numThreads)
     // buffer just lets workers stay fed when their per-frame work is heavier.
     syncMaxInFlight_ = defaultMaxInFlight(32);
     asyncFanoutEnabled_ = defaultAsyncFanout() && syncConvertWorkerCount_ > 0;
+    outputBufferPool_ = std::make_shared<OutputBufferPool>();
     NELUX_DEBUG("BASE DECODER: Decoder constructed (sync_workers={}, max_inflight={})",
                 syncConvertWorkerCount_, syncMaxInFlight_);
 }
@@ -81,6 +82,7 @@ Decoder::Decoder(int numThreads, int resizeWidth, int resizeHeight)
     // buffer just lets workers stay fed when their per-frame work is heavier.
     syncMaxInFlight_ = defaultMaxInFlight(32);
     asyncFanoutEnabled_ = defaultAsyncFanout() && syncConvertWorkerCount_ > 0;
+    outputBufferPool_ = std::make_shared<OutputBufferPool>();
     NELUX_DEBUG("BASE DECODER: Decoder constructed with resize={}x{} (sync_workers={}, max_inflight={})",
                 resizeWidth_, resizeHeight_, syncConvertWorkerCount_, syncMaxInFlight_);
 }
@@ -601,8 +603,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
                 // Wake producer in case it was throttled on in-flight cap.
                 olk.unlock();
                 syncConvertWorkCv_.notify_all();
-                // Build the tensor on this (consumer/main) thread, not the worker.
-                return tensorFromConvertBuffer(e.buffer);
+                // Zero-copy wrap on this (consumer/main) thread, not the worker.
+                return tensorFromPooledBuffer(std::move(e.buffer));
             }
             const bool producer_done =
                 fanoutProducerDone_.load(std::memory_order_acquire);
@@ -729,20 +731,22 @@ void Decoder::syncConvertWorkerLoop()
             syncConvertWorkQueue_.pop();
         }
 
-        // Convert into a plain heap buffer on this worker thread. The output
-        // torch::Tensor is built by the consumer (main) thread from this buffer
-        // -- never allocated here -- so torch's CPU allocator never sees an
-        // alloc-on-worker / free-on-main split, which leaks ~one frame of host
-        // RAM per frame. std::vector cross-thread free is fine.
+        // Convert into a pooled plain heap buffer on this worker thread. The
+        // output torch::Tensor wraps this buffer on the consumer thread via
+        // from_blob -- never allocated here -- so torch's CPU allocator never
+        // sees an alloc-on-worker / free-on-main split, which leaks ~one frame
+        // of host RAM per frame. Plain heap/pool ops are cross-thread safe.
+        // Recycling through outputBufferPool_ avoids the per-frame 6+MB
+        // alloc + zero-init that made the pooled path slower than cw=0.
         const int elemSize =
             (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
         const size_t nbytes = static_cast<size_t>(properties.width) *
                               static_cast<size_t>(properties.height) * 3 *
                               static_cast<size_t>(elemSize);
         SyncConvertOutEntry entry;
-        entry.buffer.resize(nbytes);
+        entry.buffer = acquireOutputBuffer(nbytes);
         entry.timestamp = getFrameTimestamp(w.frame.get());
-        local_converter->convert(w.frame, entry.buffer.data());
+        local_converter->convert(w.frame, entry.buffer.get());
 
         {
             std::lock_guard<std::mutex> lk(syncConvertOutMu_);
@@ -756,6 +760,16 @@ void Decoder::startSyncConvertWorkers()
 {
     if (!syncConvertWorkers_.empty() || syncConvertWorkerCount_ <= 0)
         return;
+    if (!outputBufferPool_)
+        outputBufferPool_ = std::make_shared<OutputBufferPool>();
+    {
+        // Retain enough buffers to cover everything that can be in flight at
+        // once (work queue + out map + consumer-held) so steady state never
+        // hits the heap.
+        std::lock_guard<std::mutex> lk(outputBufferPool_->mu);
+        outputBufferPool_->maxRetained =
+            syncMaxInFlight_ + static_cast<size_t>(syncConvertWorkerCount_) + 4;
+    }
     syncConvertStop_ = false;
     syncConvertWorkers_.reserve(syncConvertWorkerCount_);
     for (int i = 0; i < syncConvertWorkerCount_; ++i)
@@ -789,15 +803,62 @@ void Decoder::stopSyncConvertWorkers()
     }
 }
 
-torch::Tensor Decoder::tensorFromConvertBuffer(const std::vector<uint8_t>& buf) const
+std::unique_ptr<uint8_t[]> Decoder::acquireOutputBuffer(size_t nbytes)
+{
+    if (outputBufferPool_)
+    {
+        std::lock_guard<std::mutex> lk(outputBufferPool_->mu);
+        if (outputBufferPool_->bufferBytes != nbytes)
+        {
+            // Frame geometry changed (reconfigure / resize): stale buffers
+            // are the wrong size, drop them.
+            outputBufferPool_->free_.clear();
+            outputBufferPool_->bufferBytes = nbytes;
+        }
+        if (!outputBufferPool_->free_.empty())
+        {
+            std::unique_ptr<uint8_t[]> buf =
+                std::move(outputBufferPool_->free_.back());
+            outputBufferPool_->free_.pop_back();
+            return buf;
+        }
+    }
+    // operator new[] does not zero-initialize: skips the full-frame memset
+    // that std::vector::resize paid on every frame.
+    return std::unique_ptr<uint8_t[]>(new uint8_t[nbytes]);
+}
+
+torch::Tensor Decoder::tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf)
 {
     const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
     const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
-    torch::Tensor t = torch::empty(
-        {properties.height, properties.width, 3},
+    const size_t nbytes = static_cast<size_t>(properties.width) *
+                          static_cast<size_t>(properties.height) * 3 *
+                          static_cast<size_t>(elemSize);
+    // The deleter captures the pool by shared_ptr so recycling works even if
+    // the Decoder is destroyed while Python still holds frames. It runs on
+    // whatever thread drops the last tensor reference; everything it touches
+    // (mutex, vector, delete[]) is cross-thread safe and torch-allocator-free.
+    std::shared_ptr<OutputBufferPool> pool = outputBufferPool_;
+    uint8_t* raw = buf.release();
+    auto deleter = [pool, nbytes](void* p)
+    {
+        uint8_t* bytes = static_cast<uint8_t*>(p);
+        if (pool)
+        {
+            std::lock_guard<std::mutex> lk(pool->mu);
+            if (pool->bufferBytes == nbytes &&
+                pool->free_.size() < pool->maxRetained)
+            {
+                pool->free_.emplace_back(std::unique_ptr<uint8_t[]>(bytes));
+                return;
+            }
+        }
+        delete[] bytes;
+    };
+    return torch::from_blob(
+        raw, {properties.height, properties.width, 3}, std::move(deleter),
         torch::TensorOptions().dtype(dtype).device(torch::kCPU));
-    std::memcpy(t.data_ptr(), buf.data(), buf.size());
-    return t;
 }
 
 torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
@@ -887,8 +948,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
                 lk.unlock();
-                // Build the tensor on this (consumer/main) thread, not the worker.
-                return tensorFromConvertBuffer(e.buffer);
+                // Zero-copy wrap on this (consumer/main) thread, not the worker.
+                return tensorFromPooledBuffer(std::move(e.buffer));
             }
         }
 

@@ -278,14 +278,16 @@ class Decoder
     // costs one map allocation instead of two on the hot path.
     struct SyncConvertOutEntry
     {
-        // Converted RGB bytes, filled by a worker thread. We deliberately do
-        // NOT store a torch::Tensor here: allocating a CPU tensor on a convert
-        // worker and freeing it on the consumer (main) thread leaks ~one frame
-        // of host RAM per frame, because torch's CPU allocator retains the
-        // freed block on the main thread's pool while the worker that owned the
-        // allocation never reclaims it. The consumer builds the tensor from
-        // this buffer so torch alloc+free both happen on the main thread.
-        std::vector<uint8_t> buffer;
+        // Converted RGB bytes, filled by a worker thread into a raw buffer
+        // recycled via outputBufferPool_. We deliberately do NOT store a
+        // torch::Tensor here: allocating a CPU tensor on a convert worker and
+        // freeing it on the consumer (main) thread leaks ~one frame of host
+        // RAM per frame, because torch's CPU allocator retains the freed block
+        // on the main thread's pool while the worker that owned the allocation
+        // never reclaims it. The consumer wraps this buffer zero-copy with
+        // torch::from_blob; the tensor deleter only does plain heap/pool ops,
+        // never touching the torch CPU allocator, so the leak cannot recur.
+        std::unique_ptr<uint8_t[]> buffer;
         double timestamp = 0.0;
     };
     std::map<int64_t, SyncConvertOutEntry> syncConvertOutMap_;
@@ -302,10 +304,15 @@ class Decoder
     void startSyncConvertWorkers();
     void stopSyncConvertWorkers();
     void syncConvertWorkerLoop();
-    // Build the output tensor from a worker-filled convert buffer. MUST be
-    // called on the consumer (main) thread so the torch CPU allocation is
-    // freed on the same thread it is allocated on (see SyncConvertOutEntry).
-    torch::Tensor tensorFromConvertBuffer(const std::vector<uint8_t>& buf) const;
+    // Pop a recycled output buffer from outputBufferPool_, or heap-allocate a
+    // fresh one (operator new[] -- NOT zero-initialized, unlike the old
+    // std::vector::resize which paid a full-frame memset per frame).
+    std::unique_ptr<uint8_t[]> acquireOutputBuffer(size_t nbytes);
+    // Wrap a worker-filled pooled buffer zero-copy via torch::from_blob. The
+    // tensor's deleter returns the buffer to outputBufferPool_ (or delete[]s
+    // it) -- plain heap/mutex ops only, safe on any thread, no torch CPU
+    // allocator involvement (see SyncConvertOutEntry leak note).
+    torch::Tensor tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf);
 
   public:
     /**

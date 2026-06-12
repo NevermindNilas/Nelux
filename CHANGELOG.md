@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.7] - 2026-06-12
+
+### Fixed
+
+- **Convert worker pool was slower than single-threaded convert** — the 0.12.5
+  leak fix made the pooled path (`convert_workers` default) lose to
+  `convert_workers=0` at every pool size: ~976 vs ~1770 fps on easy 1080p H.264,
+  ~2186 vs ~2955 at 720p (i7-13700K), inverting the 0.11 numbers the default was
+  chosen on. Per frame the pooled path paid a fresh 6+ MB `std::vector`
+  alloc + zero-init on the worker, plus a `torch::empty` + full-frame `memcpy`
+  serialized on the consumer. Buffers are now recycled through the (previously
+  dead) `OutputBufferPool` — `operator new[]`, no zeroing, steady state never
+  hits the heap — and the consumer wraps them zero-copy with `torch::from_blob`;
+  the tensor deleter returns the buffer to the pool. The deleter does plain
+  heap/mutex ops only, never the torch CPU allocator, so the 0.12.5 cross-thread
+  leak cannot recur (verified flat RSS over 7200 frames). Pooled convert now
+  wins everywhere: easy 1080p 972 → 2795 fps, 720p 2186 → 4536, BBB 720p
+  3645 fps, real 1080p 2556 fps; `prefetch=True` fanout heals identically
+  (955 → 2710 at 1080p). Output byte-identical to `convert_workers=0` and to
+  ffmpeg `format=rgb24`/`rgb48` (8-bit and 10-bit; PSNR=inf, max_abs=0), frame
+  count/order preserved, held-frame integrity verified (live tensors are never
+  recycled). Both consumers of the pool — the sync path and the async fanout
+  path — take the new route; `convert_workers=0` is unchanged.
+
 ## [0.12.6] - 2026-06-01
 
 ### Fixed
