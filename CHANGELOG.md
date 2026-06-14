@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.8] - 2026-06-14
+
+### Fixed
+
+- **Slice-threaded software encoders ran single-threaded (3–4.7× slower than
+  ffmpeg).** The auto-threading gate enabled `thread_count=0` only for codecs
+  advertising `AV_CODEC_CAP_FRAME_THREADS` or `AV_CODEC_CAP_OTHER_THREADS`, but
+  not `AV_CODEC_CAP_SLICE_THREADS`. Slice-only-threaded encoders — `mpeg1video`,
+  `mpeg2video`, `mpeg4`, `ffv1`, `dnxhd`, … — were therefore left at the FFmpeg
+  default `thread_count=1` and encoded on a single core while `ffmpeg` uses all
+  of them. At 720p on a 24-core box this was `mpeg4` 302 → 1249 fps,
+  `mpeg2video` 361 → 1408, `ffv1` 192 → 536 — from ~3–4.7× slower than ffmpeg to
+  matching-or-faster (1.07–1.31×). Added `AV_CODEC_CAP_SLICE_THREADS` to the
+  gate; `thread_type` stays at the AVCodecContext default so each codec uses
+  whatever parallelism it advertises. Hardware (NVENC) path is unaffected (it
+  pins `thread_count=1` separately); frame-threaded encoders (libx264/libx265/
+  libsvtav1/…) were already covered. Output now matches ffmpeg's multi-slice
+  layout; decoded quality verified equivalent (mpeg4 PSNR 41.99, mpeg2 41.70,
+  ffv1 lossless of 4:2:0).
+
+- **Forced B-frames made intra-only codecs un-openable.** The encoder set
+  `max_b_frames = 2` unconditionally, but intra-only codecs reject a non-zero
+  `max_b_frames` at `avcodec_open2` (`mjpeg`: "B-frames not supported by codec"),
+  so `mjpeg` and other intra-only codecs (image codecs, some uncompressed
+  formats) could not be opened at all. `max_b_frames` is now zeroed when the
+  codec descriptor is flagged `AV_CODEC_PROP_INTRA_ONLY`. `mjpeg` now encodes
+  (720p ~769 fps, parity with ffmpeg); codecs that support B-frames are
+  unchanged.
+
 ## [0.12.7] - 2026-06-12
 
 ### Fixed

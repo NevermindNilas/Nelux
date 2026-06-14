@@ -909,7 +909,17 @@ void Encoder::initVideoStream()
     videoCodecCtx->time_base = {1, properties.fps};
     videoCodecCtx->framerate = {properties.fps, 1};
     videoCodecCtx->gop_size = properties.gopSize;
-    videoCodecCtx->max_b_frames = properties.maxBFrames;
+    // B-frames are meaningless for intra-only codecs (mjpeg, prores, ffv1, dnxhd,
+    // image codecs, ...). Some (notably mjpeg) HARD-REJECT a non-zero
+    // max_b_frames at avcodec_open2 ("B-frames not supported by codec"), so a
+    // forced default of 2 made those encoders un-openable. Zero it for intra-only.
+    {
+        int maxB = properties.maxBFrames;
+        const AVCodecDescriptor* desc = avcodec_descriptor_get(videoCodecCtx->codec_id);
+        if (desc && (desc->props & AV_CODEC_PROP_INTRA_ONLY))
+            maxB = 0;
+        videoCodecCtx->max_b_frames = maxB;
+    }
 
     // Tag color metadata so decoders apply the matching inverse matrix.
     // Without this, players default to BT.709 for HD content regardless of
@@ -1031,8 +1041,14 @@ void Encoder::initVideoStream()
         // thread_count=1 -> near single-threaded x264 (much lower CPU AND fps
         // than ffmpeg-cli's default -threads 0).
         if (codec->capabilities &
-            (AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_OTHER_THREADS))
+            (AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_SLICE_THREADS |
+             AV_CODEC_CAP_OTHER_THREADS))
         {
+            // SLICE_THREADS was missing here: slice-only-threaded encoders
+            // (mpeg1/2/4, ffv1, dnxhd, ...) were left at thread_count=1 and ran
+            // single-threaded -> 3-4.7x slower than ffmpeg-cli's -threads 0
+            // default. thread_type stays at the AVCodecContext default
+            // (FRAME|SLICE) so the codec picks whatever parallelism it has.
             videoCodecCtx->thread_count = 0; // 0 = auto-detect number of threads
         }
     }
