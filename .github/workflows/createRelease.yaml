@@ -14,7 +14,11 @@ env:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # Pinned to windows-2022 (VS2022). `windows-latest` migrated to VS2026
+    # (MSVC 19.5x), which the pinned CUDA 13.1 toolkit rejects in
+    # crt/host_config.h ("unsupported Microsoft Visual Studio version" +
+    # cudafe++ ACCESS_VIOLATION). VS2022 is the toolchain 0.12.7 built on.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
