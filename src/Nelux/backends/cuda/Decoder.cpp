@@ -432,6 +432,16 @@ void Decoder::initCodecContextWithHwAccel()
 {
     NELUX_DEBUG("CUDA DECODER: Initializing codec context with hardware acceleration");
 
+    // Reconfigure can switch between rawvideo and cuvid-backed codecs.
+    if (rawSwsFrame_)
+        av_frame_free(&rawSwsFrame_);
+    if (rawSwsCtx_)
+    {
+        sws_freeContext(rawSwsCtx_);
+        rawSwsCtx_ = nullptr;
+    }
+    rawPassthroughMode_ = false;
+
     AVCodecID codec_id = formatCtx->streams[videoStreamIndex]->codecpar->codec_id;
 
     // Find decoder that supports hardware acceleration
@@ -567,20 +577,10 @@ void Decoder::initRawPassthrough()
 {
     NELUX_INFO("CUDA DECODER: rawvideo passthrough requested (no cuvid codec)");
 
-    // Clean up any existing raw-passthrough state (supports reconfigure()).
-    if (rawSwsFrame_)
-        av_frame_free(&rawSwsFrame_);
-    if (rawSwsCtx_)
-    {
-        sws_freeContext(rawSwsCtx_);
-        rawSwsCtx_ = nullptr;
-    }
-    rawPassthroughMode_ = false;
-
     AVCodecParameters* par = formatCtx->streams[videoStreamIndex]->codecpar;
-    rawPassthroughMode_ = true;
     NELUX_INFO("CUDA DECODER: rawvideo src_fmt={}",
                av_get_pix_fmt_name(static_cast<AVPixelFormat>(par->format)));
+
     // Open the FFmpeg software rawvideo decoder. It is a near-no-op decoder
     // (no entropy coding to undo) that just wraps the raw bytes into AVFrames
     // honoring width/height/format from the container.
@@ -613,6 +613,8 @@ void Decoder::initRawPassthrough()
         av_strerror(ret, errbuf, sizeof(errbuf));
         throw CxException(std::string("Failed to open rawvideo codec: ") + errbuf);
     }
+
+    rawPassthroughMode_ = true;
 
     // No hwframe pool needed: the consumer thread (decodeNextFrame /
     // decodeNextFrameML) converts to RGB24 and uploads it directly. This avoids
