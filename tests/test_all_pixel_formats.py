@@ -1,6 +1,7 @@
 import pytest
 import os
 import glob
+import torch  # noqa: F401 -- Nelux requires torch to be loaded first
 from nelux import VideoReader
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated_formats")

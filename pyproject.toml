@@ -37,3 +37,6 @@ ninja.make-fallback = false
 NELUX_ENABLE_CUDA = {env="NELUX_ENABLE_CUDA", default="OFF"}
 NELUX_BUNDLE_FFMPEG_DLLS = {env="NELUX_BUNDLE_FFMPEG_DLLS", default="ON"}
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

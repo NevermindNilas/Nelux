@@ -39,6 +39,9 @@ def get_video(mode="full"):
     video_path = os.path.join(DATA_DIR, video_info["filename"])
 
     if not os.path.exists(video_path):
+        local_fixture = os.path.join(DATA_DIR, "output_rgb24.mp4")
+        if os.path.exists(local_fixture):
+            return local_fixture
         download_video(video_info["url"], video_path)
    # else:
        # logging.info(f"Video already exists: {video_path}")
@@ -73,4 +76,3 @@ def main():
     get_video("lite")   
     get_video("full")
     logging.info("Both test videos are available.")
-    

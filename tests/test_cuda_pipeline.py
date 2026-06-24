@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 import torch
 import torch.cuda as cuda
+import pytest
 import nelux
 
 # Configuration
@@ -502,6 +503,7 @@ def run_pipeline():
         return False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_concurrent_streams():
     """
     Additional test: Verify multiple CUDA streams can work concurrently

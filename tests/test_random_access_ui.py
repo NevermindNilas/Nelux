@@ -12,7 +12,9 @@ Controls: q=quit, space=pause, r=manual random-access frame.
 import random
 import sys
 
-import cv2
+import pytest
+
+cv2 = pytest.importorskip("cv2")
 import numpy as np
 import torch
 

@@ -15,7 +15,7 @@ import torch
 import time
 
 
-def test_nvenc_encoding(codec_name, device, width=1920, height=1080, frames=60):
+def run_nvenc_encoding(codec_name, device, width=1920, height=1080, frames=60):
     output_file = f"test_{codec_name}_{device}.mp4"
     if os.path.exists(output_file):
         os.remove(output_file)
@@ -150,7 +150,7 @@ def main():
         print(f"\n=== Testing Encoder: {name} ===")
 
         for dev in devices:
-            test_nvenc_encoding(name, dev)
+            run_nvenc_encoding(name, dev)
 
 
 if __name__ == "__main__":

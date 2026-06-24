@@ -5,6 +5,7 @@ Tests that decoder reuse via reconfigure() is faster than creating new readers.
 
 import sys
 import os
+from pathlib import Path
 
 # Add NeLux to path for development testing
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,8 +14,9 @@ import time
 import nelux
 
 # Test videos - use existing test data
-VIDEO1 = r"D:\NeLux\tests\data\sample_h264.mp4"
-VIDEO2 = r"D:\NeLux\tests\data\ForBiggerBlazes.mp4"
+TESTS = Path(__file__).resolve().parent
+VIDEO1 = str(TESTS / "data" / "output_rgb24.mp4")
+VIDEO2 = str(TESTS / "pix_fmt_clips" / "yuv420p.mp4")
 
 
 def test_reconfigure_basic():
@@ -46,7 +48,6 @@ def test_reconfigure_basic():
     print(f"Read {i + 1} frames from reconfigured video")
 
     print("✓ Basic reconfigure test passed!")
-    return True
 
 
 def test_reconfigure_performance():
@@ -58,7 +59,7 @@ def test_reconfigure_performance():
     # Method 1: Create new reader each time
     start = time.perf_counter()
     for _ in range(iterations):
-    reader = nelux.VideoReader(VIDEO1)
+        reader = nelux.VideoReader(VIDEO1)
         # Read one frame to ensure decoder is initialized
         for frame in reader:
             break
@@ -91,7 +92,6 @@ def test_reconfigure_performance():
     )
     print(f"\n✓ Speedup: {speedup:.1f}x faster with reconfigure()")
 
-    return True
 
 
 def test_reconfigure_state_reset():
@@ -121,7 +121,6 @@ def test_reconfigure_state_reset():
 
     # Both reads should complete (iterator was reset)
     print("✓ State reset test passed!")
-    return True
 
 
 def main():

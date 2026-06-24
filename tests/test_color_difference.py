@@ -2,7 +2,9 @@ import sys
 import subprocess
 import time
 import numpy as np
-import cv2
+import pytest
+
+cv2 = pytest.importorskip("cv2")
 import torch
 
 from nelux import VideoReader
