@@ -57,49 +57,19 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
                 ? torch::Device(torch::kCUDA, cuda_device_index)
                 : torch::Device(torch::kCPU);
 
-        // Main sequential decoder with fallback logic
-        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-        {
-            try
-            {
-                // Try NVDEC first
-                decoder = nelux::Factory::createDecoder(
-                    torchDevice, filePath, numThreads, decodeAccelerator,
-                    cuda_device_index, resizeWidth_, resizeHeight_);
-                decoder->setForce8Bit(force_8bit);
-                NELUX_INFO("Main decoder created successfully with accelerator: {}",
-                           decode_accelerator);
-            }
-            catch (const std::exception& nvdec_ex)
-            {
-                // NVDEC failed - fall back to CPU decoder
-                NELUX_WARN("NVDEC decoder failed: {}. Falling back to CPU decoder.",
-                           nvdec_ex.what());
-
-                // Update internal state to reflect CPU fallback
-                decodeAccelerator = nelux::DecodeAccelerator::CPU;
-                torchDevice = torch::Device(torch::kCPU);
-
-                decoder = nelux::Factory::createDecoder(
-                    torchDevice, filePath, numThreads, nelux::DecodeAccelerator::CPU, 0,
-                    resizeWidth_, resizeHeight_);
-                decoder->setForce8Bit(force_8bit);
-                NELUX_INFO("Fallback to CPU decoder successful after NVDEC failure");
-            }
-        }
-        else
-        {
-            // Direct CPU decoder path. Sync mode is opt-in; bypasses the
-            // producer thread / queue for raw single-stream throughput.
-            const bool syncMode =
-                !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
-            decoder = nelux::Factory::createDecoder(
-                torchDevice, filePath, numThreads, decodeAccelerator, cuda_device_index,
-                resizeWidth_, resizeHeight_, syncMode);
-            decoder->setForce8Bit(force_8bit);
-            NELUX_INFO("Main decoder created successfully with accelerator: {}",
-                       decode_accelerator);
-        }
+        // Main sequential decoder. NVDEC failures are surfaced as hard errors
+        // rather than silently downgraded to CPU: the caller explicitly asked
+        // for hardware decode and silent fallback has historically masked
+        // configuration mistakes (wrong device, missing codec support, etc.).
+        // Set decode_accelerator='cpu' explicitly to opt into software decode.
+        const bool syncMode =
+            !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
+        decoder = nelux::Factory::createDecoder(
+            torchDevice, filePath, numThreads, decodeAccelerator, cuda_device_index,
+            resizeWidth_, resizeHeight_, syncMode);
+        decoder->setForce8Bit(force_8bit);
+        NELUX_INFO("Main decoder created successfully with accelerator: {}",
+                   decode_accelerator);
 
         // Apply user-supplied convert_workers override before any decode
         // call spawns the worker pool (lazy-start in startSyncConvertWorkers).
@@ -258,55 +228,32 @@ torch::Tensor VideoReader::decodeFrame()
     bool success = false;
     torch::Tensor outTensor;  // populated by zero-copy CPU path
 
-    // Retry loop. A one-shot NVDEC->CPU fallback re-runs the decode by looping
-    // rather than recursing: recursing would call decodeFrame() while this
-    // scope's gil_scoped_release is still active, constructing a second release
-    // with the GIL already dropped — undefined behavior (PyEval_SaveThread on a
-    // NULL thread state). After the fallback the accelerator is CPU, so a
-    // second failure rethrows and the loop cannot spin.
-    while (true)
+    // No silent NVDEC->CPU fallback: if hardware decode fails mid-stream we
+    // surface the error to the caller. Silent fallback was removed because it
+    // masked configuration errors and silently switched output devices/tensor
+    // layouts under the caller's feet. Use decode_accelerator='cpu' to opt in
+    // to software decode explicitly.
+    try
     {
-        try
+        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
         {
-            if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
-            {
-                outTensor = prefetch
-                                ? decoder->decodeNextFrameTensor(&frame_timestamp)
-                                : decoder->decodeNextFrameTensorSync(&frame_timestamp);
-                success = outTensor.defined();
-            }
-            else
-            {
-                // NVDEC / hardware path: in-place write into shared CUDA tensor.
-                success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
-            }
-            break; // decode attempt finished (frame produced or clean EOF)
+            outTensor = prefetch
+                            ? decoder->decodeNextFrameTensor(&frame_timestamp)
+                            : decoder->decodeNextFrameTensorSync(&frame_timestamp);
+            success = outTensor.defined();
         }
-        catch (const std::exception& ex)
+        else
         {
-            std::cerr << "VideoReader: Exception caught: " << ex.what() << std::endl;
-            // If NVDEC fails mid-iteration, fall back to CPU.
-            if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-            {
-                NELUX_WARN("decodeFrame(): NVDEC failed: {}. Falling back to CPU decoder.",
-                           ex.what());
-
-                decodeAccelerator = nelux::DecodeAccelerator::CPU;
-                decoder = nelux::Factory::createDecoder(
-                    torch::Device(torch::kCPU), filePath, numThreads, decodeAccelerator, 0,
-                    resizeWidth_, resizeHeight_);
-                decoder->setForce8Bit(force_8bit);
-
-                // Recreate output tensor on CPU with HWC format
-                torch::Dtype torchDataType = findTypeFromBitDepth();
-                tensor = torch::empty(
-                    {properties.height, properties.width, 3},
-                    torch::TensorOptions().dtype(torchDataType).device(torch::kCPU));
-
-                continue; // retry with CPU path, no recursion
-            }
-            throw;
+            // NVDEC / hardware path: in-place write into shared CUDA tensor.
+            success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
         }
+    }
+    catch (const std::exception& ex)
+    {
+        NELUX_ERROR("decodeFrame(): decoder failed: {}. "
+                    "Set decode_accelerator='cpu' to use software decode.",
+                    ex.what());
+        throw;
     }
     
     if (!success)
@@ -649,35 +596,14 @@ void VideoReader::ensureRandDecoder()
             (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
                 ? torch::Device(torch::kCUDA, cudaDeviceIndex)
                 : torch::Device(torch::kCPU);
-        
-        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-        {
-            try
-            {
-                // Try NVDEC first for random decoder too
-                rand_decoder = nelux::Factory::createDecoder(
-                    torchDevice, filePath, numThreads, decodeAccelerator,
-                    cudaDeviceIndex, resizeWidth_, resizeHeight_);
-                rand_decoder->setForce8Bit(force_8bit);
-            }
-            catch (const std::exception& nvdec_ex)
-            {
-                // NVDEC failed - fall back to CPU decoder for random access
-                NELUX_WARN("NVDEC rand_decoder failed: {}. Falling back to CPU.",
-                           nvdec_ex.what());
-                rand_decoder = nelux::Factory::createDecoder(
-                    torch::Device(torch::kCPU), filePath, numThreads,
-                    nelux::DecodeAccelerator::CPU, 0, resizeWidth_, resizeHeight_);
-                rand_decoder->setForce8Bit(force_8bit);
-            }
-        }
-        else
-        {
-            rand_decoder = nelux::Factory::createDecoder(
-                torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-                resizeWidth_, resizeHeight_);
-            rand_decoder->setForce8Bit(force_8bit);
-        }
+
+        // No silent NVDEC->CPU fallback for the random-access decoder either.
+        // A failure here surfaces as a hard error consistent with the main
+        // decoder path; use decode_accelerator='cpu' for software decode.
+        rand_decoder = nelux::Factory::createDecoder(
+            torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
+            resizeWidth_, resizeHeight_);
+        rand_decoder->setForce8Bit(force_8bit);
     }
 }
 
