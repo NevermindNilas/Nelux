@@ -15,6 +15,7 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 namespace nelux::backends::cuda
@@ -178,14 +179,20 @@ protected:
     void initialize(const std::string& filePath);
     void initHardwareContext();
     void initCodecContextWithHwAccel();
-    
+
+    // rawvideo passthrough: opens the FFmpeg software rawvideo decoder (no
+    // cuvid codec exists). Called from initCodecContextWithHwAccel.
+    void initRawPassthrough();
+
     /**
      * @brief Transfer and convert frame from NV12 to RGB on GPU
      * @param hwFrame Hardware frame from NVDEC
      * @param outputBuffer Output RGB buffer (device pointer)
      */
     void transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch = 0);
-    
+    void transferAndConvertRawFrame(AVFrame* swFrame, void* outputBuffer,
+                                    int outputPitch = 0);
+
     // Static callback for FFmpeg hardware pixel format selection
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);
 
@@ -219,6 +226,18 @@ private:
 
     // Serialize access to shared CUDA buffers/stream across threads.
     std::mutex cudaDecodeMutex_;
+
+    // --- rawvideo passthrough (NVDEC path for uncompressed input) ---
+    // cuvid has no rawvideo codec, so when the demuxer reports
+    // AV_CODEC_ID_RAWVIDEO we open the FFmpeg software rawvideo decoder for
+    // parsing/framing. The consumer converts software frames to RGB24 and
+    // uploads them directly into the CUDA output path.
+    bool rawPassthroughMode_ = false;
+    // Cached software conversion state used before the device upload.
+    SwsContext* rawSwsCtx_ = nullptr;
+    // Pre-allocated scratch frame that rawSwsCtx_ writes into. Reused across
+    // frames; only one producer thread, so no extra sync needed.
+    AVFrame* rawSwsFrame_ = nullptr;
 };
 
 } // namespace nelux::backends::cuda

@@ -298,7 +298,9 @@ Decoder::Decoder(Decoder&& other) noexcept
       hwDeviceCtx_(other.hwDeviceCtx_), hwPixFmt_(other.hwPixFmt_),
       nv12Buffer_(other.nv12Buffer_), nv12BufferSize_(other.nv12BufferSize_),
       rgb24Buffer_(other.rgb24Buffer_), rgb24BufferSize_(other.rgb24BufferSize_),
-      hwInitialized_(other.hwInitialized_)
+      hwInitialized_(other.hwInitialized_),
+      rawPassthroughMode_(other.rawPassthroughMode_),
+      rawSwsCtx_(other.rawSwsCtx_), rawSwsFrame_(other.rawSwsFrame_)
 {
     other.cudaStream_ = nullptr;
     other.decodeCompleteEvent_ = nullptr;
@@ -307,6 +309,9 @@ Decoder::Decoder(Decoder&& other) noexcept
     other.nv12Buffer_ = nullptr;
     other.rgb24Buffer_ = nullptr;
     other.hwInitialized_ = false;
+    other.rawPassthroughMode_ = false;
+    other.rawSwsCtx_ = nullptr;
+    other.rawSwsFrame_ = nullptr;
 }
 
 Decoder& Decoder::operator=(Decoder&& other) noexcept
@@ -328,6 +333,9 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         rgb24Buffer_ = other.rgb24Buffer_;
         rgb24BufferSize_ = other.rgb24BufferSize_;
         hwInitialized_ = other.hwInitialized_;
+        rawPassthroughMode_ = other.rawPassthroughMode_;
+        rawSwsCtx_ = other.rawSwsCtx_;
+        rawSwsFrame_ = other.rawSwsFrame_;
 
         other.cudaStream_ = nullptr;
         other.decodeCompleteEvent_ = nullptr;
@@ -336,6 +344,9 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         other.nv12Buffer_ = nullptr;
         other.rgb24Buffer_ = nullptr;
         other.hwInitialized_ = false;
+        other.rawPassthroughMode_ = false;
+        other.rawSwsCtx_ = nullptr;
+        other.rawSwsFrame_ = nullptr;
     }
     return *this;
 }
@@ -421,6 +432,16 @@ void Decoder::initCodecContextWithHwAccel()
 {
     NELUX_DEBUG("CUDA DECODER: Initializing codec context with hardware acceleration");
 
+    // Reconfigure can switch between rawvideo and cuvid-backed codecs.
+    if (rawSwsFrame_)
+        av_frame_free(&rawSwsFrame_);
+    if (rawSwsCtx_)
+    {
+        sws_freeContext(rawSwsCtx_);
+        rawSwsCtx_ = nullptr;
+    }
+    rawPassthroughMode_ = false;
+
     AVCodecID codec_id = formatCtx->streams[videoStreamIndex]->codecpar->codec_id;
 
     // Find decoder that supports hardware acceleration
@@ -458,6 +479,15 @@ void Decoder::initCodecContextWithHwAccel()
     case AV_CODEC_ID_VC1:
         hw_decoder_name = "vc1_cuvid";
         break;
+    case AV_CODEC_ID_RAWVIDEO:
+        // cuvid has no rawvideo codec (there is nothing to decode — rawvideo
+        // is uncompressed pixels). We still want the NVDEC pipeline (GPU-
+        // resident RGB output, ML tensor mode) for raw inputs, so we open the
+        // FFmpeg software rawvideo decoder for parsing/framing. Raw software
+        // frames stay on the producer queue; the consumer thread handles
+        // RGB24 conversion + H2D upload. None of the cuvid setup below applies.
+        initRawPassthrough();
+        return;
     default:
         // No hardware decoder available, will use software with hwaccel
         break;
@@ -543,6 +573,109 @@ void Decoder::initCodecContextWithHwAccel()
     NELUX_DEBUG("CUDA DECODER: Codec opened with hardware acceleration");
 }
 
+void Decoder::initRawPassthrough()
+{
+    NELUX_INFO("CUDA DECODER: rawvideo passthrough requested (no cuvid codec)");
+
+    AVCodecParameters* par = formatCtx->streams[videoStreamIndex]->codecpar;
+    NELUX_INFO("CUDA DECODER: rawvideo src_fmt={}",
+               av_get_pix_fmt_name(static_cast<AVPixelFormat>(par->format)));
+
+    // Open the FFmpeg software rawvideo decoder. It is a near-no-op decoder
+    // (no entropy coding to undo) that just wraps the raw bytes into AVFrames
+    // honoring width/height/format from the container.
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_RAWVIDEO);
+    if (!codec)
+    {
+        throw CxException("CUDA DECODER: FFmpeg rawvideo decoder not available");
+    }
+
+    AVCodecContext* codecCtxRaw = avcodec_alloc_context3(codec);
+    if (!codecCtxRaw)
+    {
+        throw CxException("CUDA DECODER: Could not allocate rawvideo codec context");
+    }
+    codecCtx.reset(codecCtxRaw);
+
+    FF_CHECK_MSG(avcodec_parameters_to_context(codecCtx.get(), par),
+                 std::string("Failed to copy rawvideo codec parameters:"));
+
+    // Software decode: no hw_device_ctx, no get_format callback. Keep threads
+    // off — rawvideo is a trivial parser, threading only adds overhead.
+    codecCtx->thread_count = 1;
+    codecCtx->thread_type = 0;
+    codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
+
+    int ret = avcodec_open2(codecCtx.get(), codec, nullptr);
+    if (ret < 0)
+    {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        throw CxException(std::string("Failed to open rawvideo codec: ") + errbuf);
+    }
+
+    rawPassthroughMode_ = true;
+
+    // No hwframe pool needed: the consumer thread (decodeNextFrame /
+    // decodeNextFrameML) converts to RGB24 and uploads it directly. This avoids
+    // version-dependent hwframe API quirks (for example, CUDA hwcontexts that
+    // do not support RGB software formats).
+}
+
+void Decoder::transferAndConvertRawFrame(AVFrame* frame, void* outputBuffer,
+                                         int outputPitch)
+{
+    if (!rawPassthroughMode_ || !frame || !outputBuffer)
+        throw CxException("CUDA DECODER: Invalid rawvideo conversion request");
+
+    const AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+    const int srcWidth = frame->width;
+    const int srcHeight = frame->height;
+    const int width = properties.width;
+    const int height = properties.height;
+    AVFrame* rgbFrame = frame;
+
+    if (srcFmt != AV_PIX_FMT_RGB24 || srcWidth != width || srcHeight != height)
+    {
+        SwsContext* sws = sws_getCachedContext(
+            rawSwsCtx_, srcWidth, srcHeight, srcFmt, width, height, AV_PIX_FMT_RGB24,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws)
+            throw CxException("CUDA DECODER: sws_getCachedContext failed for rawvideo");
+        rawSwsCtx_ = sws;
+
+        if (!rawSwsFrame_ || rawSwsFrame_->width != width ||
+            rawSwsFrame_->height != height)
+        {
+            av_frame_free(&rawSwsFrame_);
+            rawSwsFrame_ = av_frame_alloc();
+            if (!rawSwsFrame_)
+                throw CxException("CUDA DECODER: av_frame_alloc failed for rawvideo");
+            rawSwsFrame_->format = AV_PIX_FMT_RGB24;
+            rawSwsFrame_->width = width;
+            rawSwsFrame_->height = height;
+            if (av_frame_get_buffer(rawSwsFrame_, 0) < 0)
+            {
+                av_frame_free(&rawSwsFrame_);
+                throw CxException("CUDA DECODER: av_frame_get_buffer failed for rawvideo");
+            }
+        }
+        if (av_frame_make_writable(rawSwsFrame_) < 0 ||
+            sws_scale(rawSwsCtx_, frame->data, frame->linesize, 0, srcHeight,
+                      rawSwsFrame_->data, rawSwsFrame_->linesize) != height)
+            throw CxException("CUDA DECODER: Rawvideo conversion failed");
+        rgbFrame = rawSwsFrame_;
+    }
+
+    const int rgbPitch = outputPitch > 0 ? outputPitch : width * 3;
+    cudaError_t err = cudaMemcpy2DAsync(
+        outputBuffer, rgbPitch, rgbFrame->data[0], rgbFrame->linesize[0],
+        width * 3, height, cudaMemcpyHostToDevice, cudaStream_);
+    if (err != cudaSuccess)
+        throw CxException(std::string("CUDA DECODER: Rawvideo upload failed: ") +
+                          cudaGetErrorString(err));
+}
+
 void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
                                       int outputPitch)
 {
@@ -562,6 +695,11 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
 
     if (hwFrame->format != AV_PIX_FMT_CUDA)
     {
+        if (rawPassthroughMode_)
+        {
+            transferAndConvertRawFrame(hwFrame, outputBuffer, outputPitch);
+            return;
+        }
         throw CxException(
             std::string("CUDA DECODER: Expected CUDA frame format, got ") +
             av_get_pix_fmt_name(static_cast<AVPixelFormat>(hwFrame->format)));
@@ -661,7 +799,8 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
             av_get_pix_fmt_name(swFormat) +
             "' for GPU color conversion. "
             "Supported formats: NV12, P010LE, P016LE, YUV444P, YUV444P10LE, "
-            "YUV444P12LE, YUV444P16LE. Consider using CPU decoder for this format.");
+            "YUV444P12LE, YUV444P16LE. "
+            "Consider using CPU decoder for this format.");
     }
     }
 
@@ -727,12 +866,12 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
     // Convert and transfer the frame
     // For hardware frames, we use our GPU-side conversion
-    if (frame.get()->format == AV_PIX_FMT_CUDA)
+    if (frame.get()->format == AV_PIX_FMT_CUDA || rawPassthroughMode_)
     {
         // Use intermediate aligned buffer to ensure kernel works correctly
         // and to support writing to unaligned host memory (CPU tensor)
-        int width = frame.get()->width;
-        int height = frame.get()->height;
+        int width = rawPassthroughMode_ ? properties.width : frame.get()->width;
+        int height = rawPassthroughMode_ ? properties.height : frame.get()->height;
         int alignedPitch = (width * 3 + 255) & ~255;
         size_t alignedSize = alignedPitch * height;
 
@@ -877,6 +1016,18 @@ void Decoder::close()
         rgb24Buffer_ = nullptr;
         rgb24BufferSize_ = 0;
     }
+
+    // Release rawvideo-passthrough resources.
+    if (rawSwsFrame_)
+    {
+        av_frame_free(&rawSwsFrame_);
+    }
+    if (rawSwsCtx_)
+    {
+        sws_freeContext(rawSwsCtx_);
+        rawSwsCtx_ = nullptr;
+    }
+    rawPassthroughMode_ = false;
 
     // Release hardware device context
     if (hwDeviceCtx_)
@@ -1056,7 +1207,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
     // Convert and transfer the frame using unified two-step approach
-    if (frame.get()->format == AV_PIX_FMT_CUDA)
+    if (frame.get()->format == AV_PIX_FMT_CUDA || rawPassthroughMode_)
     {
         // Unified two-step conversion for ALL formats:
         // Step 1: Convert any format (NV12, P010, YUV444, etc.) to RGB24 using existing
@@ -1068,9 +1219,13 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         // - Negligible performance cost (~20 microseconds vs direct path)
 
         // Step 1: Check format and choose path
-        AVHWFramesContext* hwFramesCtx =
-            (AVHWFramesContext*)frame.get()->hw_frames_ctx->data;
-        AVPixelFormat swFormat = hwFramesCtx->sw_format;
+        AVPixelFormat swFormat = AV_PIX_FMT_NONE;
+        if (frame.get()->format == AV_PIX_FMT_CUDA)
+        {
+            AVHWFramesContext* hwFramesCtx =
+                (AVHWFramesContext*)frame.get()->hw_frames_ctx->data;
+            swFormat = hwFramesCtx->sw_format;
+        }
 
         // RGBA32 Path for NV12 (Fixes alignment stripes)
         if (swFormat == AV_PIX_FMT_NV12)
@@ -1115,8 +1270,8 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         else
         {
             // Legacy/Fallback Path for P010, P016 etc.
-            int width = frame.get()->width;
-            int height = frame.get()->height;
+            int width = rawPassthroughMode_ ? properties.width : frame.get()->width;
+            int height = rawPassthroughMode_ ? properties.height : frame.get()->height;
             int rgbPitch = (width * 3 + 255) & ~255;
             size_t rgb24Size = rgbPitch * height;
 
