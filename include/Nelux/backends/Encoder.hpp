@@ -3,7 +3,6 @@
 #define ENCODER_HPP
 
 #include "error/CxException.hpp"
-#include <Conversion.hpp>
 #include <Frame.hpp>
 #include <filesystem>
 #include <map>

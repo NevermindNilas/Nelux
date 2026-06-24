@@ -8,7 +8,7 @@ extern "C"
 #include <libswscale/swscale.h>
 }
 
-#include "Nelux/conversion/cpu/CPUConverter.hpp"
+#include "Frame.hpp"
 #include <iostream>
 #include <stdexcept>
 
@@ -26,13 +26,13 @@ namespace cpu
  *   RGBToAutoConverter conv(width, height, AV_PIX_FMT_YUV420P);
  *   conv.convert(yuvFrame, rgbTensor.data_ptr<uint8_t>());
  */
-class RGBToAutoConverter : public ConverterBase
+class RGBToAutoConverter
 {
   public:
     RGBToAutoConverter(int dstWidth, int dstHeight, AVPixelFormat dstPixFmt,
                        AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED,
                        AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED)
-        : ConverterBase(), width(dstWidth), height(dstHeight), dst_fmt(dstPixFmt),
+        : width(dstWidth), height(dstHeight), dst_fmt(dstPixFmt),
           dst_colorspace(colorspace), dst_color_range(colorRange)
     {
         NELUX_DEBUG("Initializing RGBToAutoConverter ({}x{}, cs={}, range={})", width,
@@ -40,7 +40,7 @@ class RGBToAutoConverter : public ConverterBase
                     static_cast<int>(colorRange));
     }
 
-    ~RGBToAutoConverter() override
+    ~RGBToAutoConverter()
     {
         if (swsContext)
         {
@@ -55,7 +55,7 @@ class RGBToAutoConverter : public ConverterBase
      * @param frame  Output nelux::Frame (must be pre-allocated, correct format/size).
      * @param buffer Input buffer (raw RGB24, typically from tensor).
      */
-    void convert(nelux::Frame& frame, void* buffer) override
+    void convert(nelux::Frame& frame, void* buffer)
     {
         // Check destination frame format
         if (frame.getWidth() != width || frame.getHeight() != height ||
@@ -164,6 +164,7 @@ class RGBToAutoConverter : public ConverterBase
 
 
   private:
+    SwsContext* swsContext = nullptr;
     int width;
     int height;
     AVPixelFormat dst_fmt;

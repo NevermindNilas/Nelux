@@ -1,7 +1,7 @@
 #pragma once
 
 #include "error/CxException.hpp"
-#include <Conversion.hpp>
+#include <cpu/AutoToRGB.hpp>
 #include <Frame.hpp>
 #include <atomic>
 #include <condition_variable>
@@ -166,7 +166,7 @@ class Decoder
 
     double getFrameTimestamp(AVFrame* frame);
 
-    std::unique_ptr<nelux::conversion::IConverter> converter;
+    std::unique_ptr<nelux::conversion::cpu::AutoToRGBConverter> converter;
     std::unique_ptr<AVFormatContext, AVFormatContextDeleter> formatCtx;
     std::unique_ptr<AVCodecContext, AVCodecContextDeleter> codecCtx;
     std::unique_ptr<AVPacket, AVPacketDeleter> pkt;

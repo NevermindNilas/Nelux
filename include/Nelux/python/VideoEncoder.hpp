@@ -3,6 +3,7 @@
 #define VIDEO_ENCODER_HPP
 
 #include "Encoder.hpp"
+#include <cpu/RGBToAuto.hpp>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -66,7 +67,6 @@ class VideoEncoder
     std::unique_ptr<nelux::Encoder> encoder;
     int width, height;
     AVPixelFormat outputPixelFormat;  // Actual pixel format used
-    std::unique_ptr<nelux::conversion::IConverter> converter;
     
 #ifdef NELUX_ENABLE_CUDA
     // GPU converter for zero-copy encoding when tensor is on CUDA
@@ -120,7 +120,7 @@ class VideoEncoder
     std::vector<std::thread> convertWorkers;
     std::thread encodeThread;
     // One converter (own SwsContext — not thread-safe to share) per convert worker.
-    std::vector<std::unique_ptr<nelux::conversion::IConverter>> converters;
+    std::vector<std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter>> converters;
 
     // Recyclable buffers / frames (sized to cover max frames in flight).
     std::vector<std::unique_ptr<std::vector<uint8_t>>> stagingPool;

@@ -3,7 +3,6 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
-#include <Factory.hpp>
 #include <cpu/RGBToAuto.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
@@ -436,7 +435,7 @@ void VideoEncoder::ensureConvertPipeline()
 
 void VideoEncoder::convertWorkerLoop(int workerId)
 {
-    nelux::conversion::IConverter* conv = converters[workerId].get();
+    auto* conv = converters[workerId].get();
     for (;;)
     {
         ConvertJob job;
@@ -721,8 +720,6 @@ void VideoEncoder::close()
         encoder->close();
         encoder.reset();
     }
-
-    converter.reset();
 
 #ifdef NELUX_ENABLE_CUDA
     // Drain any GPU tensors the submit thread retired but the caller didn't get

@@ -9,7 +9,7 @@ extern "C"
 #include <libswscale/swscale.h>
 }
 
-#include "CPUConverter.hpp"
+#include "Frame.hpp"
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -26,11 +26,11 @@ namespace cpu
 /**
  * @brief Robust color-accurate converter dynamically handling pixel formats to RGB24.
  */
-class AutoToRGBConverter : public ConverterBase
+class AutoToRGBConverter
 {
   public:
     AutoToRGBConverter()
-        : ConverterBase(), sws_ctx(nullptr), last_src_fmt(AV_PIX_FMT_NONE),
+        : sws_ctx(nullptr), last_src_fmt(AV_PIX_FMT_NONE),
           last_dst_fmt(AV_PIX_FMT_NONE), last_src_colorspace(AVCOL_SPC_UNSPECIFIED),
           last_src_color_range(AVCOL_RANGE_UNSPECIFIED), last_width(0), last_height(0),
           last_out_width(0), last_out_height(0),
@@ -38,7 +38,7 @@ class AutoToRGBConverter : public ConverterBase
     {
     }
 
-    ~AutoToRGBConverter() override
+    ~AutoToRGBConverter()
     {
         if (sws_ctx)
             sws_freeContext(sws_ctx);
@@ -55,7 +55,7 @@ class AutoToRGBConverter : public ConverterBase
         out_height = (width > 0 && height > 0) ? height : 0;
     }
 
-    void convert(nelux::Frame& frame, void* buffer) override
+    void convert(nelux::Frame& frame, void* buffer)
     {
         AVFrame* av_frame = frame.get();
 

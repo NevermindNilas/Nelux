@@ -51,7 +51,6 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
 
     try
     {
-        // Determine the torch device based on decode accelerator
         torch::Device torchDevice =
             (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
                 ? torch::Device(torch::kCUDA, cuda_device_index)
@@ -64,8 +63,8 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // Set decode_accelerator='cpu' explicitly to opt into software decode.
         const bool syncMode =
             !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
-        decoder = nelux::Factory::createDecoder(
-            torchDevice, filePath, numThreads, decodeAccelerator, cuda_device_index,
+        decoder = nelux::createDecoder(
+            filePath, numThreads, decodeAccelerator, cuda_device_index,
             resizeWidth_, resizeHeight_, syncMode);
         decoder->setForce8Bit(force_8bit);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
@@ -592,16 +591,11 @@ void VideoReader::ensureRandDecoder()
     if (!rand_decoder)
     {
         NELUX_INFO("Initializing random-access decoder (lazy load)");
-        torch::Device torchDevice =
-            (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-                ? torch::Device(torch::kCUDA, cudaDeviceIndex)
-                : torch::Device(torch::kCPU);
-
         // No silent NVDEC->CPU fallback for the random-access decoder either.
         // A failure here surfaces as a hard error consistent with the main
         // decoder path; use decode_accelerator='cpu' for software decode.
-        rand_decoder = nelux::Factory::createDecoder(
-            torchDevice, filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
+        rand_decoder = nelux::createDecoder(
+            filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
             resizeWidth_, resizeHeight_);
         rand_decoder->setForce8Bit(force_8bit);
     }

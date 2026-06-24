@@ -34,54 +34,35 @@ inline DecodeAccelerator stringToDecodeAccelerator(const std::string& str)
                                     ". Valid options: 'cpu', 'nvdec'");
 }
 
-/**
- * @brief Factory class to create Decoders, Encoders, and Converters based on backend
- * and configuration.
- */
-class Factory
+inline std::shared_ptr<Decoder>
+createDecoder(const std::string& filename, int numThreads,
+              DecodeAccelerator accelerator = DecodeAccelerator::CPU,
+              int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
+              bool syncMode = false)
 {
-  public:
-    /**
-     * @brief Creates a Decoder instance based on the specified backend.
-     *
-     * @param device Torch device (CPU or CUDA).
-     * @param filename Path to the video file.
-     * @param numThreads Number of threads for decoding.
-     * @param accelerator Decode acceleration type (CPU or NVDEC).
-     * @param cudaDeviceIndex CUDA device index (only used if accelerator is NVDEC).
-     * @return std::shared_ptr<Decoder> Pointer to the created Decoder.
-     */
-    static std::shared_ptr<Decoder>
-    createDecoder(torch::Device device, const std::string& filename, int numThreads,
-                  DecodeAccelerator accelerator = DecodeAccelerator::CPU,
-                  int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
-                  bool syncMode = false)
+    switch (accelerator)
     {
-        switch (accelerator)
-        {
-            case DecodeAccelerator::CPU:
-                if (resizeWidth > 0 && resizeHeight > 0)
-                    return std::make_shared<nelux::backends::cpu::Decoder>(
-                        filename, numThreads, resizeWidth, resizeHeight, syncMode);
+        case DecodeAccelerator::CPU:
+            if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
-                    filename, numThreads, syncMode);
+                    filename, numThreads, resizeWidth, resizeHeight, syncMode);
+            return std::make_shared<nelux::backends::cpu::Decoder>(
+                filename, numThreads, syncMode);
 
-            case DecodeAccelerator::NVDEC:
+        case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA
-                return std::make_shared<nelux::backends::cuda::Decoder>(
-                    filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
+            return std::make_shared<nelux::backends::cuda::Decoder>(
+                filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
 #else
-                throw std::runtime_error(
-                    "NVDEC acceleration requested but Nelux was not built with CUDA support. "
-                    "Rebuild with -DNELUX_ENABLE_CUDA=ON to enable NVDEC.");
+            throw std::runtime_error(
+                "NVDEC acceleration requested but Nelux was not built with CUDA support. "
+                "Rebuild with -DNELUX_ENABLE_CUDA=ON to enable NVDEC.");
 #endif
 
-            default:
-                throw std::invalid_argument("Unknown decode accelerator");
-        }
+        default:
+            throw std::invalid_argument("Unknown decode accelerator");
     }
-
-};
+}
 
 } // namespace nelux
 

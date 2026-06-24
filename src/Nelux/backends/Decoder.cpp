@@ -2,7 +2,6 @@
 #include "Decoder.hpp"
 #include "BatchDecoder.hpp"
 #include "conversion/cpu/AutoToRGB.hpp"
-#include <Factory.hpp>
 #include <cstdlib>
 #include <cstring>
 
@@ -225,15 +224,10 @@ void Decoder::initialize(const std::string& filePath)
     setProperties();
 
     converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
-    auto* autoConverter =
-        dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
-    if (autoConverter)
+    converter->setForce8Bit(force_8bit);
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
     {
-        autoConverter->setForce8Bit(force_8bit);
-        if (resizeWidth_ > 0 && resizeHeight_ > 0)
-        {
-            autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
-        }
+        converter->setOutputSize(resizeWidth_, resizeHeight_);
     }
 
     // Push raw AVFrames from the producer and convert on the consumer thread.
@@ -1175,8 +1169,6 @@ void Decoder::close()
     }
     if (converter)
     {
-        NELUX_DEBUG("BASE DECODER: Synchronizing converter in Decoder close");
-        converter->synchronize();
         converter.reset();
     }
     preconvertEnabled = false;
@@ -1332,12 +1324,7 @@ void Decoder::setForce8Bit(bool enabled)
     force_8bit = enabled;
     if (converter)
     {
-        auto* autoConverter =
-            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
-        if (autoConverter)
-        {
-            autoConverter->setForce8Bit(enabled);
-        }
+        converter->setForce8Bit(enabled);
     }
 }
 
@@ -1432,27 +1419,18 @@ void Decoder::reconfigure(const std::string& filePath)
     // Update converter if needed
     if (converter)
     {
-        // Let the converter reinitialize on next frame
-        converter->synchronize();
-        auto* autoConverter =
-            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
-        if (autoConverter && resizeWidth_ > 0 && resizeHeight_ > 0)
+        if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
-            autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
+            converter->setOutputSize(resizeWidth_, resizeHeight_);
         }
     }
     else
     {
         converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
-        auto* autoConverter =
-            dynamic_cast<nelux::conversion::cpu::AutoToRGBConverter*>(converter.get());
-        if (autoConverter)
+        converter->setForce8Bit(force_8bit);
+        if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
-            autoConverter->setForce8Bit(force_8bit);
-            if (resizeWidth_ > 0 && resizeHeight_ > 0)
-            {
-                autoConverter->setOutputSize(resizeWidth_, resizeHeight_);
-            }
+            converter->setOutputSize(resizeWidth_, resizeHeight_);
         }
     }
 
