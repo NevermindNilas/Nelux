@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint> // For fixed-width integer types
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <ostream>   // For std::ostream
@@ -18,15 +19,12 @@
 #include <optional>
 #include <type_traits>
 #include <sstream>
-#include "Json.hpp" // Include the nlohmann/json header
 #include <fstream>   // For file I/O
 #include <iomanip>   // For std::setprecision
 #include <unordered_map>
 #include <tuple>
 #include <functional>
 
-
-using json = nlohmann::json;
 
 extern "C"
 {

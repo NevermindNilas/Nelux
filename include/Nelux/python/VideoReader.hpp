@@ -1,7 +1,7 @@
 #ifndef VIDEOREADER_HPP
 #define VIDEOREADER_HPP
 
-#include "Decoder.hpp" // Ensure this includes the Filter class
+#include "Decoder.hpp"
 #include "Factory.hpp"
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
