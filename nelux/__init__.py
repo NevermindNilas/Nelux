@@ -105,6 +105,22 @@ def _likely_missing_transitive_dlls(dll_name: str) -> List[str]:
     return sorted(set(missing))
 
 
+_FFMPEG_DLL_FALLBACKS = {
+    "avcodec": ["avcodec-63.dll", "avcodec-62.dll"],
+    "avformat": ["avformat-63.dll", "avformat-62.dll"],
+    "avutil": ["avutil-61.dll", "avutil-60.dll"],
+    "swscale": ["swscale-10.dll", "swscale-9.dll"],
+    "swresample": ["swresample-7.dll", "swresample-6.dll"],
+    "avfilter": ["avfilter-12.dll", "avfilter-11.dll"],
+    "avdevice": ["avdevice-63.dll", "avdevice-62.dll"],
+}
+
+
+def _ffmpeg_dll_fallbacks(dll_name: str) -> List[str]:
+    base = dll_name.split("-", 1)[0].lower()
+    return _FFMPEG_DLL_FALLBACKS.get(base, [dll_name])
+
+
 def diagnose_runtime_dlls() -> Dict[str, object]:
     """Diagnose missing runtime DLLs for Nelux on Windows."""
     if os.name != "nt":
@@ -120,12 +136,12 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
     required = _read_required_dlls_windows(extension_path)
     if not required:
         required = [
-            "avcodec-62.dll",
-            "avformat-62.dll",
-            "avutil-60.dll",
-            "swscale-9.dll",
-            "avfilter-11.dll",
-            "avdevice-62.dll",
+            "avcodec-63.dll",
+            "avformat-63.dll",
+            "avutil-61.dll",
+            "swscale-10.dll",
+            "avfilter-12.dll",
+            "avdevice-63.dll",
             "fmt.dll",
             "spdlog.dll",
             "torch_cpu.dll",
@@ -164,6 +180,19 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
         try:
             ctypes.WinDLL(dll)
         except OSError as load_err:
+            fallback_loaded = False
+            for fallback in _ffmpeg_dll_fallbacks(dll):
+                if fallback.lower() == dll.lower():
+                    continue
+                try:
+                    ctypes.WinDLL(fallback)
+                    fallback_loaded = True
+                    break
+                except OSError:
+                    pass
+            if fallback_loaded:
+                continue
+
             nested = _likely_missing_transitive_dlls(dll)
             if nested:
                 missing[dll] = f"{load_err} | likely dependency: {', '.join(nested)}"

@@ -226,7 +226,34 @@ set(_ffmpeg_components avcodec avformat avutil avfilter swscale swresample avdev
 if(WIN32)
   set(NELUX_FFMPEG_LIBS)
   foreach(_c ${_ffmpeg_components})
-    list(APPEND NELUX_FFMPEG_LIBS "${_ffmpeg_lib_dir}/${_c}.lib")
+    if(MSVC)
+      file(GLOB _defs "${_ffmpeg_lib_dir}/${_c}-*.def")
+      if(NOT _defs)
+        message(FATAL_ERROR "FFmpeg definition file not found for ${_c} in ${_ffmpeg_lib_dir}")
+      endif()
+      list(SORT _defs)
+      list(REVERSE _defs)
+      list(GET _defs 0 _def)
+
+      set(_import_dir "${CMAKE_BINARY_DIR}/ffmpeg-msvc-import")
+      file(MAKE_DIRECTORY "${_import_dir}")
+      set(_import_lib "${_import_dir}/${_c}.lib")
+      if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_machine x64)
+      else()
+        set(_machine x86)
+      endif()
+      execute_process(
+        COMMAND "${CMAKE_AR}" /nologo /machine:${_machine} /def:${_def} /out:${_import_lib}
+        RESULT_VARIABLE _lib_result
+      )
+      if(NOT _lib_result EQUAL 0)
+        message(FATAL_ERROR "Failed to create MSVC FFmpeg import lib from ${_def}")
+      endif()
+      list(APPEND NELUX_FFMPEG_LIBS "${_import_lib}")
+    else()
+      list(APPEND NELUX_FFMPEG_LIBS "${_ffmpeg_lib_dir}/${_c}.lib")
+    endif()
   endforeach()
 elseif(APPLE)
   # Prefer unversioned symlink, fall back to highest-version .dylib found
@@ -347,6 +374,7 @@ file(GLOB_RECURSE NELUX_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/conversion/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/*.cpp
 )
+list(REMOVE_ITEM NELUX_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/FFmpegDelayLoad.cpp)
 
 # Add CUDA sources if CUDA is enabled  
 if(NELUX_ENABLE_CUDA)
@@ -398,11 +426,6 @@ if(NELUX_ENABLE_CUDA)
   endif()
   
   message(STATUS "CUDA .cpp sources: ${NELUX_CUDA_CPP_SOURCES}")
-endif()
-
-# Add delay-load hook for FFmpeg on Windows
-if(WIN32)
-  list(APPEND NELUX_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/FFmpegDelayLoad.cpp)
 endif()
 
 add_library(NeluxLib STATIC ${NELUX_SOURCES})
@@ -466,7 +489,11 @@ elseif(UNIX)
 endif()
 
 if(NELUX_BUILD_PYTHON)
-  add_library(nelux MODULE src/Nelux/python/Bindings.cpp)
+  set(NELUX_PYTHON_SOURCES src/Nelux/python/Bindings.cpp)
+  if(WIN32)
+    list(APPEND NELUX_PYTHON_SOURCES src/Nelux/FFmpegDelayLoad.cpp)
+  endif()
+  add_library(nelux MODULE ${NELUX_PYTHON_SOURCES})
 
   nelux_apply_perf_flags(nelux)
 
@@ -497,16 +524,13 @@ if(NELUX_BUILD_PYTHON)
     # Link delayimp.lib for delay-load support
     target_link_libraries(nelux PRIVATE delayimp)
     
-    # Delay-load FFmpeg DLLs - they will be resolved at runtime via our hook
-    target_link_options(nelux PRIVATE
-      "/DELAYLOAD:avcodec-62.dll"
-      "/DELAYLOAD:avformat-62.dll"
-      "/DELAYLOAD:avutil-60.dll"
-      "/DELAYLOAD:swscale-9.dll"
-      "/DELAYLOAD:swresample-6.dll"
-      "/DELAYLOAD:avfilter-11.dll"
-      "/DELAYLOAD:avdevice-62.dll"
-    )
+    file(GLOB _nelux_ffmpeg_delay_dlls "${NELUX_FFMPEG_DIR}/bin/av*.dll" "${NELUX_FFMPEG_DIR}/bin/sw*.dll")
+    foreach(_dll ${_nelux_ffmpeg_delay_dlls})
+      get_filename_component(_dll_name "${_dll}" NAME)
+      if(_dll_name MATCHES "^(avcodec|avformat|avutil|swscale|swresample|avfilter|avdevice)-.*\\.dll$")
+        target_link_options(nelux PRIVATE "/DELAYLOAD:${_dll_name}")
+      endif()
+    endforeach()
     message(STATUS "MSVC: FFmpeg DLLs will be delay-loaded for version flexibility")
   endif()
 

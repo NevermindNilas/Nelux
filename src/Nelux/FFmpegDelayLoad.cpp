@@ -1,6 +1,6 @@
 // FFmpegDelayLoad.cpp
 // Delay-load hook for FFmpeg DLLs to support multiple versions
-// This allows Nelux to work with FFmpeg 7.x, 8.x, etc.
+// This allows Nelux to work with multiple FFmpeg DLL ABIs.
 
 #ifdef _WIN32
 
@@ -12,13 +12,20 @@
 #include <string>
 
 // FFmpeg DLL versions to try in order of preference (newest first)
-static const char* AVCODEC_VERSIONS[] = {"avcodec-62.dll", "avcodec-61.dll", "avcodec-60.dll", nullptr};
-static const char* AVFORMAT_VERSIONS[] = {"avformat-62.dll", "avformat-61.dll", "avformat-60.dll", nullptr};
-static const char* AVUTIL_VERSIONS[] = {"avutil-60.dll", "avutil-59.dll", "avutil-58.dll", nullptr};
-static const char* SWSCALE_VERSIONS[] = {"swscale-9.dll", "swscale-8.dll", "swscale-7.dll", nullptr};
-static const char* SWRESAMPLE_VERSIONS[] = {"swresample-6.dll", "swresample-5.dll", "swresample-4.dll", nullptr};
-static const char* AVFILTER_VERSIONS[] = {"avfilter-11.dll", "avfilter-10.dll", "avfilter-9.dll", nullptr};
-static const char* AVDEVICE_VERSIONS[] = {"avdevice-62.dll", "avdevice-61.dll", "avdevice-60.dll", nullptr};
+static const char* AVCODEC_VERSIONS[] = {"avcodec-63.dll", "avcodec-62.dll", nullptr};
+static const char* AVFORMAT_VERSIONS[] = {"avformat-63.dll", "avformat-62.dll", nullptr};
+static const char* AVUTIL_VERSIONS[] = {"avutil-61.dll", "avutil-60.dll", nullptr};
+static const char* SWSCALE_VERSIONS[] = {"swscale-10.dll", "swscale-9.dll", nullptr};
+static const char* SWRESAMPLE_VERSIONS[] = {"swresample-7.dll", "swresample-6.dll", nullptr};
+static const char* AVFILTER_VERSIONS[] = {"avfilter-12.dll", "avfilter-11.dll", nullptr};
+static const char* AVDEVICE_VERSIONS[] = {"avdevice-63.dll", "avdevice-62.dll", nullptr};
+
+static HMODULE LoadFFmpegDll(const char* name) {
+    HMODULE hMod = ::LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (hMod == NULL)
+        hMod = ::LoadLibraryA(name);
+    return hMod;
+}
 
 // Map DLL base names to version lists
 struct DllVersionMap {
@@ -65,9 +72,16 @@ FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
         const char** versions = GetVersionList(pdli->szDll);
         
         if (versions) {
+            HMODULE hMod = LoadFFmpegDll(pdli->szDll);
+            if (hMod != NULL)
+                return reinterpret_cast<FARPROC>(hMod);
+
             // Try each version in order
             for (int i = 0; versions[i] != nullptr; ++i) {
-                HMODULE hMod = ::LoadLibraryA(versions[i]);
+                if (std::string(versions[i]) == pdli->szDll)
+                    continue;
+
+                hMod = LoadFFmpegDll(versions[i]);
                 if (hMod != NULL) {
                     // Return the module handle cast to FARPROC
                     // The delay-load helper will use this module

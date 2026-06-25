@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.9] - 2026-06-25
+
+### Fixed
+
+- **Windows FFmpeg shared DLL compatibility for TAS.** Wheels now build against
+  FFmpeg master headers/libs and delay-load the FFmpeg DLL names discovered at
+  build time, with tested fallback across FFmpeg master/`avcodec-63` and FFmpeg
+  8.1/`avcodec-62`. Runtime diagnostics mirror that fallback so compatible
+  FFmpeg 8.1 DLLs are not reported as missing. Older FFmpeg 7/6/5/4 shared DLL
+  ABIs are intentionally unsupported after smoke tests showed bogus decode
+  output or crashes.
+
 ## [0.12.8] - 2026-06-14
 
 ### Fixed

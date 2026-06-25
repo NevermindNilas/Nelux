@@ -1,4 +1,11 @@
 
+### **Version 0.12.9 (2026-06-25)**
+
+#### **Fix: Windows FFmpeg master/shared DLL compatibility**
+- **Fixed:** Windows wheels built against FFmpeg 8.x (`avcodec-62`) failed to import or decode when TAS downloaded a newer shared FFmpeg build with `avcodec-63`. Windows now builds against FFmpeg master headers/libs and delay-loads the actual FFmpeg DLL names found at build time, with a tested fallback across the known-good FFmpeg master/63 and FFmpeg 8.1/62 shared ABIs. The runtime diagnostic helper mirrors that fallback so it no longer reports a missing `avcodec-63.dll` when the compatible `avcodec-62.dll` set is present. Older FFmpeg 7/6/5/4 DLL ABIs are intentionally not advertised after decode smoke tests showed bogus output or crashes.
+
+---
+
 ### **Version 0.12.5 (2026-06-01)**
 
 #### **Fix: host-RAM leak in CPU decoding with the convert worker pool**

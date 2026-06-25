@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -32,6 +33,83 @@ extern "C" {
 
 namespace
 {
+
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+using AvcodecGetSupportedConfigFn = int (*)(const AVCodecContext*, const AVCodec*,
+                                            AVCodecConfig, unsigned, const void**, int*);
+
+AvcodecGetSupportedConfigFn avcodecGetSupportedConfig()
+{
+#ifdef _WIN32
+    static AvcodecGetSupportedConfigFn fn = [] {
+        const char* names[] = {"avcodec-63.dll", "avcodec-62.dll", nullptr};
+        for (int i = 0; names[i] != nullptr; ++i)
+        {
+            HMODULE module = ::GetModuleHandleA(names[i]);
+            if (!module)
+                continue;
+
+            auto proc = ::GetProcAddress(module, "avcodec_get_supported_config");
+            if (proc)
+                return reinterpret_cast<AvcodecGetSupportedConfigFn>(proc);
+        }
+        return static_cast<AvcodecGetSupportedConfigFn>(nullptr);
+    }();
+    return fn;
+#else
+    return avcodec_get_supported_config;
+#endif
+}
+
+bool getSupportedConfig(const AVCodecContext* ctx, const AVCodec* codec,
+                        AVCodecConfig config, const void** out)
+{
+    AvcodecGetSupportedConfigFn fn = avcodecGetSupportedConfig();
+    return fn && fn(ctx, codec, config, 0, out, nullptr) >= 0;
+}
+#endif
+
+const AVSampleFormat* supportedSampleFormats(const AVCodec* codec,
+                                             const AVCodecContext* ctx = nullptr)
+{
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+    const void* configs = nullptr;
+    if (getSupportedConfig(ctx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, &configs))
+        return static_cast<const AVSampleFormat*>(configs);
+#else
+    (void)ctx;
+    return codec->sample_fmts;
+#endif
+    return nullptr;
+}
+
+const int* supportedSampleRates(const AVCodec* codec,
+                                const AVCodecContext* ctx = nullptr)
+{
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+    const void* configs = nullptr;
+    if (getSupportedConfig(ctx, codec, AV_CODEC_CONFIG_SAMPLE_RATE, &configs))
+        return static_cast<const int*>(configs);
+#else
+    (void)ctx;
+    return codec->supported_samplerates;
+#endif
+    return nullptr;
+}
+
+const AVPixelFormat* supportedPixelFormats(const AVCodec* codec,
+                                           const AVCodecContext* ctx = nullptr)
+{
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+    const void* configs = nullptr;
+    if (getSupportedConfig(ctx, codec, AV_CODEC_CONFIG_PIX_FORMAT, &configs))
+        return static_cast<const AVPixelFormat*>(configs);
+#else
+    (void)ctx;
+    return codec->pix_fmts;
+#endif
+    return nullptr;
+}
 
 // SVT-AV1 prints a startup banner and end-of-stream stats directly to stderr
 // through its internal SVT_LOG, bypassing FFmpeg's av_log and the -svtav1-params
@@ -339,17 +417,18 @@ bool Encoder::setupAudioTranscode(AVStream* in)
     if (!enc)
         return false;
 
-    enc->sample_fmt = (encC->sample_fmts) ? encC->sample_fmts[0]
-                                          : AV_SAMPLE_FMT_FLTP;
+    const AVSampleFormat* sampleFormats = supportedSampleFormats(encC, enc.get());
+    enc->sample_fmt = sampleFormats ? sampleFormats[0] : AV_SAMPLE_FMT_FLTP;
 
     int rate = dec->sample_rate > 0 ? dec->sample_rate : 48000;
-    if (encC->supported_samplerates)
+    const int* sampleRates = supportedSampleRates(encC, enc.get());
+    if (sampleRates)
     {
         bool found = false;
-        for (int i = 0; encC->supported_samplerates[i]; ++i)
-            if (encC->supported_samplerates[i] == rate) { found = true; break; }
+        for (int i = 0; sampleRates[i]; ++i)
+            if (sampleRates[i] == rate) { found = true; break; }
         if (!found)
-            rate = encC->supported_samplerates[0];
+            rate = sampleRates[0];
     }
     enc->sample_rate = rate;
 
@@ -946,12 +1025,13 @@ void Encoder::initVideoStream()
         // libsvtav1, libaom-av1, h264_mf, hevc_mf, ...) uniformly: unsupported
         // formats (notably grayscale on codecs without monochrome support)
         // fall back with a warning instead of failing at avcodec_open2.
-        if (codec->pix_fmts)
+        const AVPixelFormat* pixFmts = supportedPixelFormats(codec, videoCodecCtx.get());
+        if (pixFmts)
         {
             bool supported = false;
-            for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+            for (int i = 0; pixFmts[i] != AV_PIX_FMT_NONE; ++i)
             {
-                if (codec->pix_fmts[i] == properties.pixelFormat)
+                if (pixFmts[i] == properties.pixelFormat)
                 {
                     supported = true;
                     break;
@@ -968,13 +1048,13 @@ void Encoder::initVideoStream()
                 // 1. If gray was requested, try any gray variant from the list.
                 if (wantGray)
                 {
-                    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+                    for (int i = 0; pixFmts[i] != AV_PIX_FMT_NONE; ++i)
                     {
                         const AVPixFmtDescriptor* d =
-                            av_pix_fmt_desc_get(codec->pix_fmts[i]);
+                            av_pix_fmt_desc_get(pixFmts[i]);
                         if (d && d->nb_components == 1)
                         {
-                            fallback = codec->pix_fmts[i];
+                            fallback = pixFmts[i];
                             break;
                         }
                     }
@@ -982,9 +1062,9 @@ void Encoder::initVideoStream()
                 // 2. yuv420p is the most universal YUV fallback.
                 if (fallback == AV_PIX_FMT_NONE)
                 {
-                    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i)
+                    for (int i = 0; pixFmts[i] != AV_PIX_FMT_NONE; ++i)
                     {
-                        if (codec->pix_fmts[i] == AV_PIX_FMT_YUV420P)
+                        if (pixFmts[i] == AV_PIX_FMT_YUV420P)
                         {
                             fallback = AV_PIX_FMT_YUV420P;
                             break;
@@ -994,7 +1074,7 @@ void Encoder::initVideoStream()
                 // 3. Last resort: first format the codec advertises.
                 if (fallback == AV_PIX_FMT_NONE)
                 {
-                    fallback = codec->pix_fmts[0];
+                    fallback = pixFmts[0];
                 }
 
                 if (wantGray)
