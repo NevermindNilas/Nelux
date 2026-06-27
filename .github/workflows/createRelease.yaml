@@ -170,6 +170,7 @@ jobs:
           export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
+          python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
           # Use --no-build-isolation so we usage the pre-installed CUDA-enabled Torch
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 
@@ -230,6 +231,7 @@ jobs:
           Remove-Item dist/*.whl -Force
           Move-Item dist_repaired/*.whl dist/
           Remove-Item dist_repaired -Recurse -Force
+          python tools/tag_wheel_torch.py (Get-ChildItem dist/*.whl).FullName
           Write-Host "=== Wheel repair complete ==="
 
       - name: List wheel contents
@@ -377,6 +379,7 @@ jobs:
             -DNELUX_ENABLE_CUDA=ON \
             -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
 
+          python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 
       - name: Repair wheel with auditwheel
@@ -410,6 +413,7 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
+          python tools/tag_wheel_torch.py dist/*.whl
 
       - name: Test wheel (import + real decode smoke test)
         run: |
@@ -544,6 +548,7 @@ jobs:
             -DNELUX_BUNDLE_FFMPEG_DLLS=OFF \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
 
+          python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 
       - name: Repair wheel with delocate
@@ -567,6 +572,7 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
+          python tools/tag_wheel_torch.py dist/*.whl
 
       - name: Test wheel (import + real decode smoke test)
         run: |

@@ -101,6 +101,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
+          python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
           python -m pip wheel . --no-deps --no-build-isolation -w dist -v
 
       - name: Debug - list artifacts
@@ -135,6 +136,7 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
+          python tools/tag_wheel_torch.py dist/*.whl
           echo "=== Repaired wheel ==="
           ls -la dist/
 

@@ -1,4 +1,11 @@
 
+### **Version 0.12.10 (2026-06-27)**
+
+#### **Build: PyTorch ABI-labelled wheels**
+- **Changed:** Release wheels now include the build-time PyTorch ABI minor as a valid wheel build tag, for example `nelux-0.12.10-212torch-cp313-cp313-win_amd64.whl`. The extension also exposes `nelux.__torch_abi__` (currently `2.12`) and CMake prints the detected PyTorch ABI during configuration, making it clear which PyTorch minor a binary was built against without changing Nelux's PyTorch-first API or bundling torch into the wheel.
+
+---
+
 ### **Version 0.12.9 (2026-06-25)**
 
 #### **Fix: Windows FFmpeg master/shared DLL compatibility**

@@ -89,6 +89,7 @@ def main() -> int:
 
     print(
         f"[smoke] nelux={nelux.__version__} "
+        f"torch_abi={getattr(nelux, '__torch_abi__', '?')} "
         f"cuda_support={getattr(nelux, '__cuda_support__', '?')} "
         f"torch={torch.__version__}",
         flush=True,

@@ -210,6 +210,7 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
 try:
     from ._nelux import (
         __version__,
+        __torch_abi__,
         __cuda_support__,
         VideoReader as _VideoReaderBase,
         VideoEncoder,
@@ -248,6 +249,15 @@ except ImportError as e:
         ) from e
     raise
 
+_torch_version = sys.modules["torch"].__version__.split("+", 1)[0].split(".")[:2]
+_torch_abi = ".".join(_torch_version)
+if __torch_abi__ != "unknown" and _torch_abi != __torch_abi__:
+    raise ImportError(
+        f"This Nelux wheel was built for PyTorch {__torch_abi__}.x, "
+        f"but the imported PyTorch is {sys.modules['torch'].__version__}. "
+        "Install the Nelux wheel tagged for your PyTorch minor version."
+    )
+
 # Import batch mixin
 from .batch import BatchMixin
 
@@ -279,6 +289,7 @@ class VideoReader(BatchMixin, _VideoReaderBase):
 
 __all__ = [
     "__version__",
+    "__torch_abi__",
     "__cuda_support__",
     "VideoReader",
     "VideoEncoder",

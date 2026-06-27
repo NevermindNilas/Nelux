@@ -353,6 +353,12 @@ if(NELUX_BUILD_PYTHON)
   if(_torch_result EQUAL 0 AND EXISTS "${TORCH_PACKAGE_DIR}")
     set(NELUX_PYTORCH_LIBDIR "${TORCH_PACKAGE_DIR}/lib")
     set(NELUX_PYTORCH_INCLUDEDIR "${TORCH_PACKAGE_DIR}/include")
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE}
+              -c "import torch; v=torch.__version__.split('+', 1)[0].split('.')[:2]; print('.'.join(v))"
+      OUTPUT_VARIABLE NELUX_TORCH_ABI
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
     
     # Main headers: torch/include and torch/include/torch/csrc/api/include
     include_directories(
@@ -364,6 +370,7 @@ if(NELUX_BUILD_PYTHON)
     
     message(STATUS "Using torch headers: ${NELUX_PYTORCH_INCLUDEDIR}")
     message(STATUS "Using torch libs:    ${NELUX_PYTORCH_LIBDIR}")
+    message(STATUS "Building Nelux against PyTorch ABI: ${NELUX_TORCH_ABI}")
   else()
     message(FATAL_ERROR "PyTorch not found. Run: pip install torch")
   endif()
@@ -561,6 +568,10 @@ if(NELUX_BUILD_PYTHON)
       )
       message(STATUS "MSVC: c10_cuda.dll/torch_cuda.dll delay-loaded — import works on CPU-only PyTorch")
     endif()
+  endif()
+
+  if(NELUX_TORCH_ABI)
+    target_compile_definitions(nelux PRIVATE NELUX_TORCH_ABI="${NELUX_TORCH_ABI}")
   endif()
 
   set_target_properties(nelux PROPERTIES

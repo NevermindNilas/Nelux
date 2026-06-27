@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.10] - 2026-06-27
+
+### Changed
+
+- **PyTorch ABI-labelled wheels.** Release wheels now carry the build-time
+  PyTorch ABI minor in the wheel build tag, e.g.
+  `nelux-0.12.10-212torch-cp313-cp313-win_amd64.whl`, and the extension exposes
+  `nelux.__torch_abi__` so users can see which PyTorch minor the binary was
+  built against.
+
 ## [0.12.9] - 2026-06-25
 
 ### Fixed

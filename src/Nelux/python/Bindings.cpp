@@ -8,6 +8,9 @@
 
 namespace py = pybind11;
 #define PYBIND11_DETAILED_ERROR_MESSAGES
+#ifndef NELUX_TORCH_ABI
+#define NELUX_TORCH_ABI "unknown"
+#endif
 
 // Helper function to convert string to Backend enum
 Backend backendFromString(const std::string& backend_str)
@@ -30,7 +33,8 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.12.9";
+    m.attr("__version__") = "0.12.10";
+    m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -40,8 +44,8 @@ PYBIND11_MODULE(_nelux, m)
 #endif
 
     m.attr("__all__") =
-        py::make_tuple("__version__", "__cuda_support__", "VideoReader", "VideoEncoder",
-                       "set_log_level", "LogLevel");
+        py::make_tuple("__version__", "__torch_abi__", "__cuda_support__",
+                       "VideoReader", "VideoEncoder", "set_log_level", "LogLevel");
     py::enum_<spdlog::level::level_enum>(m, "LogLevel")
         .value("trace", spdlog::level::trace)
         .value("debug", spdlog::level::debug)

@@ -6,6 +6,7 @@ from numpy.typing import NDArray
 from enum import Enum
 
 __version__: str
+__torch_abi__: str
 __cuda_support__: bool
 
 class LogLevel(Enum):
