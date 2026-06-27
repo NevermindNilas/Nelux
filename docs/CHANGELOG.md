@@ -1,4 +1,11 @@
 
+### **Version 0.12.11 (2026-06-27)**
+
+#### **Fix: PyPI RECORD-safe wheel retagging**
+- **Fixed:** The PyTorch ABI wheel retag step now repacks wheels through `wheel unpack` / `wheel pack --build-number` instead of editing zip contents directly. This keeps the `Build` metadata in the correct `WHEEL` header block and regenerates `RECORD` with matching hashes, avoiding PyPI's upcoming strict wheel-content validation warning.
+
+---
+
 ### **Version 0.12.10 (2026-06-27)**
 
 #### **Build: PyTorch ABI-labelled wheels**

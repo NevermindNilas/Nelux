@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.11] - 2026-06-27
+
+### Fixed
+
+- **Wheel RECORD correctness for PyTorch ABI-tagged wheels.** The wheel retag
+  step now uses `wheel unpack`/`wheel pack --build-number` instead of editing
+  wheel zip contents directly, so the `WHEEL` metadata and `RECORD` hashes stay
+  consistent for PyPI's upcoming strict validation.
+
 ## [0.12.10] - 2026-06-27
 
 ### Changed
