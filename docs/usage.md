@@ -10,6 +10,7 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
   - [Constructor Parameters](#constructor-parameters)
   - [Video Properties](#video-properties)
   - [Reading Frames](#reading-frames)
+  - [Motion Vectors](#motion-vectors)
   - [Random Access](#random-access)
   - [Batch Frame Reading](#batch-frame-reading)
   - [Frame Ranges](#frame-ranges)
@@ -172,6 +173,26 @@ with VideoReader("video.mp4") as reader:
         process(frame)
 # Reader automatically cleaned up
 ```
+
+---
+
+### Motion Vectors
+
+```python
+reader = VideoReader("video.mp4", decode_accelerator="cpu")
+
+frame, vectors = reader.read_frame_with_motion_vectors()
+dense_vectors, frame_type = reader.read_motion_vectors()
+last_vectors = reader.motion_vectors
+last_dense_vectors = reader.motion_vectors_array
+```
+
+Each vector is a dict with `source`, `w`, `h`, `src_x`, `src_y`, `dst_x`,
+`dst_y`, `flags`, `motion_x`, `motion_y`, and `motion_scale`. This uses FFmpeg
+decoder side-data; codecs or decoder builds that do not export motion vectors
+return an empty list. `read_motion_vectors()` skips RGB conversion and returns
+an `int32` `[N, 10]` array plus frame type (`I`, `P`, `B`). Dense columns are
+`source, w, h, src_x, src_y, dst_x, dst_y, motion_x, motion_y, motion_scale`.
 
 ---
 

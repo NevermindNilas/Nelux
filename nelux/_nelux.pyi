@@ -128,6 +128,33 @@ class VideoReader:
         """
         ...
 
+    def read_frame_with_motion_vectors(self) -> Tuple[Union[torch.Tensor, NDArray], List[dict]]:
+        """
+        Decode the next frame and return ``(frame, motion_vectors)``.
+        """
+        ...
+
+    def read_motion_vectors(self) -> Tuple[NDArray, str]:
+        """
+        Decode only the next frame's motion-vector side-data.
+        """
+        ...
+
+    @property
+    def motion_vectors(self) -> List[dict]:
+        """Motion vectors exported for the last decoded frame."""
+        ...
+
+    @property
+    def motion_vectors_array(self) -> NDArray:
+        """Motion vectors for the last decoded frame as an int32 [N, 10] array."""
+        ...
+
+    @property
+    def frame_type(self) -> str:
+        """Frame type for the last decoded frame: I, P, B, or empty if unknown."""
+        ...
+
     def reset(self) -> None:
         """
         Reset reader to the beginning or to the start of the set range.

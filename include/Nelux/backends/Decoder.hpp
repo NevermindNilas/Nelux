@@ -22,6 +22,21 @@ class BatchDecoder; // Forward declaration
 class Decoder
 {
   public:
+    struct MotionVector
+    {
+        int32_t source = 0;
+        uint8_t w = 0;
+        uint8_t h = 0;
+        int16_t src_x = 0;
+        int16_t src_y = 0;
+        int16_t dst_x = 0;
+        int16_t dst_y = 0;
+        uint64_t flags = 0;
+        int32_t motion_x = 0;
+        int32_t motion_y = 0;
+        uint16_t motion_scale = 0;
+    };
+
     struct VideoProperties
     {
         std::string codec;
@@ -59,6 +74,8 @@ class Decoder
     // memcpy that decodeNextFrame() performs. Returns an undefined Tensor
     // when no more frames are available.
     virtual torch::Tensor decodeNextFrameTensor(double* frame_timestamp = nullptr);
+    bool decodeNextMotionVectors(double* frame_timestamp = nullptr,
+                                 char* frame_type = nullptr);
 
     // Synchronous, single-threaded decode path: bypasses the producer thread,
     // queue, and mutex entirely. Returns the next decoded frame as a fresh
@@ -155,6 +172,8 @@ class Decoder
     // Batch decoding support
     int64_t get_frame_count();
     virtual torch::Tensor decode_batch(const std::vector<int64_t>& indices);
+    std::vector<MotionVector> getLastMotionVectors() const;
+    char getLastFrameType() const;
 
   protected:
     void initialize(const std::string& filePath);
@@ -165,6 +184,9 @@ class Decoder
     virtual int64_t convertTimestamp(double timestamp) const;
 
     double getFrameTimestamp(AVFrame* frame);
+    std::vector<MotionVector> extractMotionVectors(const AVFrame* frame) const;
+    void setLastMotionVectors(std::vector<MotionVector> vectors);
+    void setLastFrameType(const AVFrame* frame);
 
     std::unique_ptr<nelux::conversion::cpu::AutoToRGBConverter> converter;
     std::unique_ptr<AVFormatContext, AVFormatContextDeleter> formatCtx;
@@ -185,6 +207,8 @@ class Decoder
         std::vector<uint8_t> buffer;        // legacy memcpy path
         torch::Tensor tensor;               // zero-copy path
         double timestamp = 0.0;
+        std::vector<MotionVector> motionVectors;
+        char frameType = '?';
     };
     std::queue<ConvertedFrame> convertedQueue;
     // Pool of pre-sized byte buffers used by preconversion to avoid
@@ -229,6 +253,9 @@ class Decoder
     double timestampOffset_ = 0.0;
     bool timestampOffsetInitialized_ = false;
     int timestampDebugCount_ = 0;
+    std::vector<MotionVector> lastMotionVectors_;
+    mutable std::mutex motionVectorsMutex_;
+    char lastFrameType_ = '?';
 
     virtual void decodingLoop();
     void startDecodingThread();
@@ -289,6 +316,8 @@ class Decoder
         // never touching the torch CPU allocator, so the leak cannot recur.
         std::unique_ptr<uint8_t[]> buffer;
         double timestamp = 0.0;
+        std::vector<MotionVector> motionVectors;
+        char frameType = '?';
     };
     std::map<int64_t, SyncConvertOutEntry> syncConvertOutMap_;
     std::mutex syncConvertWorkMu_;

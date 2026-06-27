@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Motion vector export.** `VideoReader.read_frame_with_motion_vectors()` now
+  returns `(frame, vectors)` using FFmpeg decoder side-data, and
+  `VideoReader.motion_vectors` exposes the vectors for the last decoded frame.
+  Decoders/codecs that do not export motion-vector side-data return an empty
+  list.
+- **Vectors-only motion-vector reads.** `VideoReader.read_motion_vectors()`
+  decodes only the next frame's motion-vector side-data, skipping RGB
+  conversion, and returns `(vectors, frame_type)` where `vectors` is an `int32`
+  `[N, 10]` NumPy array.
+
 ## [0.12.11] - 2026-06-27
 
 ### Fixed

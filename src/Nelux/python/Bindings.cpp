@@ -137,6 +137,16 @@ Args:
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "
              "based on backend).")
+        .def("read_frame_with_motion_vectors", &VideoReader::readFrameWithMotionVectors,
+             "Decode the next frame and return (frame, motion_vectors).")
+        .def("read_motion_vectors", &VideoReader::readMotionVectors,
+             "Decode the next frame's motion vectors only, returning (vectors, frame_type).")
+        .def_property_readonly("motion_vectors", &VideoReader::getMotionVectors,
+             "Motion vectors exported for the last decoded frame.")
+        .def_property_readonly("motion_vectors_array", &VideoReader::getMotionVectorsArray,
+             "Motion vectors for the last decoded frame as an int32 [N,10] array.")
+        .def_property_readonly("frame_type", &VideoReader::getFrameType,
+             "Frame type for the last decoded frame: I, P, B, or empty if unknown.")
         .def_property_readonly("properties", &VideoReader::getProperties)
         .def_property_readonly("width", &VideoReader::getWidth)
         .def_property_readonly("height", &VideoReader::getHeight)

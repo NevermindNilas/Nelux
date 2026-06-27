@@ -83,6 +83,25 @@ print(len(vr))                              # Total frame count
 print(vr.shape)                             # (frames, H, W, 3)
 ```
 
+### Motion Vectors
+
+```python
+from nelux import VideoReader
+
+vr = VideoReader("video.mp4", decode_accelerator="cpu")
+frame, vectors = vr.read_frame_with_motion_vectors()
+dense_vectors, frame_type = vr.read_motion_vectors()
+
+for mv in vectors:
+    print(mv["src_x"], mv["src_y"], "->", mv["dst_x"], mv["dst_y"])
+```
+
+`vectors` is FFmpeg decoder side-data for the frame just decoded. Codecs or
+decoder builds that do not export motion vectors return an empty list. Use
+`read_motion_vectors()` when you only need vectors; it skips RGB conversion and
+returns an `int32` `[N, 10]` array plus frame type (`I`, `P`, `B`). Columns are
+`source, w, h, src_x, src_y, dst_x, dst_y, motion_x, motion_y, motion_scale`.
+
 ### Video Encoding
 
 ```python
@@ -132,6 +151,7 @@ per encoder; a second call raises.
 - **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, 3]` (or `[H, W, 3]` `int16` for >8-bit sources; force_8bit=True clamps to uint8 always). No implicit float conversion — you cast/normalize on your side based on your model's expected input
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
+- **Motion Vector Export**: `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; `read_motion_vectors()` skips RGB conversion and returns a dense `[N, 10]` array plus frame type
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
 
 ### Performance Knobs

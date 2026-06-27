@@ -279,6 +279,90 @@ py::object VideoReader::readFrame()
     return tensorToOutput(frame);
 }
 
+py::tuple VideoReader::readFrameWithMotionVectors()
+{
+    torch::Tensor frame = decodeFrame();
+    if (!frame.defined() || frame.numel() == 0)
+        return py::make_tuple(tensorToOutput(frame), py::list());
+    return py::make_tuple(tensorToOutput(frame), getMotionVectors());
+}
+
+py::tuple VideoReader::readMotionVectors()
+{
+    if (decodeAccelerator != nelux::DecodeAccelerator::CPU)
+        throw std::runtime_error("read_motion_vectors() requires decode_accelerator='cpu'");
+
+    double frame_timestamp = 0.0;
+    char frame_type = '?';
+    bool ok = false;
+    {
+        py::gil_scoped_release release;
+        ok = decoder->decodeNextMotionVectors(&frame_timestamp, &frame_type);
+    }
+    if (!ok)
+        return py::make_tuple(getMotionVectorsArray(), std::string());
+    current_timestamp = frame_timestamp;
+    currentIndex++;
+    return py::make_tuple(getMotionVectorsArray(), std::string(1, frame_type));
+}
+
+py::list VideoReader::getMotionVectors() const
+{
+    py::list result;
+    if (!decoder)
+        return result;
+    for (const auto& mv : decoder->getLastMotionVectors())
+    {
+        py::dict item;
+        item["source"] = mv.source;
+        item["w"] = static_cast<int>(mv.w);
+        item["h"] = static_cast<int>(mv.h);
+        item["src_x"] = mv.src_x;
+        item["src_y"] = mv.src_y;
+        item["dst_x"] = mv.dst_x;
+        item["dst_y"] = mv.dst_y;
+        item["flags"] = mv.flags;
+        item["motion_x"] = mv.motion_x;
+        item["motion_y"] = mv.motion_y;
+        item["motion_scale"] = static_cast<int>(mv.motion_scale);
+        result.append(item);
+    }
+    return result;
+}
+
+py::array_t<int32_t> VideoReader::getMotionVectorsArray() const
+{
+    std::vector<nelux::Decoder::MotionVector> vectors =
+        decoder ? decoder->getLastMotionVectors() : std::vector<nelux::Decoder::MotionVector>();
+    std::vector<py::ssize_t> shape = {
+        static_cast<py::ssize_t>(vectors.size()), static_cast<py::ssize_t>(10)};
+    py::array_t<int32_t> out(shape);
+    auto r = out.mutable_unchecked<2>();
+    for (py::ssize_t i = 0; i < static_cast<py::ssize_t>(vectors.size()); ++i)
+    {
+        const auto& mv = vectors[static_cast<size_t>(i)];
+        r(i, 0) = mv.source;
+        r(i, 1) = mv.w;
+        r(i, 2) = mv.h;
+        r(i, 3) = mv.src_x;
+        r(i, 4) = mv.src_y;
+        r(i, 5) = mv.dst_x;
+        r(i, 6) = mv.dst_y;
+        r(i, 7) = mv.motion_x;
+        r(i, 8) = mv.motion_y;
+        r(i, 9) = mv.motion_scale;
+    }
+    return out;
+}
+
+std::string VideoReader::getFrameType() const
+{
+    if (!decoder)
+        return "";
+    char t = decoder->getLastFrameType();
+    return t == '?' ? "" : std::string(1, t);
+}
+
 py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
 {
     if (!t.defined() || t.numel() == 0)

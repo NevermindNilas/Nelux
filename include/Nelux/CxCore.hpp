@@ -35,6 +35,7 @@ extern "C"
 #include <libavutil/dict.h>
 #include <libavutil/error.h>          // For error codes
 #include <libavutil/imgutils.h>       // For image utilities
+#include <libavutil/motion_vector.h>  // For decoder-exported motion vectors
 #include <libavutil/opt.h>            // For AVOptions
 #include <libavutil/pixfmt.h>         // For pixel formats
 

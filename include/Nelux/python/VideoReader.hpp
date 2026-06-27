@@ -122,6 +122,11 @@ class VideoReader
      * backend).
      */
     py::object readFrame();
+    py::tuple readFrameWithMotionVectors();
+    py::list getMotionVectors() const;
+    py::array_t<int32_t> getMotionVectorsArray() const;
+    py::tuple readMotionVectors();
+    std::string getFrameType() const;
 
     /**
      * @brief Internal method to decode the next frame into the internal tensor buffer.

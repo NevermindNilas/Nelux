@@ -391,6 +391,8 @@ void Decoder::initCodecContext()
                 "thread_type={}",
                 codecCtx->thread_count, codecCtx->thread_type);
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
+    codecCtx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
+    codecCtx->export_side_data |= AV_CODEC_EXPORT_DATA_MVS;
 
     // Allow experimental compliance (needed for some AV1 implementations)
     codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
@@ -522,6 +524,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         {
             *frame_timestamp = cf.timestamp;
         }
+        setLastMotionVectors(std::move(cf.motionVectors));
+        lastFrameType_ = cf.frameType;
 
         if (!buffer)
         {
@@ -558,6 +562,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             *frame_timestamp = getFrameTimestamp(frame.get());
         }
 
+        setLastMotionVectors(extractMotionVectors(frame.get()));
+        setLastFrameType(frame.get());
         converter->convert(frame, buffer);
         return true;
     }
@@ -592,6 +598,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
                 SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
                     *frame_timestamp = e.timestamp;
+                setLastMotionVectors(std::move(e.motionVectors));
+                lastFrameType_ = e.frameType;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
                 // Wake producer in case it was throttled on in-flight cap.
@@ -631,6 +639,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
 
         if (frame_timestamp)
             *frame_timestamp = cf.timestamp;
+        setLastMotionVectors(std::move(cf.motionVectors));
+        lastFrameType_ = cf.frameType;
 
         if (cf.tensor.defined())
         {
@@ -668,6 +678,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
     if (frame_timestamp)
         *frame_timestamp = getFrameTimestamp(frame.get());
 
+    setLastMotionVectors(extractMotionVectors(frame.get()));
+    setLastFrameType(frame.get());
     const int elemSize =
         (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
     const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
@@ -740,6 +752,8 @@ void Decoder::syncConvertWorkerLoop()
         SyncConvertOutEntry entry;
         entry.buffer = acquireOutputBuffer(nbytes);
         entry.timestamp = getFrameTimestamp(w.frame.get());
+        entry.motionVectors = extractMotionVectors(w.frame.get());
+        entry.frameType = av_get_picture_type_char(w.frame.get()->pict_type);
         local_converter->convert(w.frame, entry.buffer.get());
 
         {
@@ -901,6 +915,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             {
                 if (frame_timestamp)
                     *frame_timestamp = getFrameTimestamp(f);
+                setLastMotionVectors(extractMotionVectors(f));
+                setLastFrameType(f);
                 const int elemSize =
                     (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
                 const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
@@ -939,6 +955,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
                     *frame_timestamp = e.timestamp;
+                setLastMotionVectors(std::move(e.motionVectors));
+                lastFrameType_ = e.frameType;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
                 lk.unlock();
@@ -1319,6 +1337,122 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     NELUX_WARN("Frame has no valid timestamp. Returning -1.0");
     return -1.0;
 }
+
+bool Decoder::decodeNextMotionVectors(double* frame_timestamp, char* frame_type)
+{
+    if (decodingThread.joinable())
+    {
+        stopDecodingThread();
+        stopSyncConvertWorkers();
+        clearQueue();
+    }
+    if (syncDrained_)
+    {
+        setLastMotionVectors({});
+        lastFrameType_ = '?';
+        return false;
+    }
+
+    AVFrame* f = syncFrame_.get();
+    while (true)
+    {
+        while (!syncEofReached_)
+        {
+            int rret = av_read_frame(formatCtx.get(), pkt.get());
+            if (rret < 0)
+            {
+                syncEofReached_ = true;
+                break;
+            }
+            if (pkt->stream_index != videoStreamIndex)
+            {
+                av_packet_unref(pkt.get());
+                continue;
+            }
+            int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
+            av_packet_unref(pkt.get());
+            if (sret == AVERROR(EAGAIN))
+                break;
+            if (sret < 0)
+            {
+                syncDrained_ = true;
+                setLastMotionVectors({});
+                lastFrameType_ = '?';
+                return false;
+            }
+            break;
+        }
+        if (syncEofReached_ && !syncFlushSent_)
+        {
+            avcodec_send_packet(codecCtx.get(), nullptr);
+            syncFlushSent_ = true;
+        }
+
+        int ret = avcodec_receive_frame(codecCtx.get(), f);
+        if (ret == 0)
+        {
+            if (frame_timestamp)
+                *frame_timestamp = getFrameTimestamp(f);
+            setLastMotionVectors(extractMotionVectors(f));
+            setLastFrameType(f);
+            if (frame_type)
+                *frame_type = lastFrameType_;
+            av_frame_unref(f);
+            return true;
+        }
+        if (ret == AVERROR_EOF || ret != AVERROR(EAGAIN))
+        {
+            syncDrained_ = true;
+            setLastMotionVectors({});
+            lastFrameType_ = '?';
+            return false;
+        }
+    }
+}
+
+std::vector<Decoder::MotionVector>
+Decoder::extractMotionVectors(const AVFrame* frame) const
+{
+    std::vector<MotionVector> out;
+    const AVFrameSideData* sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
+    if (!sd || sd->size <= 0)
+        return out;
+
+    const int count = sd->size / static_cast<int>(sizeof(AVMotionVector));
+    const auto* vectors = reinterpret_cast<const AVMotionVector*>(sd->data);
+    out.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i)
+    {
+        const AVMotionVector& mv = vectors[i];
+        out.push_back(MotionVector{mv.source, mv.w, mv.h, mv.src_x, mv.src_y,
+                                   mv.dst_x, mv.dst_y, mv.flags, mv.motion_x,
+                                   mv.motion_y, mv.motion_scale});
+    }
+    return out;
+}
+
+void Decoder::setLastMotionVectors(std::vector<MotionVector> vectors)
+{
+    std::lock_guard<std::mutex> lock(motionVectorsMutex_);
+    lastMotionVectors_ = std::move(vectors);
+}
+
+std::vector<Decoder::MotionVector> Decoder::getLastMotionVectors() const
+{
+    std::lock_guard<std::mutex> lock(motionVectorsMutex_);
+    return lastMotionVectors_;
+}
+
+void Decoder::setLastFrameType(const AVFrame* frame)
+{
+    lastFrameType_ = av_get_picture_type_char(frame->pict_type);
+}
+
+char Decoder::getLastFrameType() const
+{
+    return lastFrameType_;
+}
 void Decoder::setForce8Bit(bool enabled)
 {
     force_8bit = enabled;
@@ -1596,6 +1730,8 @@ void Decoder::decodingLoop()
             {
                 ConvertedFrame cf;
                 cf.timestamp = getFrameTimestamp(localFrame.get());
+                cf.motionVectors = extractMotionVectors(localFrame.get());
+                cf.frameType = av_get_picture_type_char(localFrame.get()->pict_type);
                 const int elemSize =
                     (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
                 if (convertedFrameBytes == 0)
