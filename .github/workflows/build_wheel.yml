@@ -213,13 +213,20 @@ jobs:
           # inflating the wheel ~100 MB. We scan BOTH torch/lib and the CUDA
           # toolkit bin because the dep walker may pick up either copy depending
           # on PATH ordering, and they may have different minor versions.
+          # NOTE: c10.dll is deliberately NOT excluded -- it is bundled into the
+          # wheel so the torch-free NumPy backend imports and decodes with PyTorch
+          # not installed. c10.dll cannot be delay-loaded (data-symbol import,
+          # LNK1194) and depends only on the system CRT, so it is self-contained.
+          # torch_cpu/torch_python/torch are delay-loaded and resolved from the
+          # user's own PyTorch install when the PyTorch backend runs, so they stay
+          # excluded (must match the user's torch ABI).
           $CudaPatterns = @(
             "cudart64_*.dll", "nvrtc64_*.dll", "nvrtc-builtins64_*.dll",
             "cufft64_*.dll", "curand64_*.dll", "cusolver64_*.dll",
             "cusparse64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll",
             "cudnn*64_*.dll", "nvToolsExt64_*.dll", "caffe2_nvrtc.dll",
             "torch.dll", "torch_cpu.dll", "torch_cuda.dll",
-            "torch_python.dll", "c10.dll", "c10_cuda.dll", "shm.dll"
+            "torch_python.dll", "c10_cuda.dll", "shm.dll"
           )
           $ScanDirs = @($TorchLib)
           if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
