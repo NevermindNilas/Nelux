@@ -129,11 +129,14 @@ class VideoReader
     std::string getFrameType() const;
 
     /**
-     * @brief Internal method to decode the next frame into the internal tensor buffer.
+     * @brief Internal method to decode the next frame.
      *
-     * @return torch::Tensor The decoded frame as torch::Tensor (internal use).
+     * Returns the frame already wrapped as a Python object (torch.Tensor for the
+     * PyTorch backend, numpy.ndarray for the NumPy backend), or py::none() at
+     * EOF. Keeping the backend branch here lets the NumPy CPU path avoid ever
+     * constructing a torch::Tensor, so it references no torch/c10 symbol.
      */
-    torch::Tensor decodeFrame();
+    py::object decodeFrame();
 
     /**
      * @brief Seek to a specific timestamp in the video.
@@ -381,6 +384,17 @@ class VideoReader
     {
         return (properties.fps > 0.0) ? 1.0 / properties.fps : 0.0;
     }
+
+    // True when the main decoder runs the synchronous frame-threaded CPU path
+    // (no async producer). Seeking such a context via avcodec_flush_buffers
+    // trips an internal FFmpeg assertion, so iter() skips redundant flush-seeks
+    // here. The NumPy backend always forces sync mode (see the constructor), so
+    // it counts as sync regardless of the prefetch flag.
+    bool isCpuSyncPath() const
+    {
+        return decodeAccelerator == nelux::DecodeAccelerator::CPU &&
+               (!prefetch || backend == Backend::NumPy);
+    }
     std::shared_ptr<nelux::Decoder> rand_decoder;
 
     torch::Tensor makeLikeOutputTensor() const;
@@ -398,20 +412,33 @@ class VideoReader
     py::object tensorToOutput(const torch::Tensor& t) const;
 
     /**
+     * @brief Wrap a raw pooled RGB byte buffer as a numpy.ndarray (HWC), zero-copy
+     * and torch-free (pybind11 only; a capsule delete[]s the buffer on GC). Used
+     * exclusively by the NumPy backend.
+     */
+    py::object bufferToNumpy(std::unique_ptr<uint8_t[]> buf) const;
+
+    /**
+     * @brief Backend-appropriate empty frame (EOF sentinel surfaced to Python):
+     * an empty (0, W, 3) numpy array for NumPy, an undefined tensor for PyTorch.
+     */
+    py::object emptyFrame() const;
+
+    /**
      * @brief Internal method to decode frame at timestamp using rand_decoder.
      *
      * @param timestamp_seconds Timestamp in seconds.
-     * @return torch::Tensor The decoded frame.
+     * @return py::object The decoded frame (torch.Tensor or numpy.ndarray).
      */
-    torch::Tensor decodeFrameAt(double timestamp_seconds);
+    py::object decodeFrameAt(double timestamp_seconds);
 
     /**
      * @brief Internal method to decode frame at index using rand_decoder.
      *
      * @param frame_index Frame index.
-     * @return torch::Tensor The decoded frame.
+     * @return py::object The decoded frame (torch.Tensor or numpy.ndarray).
      */
-    torch::Tensor decodeFrameAt(int frame_index);
+    py::object decodeFrameAt(int frame_index);
 
     // Member variables
     std::shared_ptr<nelux::Decoder> decoder;
@@ -435,7 +462,7 @@ class VideoReader
     int rangeFrameLimit_ = -1;
     int rangeFramesEmitted_ = 0;
     // List of filters to be added before initialization
-    torch::Tensor bufferedFrame; // The "first valid" frame, if we found it early
+    py::object bufferedFrame; // The "first valid" frame, if we found it early
     bool hasBufferedFrame = false;
 
     // Lazy loading support
