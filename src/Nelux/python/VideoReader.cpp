@@ -99,7 +99,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             tensor = torch::empty(
                 {properties.height, properties.width, 3},
                 torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-            CHECK_TENSOR(*tensor);
+            CHECK_TENSOR((*tensor));
 
             NELUX_INFO("VideoReader initialized with HWC format, dtype={}",
                        torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
