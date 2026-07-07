@@ -190,6 +190,7 @@ per encoder; a second call raises.
 
 - **Hardware Acceleration**: NVDEC (decode) and NVENC (encode) on NVIDIA GPUs
 - **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, 3]` (or `[H, W, 3]` `int16` for >8-bit sources; force_8bit=True clamps to uint8 always). No implicit float conversion — you cast/normalize on your side based on your model's expected input
+- **RGB or Grayscale Output**: `color_format="rgb"` (default) or `color_format="gray"` for single-channel `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only. Grayscale input is likewise accepted by `encode_frame` (`[H, W, 1]` or `[H, W]`), replicated to RGB for the encoder — pair with `pixel_format="gray"` for a monochrome encode
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
 - **Motion Vector Export**: `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; `read_motion_vectors()` skips RGB conversion and returns a dense `[N, 10]` array plus frame type. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
@@ -289,6 +290,7 @@ VideoReader(
     resize: tuple[int, int] | None = None,         # decoder-side scale to (W, H)
     prefetch: bool = False,                        # background producer thread
     convert_workers: int | None = None,            # None = min(hw, 16); 0 = polite
+    color_format: Literal["rgb", "gray"] = "rgb",  # "gray" = [H, W, 1] luma (CPU only)
 )
 ```
 

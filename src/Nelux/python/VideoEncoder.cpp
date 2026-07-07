@@ -149,16 +149,52 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         throw std::runtime_error("Encoder is not initialized");
 
     // Validate input size up front, while the GIL is still held so this raises
-    // as a clean Python exception. encode_frame copies exactly width*height*3
-    // bytes from the tensor; a smaller tensor would read out of bounds in the
-    // staging memcpy / GPU normalize. Reject anything whose element count
-    // doesn't match the configured HWC RGB24 frame.
-    const int64_t expectedElems = static_cast<int64_t>(width) * height * 3;
-    if (frame.numel() != expectedElems)
+    // as a clean Python exception. The convert pipeline consumes exactly
+    // width*height*3 RGB bytes; accept either a 3-channel HWC RGB frame or a
+    // single-channel grayscale frame (H*W, shape H×W or H×W×1). A grayscale
+    // frame is replicated to RGB below so the rest of the pipeline is unchanged
+    // (R==G==B => the encoder sees neutral chroma / exact luma).
+    const int64_t rgbElems = static_cast<int64_t>(width) * height * 3;
+    const int64_t grayElems = static_cast<int64_t>(width) * height;
+    const bool grayInput = (frame.numel() == grayElems);
+    if (frame.numel() != rgbElems && !grayInput)
         throw std::invalid_argument(
             "encode_frame: tensor has " + std::to_string(frame.numel()) +
-            " elements, expected " + std::to_string(expectedElems) + " (" +
-            std::to_string(height) + "x" + std::to_string(width) + "x3 HWC RGB)");
+            " elements, expected " + std::to_string(rgbElems) + " (" +
+            std::to_string(height) + "x" + std::to_string(width) +
+            "x3 HWC RGB) or " + std::to_string(grayElems) + " (" +
+            std::to_string(height) + "x" + std::to_string(width) +
+            " grayscale)");
+
+    // The element count alone does not pin down the layout: a CHW [3,H,W] frame,
+    // a transposed [W,H], or a mismatched-but-equal-area shape would pass the
+    // count check and then be memcpy'd as HWC, producing scrambled output.
+    // Require the documented HWC layout — [H,W,3], [H,W,1], or [H,W] — while
+    // still accepting a flat 1-D buffer (count already validated) for callers
+    // that pass raw contiguous bytes.
+    {
+        const int64_t d = frame.dim();
+        bool shapeOk = false;
+        if (d == 1)
+            shapeOk = true;
+        else if (d == 2)
+            shapeOk = (frame.size(0) == height && frame.size(1) == width);
+        else if (d == 3)
+            shapeOk = (frame.size(0) == height && frame.size(1) == width &&
+                       (frame.size(2) == 3 || frame.size(2) == 1));
+        if (!shapeOk)
+        {
+            std::string got;
+            for (int64_t i = 0; i < d; ++i)
+                got += (i ? "x" : "") + std::to_string(frame.size(i));
+            throw std::invalid_argument(
+                "encode_frame: expected HWC layout [" + std::to_string(height) +
+                "x" + std::to_string(width) + "x3], [" + std::to_string(height) +
+                "x" + std::to_string(width) + "x1], or [" +
+                std::to_string(height) + "x" + std::to_string(width) +
+                "] (grayscale); got shape [" + got + "]");
+        }
+    }
 
 #ifdef NELUX_ENABLE_CUDA
     // Free GPU tensors retired by the submit thread, here while pybind still
@@ -176,7 +212,44 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
 #endif
 
     py::gil_scoped_release release;
-    
+
+    // Grayscale input: replicate the single luma channel into a fresh 3-channel
+    // RGB tensor so the rest of the pipeline is unchanged (R==G==B). Uses only
+    // .to()/.contiguous()/torch::empty plus a raw byte fill (no torch reshape/
+    // expand/repeat) to keep the interleave explicit and cheap. The result is a
+    // CPU tensor, so a grayscale frame handed to an NVENC encoder takes the
+    // CPU-stage -> hwupload path instead of the zero-copy GPU path; RGB input
+    // keeps the fast path.
+    if (grayInput)
+    {
+        torch::Tensor g = frame;
+        if (g.device().is_cuda())
+            g = g.to(torch::kCPU);
+        if (g.dtype() == torch::kFloat16 || g.dtype() == torch::kFloat32)
+            g = (g.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+        else if (g.scalar_type() == torch::ScalarType::UInt16)
+            g = (g.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
+        else if (g.dtype() != torch::kUInt8)
+            g = g.to(torch::kUInt8);
+        if (!g.is_contiguous())
+            g = g.contiguous();
+
+        torch::Tensor rgb = torch::empty(
+            {height, width, 3},
+            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+        const uint8_t* src = g.data_ptr<uint8_t>();
+        uint8_t* dst = rgb.data_ptr<uint8_t>();
+        const int64_t n = static_cast<int64_t>(width) * height;
+        for (int64_t i = 0; i < n; ++i)
+        {
+            const uint8_t v = src[i];
+            dst[3 * i + 0] = v;
+            dst[3 * i + 1] = v;
+            dst[3 * i + 2] = v;
+        }
+        frame = rgb;
+    }
+
 #ifdef NELUX_ENABLE_CUDA
     // GPU path: tensor already on CUDA and the encoder is NVENC -> keep the
     // whole pipeline on the GPU (zero-copy). The caller only does the GPU dtype

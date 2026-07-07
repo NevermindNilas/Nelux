@@ -46,6 +46,12 @@ class AutoToRGBConverter
 
     void setForce8Bit(bool enabled) { force_8bit = enabled; }
 
+    // Select grayscale output (single-channel GRAY8 / GRAY16LE) instead of the
+    // default 3-channel RGB24 / RGB48LE. libswscale derives luma from the
+    // source colorspace/range exactly as it does for the RGB path, so the
+    // grayscale plane is BT.601/709-correct rather than a naive channel average.
+    void setGrayscale(bool enabled) { grayscale_ = enabled; }
+
     // Set decoder-side output dimensions. Pass (0, 0) to disable (use source dims).
     // When both are > 0, sws_scale will resize the frame to these dimensions and
     // the RGB-passthrough fast path is bypassed.
@@ -101,8 +107,9 @@ class AutoToRGBConverter
             src_color_range = AVCOL_RANGE_MPEG;
 
         // 1.8) Fast-path for RGB24 input. Direct memcpy per row — no swscale
-        // overhead, no libyuv dep. Skip when resizing.
-        if (!resize_active && bit_depth <= 8 && src_fmt == AV_PIX_FMT_RGB24)
+        // overhead, no libyuv dep. Skip when resizing or when grayscale output
+        // is requested (RGB24 -> GRAY8 still needs a luma conversion).
+        if (!resize_active && !grayscale_ && bit_depth <= 8 && src_fmt == AV_PIX_FMT_RGB24)
         {
             uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
             int dst_stride = width * 3;
@@ -115,12 +122,15 @@ class AutoToRGBConverter
         }
 
         // 2) Choose destination format/stride accordingly
-        // If force_8bit is true, we want RGB24 regardless of input bit depth.
-        // Otherwise, preserve >8-bit sources by using RGB48LE.
+        // If force_8bit is true, we want 8-bit output regardless of input bit
+        // depth. Otherwise, preserve >8-bit sources with a 16-bit output.
+        // grayscale_ picks the single-channel GRAY variant of each.
+        const bool eightBit = (bit_depth <= 8 || force_8bit);
         const AVPixelFormat dst_fmt =
-            (bit_depth <= 8 || force_8bit) ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_RGB48LE;
-        const int elem_size = (bit_depth <= 8 || force_8bit) ? 1 : 2; // bytes per channel
-        const int channels = 3;
+            grayscale_ ? (eightBit ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_GRAY16LE)
+                       : (eightBit ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_RGB48LE);
+        const int elem_size = eightBit ? 1 : 2; // bytes per channel
+        const int channels = grayscale_ ? 1 : 3;
 
 
         // 3) (Re)build sws context if anything changed
@@ -221,6 +231,7 @@ class AutoToRGBConverter
     int last_out_width, last_out_height;
     bool force_8bit;
     int out_width, out_height;
+    bool grayscale_ = false;
 };
 
 } // namespace cpu

@@ -33,7 +33,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.13.0";
+    m.attr("__version__") = "0.14.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Expose CUDA build status
@@ -65,7 +65,8 @@ PYBIND11_MODULE(_nelux, m)
                     const std::string& backend, const std::string& decode_accelerator,
                     int cuda_device_index,
                     std::optional<std::pair<int, int>> resize, bool prefetch,
-                    std::optional<int> convert_workers)
+                    std::optional<int> convert_workers,
+                    const std::string& color_format)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -94,7 +95,7 @@ PYBIND11_MODULE(_nelux, m)
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
-                         cuda_device_index, rw, rh, prefetch, cw);
+                         cuda_device_index, rw, rh, prefetch, cw, color_format);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
@@ -102,6 +103,7 @@ PYBIND11_MODULE(_nelux, m)
              py::arg("decode_accelerator") = "cpu", py::arg("cuda_device_index") = 0,
              py::arg("resize") = py::none(), py::arg("prefetch") = false,
              py::arg("convert_workers") = py::none(),
+             py::arg("color_format") = "rgb",
              R"doc(Open a video file for reading.
 
 Args:
@@ -133,6 +135,12 @@ Args:
         pass 0 to disable the worker pool entirely (single-threaded convert, polite
         mode that matches torchcodec's CPU footprint at the cost of fanout fps).
         Smaller values lower CPU usage with a corresponding fps drop.
+    color_format (str, optional): Output color format. "rgb" (default) returns a
+        3-channel HWC RGB frame; "gray" (aliases: "grayscale", "l") returns a
+        single-channel HWC luma frame (shape H×W×1), derived from the source
+        colorspace/range by libswscale (BT.601/709-correct, not a naive channel
+        average). Grayscale is CPU-decode only (decode_accelerator="cpu") and is
+        not supported by decode_batch().
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

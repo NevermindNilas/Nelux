@@ -38,16 +38,21 @@ inline std::shared_ptr<Decoder>
 createDecoder(const std::string& filename, int numThreads,
               DecodeAccelerator accelerator = DecodeAccelerator::CPU,
               int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
-              bool syncMode = false)
+              bool syncMode = false, bool grayscale = false)
 {
     switch (accelerator)
     {
         case DecodeAccelerator::CPU:
+            // Grayscale must be configured before the CPU decoder's producer
+            // thread can start (it starts inside the ctor's initialize() when
+            // syncMode is false), so it is passed into the ctor rather than set
+            // afterward — otherwise the producer races on the channel count.
             if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
-                    filename, numThreads, resizeWidth, resizeHeight, syncMode);
+                    filename, numThreads, resizeWidth, resizeHeight, syncMode,
+                    grayscale);
             return std::make_shared<nelux::backends::cpu::Decoder>(
-                filename, numThreads, syncMode);
+                filename, numThreads, syncMode, grayscale);
 
         case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA

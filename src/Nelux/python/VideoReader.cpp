@@ -1,5 +1,6 @@
 // Python/VideoReader.cpp
 #include "python/VideoReader.hpp"
+#include <algorithm> // For std::transform
 #include <cstring> // For std::memcpy
 #include <iostream>
 #include <cmath>
@@ -24,7 +25,8 @@ namespace py = pybind11;
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
                          int cuda_device_index, int resizeWidth, int resizeHeight,
-                         bool prefetch, int convertWorkers)
+                         bool prefetch, int convertWorkers,
+                         const std::string& color_format)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -49,6 +51,30 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         throw std::invalid_argument(
             "resize must be a (width, height) pair with both > 0, or (0, 0) to disable");
 
+    // Resolve the output color format. "rgb" (default) = 3-channel HWC RGB;
+    // "gray"/"grayscale" = single-channel HWC luma. Grayscale is a CPU-decode
+    // feature: the NVDEC fused-convert kernels only emit RGB, so reject the
+    // combination up front rather than silently returning RGB.
+    {
+        std::string cf = color_format;
+        std::transform(cf.begin(), cf.end(), cf.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (cf == "rgb" || cf == "rgb24" || cf.empty())
+            grayscale_ = false;
+        else if (cf == "gray" || cf == "grey" || cf == "grayscale" ||
+                 cf == "greyscale" || cf == "gray8" || cf == "l")
+            grayscale_ = true;
+        else
+            throw std::invalid_argument(
+                "Unknown color_format: '" + color_format +
+                "'. Valid options: 'rgb', 'gray'.");
+    }
+    outChannels_ = grayscale_ ? 1 : 3;
+    if (grayscale_ && decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        throw std::invalid_argument(
+            "color_format='gray' is only supported with decode_accelerator='cpu'; "
+            "NVDEC decode outputs RGB.");
+
     try
     {
         torch::Device torchDevice =
@@ -63,9 +89,13 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // Set decode_accelerator='cpu' explicitly to opt into software decode.
         const bool syncMode =
             !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
+        // Grayscale is passed into createDecoder so the CPU decoder configures
+        // its channel count before the producer thread can start (avoids a race
+        // on the channel count when prefetch=true). grayscale_ is only ever true
+        // for the CPU path (NVDEC + grayscale is rejected above).
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
-            resizeWidth_, resizeHeight_, syncMode);
+            resizeWidth_, resizeHeight_, syncMode, grayscale_);
         decoder->setForce8Bit(force_8bit);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
@@ -86,7 +116,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // - Native bit depth preserved
         torch::Dtype torchDataType = findTypeFromBitDepth();
         tensor = torch::empty(
-            {properties.height, properties.width, 3},
+            {properties.height, properties.width, outChannels_},
             torch::TensorOptions().dtype(torchDataType).device(torchDevice));
         CHECK_TENSOR(tensor);
         
@@ -370,8 +400,13 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         // Return empty tensor/array based on backend with proper shape
         if (backend == Backend::NumPy)
         {
-            // Return an empty numpy array with the expected shape (0, width, 3)
-            return py::array(py::dtype::of<uint8_t>(), {0, properties.width, 3});
+            // Match the dtype of non-empty frames: uint16 for >8-bit sources
+            // (unless force_8bit), else uint8 — so the EOF sentinel doesn't
+            // silently differ from the frames that preceded it.
+            const bool sixteen = (!force_8bit && properties.bitDepth > 8);
+            py::dtype dt =
+                sixteen ? py::dtype::of<uint16_t>() : py::dtype::of<uint8_t>();
+            return py::array(dt, {0, properties.width, outChannels_});
         }
         return py::cast(torch::Tensor());
     }
@@ -453,7 +488,7 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
 torch::Tensor VideoReader::makeLikeOutputTensor() const
 {
     return torch::empty(
-        {properties.height, properties.width, 3},
+        {properties.height, properties.width, outChannels_},
         torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
 }
 
@@ -684,9 +719,12 @@ void VideoReader::ensureRandDecoder()
         // async fanout producer instead routes every frame to the convert-worker
         // map (syncConvertOutMap_, only decodeNextFrameTensor reads it), so those
         // queues never fill and frame_at() deadlocks. Sync mode disables fanout.
+        // Match the main decoder's channel count (caller buffers are sized for
+        // outChannels_). Passed into the ctor for the same reason as the main
+        // decoder — no post-construction channel switch.
         rand_decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_, /*syncMode=*/true);
+            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_);
         rand_decoder->setForce8Bit(force_8bit);
     }
 }
@@ -1145,6 +1183,14 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
             "decode_batch is not supported when resize is configured on the "
             "VideoReader. Create a reader without the resize argument for batch "
             "decoding, or call frame_at() in a loop.");
+    }
+
+    if (grayscale_)
+    {
+        throw std::runtime_error(
+            "decode_batch is not supported with color_format='gray'. Use "
+            "read_frame()/frame_at() for grayscale decoding, or create the reader "
+            "with the default color_format='rgb' for batch decoding.");
     }
 
     // Use the main decoder for batch operations

@@ -50,6 +50,7 @@ class VideoReader:
         resize: Optional[Tuple[int, int]] = None,
         prefetch: bool = False,
         convert_workers: Optional[int] = None,
+        color_format: Literal["rgb", "gray"] = "rgb",
     ) -> None:
         """
         Open a video file for reading.
@@ -79,6 +80,11 @@ class VideoReader:
                 pin the pool size; pass 0 to disable the pool (single-threaded convert,
                 polite mode that matches torchcodec's CPU footprint at the cost of
                 fanout fps). Smaller values lower CPU usage with a corresponding fps drop.
+            color_format (str, optional): Output color format. "rgb" (default) returns a
+                3-channel HWC RGB frame; "gray" (aliases: "grayscale", "l") returns a
+                single-channel HWC luma frame (shape H×W×1), derived from the source
+                colorspace/range by libswscale. Grayscale is CPU-decode only
+                (decode_accelerator="cpu") and is not supported by decode_batch().
         """
         ...
 
@@ -256,7 +262,12 @@ class VideoEncoder:
 
     def encode_frame(self, frame: torch.Tensor) -> None:
         """
-        Encode one video frame HWC, 3-channel, uint8 tensor).
+        Encode one video frame (HWC uint8 tensor).
+
+        Accepts either a 3-channel RGB frame (H×W×3) or a single-channel
+        grayscale frame (H×W or H×W×1). Grayscale input is replicated to RGB
+        internally, so pair it with ``pixel_format="gray"`` for a true
+        grayscale (monochrome) encode, or any YUV format for neutral chroma.
         """
         ...
 

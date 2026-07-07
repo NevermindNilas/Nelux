@@ -96,6 +96,16 @@ class Decoder
     void setForce8Bit(bool enabled);
     int getBitDepth() const;
 
+    // Select the decoded output color format. false (default) = 3-channel RGB;
+    // true = single-channel grayscale (GRAY8 / GRAY16LE). Must be called before
+    // the first decode call (after construction, like setForce8Bit): it
+    // reconfigures the converter and the pooled buffer geometry. CPU path only —
+    // the NVDEC decoder does not override this.
+    void setColorFormat(bool grayscale);
+
+    // Number of output channels (1 grayscale / 3 RGB) currently configured.
+    int getOutputChannels() const { return outChannels_; }
+
     // Prefetch control API
     /**
      * @brief Set the prefetch buffer size (max frames to decode ahead).
@@ -197,6 +207,11 @@ class Decoder
     VideoProperties properties;
     Frame frame;
     bool force_8bit = false;
+    // Output color format. 3-channel RGB by default; grayscale_ selects a
+    // single-channel GRAY plane. outChannels_ mirrors it for buffer/tensor
+    // geometry so every convert path stays channel-count agnostic.
+    bool grayscale_ = false;
+    int outChannels_ = 3;
 
     std::thread decodingThread;
     std::atomic<bool> stopDecoding{false};
