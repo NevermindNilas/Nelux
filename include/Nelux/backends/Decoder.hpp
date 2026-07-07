@@ -84,13 +84,6 @@ class Decoder
     // decoder before any decode call.
     virtual torch::Tensor decodeNextFrameTensorSync(double* frame_timestamp = nullptr);
 
-    // Torch-free sibling of decodeNextFrameTensorSync used by the NumPy backend.
-    // Drives the codec single-threaded (no worker pool, no torch::Tensor) and
-    // returns the converted RGB frame as a raw pooled byte buffer, or nullptr at
-    // EOF. Lets the NumPy path decode without touching any torch/c10 symbol so
-    // `import nelux` works with PyTorch absent (torch DLLs are delay-loaded).
-    std::unique_ptr<uint8_t[]> decodeNextFrameBufferSync(double* frame_timestamp = nullptr);
-
     // Toggle synchronous decode mode. When true, the producer thread is never
     // started; callers must use decodeNextFrameTensorSync(). Must be set
     // before the first decode call.

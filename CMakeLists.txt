@@ -539,32 +539,6 @@ if(NELUX_BUILD_PYTHON)
       endif()
     endforeach()
     message(STATUS "MSVC: FFmpeg DLLs will be delay-loaded for version flexibility")
-
-    # Delay-load the core PyTorch runtime (torch_cpu/c10/torch_python) so the
-    # module IMPORTS even when PyTorch is not installed at all. The NumPy backend
-    # decodes through a fully torch-free path (VideoReader's decodeNextFrameBufferSync
-    # / bufferToNumpy), so none of these symbols is referenced unless the caller
-    # actually selects the PyTorch backend (or NVDEC) and requests a frame -- at
-    # which point the delay-load thunk resolves them from the user's installed
-    # torch. Without this they are eager import-table entries and `import nelux`
-    # fails with WinError 126 when torch is absent. torch.dll carries no
-    # referenced symbols in the import table; it is listed defensively (benign
-    # LNK4199 if unused). delayimp.lib is linked just above.
-    #
-    # NOTE (Linux): the equivalent decoupling would require lazy/-z-now-off
-    # binding of libtorch_cpu/libc10; not attempted here. On Linux torch remains
-    # a load-time (DT_NEEDED) dependency.
-    # NOTE: c10.dll CANNOT be delay-loaded -- libtorch headers reference a c10
-    # *data* symbol (e.g. caffe2::detail ...metadata_index), and the delay-load
-    # thunk mechanism only intercepts function imports, not data imports
-    # (LNK1194). So c10.dll stays a load-time dependency; torch_cpu/torch_python/
-    # torch are delay-loaded and resolve only when the PyTorch backend runs.
-    target_link_options(nelux PRIVATE
-      "/DELAYLOAD:torch_cpu.dll"
-      "/DELAYLOAD:torch_python.dll"
-      "/DELAYLOAD:torch.dll"
-    )
-    message(STATUS "MSVC: torch_cpu/torch_python/torch delay-loaded (c10.dll stays load-time: data-symbol import)")
   endif()
 
   if(NELUX_ENABLE_CUDA)
@@ -714,27 +688,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     endif()
   else()
     message(STATUS "NELUX_BUNDLE_FFMPEG_DLLS=OFF, skipping FFmpeg runtime DLL bundling")
-  endif()
-
-  # Bundle c10.dll -- the ONE torch runtime DLL that cannot be delay-loaded (it
-  # is referenced via a data symbol, see the /DELAYLOAD block above). Shipping it
-  # inside the wheel lets the NumPy backend import and decode with PyTorch NOT
-  # installed at all. c10.dll depends only on the system CRT (no other torch DLL),
-  # so it is fully self-contained. torch_cpu/torch_python are delay-loaded and
-  # resolved from the user's own PyTorch install when the PyTorch backend runs,
-  # so they are intentionally NOT bundled (and must match the wheel's torch ABI).
-  if(NELUX_PYTORCH_LIBDIR)
-    # NELUX_PYTORCH_LIBDIR comes from torch.__path__ and may use native (back)slashes;
-    # normalize to a CMake path so the generated install script doesn't choke on
-    # backslash escapes (e.g. '\N' in D:\Nelux...).
-    file(TO_CMAKE_PATH "${NELUX_PYTORCH_LIBDIR}/c10.dll" _nelux_c10_dll)
-    if(EXISTS "${_nelux_c10_dll}")
-      list(APPEND NELUX_DLLS "${_nelux_c10_dll}")
-      message(STATUS "Bundling c10.dll for the torch-free NumPy backend: ${_nelux_c10_dll}")
-    else()
-      message(WARNING "c10.dll not found at '${_nelux_c10_dll}'; the NumPy backend "
-                      "will require c10.dll on the DLL search path at runtime")
-    endif()
   endif()
 
   # Deduplicate in case multiple glob sources overlap
