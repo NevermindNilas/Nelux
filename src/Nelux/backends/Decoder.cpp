@@ -1089,6 +1089,77 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
     }
 }
 
+std::unique_ptr<uint8_t[]> Decoder::decodeNextFrameBufferSync(double* frame_timestamp)
+{
+    // Torch-free single-threaded decode used by the NumPy backend. Mirrors the
+    // worker-count==0 fallback of decodeNextFrameTensorSync but writes the
+    // converted RGB into a pooled raw buffer instead of a torch::Tensor, so no
+    // torch/c10 symbol is referenced on this path.
+    if (syncDrained_)
+        return nullptr;
+
+    AVFrame* f = syncFrame_.get();
+    while (true)
+    {
+        while (!syncEofReached_)
+        {
+            int rret = av_read_frame(formatCtx.get(), pkt.get());
+            if (rret < 0)
+            {
+                syncEofReached_ = true;
+                break;
+            }
+            if (pkt->stream_index != videoStreamIndex)
+            {
+                av_packet_unref(pkt.get());
+                continue;
+            }
+            int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
+            av_packet_unref(pkt.get());
+            if (sret == AVERROR(EAGAIN))
+                break;
+            if (sret < 0)
+            {
+                syncDrained_ = true;
+                return nullptr;
+            }
+            break;
+        }
+        if (syncEofReached_ && !syncFlushSent_)
+        {
+            avcodec_send_packet(codecCtx.get(), nullptr);
+            syncFlushSent_ = true;
+        }
+        int ret = avcodec_receive_frame(codecCtx.get(), f);
+        if (ret == 0)
+        {
+            if (frame_timestamp)
+                *frame_timestamp = getFrameTimestamp(f);
+            setLastMotionVectors(extractMotionVectors(f));
+            setLastFrameType(f);
+            const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
+            const size_t nbytes = static_cast<size_t>(properties.width) *
+                                  static_cast<size_t>(properties.height) * 3 *
+                                  static_cast<size_t>(elemSize);
+            std::unique_ptr<uint8_t[]> buf = acquireOutputBuffer(nbytes);
+            if (converter)
+                converter->convert(syncFrame_, buf.get());
+            av_frame_unref(f);
+            return buf;
+        }
+        if (ret == AVERROR_EOF)
+        {
+            syncDrained_ = true;
+            return nullptr;
+        }
+        if (ret != AVERROR(EAGAIN))
+        {
+            syncDrained_ = true;
+            return nullptr;
+        }
+    }
+}
+
 bool Decoder::seekFrame(int frameIndex)
 {
     NELUX_TRACE("Seeking to frame index: {}", frameIndex);

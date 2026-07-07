@@ -61,8 +61,12 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // for hardware decode and silent fallback has historically masked
         // configuration mistakes (wrong device, missing codec support, etc.).
         // Set decode_accelerator='cpu' explicitly to opt into software decode.
+        // The NumPy backend always uses the torch-free synchronous buffer path
+        // (decodeNextFrameBufferSync), so force sync mode for NumPy+CPU
+        // regardless of prefetch (the async producer fills torch::Tensors).
         const bool syncMode =
-            !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
+            decodeAccelerator == nelux::DecodeAccelerator::CPU &&
+            (!prefetch || backend == Backend::NumPy);
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
             resizeWidth_, resizeHeight_, syncMode);
@@ -80,18 +84,30 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
 
         properties = decoder->getVideoProperties();
 
-        // Always use HWC format with native dtype (uint8/int16):
-        // - No BCHW conversion
-        // - No floating point conversion
-        // - Native bit depth preserved
-        torch::Dtype torchDataType = findTypeFromBitDepth();
-        tensor = torch::empty(
-            {properties.height, properties.width, 3},
-            torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-        CHECK_TENSOR(tensor);
-        
-        NELUX_INFO("VideoReader initialized with HWC format, dtype={}", 
-                   torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
+        // The shared torch::Tensor is only used by the PyTorch backend and the
+        // NVDEC path (in-place GPU write). Allocating it calls torch::empty (a
+        // torch_cpu symbol) which would break `import nelux` when PyTorch is
+        // absent, so the NumPy CPU path skips it entirely and stays torch-free.
+        if (backend == Backend::PyTorch ||
+            decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        {
+            // Always use HWC format with native dtype (uint8/int16):
+            // - No BCHW conversion
+            // - No floating point conversion
+            // - Native bit depth preserved
+            torch::Dtype torchDataType = findTypeFromBitDepth();
+            tensor = torch::empty(
+                {properties.height, properties.width, 3},
+                torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+            CHECK_TENSOR((*tensor));
+
+            NELUX_INFO("VideoReader initialized with HWC format, dtype={}",
+                       torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
+        }
+        else
+        {
+            NELUX_INFO("VideoReader initialized (NumPy backend, torch-free CPU path)");
+        }
     }
     catch (const std::exception& ex)
     {
@@ -218,11 +234,43 @@ void VideoReader::setRangeByTimestamps(double startTime, double endTime)
     NELUX_INFO("Timestamp range set: start_time={}, end_time={}", start_time, end_time);
 }
 
-torch::Tensor VideoReader::decodeFrame()
+py::object VideoReader::decodeFrame()
 {
     NELUX_TRACE("decodeFrame() called");
-    py::gil_scoped_release release; // Release GIL before calling decoder
 
+    // ---- NumPy backend, CPU decode: fully torch-free raw-buffer path. ----
+    // Decodes into a pooled uint8 buffer and wraps it as a numpy array without
+    // ever constructing a torch::Tensor, so no torch/c10 symbol is touched.
+    if (backend == Backend::NumPy &&
+        decodeAccelerator == nelux::DecodeAccelerator::CPU)
+    {
+        double frame_timestamp = 0.0;
+        std::unique_ptr<uint8_t[]> buf;
+        {
+            py::gil_scoped_release release;
+            try
+            {
+                buf = decoder->decodeNextFrameBufferSync(&frame_timestamp);
+            }
+            catch (const std::exception& ex)
+            {
+                NELUX_ERROR("decodeFrame(): decoder failed: {}", ex.what());
+                throw;
+            }
+        }
+        if (!buf)
+        {
+            NELUX_WARN("Decoding failed or no more frames available");
+            return py::none();
+        }
+        current_timestamp = frame_timestamp;
+        currentIndex++;
+        NELUX_TRACE("Frame decoded (numpy) index={}, timestamp={}", currentIndex - 1,
+                    current_timestamp);
+        return bufferToNumpy(std::move(buf));
+    }
+
+    // ---- PyTorch backend / NVDEC: torch::Tensor path. ----
     double frame_timestamp = 0.0;
     bool success = false;
     torch::Tensor outTensor;  // populated by zero-copy CPU path
@@ -232,33 +280,36 @@ torch::Tensor VideoReader::decodeFrame()
     // masked configuration errors and silently switched output devices/tensor
     // layouts under the caller's feet. Use decode_accelerator='cpu' to opt in
     // to software decode explicitly.
-    try
     {
-        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        py::gil_scoped_release release; // Release GIL before calling decoder
+        try
         {
-            outTensor = prefetch
-                            ? decoder->decodeNextFrameTensor(&frame_timestamp)
-                            : decoder->decodeNextFrameTensorSync(&frame_timestamp);
-            success = outTensor.defined();
+            if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+            {
+                outTensor = prefetch
+                                ? decoder->decodeNextFrameTensor(&frame_timestamp)
+                                : decoder->decodeNextFrameTensorSync(&frame_timestamp);
+                success = outTensor.defined();
+            }
+            else
+            {
+                // NVDEC / hardware path: in-place write into shared CUDA tensor.
+                success = decoder->decodeNextFrame(tensor->data_ptr(), &frame_timestamp);
+            }
         }
-        else
+        catch (const std::exception& ex)
         {
-            // NVDEC / hardware path: in-place write into shared CUDA tensor.
-            success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+            NELUX_ERROR("decodeFrame(): decoder failed: {}. "
+                        "Set decode_accelerator='cpu' to use software decode.",
+                        ex.what());
+            throw;
         }
     }
-    catch (const std::exception& ex)
-    {
-        NELUX_ERROR("decodeFrame(): decoder failed: {}. "
-                    "Set decode_accelerator='cpu' to use software decode.",
-                    ex.what());
-        throw;
-    }
-    
+
     if (!success)
     {
         NELUX_WARN("Decoding failed or no more frames available");
-        return torch::Tensor(); // Return an empty tensor if decoding failed
+        return py::none();
     }
 
     // Update current timestamp
@@ -269,22 +320,52 @@ torch::Tensor VideoReader::decodeFrame()
                 current_timestamp);
     // CPU path returns a per-frame tensor (zero-copy from decoder pool).
     // GPU path still returns the shared `tensor` member.
-    return outTensor.defined() ? outTensor : tensor;
+    return tensorToOutput(outTensor.defined() ? outTensor : *tensor);
+}
+
+py::object VideoReader::emptyFrame() const
+{
+    if (backend == Backend::NumPy)
+        return py::array(py::dtype::of<uint8_t>(),
+                         {static_cast<py::ssize_t>(0),
+                          static_cast<py::ssize_t>(properties.width),
+                          static_cast<py::ssize_t>(3)});
+    return py::cast(torch::Tensor());
+}
+
+py::object VideoReader::bufferToNumpy(std::unique_ptr<uint8_t[]> buf) const
+{
+    const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
+    py::dtype dt =
+        (elemSize == 1) ? py::dtype::of<uint8_t>() : py::dtype::of<uint16_t>();
+    std::vector<py::ssize_t> shape = {static_cast<py::ssize_t>(properties.height),
+                                      static_cast<py::ssize_t>(properties.width),
+                                      static_cast<py::ssize_t>(3)};
+    std::vector<py::ssize_t> strides = {
+        static_cast<py::ssize_t>(properties.width) * 3 * elemSize,
+        static_cast<py::ssize_t>(3) * elemSize,
+        static_cast<py::ssize_t>(elemSize)};
+    // Hand the buffer to a capsule that delete[]s it when the array is GC'd.
+    // Each decoded frame owns a distinct buffer (acquireOutputBuffer), so this
+    // zero-copy view never aliases a later frame.
+    uint8_t* raw = buf.release();
+    py::capsule base(raw, [](void* p) { delete[] static_cast<uint8_t*>(p); });
+    return py::array(dt, shape, strides, raw, base);
 }
 
 py::object VideoReader::readFrame()
 {
     NELUX_TRACE("readFrame() called");
-    torch::Tensor frame = decodeFrame();
-    return tensorToOutput(frame);
+    py::object frame = decodeFrame();
+    return frame.is_none() ? emptyFrame() : frame;
 }
 
 py::tuple VideoReader::readFrameWithMotionVectors()
 {
-    torch::Tensor frame = decodeFrame();
-    if (!frame.defined() || frame.numel() == 0)
-        return py::make_tuple(tensorToOutput(frame), py::list());
-    return py::make_tuple(tensorToOutput(frame), getMotionVectors());
+    py::object frame = decodeFrame();
+    if (frame.is_none())
+        return py::make_tuple(emptyFrame(), py::list());
+    return py::make_tuple(frame, getMotionVectors());
 }
 
 py::tuple VideoReader::readMotionVectors()
@@ -454,7 +535,7 @@ torch::Tensor VideoReader::makeLikeOutputTensor() const
 {
     return torch::empty(
         {properties.height, properties.width, 3},
-        torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+        torch::TensorOptions().dtype(tensor->dtype()).device(tensor->device()));
 }
 
 bool VideoReader::seek(double timestamp)
@@ -583,11 +664,11 @@ py::object VideoReader::operator[](py::object key)
         // forward jump).
         if (diff_frames >= 0 && diff_sec <= smart_seek_threshold_sec)
         {
-            torch::Tensor f;
+            py::object f = py::none();
             for (long long i = 0; i <= diff_frames; ++i)
             {
                 f = decodeFrame();
-                if (!f.defined() || f.numel() == 0)
+                if (f.is_none())
                 {
                     throw std::runtime_error(
                         "Failed to decode frame near index " + std::to_string(req) +
@@ -595,7 +676,7 @@ py::object VideoReader::operator[](py::object key)
                         ")");
                 }
             }
-            return tensorToOutput(f);
+            return f;
         }
 
         // Fallback to random decoder
@@ -624,7 +705,7 @@ py::object VideoReader::operator[](py::object key)
                     ? static_cast<int>(properties.fps * smart_seek_threshold_sec) + 8
                     : 150;
 
-            torch::Tensor f;
+            py::object f = py::none();
             for (int i = 0; i < cap; ++i)
             {
                 // If we are already close enough, we might need a frame?
@@ -637,11 +718,11 @@ py::object VideoReader::operator[](py::object key)
 
                 // For now, let's keep it simple: if we are close, just decode.
                 f = decodeFrame();
-                if (!f.defined() || f.numel() == 0)
+                if (f.is_none())
                     break;
 
                 if (current_timestamp + 1e-9 >= ts - half)
-                    return tensorToOutput(f);
+                    return f;
             }
             // If loop fails, fall back
         }
@@ -691,7 +772,7 @@ void VideoReader::ensureRandDecoder()
     }
 }
 
-torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
+py::object VideoReader::decodeFrameAt(double timestamp_seconds)
 {
     ensureRandDecoder();
     if (!rand_decoder)
@@ -712,11 +793,48 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         }
     }
 
-    // 2. Decode forward until we reach the requested timestamp
-    torch::Tensor out_frame;
-    double hit_ts = -1.0;
     const double half = 0.5 * ((properties.fps > 0) ? 1.0 / properties.fps : 0.0);
     int safety = 0, cap = static_cast<int>(properties.fps * 3) + 16;
+
+    // ---- NumPy backend, CPU: torch-free raw-buffer random access. ----
+    // decodeNextFrame(void*) writes converted RGB into a caller buffer, so no
+    // torch::Tensor is needed for the random-access path either.
+    if (backend == Backend::NumPy &&
+        decodeAccelerator == nelux::DecodeAccelerator::CPU)
+    {
+        const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
+        const size_t nbytes = static_cast<size_t>(properties.width) *
+                              static_cast<size_t>(properties.height) * 3 *
+                              static_cast<size_t>(elemSize);
+        std::unique_ptr<uint8_t[]> buf(new uint8_t[nbytes]);
+        while (true)
+        {
+            double ts = 0.0;
+            bool ok;
+            {
+                py::gil_scoped_release release;
+                ok = rand_decoder->decodeNextFrame(buf.get(), &ts);
+            }
+            if (!ok)
+                break;
+            if (ts + 1e-9 >= timestamp_seconds - half)
+            {
+                NELUX_DEBUG("decodeFrameAt(numpy): hit ts={}", ts);
+                return bufferToNumpy(std::move(buf));
+            }
+            if (++safety > cap)
+            {
+                NELUX_WARN("decodeFrameAt(): safety cap hit while advancing to ts={}",
+                           timestamp_seconds);
+                break;
+            }
+        }
+        throw std::runtime_error("Failed to decode frame at requested timestamp");
+    }
+
+    // ---- PyTorch backend / NVDEC: torch::Tensor path. ----
+    torch::Tensor out_frame;
+    double hit_ts = -1.0;
 
     // Allocate buffer once outside the loop
     torch::Tensor buf = makeLikeOutputTensor();
@@ -752,10 +870,10 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         throw std::runtime_error("Failed to decode frame at requested timestamp");
 
     NELUX_DEBUG("decodeFrameAt(): hit ts={}", hit_ts);
-    return out_frame;
+    return tensorToOutput(out_frame);
 }
 
-torch::Tensor VideoReader::decodeFrameAt(int frame_index)
+py::object VideoReader::decodeFrameAt(int frame_index)
 {
     NELUX_TRACE("decodeFrameAt(index={}) using rand_decoder", frame_index);
 
@@ -768,14 +886,12 @@ torch::Tensor VideoReader::decodeFrameAt(int frame_index)
 
 py::object VideoReader::frameAt(double timestamp_seconds)
 {
-    torch::Tensor frame = decodeFrameAt(timestamp_seconds);
-    return tensorToOutput(frame);
+    return decodeFrameAt(timestamp_seconds);
 }
 
 py::object VideoReader::frameAt(int frame_index)
 {
-    torch::Tensor frame = decodeFrameAt(frame_index);
-    return tensorToOutput(frame);
+    return decodeFrameAt(frame_index);
 }
 
 bool VideoReader::seekToFrame(int frame_number)
@@ -817,7 +933,7 @@ VideoReader& VideoReader::iter()
     // Reset iterator state
     currentIndex = 0;
     current_timestamp = 0.0;
-    bufferedFrame = torch::Tensor(); // Clear any old buffered frame
+    bufferedFrame = py::object(); // Clear any old buffered frame
     hasBufferedFrame = false;
 
     if (start_time >= 0.0 && end_time > 0.0)
@@ -843,8 +959,7 @@ VideoReader& VideoReader::iter()
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
         }
-        else if (start_time <= 0.0 &&
-                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (start_time <= 0.0 && isCpuSyncPath())
         {
             // CPU sync path: seeking flushes a frame-threaded codec context and
             // trips an internal FFmpeg assertion (see the no-range branch). The
@@ -868,8 +983,8 @@ VideoReader& VideoReader::iter()
         while (true)
         {
             // Attempt to decode a frame
-            torch::Tensor f = decodeFrame();
-            if (!f.defined() || f.numel() == 0)
+            py::object f = decodeFrame();
+            if (f.is_none())
             {
                 // No more frames, or decode error
                 NELUX_WARN("Ran out of frames while discarding up to start_time={}",
@@ -908,7 +1023,7 @@ VideoReader& VideoReader::iter()
             currentIndex = 0;
             current_timestamp = 0.0;
         }
-        else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (isCpuSyncPath())
         {
             // The CPU sync path uses a frame-threaded codec context; seeking it
             // (which flushes the decoder via avcodec_flush_buffers) is unsafe
@@ -925,8 +1040,8 @@ VideoReader& VideoReader::iter()
             current_timestamp = 0.0;
             for (int i = 0; i < start_frame; ++i)
             {
-                torch::Tensor f = decodeFrame();
-                if (!f.defined() || f.numel() == 0)
+                py::object f = decodeFrame();
+                if (f.is_none())
                 {
                     NELUX_WARN("Ran out of frames while discarding up to "
                                "start_frame={} (stopped at index {})",
@@ -960,7 +1075,7 @@ VideoReader& VideoReader::iter()
         // trips an internal assertion. Since iter() at this branch is only
         // hit when no range is set and we have not decoded anything yet,
         // skipping the seek-to-zero is correct.
-        if (!(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch))
+        if (!isCpuSyncPath())
         {
             bool success = seek(0.0);
             if (!success)
@@ -987,7 +1102,7 @@ py::object VideoReader::next()
     }
 
     // If we have a buffered frame from the discard loop, consume it first.
-    torch::Tensor frame;
+    py::object frame;
     if (hasBufferedFrame)
     {
         frame = bufferedFrame;
@@ -998,7 +1113,7 @@ py::object VideoReader::next()
     {
         // Otherwise decode the next frame
         frame = decodeFrame();
-        if (!frame.defined() || frame.numel() == 0)
+        if (frame.is_none())
         {
             NELUX_INFO("No more frames available (decode returned empty).");
             throw py::stop_iteration();
@@ -1038,7 +1153,7 @@ py::object VideoReader::next()
     {
         rangeFramesEmitted_++;
     }
-    return tensorToOutput(frame);
+    return frame;
 }
 
 void VideoReader::enter()
@@ -1236,21 +1351,26 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     start_time = -1.0;
     end_time = -1.0;
     
-    // Reallocate tensor if dimensions changed (always use BCHW format)
-    torch::Device torchDevice = tensor.device();
-    torch::Dtype torchDataType = findMLTypeFromBitDepth();
-    
-    if (tensor.size(2) != properties.height || 
-        tensor.size(3) != properties.width ||
-        tensor.dtype() != torchDataType)
+    // Reallocate tensor if dimensions changed (always use BCHW format). Only the
+    // PyTorch/NVDEC backends allocate the shared tensor; the NumPy CPU path
+    // leaves it disengaged (torch-free), so skip this entirely there.
+    if (tensor.has_value())
     {
-        tensor = torch::empty(
-            {1, 3, properties.height, properties.width},
-            torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-        NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)", 
-                    properties.width, properties.height);
+        torch::Device torchDevice = tensor->device();
+        torch::Dtype torchDataType = findMLTypeFromBitDepth();
+
+        if (tensor->size(2) != properties.height ||
+            tensor->size(3) != properties.width ||
+            tensor->dtype() != torchDataType)
+        {
+            tensor = torch::empty(
+                {1, 3, properties.height, properties.width},
+                torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+            NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)",
+                        properties.width, properties.height);
+        }
     }
-    
+
     NELUX_INFO("VideoReader reconfigured successfully for: {}", newFilePath);
 }
 

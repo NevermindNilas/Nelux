@@ -6,29 +6,57 @@ Nelux - High-performance video decoding and encoding library.
 import os
 import sys
 import ctypes
+import importlib.util
 from typing import Dict, List
 
-# Check for PyTorch first
-if "torch" not in sys.modules:
-    raise ImportError(
-        "PyTorch must be imported before Nelux.\n"
-        "Add this before importing nelux:\n"
-        "  import torch"
-    )
+# NOTE: PyTorch is NOT required to import nelux. The compiled extension
+# delay-loads the torch runtime DLLs (torch_cpu/c10/torch_python), so `import
+# nelux` succeeds even when PyTorch is not installed. torch is imported lazily
+# only when the PyTorch decode backend (or NVDEC) is actually used and a frame
+# is requested -- see _ensure_torch() and VideoReader below. The NumPy backend
+# is fully torch-free.
+
+
+def _find_torch_lib_dir() -> "str | None":
+    """Locate the installed torch's ``lib`` directory WITHOUT importing torch.
+
+    ``find_spec`` reads torch's module spec but never executes its ``__init__``,
+    so this does not pull torch into ``sys.modules``. Returns None when torch is
+    not installed (the NumPy backend needs no torch)."""
+    try:
+        spec = importlib.util.find_spec("torch")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.origin:
+        return None
+    lib_dir = os.path.join(os.path.dirname(spec.origin), "lib")
+    return lib_dir if os.path.isdir(lib_dir) else None
+
 
 # Setup DLL paths on Windows
 if os.name == "nt":
     package_dir = os.path.dirname(os.path.abspath(__file__))
     libs_dir = os.path.join(package_dir, "nelux.libs")
 
+    # torch's lib dir is added best-effort so the delay-loaded torch DLLs resolve
+    # if/when the PyTorch backend is used. Absent torch -> skipped (NumPy works).
+    _torch_lib_dir = _find_torch_lib_dir()
+
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(package_dir)
         if os.path.exists(libs_dir):
             os.add_dll_directory(libs_dir)
+        if _torch_lib_dir:
+            try:
+                os.add_dll_directory(_torch_lib_dir)
+            except OSError:
+                pass
     else:
         path_entries = [package_dir]
         if os.path.exists(libs_dir):
             path_entries.append(libs_dir)
+        if _torch_lib_dir:
+            path_entries.append(_torch_lib_dir)
         os.environ["PATH"] = ";".join(path_entries) + ";" + os.environ["PATH"]
 
 
@@ -249,16 +277,42 @@ except ImportError as e:
         ) from e
     raise
 
-_torch_version = sys.modules["torch"].__version__.split("+", 1)[0].split(".")[:2]
-_torch_abi = ".".join(_torch_version)
-if __torch_abi__ != "unknown" and _torch_abi != __torch_abi__:
-    raise ImportError(
-        f"This Nelux wheel was built for PyTorch {__torch_abi__}.x, "
-        f"but the imported PyTorch is {sys.modules['torch'].__version__}. "
-        "Install the Nelux wheel tagged for your PyTorch minor version."
-    )
+_torch_abi_verified = False
 
-# Import batch mixin
+
+def _ensure_torch():
+    """Import PyTorch lazily and verify ABI compatibility, once.
+
+    Called only when the PyTorch decode backend (or NVDEC) is actually used, so
+    a pure NumPy workflow never triggers a torch import. Raises a clear error if
+    torch is missing or its minor version does not match the ABI this wheel was
+    built against.
+    """
+    global _torch_abi_verified
+    try:
+        import torch
+    except ImportError as e:
+        raise ImportError(
+            "The PyTorch backend requires PyTorch, but it is not installed.\n"
+            "Install a matching PyTorch build, or use the torch-free NumPy "
+            "backend:\n"
+            "    nelux.VideoReader(path, backend='numpy')"
+        ) from e
+
+    if not _torch_abi_verified:
+        _torch_abi_verified = True
+        if __torch_abi__ != "unknown":
+            _tv = torch.__version__.split("+", 1)[0].split(".")[:2]
+            if ".".join(_tv) != __torch_abi__:
+                raise ImportError(
+                    f"This Nelux wheel was built for PyTorch {__torch_abi__}.x, "
+                    f"but the installed PyTorch is {torch.__version__}. "
+                    "Install the Nelux wheel tagged for your PyTorch minor version."
+                )
+    return torch
+
+
+# Import batch mixin (torch-free at import time; batch.py imports torch lazily)
 from .batch import BatchMixin
 
 
@@ -266,17 +320,28 @@ class VideoReader(BatchMixin, _VideoReaderBase):
     """VideoReader with batch frame reading support."""
 
     def __init__(self, *args, **kwargs):
-        # NVDEC needs a CUDA-capable, *active* PyTorch. The CUDA runtime is
-        # delay-loaded so the module imports on CPU-only torch; guard here so
-        # requesting nvdec on a CPU/GPU-less torch raises a clear error up front
-        # instead of failing deep in the decoder. torch.cuda.is_available() is
-        # safe on CPU torch (returns False without needing c10_cuda).
+        # Resolve backend/accelerator WITHOUT importing torch. Positional order:
+        # input_path, num_threads, force_8bit, backend, decode_accelerator, ...
+        backend = kwargs.get("backend")
+        if backend is None and len(args) >= 4:
+            backend = args[3]
+        backend = backend if isinstance(backend, str) else "pytorch"
+
         accel = kwargs.get("decode_accelerator")
         if accel is None and len(args) >= 5:
-            accel = args[4]  # input_path, num_threads, force_8bit, backend, decode_accelerator
-        if isinstance(accel, str) and accel.lower() == "nvdec":
-            import torch
+            accel = args[4]
+        accel = accel if isinstance(accel, str) else "cpu"
 
+        is_numpy = backend.lower() == "numpy"
+        is_nvdec = accel.lower() == "nvdec"
+
+        if is_nvdec:
+            # NVDEC needs a CUDA-capable, *active* PyTorch regardless of output
+            # backend. The CUDA runtime is delay-loaded so the module imports on
+            # CPU-only torch; guard here so requesting nvdec on a CPU/GPU-less
+            # torch raises a clear error up front instead of failing deep in the
+            # decoder. torch.cuda.is_available() is safe on CPU torch.
+            torch = _ensure_torch()
             if not torch.cuda.is_available():
                 raise RuntimeError(
                     "decode_accelerator='nvdec' requires a CUDA-enabled PyTorch "
@@ -284,7 +349,17 @@ class VideoReader(BatchMixin, _VideoReaderBase):
                     "(CPU-only PyTorch or no NVIDIA GPU). Use "
                     "decode_accelerator='cpu', or install a CUDA build of PyTorch."
                 )
+        elif not is_numpy:
+            # PyTorch output backend on CPU: the C++ constructor allocates a
+            # torch::Tensor and frames are returned as torch.Tensor, so torch
+            # must be imported (and ABI-checked) before decoding starts. The
+            # NumPy backend is intentionally skipped here and stays torch-free.
+            _ensure_torch()
+
         super().__init__(*args, **kwargs)
+        # Remember the resolved backend so BatchMixin.get_batch can stay
+        # torch-free for the NumPy backend (a Python-subclass __dict__ attr).
+        self._nelux_backend = "numpy" if is_numpy else "pytorch"
 
 
 __all__ = [
