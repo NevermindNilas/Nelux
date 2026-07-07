@@ -678,9 +678,15 @@ void VideoReader::ensureRandDecoder()
         // No silent NVDEC->CPU fallback for the random-access decoder either.
         // A failure here surfaces as a hard error consistent with the main
         // decoder path; use decode_accelerator='cpu' for software decode.
+        //
+        // Force sync mode. Random access decodes one frame at a time via
+        // decodeNextFrame(void*), which drains convertedQueue/frameQueue. The
+        // async fanout producer instead routes every frame to the convert-worker
+        // map (syncConvertOutMap_, only decodeNextFrameTensor reads it), so those
+        // queues never fill and frame_at() deadlocks. Sync mode disables fanout.
         rand_decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_);
+            resizeWidth_, resizeHeight_, /*syncMode=*/true);
         rand_decoder->setForce8Bit(force_8bit);
     }
 }

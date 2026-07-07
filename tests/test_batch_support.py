@@ -175,7 +175,6 @@ class TestBatchEdgeCases:
 class TestBatchVsSequential:
     """Test that batch results match sequential frame_at calls."""
 
-    @pytest.mark.skip(reason="frame_at secondary decoder hangs in this environment")
     def test_consistency_with_frame_at(self):
         """Verify batch decode matches sequential frame_at."""
         vr = VideoReader(VIDEO_PATH)
