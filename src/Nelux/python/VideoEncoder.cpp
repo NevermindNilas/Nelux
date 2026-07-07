@@ -460,6 +460,16 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
 
     py::gil_scoped_release release;
 
+    // Serialize the whole verbatim path: it lazily inits grayRgbConverter_ (a
+    // non-thread-safe SwsContext) and drives the single stateful encoder, so two
+    // Python threads calling encode_frame concurrently must not overlap here.
+    std::lock_guard<std::mutex> lk(mu);
+
+    // Mark that encoding has begun, mirroring the async path's workersStarted
+    // flag, so add_passthrough() (which must precede the first frame) is
+    // rejected consistently on gray-output encoders too.
+    workersStarted = true;
+
     if (frame.device().is_cuda())
         frame = frame.to(torch::kCPU);
 
@@ -470,6 +480,9 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
     f.get()->width = width;
     f.get()->height = height;
     f.get()->color_range = AVCOL_RANGE_JPEG;
+    // Let Encoder::encodeFrame assign a strictly-increasing pts (matches the
+    // async path, which forces NOPTS on recycled frames).
+    f.get()->pts = AV_NOPTS_VALUE;
     f.allocateBuffer(32);
     uint8_t* dst = f.getData(0);
     const int stride = f.getLineSize(0);
@@ -481,7 +494,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
         {
             // 8-bit output: keep 8-bit samples verbatim. Float [0,1] scales to
             // 0-255; a 16-bit source is downscaled uniformly (v*255/65535).
-            if (g.dtype() == torch::kFloat16 || g.dtype() == torch::kFloat32)
+            if (g.is_floating_point())
                 g = (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
             else if (g.scalar_type() == torch::ScalarType::UInt16)
                 g = (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
@@ -498,7 +511,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
             // 16-bit output: preserve full precision. Float [0,1] -> 0-65535;
             // an 8-bit source is promoted exactly (v*257); a 16-bit source is
             // stored verbatim.
-            if (g.dtype() == torch::kFloat16 || g.dtype() == torch::kFloat32)
+            if (g.is_floating_point())
                 g = (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
             else if (g.dtype() == torch::kUInt8)
                 g = g.to(torch::kInt32) * 257;
@@ -525,7 +538,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
         // range) with swscale. This path is 8-bit (RGB24 source); grayscale
         // *data* callers should feed a single-channel frame for full precision.
         torch::Tensor rgb = frame;
-        if (rgb.dtype() == torch::kFloat16 || rgb.dtype() == torch::kFloat32)
+        if (rgb.is_floating_point())
             rgb = (rgb.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
         else if (rgb.dtype() != torch::kUInt8)
             rgb = rgb.clamp(0, 255).to(torch::kUInt8);

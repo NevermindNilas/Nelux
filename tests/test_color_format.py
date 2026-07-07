@@ -182,6 +182,28 @@ def test_gray16_float_depth_roundtrip():
     assert torch.equal(got, exp), "float depth -> gray16le not exact"
 
 
+def test_gray16_float64_depth_scaled():
+    """float64 (torch.double) depth input is scaled to full 16-bit like float32
+    (must not fall through unscaled)."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, "verbatim_depth64.mkv")
+    h, w = 48, 64
+    depth = torch.linspace(0, 1, h * w, dtype=torch.float64).reshape(h, w)
+    enc = VideoEncoder(out, codec="ffv1", width=w, height=h, fps=1,
+                       pixel_format="gray16le")
+    enc.encode_frame(depth)
+    enc.close()
+
+    frame = next(iter(VideoReader(out, color_format="gray")))
+    got = frame[..., 0].to(torch.int64)
+    # The encoder scales in float32; match that to avoid float64/float32
+    # boundary-rounding differences of 1 LSB.
+    exp = (depth.to(torch.float32) * 65535).round().clamp(0, 65535).to(torch.int64)
+    # not collapsed to 0/1, and spans the full range
+    assert got.max().item() >= 65000, "float64 depth was not scaled to 16-bit"
+    assert torch.equal(got, exp), "float64 depth -> gray16le not exact"
+
+
 def test_encode_rejects_wrong_layout():
     """A CHW [3,H,W] frame has the right element count but wrong layout."""
     os.makedirs(OUT_DIR, exist_ok=True)
