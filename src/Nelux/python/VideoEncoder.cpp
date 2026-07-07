@@ -113,7 +113,10 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
         }
     }
 
-    // Range follows pixfmt. YUVJ* implies full range (JPEG); rest is limited.
+    // Range follows pixfmt. YUVJ* and grayscale imply full range (JPEG); rest
+    // is limited. Grayscale is treated as a data plane (depth maps, masks): its
+    // values are stored verbatim/full-range, not squeezed into video luma's
+    // 16-235, so a round-trip is exact rather than BT.601-compressed.
     if (props.colorRange == AVCOL_RANGE_UNSPECIFIED)
     {
         const bool isFullRangePixFmt =
@@ -121,7 +124,8 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
              props.pixelFormat == AV_PIX_FMT_YUVJ422P ||
              props.pixelFormat == AV_PIX_FMT_YUVJ444P ||
              props.pixelFormat == AV_PIX_FMT_YUVJ440P ||
-             props.pixelFormat == AV_PIX_FMT_YUVJ411P);
+             props.pixelFormat == AV_PIX_FMT_YUVJ411P ||
+             isGrayVerbatimPixfmt(props.pixelFormat));
         props.colorRange = isFullRangePixFmt ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     }
 
@@ -194,6 +198,17 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
                 std::to_string(height) + "x" + std::to_string(width) +
                 "] (grayscale); got shape [" + got + "]");
         }
+    }
+
+    // Verbatim grayscale data path: when the output pixel format is a plain
+    // single-plane gray format the codec actually accepts, fill it directly
+    // (full-range, up to 16-bit) instead of funnelling through the 8-bit RGB24
+    // convert pipeline. Runs synchronously — grayscale/data output is not the
+    // throughput-critical path — so it never mixes with the async submit thread.
+    if (isGrayVerbatimPixfmt(outputPixelFormat))
+    {
+        encodeGrayVerbatim(frame);
+        return;
     }
 
 #ifdef NELUX_ENABLE_CUDA
@@ -433,6 +448,109 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         convertQueue.push_back(ConvertJob{staging, yuv, seq});
     }
     cvConvert.notify_one();
+}
+
+void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
+{
+    const AVPixelFormat pf = outputPixelFormat;
+    const bool is16 = (pf == AV_PIX_FMT_GRAY16LE || pf == AV_PIX_FMT_GRAY16BE);
+    const bool isBE = (pf == AV_PIX_FMT_GRAY16BE);
+    const int64_t grayElems = static_cast<int64_t>(width) * height;
+    const bool grayInput = (frame.numel() == grayElems);
+
+    py::gil_scoped_release release;
+
+    // Serialize the whole verbatim path: it lazily inits grayRgbConverter_ (a
+    // non-thread-safe SwsContext) and drives the single stateful encoder, so two
+    // Python threads calling encode_frame concurrently must not overlap here.
+    std::lock_guard<std::mutex> lk(mu);
+
+    // Mark that encoding has begun, mirroring the async path's workersStarted
+    // flag, so add_passthrough() (which must precede the first frame) is
+    // rejected consistently on gray-output encoders too.
+    workersStarted = true;
+
+    if (frame.device().is_cuda())
+        frame = frame.to(torch::kCPU);
+
+    // Build the output gray frame, tagged full range so the stored samples are
+    // read back verbatim (no 16-235 expansion) by a range-aware decoder.
+    nelux::Frame f;
+    f.get()->format = pf;
+    f.get()->width = width;
+    f.get()->height = height;
+    f.get()->color_range = AVCOL_RANGE_JPEG;
+    // Let Encoder::encodeFrame assign a strictly-increasing pts (matches the
+    // async path, which forces NOPTS on recycled frames).
+    f.get()->pts = AV_NOPTS_VALUE;
+    f.allocateBuffer(32);
+    uint8_t* dst = f.getData(0);
+    const int stride = f.getLineSize(0);
+
+    if (grayInput)
+    {
+        torch::Tensor g = frame.reshape({height, width});
+        if (!is16)
+        {
+            // 8-bit output: keep 8-bit samples verbatim. Float [0,1] scales to
+            // 0-255; a 16-bit source is downscaled uniformly (v*255/65535).
+            if (g.is_floating_point())
+                g = (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
+            else if (g.scalar_type() == torch::ScalarType::UInt16)
+                g = (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
+            else if (g.dtype() != torch::kUInt8)
+                g = g.clamp(0, 255).to(torch::kUInt8);
+            g = g.contiguous();
+            const uint8_t* src = g.data_ptr<uint8_t>();
+            for (int r = 0; r < height; ++r)
+                std::memcpy(dst + static_cast<size_t>(r) * stride,
+                            src + static_cast<size_t>(r) * width, width);
+        }
+        else
+        {
+            // 16-bit output: preserve full precision. Float [0,1] -> 0-65535;
+            // an 8-bit source is promoted exactly (v*257); a 16-bit source is
+            // stored verbatim.
+            if (g.is_floating_point())
+                g = (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
+            else if (g.dtype() == torch::kUInt8)
+                g = g.to(torch::kInt32) * 257;
+            else
+                g = g.to(torch::kInt32).clamp(0, 65535);
+            g = g.contiguous();
+            const int32_t* src = g.data_ptr<int32_t>();
+            for (int r = 0; r < height; ++r)
+            {
+                uint8_t* row = dst + static_cast<size_t>(r) * stride;
+                const int32_t* srow = src + static_cast<size_t>(r) * width;
+                for (int c = 0; c < width; ++c)
+                {
+                    const uint16_t v = static_cast<uint16_t>(srow[c]);
+                    if (isBE) { row[2 * c] = v >> 8; row[2 * c + 1] = v & 0xFF; }
+                    else      { row[2 * c] = v & 0xFF; row[2 * c + 1] = v >> 8; }
+                }
+            }
+        }
+    }
+    else
+    {
+        // RGB [H,W,3] input to a gray-output encoder: convert to luma (full
+        // range) with swscale. This path is 8-bit (RGB24 source); grayscale
+        // *data* callers should feed a single-channel frame for full precision.
+        torch::Tensor rgb = frame;
+        if (rgb.is_floating_point())
+            rgb = (rgb.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+        else if (rgb.dtype() != torch::kUInt8)
+            rgb = rgb.clamp(0, 255).to(torch::kUInt8);
+        rgb = rgb.reshape({height, width, 3}).contiguous();
+        if (!grayRgbConverter_)
+            grayRgbConverter_ =
+                std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
+                    width, height, pf, AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_JPEG);
+        grayRgbConverter_->convert(f, rgb.data_ptr<uint8_t>());
+    }
+
+    encoder->encodeFrame(f);
 }
 
 void VideoEncoder::startEncodeWorkersIfNeeded()

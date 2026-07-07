@@ -262,12 +262,20 @@ class VideoEncoder:
 
     def encode_frame(self, frame: torch.Tensor) -> None:
         """
-        Encode one video frame (HWC uint8 tensor).
+        Encode one video frame.
 
-        Accepts either a 3-channel RGB frame (H×W×3) or a single-channel
-        grayscale frame (H×W or H×W×1). Grayscale input is replicated to RGB
-        internally, so pair it with ``pixel_format="gray"`` for a true
-        grayscale (monochrome) encode, or any YUV format for neutral chroma.
+        Accepts a 3-channel RGB frame (H×W×3) or a single-channel frame
+        (H×W or H×W×1).
+
+        With a grayscale output ``pixel_format`` (``"gray"``/``"gray16le"``/
+        ``"gray16be"``) single-channel input is stored **verbatim and
+        full-range** — values kept exactly, up to true 16-bit, with a lossless
+        (ffv1) round-trip — ideal for depth maps and masks. Accepts uint8,
+        uint16, int32 or float single-channel tensors; float ``[0, 1]`` is
+        scaled to the full output bit depth (round-to-nearest).
+
+        With a color output ``pixel_format`` (e.g. ``"yuv420p"``) a grayscale
+        input is replicated to RGB, and an RGB input is encoded normally.
         """
         ...
 

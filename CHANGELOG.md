@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-07
+
+### Fixed
+
+- **Grayscale encode is now a verbatim, full-range data path.** `VideoEncoder`
+  with `pixel_format="gray"`/`"gray16le"`/`"gray16be"` now stores single-channel
+  values exactly — full-range (no BT.601 16–235 squeeze) and up to true 16-bit —
+  instead of funnelling through 8-bit limited-range RGB24. This makes it usable
+  for depth maps, masks and other data planes: a lossless (`ffv1`) round-trip is
+  now exact for both 8-bit (`gray`) and 16-bit (`gray16le`) input. Previously
+  `gray16le` only wrapped 8-bit data in a 16-bit container, and all grayscale
+  output was range-compressed. `encode_frame` accepts `uint8`/`uint16`/`int32`/
+  float single-channel frames; float `[0,1]` is scaled to the full output depth
+  with round-to-nearest.
+- **Grayscale decode of a matching gray/gray16 source is now exact.** Decoding a
+  full-range single-plane gray source with `color_format="gray"` copies the
+  plane directly (no libswscale rounding), so the encode→decode round-trip is
+  lossless; it is also faster than the previous swscale path for that case.
+
 ## [0.14.0] - 2026-07-07
 
 ### Added
