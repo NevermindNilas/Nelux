@@ -1,4 +1,12 @@
 
+### **Version 0.14.0 (2026-07-07)**
+
+#### **Feature: grayscale decode output and encode input (`color_format`)**
+- **Added:** `VideoReader(..., color_format="gray")` (aliases `"grayscale"`, `"l"`) returns single-channel HWC luma frames (shape `H×W×1`) for both the PyTorch and NumPy backends. The luma is derived from the source colorspace/range by libswscale (`GRAY8`/`GRAY16LE`), so it is BT.601/709-correct — the luma of the RGB decode, not a naive channel average. `color_format="rgb"` (default) is unchanged. Grayscale is CPU-decode only (`decode_accelerator="cpu"`) and is not supported by `decode_batch()`; both raise a clear error.
+- **Added:** `VideoEncoder.encode_frame` now also accepts a single-channel frame (`H×W×1` or `H×W`) in addition to `H×W×3` RGB. The luma is replicated to RGB internally, so pairing it with `pixel_format="gray"` produces a true monochrome encode (or use any YUV format for neutral chroma). Encoder input is now validated by layout (HWC), not just element count, so a CHW/transposed frame is rejected instead of silently scrambled.
+
+---
+
 ### **Version 0.12.11 (2026-06-27)**
 
 #### **Fix: PyPI RECORD-safe wheel retagging**
