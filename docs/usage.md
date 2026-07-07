@@ -464,8 +464,10 @@ for frame in frames:
 
 encoder.close()
 
-# Grayscale input is replicated to RGB internally; pair with pixel_format="gray"
-# for a true monochrome encode.
+# With a grayscale output pixel_format ("gray"/"gray16le") this is a verbatim,
+# full-range data path: single-channel values are stored exactly (up to true
+# 16-bit, lossless ffv1 round-trip) — ideal for depth maps/masks. With a color
+# pixel_format the gray input is replicated to RGB instead.
 ```
 
 ### With Context Manager

@@ -50,6 +50,16 @@ class VideoEncoder
     void encodeFrame(torch::Tensor frame);
     void close();
 
+    // True for single-plane grayscale output formats that get the verbatim
+    // full-range data path (GRAY8 / GRAY16LE / GRAY16BE) instead of the RGB24
+    // async convert pipeline. Depth maps and other single-channel data need
+    // exact, full-range, up-to-16-bit values — not video-luma range/precision.
+    static bool isGrayVerbatimPixfmt(AVPixelFormat f)
+    {
+        return f == AV_PIX_FMT_GRAY8 || f == AV_PIX_FMT_GRAY16LE ||
+               f == AV_PIX_FMT_GRAY16BE;
+    }
+
     // Copy audio and/or subtitle streams from `source` into the output
     // (ffmpeg `-c:a copy -c:s copy`). Must be called before the first
     // encodeFrame. `start`/`end` (seconds) trim the copied streams; end < 0
@@ -93,6 +103,15 @@ class VideoEncoder
     void convertWorkerLoop(int workerId);
     void encodeSubmitLoop();
     void submitYuvFrame(nelux::Frame* yuv);  // submit thread: make-writable + send + drain
+
+    // Synchronous verbatim grayscale encode (no convert pool, no RGB24 8-bit
+    // bottleneck, no range squeeze). Fills a GRAY8/GRAY16 plane directly from a
+    // single-channel tensor (8- or 16-bit), tags full range, and sends it to the
+    // codec in-line. Used for gray-output pixfmts so single-channel data (depth
+    // maps) round-trips exactly. RGB input to a gray-output encoder is converted
+    // to luma via grayRgbConverter_.
+    void encodeGrayVerbatim(torch::Tensor frame);
+    std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter> grayRgbConverter_;
 #ifdef NELUX_ENABLE_CUDA
     // GPU: wait input-ready, RGB->NV12 on stream, copy into CUDA AVFrame, send.
     void submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent);

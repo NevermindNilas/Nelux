@@ -121,6 +121,30 @@ class AutoToRGBConverter
             return;
         }
 
+        // 1.9) Fast-path for grayscale output when the source is already the
+        // matching single-plane gray format and is full-range. A direct plane
+        // copy is exact (no swscale rounding, so gray/gray16 data such as depth
+        // maps round-trips losslessly) and much cheaper than the swscale
+        // gray->gray path. A limited-range source still needs swscale to expand
+        // to full range, so it is excluded here.
+        if (grayscale_ && !resize_active && src_color_range == AVCOL_RANGE_JPEG)
+        {
+            const bool srcEightBit = (bit_depth <= 8 || force_8bit);
+            const AVPixelFormat wantSrc =
+                srcEightBit ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_GRAY16LE;
+            if (src_fmt == wantSrc)
+            {
+                const int rowBytes = width * (srcEightBit ? 1 : 2);
+                uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
+                for (int i = 0; i < height; ++i)
+                    std::memcpy(dst_ptr + static_cast<size_t>(i) * rowBytes,
+                                av_frame->data[0] +
+                                    static_cast<size_t>(i) * av_frame->linesize[0],
+                                rowBytes);
+                return;
+            }
+        }
+
         // 2) Choose destination format/stride accordingly
         // If force_8bit is true, we want 8-bit output regardless of input bit
         // depth. Otherwise, preserve >8-bit sources with a 16-bit output.

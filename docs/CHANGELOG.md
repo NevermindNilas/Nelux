@@ -1,4 +1,12 @@
 
+### **Version 0.14.1 (2026-07-07)**
+
+#### **Fix: verbatim full-range / 16-bit grayscale encode (depth maps)**
+- **Fixed:** `VideoEncoder` grayscale output (`pixel_format="gray"`/`"gray16le"`/`"gray16be"`) now stores single-channel values **verbatim and full-range** — no BT.601 16–235 range squeeze, and up to **true 16-bit** — instead of routing through an 8-bit limited-range RGB24 conversion. `"gray16le"` previously only wrapped 8-bit data in a 16-bit container, and all grayscale output was range-compressed, which made it unfit for depth maps / masks / data planes. `encode_frame` now accepts `uint8`/`uint16`/`int32`/float single-channel frames (float `[0,1]` scales to the full output bit depth with round-to-nearest), fills the gray plane directly, and tags the stream full-range. A lossless `ffv1` round-trip is now exact for both 8-bit and 16-bit input.
+- **Fixed:** decoding a matching full-range gray/gray16 source with `color_format="gray"` now copies the plane directly (no libswscale rounding), so the nelux encode→decode round-trip is lossless and that decode case is faster.
+
+---
+
 ### **Version 0.14.0 (2026-07-07)**
 
 #### **Feature: grayscale decode output and encode input (`color_format`)**

@@ -194,6 +194,8 @@ VideoEncoder(
 
 Supported `pixel_format` values include `"yuv420p"`, `"nv12"`, `"yuv444p"`, `"p010"`, `"gray"`, `"gray16le"`. Grayscale formats are software-only; NVENC falls back to NV12 with a warning.
 
+Grayscale output (`"gray"`/`"gray16le"`/`"gray16be"`) is a **verbatim, full-range data path**: feed a single-channel `[H,W]`/`[H,W,1]` tensor (`uint8`/`uint16`/`int32`/float; float `[0,1]` scales to the full depth) and values are stored exactly — no range squeeze, up to true 16-bit. A lossless (`ffv1`) round-trip is exact. Ideal for depth maps and masks.
+
 ### Methods & Properties
 
 ```python

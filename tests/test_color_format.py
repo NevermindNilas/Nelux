@@ -122,6 +122,66 @@ def test_gray_prefetch_true_stays_single_channel():
     assert count == 8
 
 
+# --- Verbatim / full-range / 16-bit grayscale data path (depth maps etc.) ---
+# Grayscale output pixel formats (gray/gray16le) store single-channel data
+# verbatim and full-range (not video-luma limited range), so lossless ffv1
+# round-trips exactly through nelux for both 8-bit and true 16-bit.
+
+def test_gray8_verbatim_full_range_roundtrip():
+    """gray output is full-range: black stays 0 (not 16), and a lossless
+    ffv1 round-trip is exact."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, "verbatim_g8.mkv")
+    h, w = 48, 64
+    vals = (torch.arange(h * w, dtype=torch.int64) % 256).reshape(h, w).to(torch.uint8)
+    enc = VideoEncoder(out, codec="ffv1", width=w, height=h, fps=1, pixel_format="gray")
+    enc.encode_frame(vals)
+    enc.close()
+
+    frame = next(iter(VideoReader(out, color_format="gray")))
+    got = frame[..., 0].to(torch.int64)
+    assert got[0, 0].item() == 0, "full-range regression: black decoded as non-zero"
+    assert torch.equal(got, vals.to(torch.int64)), "gray8 verbatim round-trip not exact"
+
+
+def test_gray16_true_16bit_roundtrip():
+    """gray16le ingests true 16-bit values (not 8-bit upconverted) and
+    round-trips losslessly through ffv1 — incl. high-byte-only differences
+    that an 8-bit path would collapse."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, "verbatim_g16.mkv")
+    h, w = 48, 64
+    vals = ((torch.arange(h * w, dtype=torch.int64) * 43) % 65536).reshape(h, w)
+    vals[0, 0], vals[0, 1], vals[0, 2] = 0, 65535, 256  # 256 = high-byte-only
+    enc = VideoEncoder(out, codec="ffv1", width=w, height=h, fps=1,
+                       pixel_format="gray16le")
+    enc.encode_frame(vals.to(torch.int32))
+    enc.close()
+
+    frame = next(iter(VideoReader(out, color_format="gray")))
+    assert frame.dtype == torch.uint16
+    got = frame[..., 0].to(torch.int64)
+    assert got[0, 2].item() == 256, "16-bit high byte lost (8-bit collapse)"
+    assert torch.equal(got, vals), "gray16le true-16-bit round-trip not exact"
+
+
+def test_gray16_float_depth_roundtrip():
+    """A float depth map in [0,1] encodes to gray16le at full 16-bit precision."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, "verbatim_depth.mkv")
+    h, w = 48, 64
+    depth = torch.linspace(0, 1, h * w).reshape(h, w)
+    enc = VideoEncoder(out, codec="ffv1", width=w, height=h, fps=1,
+                       pixel_format="gray16le")
+    enc.encode_frame(depth)
+    enc.close()
+
+    frame = next(iter(VideoReader(out, color_format="gray")))
+    got = frame[..., 0].to(torch.int64)
+    exp = (depth * 65535).round().clamp(0, 65535).to(torch.int64)
+    assert torch.equal(got, exp), "float depth -> gray16le not exact"
+
+
 def test_encode_rejects_wrong_layout():
     """A CHW [3,H,W] frame has the right element count but wrong layout."""
     os.makedirs(OUT_DIR, exist_ok=True)
