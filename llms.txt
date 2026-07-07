@@ -69,12 +69,14 @@ VideoReader(
     backend: Literal["pytorch", "numpy"] = "pytorch",
     decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
     cuda_device_index: int = 0,
+    color_format: Literal["rgb", "gray"] = "rgb",
 )
 ```
 
 - `backend="pytorch"` → `torch.Tensor`; `backend="numpy"` → `numpy.ndarray` (always CPU, memory-owned copy).
 - `decode_accelerator="nvdec"` → frames stay on GPU as CUDA tensors. Auto-falls back to CPU on NVDEC failure.
 - `force_8bit=True` → output always `uint8` regardless of source bit depth.
+- `color_format="rgb"` (default) → 3-channel HWC `[H, W, 3]`; `color_format="gray"` (aliases `"grayscale"`, `"l"`) → single-channel HWC `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only; not supported by `decode_batch()`.
 
 ### Properties (read-only)
 
@@ -195,7 +197,7 @@ Supported `pixel_format` values include `"yuv420p"`, `"nv12"`, `"yuv444p"`, `"p0
 ### Methods & Properties
 
 ```python
-encoder.encode_frame(frame)          # [H, W, 3] uint8 tensor (CPU or CUDA)
+encoder.encode_frame(frame)          # [H, W, 3] RGB or [H, W, 1]/[H, W] grayscale uint8 tensor (CPU or CUDA)
 encoder.close()                      # finalize file
 encoder.is_hardware_encoder          # True if NVENC
 ```

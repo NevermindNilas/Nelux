@@ -73,7 +73,8 @@ VideoReader(
     force_8bit: bool = False,
     backend: Literal["pytorch", "numpy"] = "pytorch",
     decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
-    cuda_device_index: int = 0
+    cuda_device_index: int = 0,
+    color_format: Literal["rgb", "gray"] = "rgb"
 )
 ```
 
@@ -85,6 +86,7 @@ VideoReader(
 | `backend` | `str` | `"pytorch"` | Output format: `"pytorch"` (torch.Tensor) or `"numpy"` (ndarray) |
 | `decode_accelerator` | `str` | `"cpu"` | Decode method: `"cpu"` (software) or `"nvdec"` (NVIDIA hardware) |
 | `cuda_device_index` | `int` | `0` | GPU index for NVDEC decoding |
+| `color_format` | `str` | `"rgb"` | Output color: `"rgb"` → `[H, W, 3]`; `"gray"` → `[H, W, 1]` luma (CPU decode only, not supported by `decode_batch()`) |
 
 **Example:**
 
@@ -458,9 +460,12 @@ encoder = VideoEncoder(
 
 # Encode frames
 for frame in frames:
-    encoder.encode_frame(frame)  # frame: torch.Tensor (H, W, 3), uint8
+    encoder.encode_frame(frame)  # (H, W, 3) RGB, or (H, W, 1)/(H, W) grayscale uint8
 
 encoder.close()
+
+# Grayscale input is replicated to RGB internally; pair with pixel_format="gray"
+# for a true monochrome encode.
 ```
 
 ### With Context Manager
