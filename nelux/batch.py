@@ -1,18 +1,8 @@
 """Batch frame reading support for VideoReader."""
 
-import sys
 import numpy as np
+import torch
 from typing import Union, List
-
-
-def _torch_module():
-    """Return the already-imported torch module, or None.
-
-    Never imports torch: if the caller is passing a torch.Tensor (or using the
-    PyTorch backend) torch is necessarily already in sys.modules. This keeps the
-    NumPy backend fully torch-free.
-    """
-    return sys.modules.get("torch")
 
 
 class BatchMixin:
@@ -24,9 +14,6 @@ class BatchMixin:
     - Sorting frames in sequential order
     - Only seeking when necessary (backward jumps or large gaps)
     """
-
-    def _is_numpy_backend(self) -> bool:
-        return getattr(self, "_nelux_backend", "pytorch") == "numpy"
 
     def _to_index_list(self, indices) -> List[int]:
         """
@@ -54,10 +41,8 @@ class BatchMixin:
         if isinstance(indices, range):
             return list(indices)
 
-        # Handle torch tensors (only if torch is already loaded -- a torch.Tensor
-        # cannot exist otherwise, so this never imports torch)
-        _torch = _torch_module()
-        if _torch is not None and isinstance(indices, _torch.Tensor):
+        # Handle torch tensors
+        if isinstance(indices, torch.Tensor):
             return indices.cpu().tolist()
 
         # Handle numpy arrays
@@ -73,7 +58,7 @@ class BatchMixin:
 
     def get_batch(
         self, indices: Union[List[int], range, slice, "torch.Tensor", np.ndarray]
-    ) -> "Union[torch.Tensor, np.ndarray]":
+    ) -> "torch.Tensor":
         """
         Decode a batch of frames at specified indices.
 
@@ -86,9 +71,7 @@ class BatchMixin:
                 - numpy.ndarray of indices
 
         Returns:
-            A stacked batch of shape [B, H, W, C]. For the PyTorch backend this
-            is a torch.Tensor; for the NumPy backend it is a numpy.ndarray
-            (built torch-free).
+            torch.Tensor of shape [B, H, W, C] where B = len(indices)
 
         Raises:
             IndexError: If any index is out of bounds
@@ -100,14 +83,9 @@ class BatchMixin:
         """
         # Convert to list
         indices_list = self._to_index_list(indices)
-        numpy_backend = self._is_numpy_backend()
 
         if not indices_list:
-            # Return empty batch with correct shape
-            if numpy_backend:
-                return np.empty((0, self.height, self.width, 3), dtype=np.uint8)
-            import torch
-
+            # Return empty tensor with correct shape
             return torch.empty(0, self.height, self.width, 3, dtype=torch.uint8)
 
         # Normalize negative indices
@@ -123,19 +101,12 @@ class BatchMixin:
             if not (0 <= idx < frame_count):
                 raise IndexError(f"Frame index {idx} out of bounds [0, {frame_count})")
 
-        if numpy_backend:
-            # Torch-free batch: decode each frame individually and stack with
-            # numpy. This trades the C++ seek-minimization of decode_batch (which
-            # returns a torch::Tensor) for a fully torch-free path.
-            frames = [self.frame_at(int(idx)) for idx in normalized]
-            return np.stack(frames, axis=0)
-
-        # Call C++ decode_batch method (returns torch.Tensor)
+        # Call C++ decode_batch method
         return self.decode_batch(normalized)
 
     def get_batch_range(
         self, start: int = 0, end: int = None, step: int = 1
-    ) -> "Union[torch.Tensor, np.ndarray]":
+    ) -> "torch.Tensor":
         """
         Decode a range of frames.
 
@@ -145,7 +116,7 @@ class BatchMixin:
             step: Step size (default: 1)
 
         Returns:
-            Batch of shape [B, H, W, C] (torch.Tensor or numpy.ndarray by backend).
+            torch.Tensor of shape [B, H, W, C]
 
         Examples:
             >>> vr = VideoReader("video.mp4")
@@ -168,7 +139,7 @@ class BatchMixin:
 
         Returns:
             - Single frame (torch.Tensor or numpy.ndarray based on backend)
-            - Batch of frames (torch.Tensor or numpy.ndarray) for slice/list access
+            - Batch of frames (torch.Tensor) for slice/list access
 
         Examples:
             >>> vr = VideoReader("video.mp4")
@@ -182,11 +153,7 @@ class BatchMixin:
             return super().__getitem__(key)
 
         # Slice or list - use batch decoding
-        batch_types = [slice, list, tuple, range, np.ndarray]
-        _torch = _torch_module()
-        if _torch is not None:
-            batch_types.append(_torch.Tensor)
-        if isinstance(key, tuple(batch_types)):
+        if isinstance(key, (slice, list, tuple, range, torch.Tensor, np.ndarray)):
             return self.get_batch(key)
 
         raise TypeError(f"Unsupported index type: {type(key)}")
