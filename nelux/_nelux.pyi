@@ -51,6 +51,10 @@ class VideoReader:
         prefetch: bool = False,
         convert_workers: Optional[int] = None,
         color_format: Literal["rgb", "gray"] = "rgb",
+        resize_filter: Literal[
+            "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
+            "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
+        ] = "bilinear",
     ) -> None:
         """
         Open a video file for reading.
@@ -85,6 +89,13 @@ class VideoReader:
                 single-channel HWC luma frame (shape H×W×1), derived from the source
                 colorspace/range by libswscale. Grayscale is CPU-decode only
                 (decode_accelerator="cpu") and is not supported by decode_batch().
+            resize_filter (str, optional): libswscale scaling kernel for the decoder-side
+                resize. Only takes effect when ``resize`` is set. Same scaler names as
+                ffmpeg's ``-sws_flags``: "fast_bilinear", "bilinear" (default), "bicubic",
+                "experimental", "neighbor", "area", "bicublin", "gauss", "sinc", "lanczos",
+                "spline". Cost scales with tap count (bilinear < bicubic < lanczos); affects
+                spatial rescaling only, never color conversion. CPU-decode only — the NVDEC
+                path uses cuvid's hardware scaler and rejects a non-default value.
         """
         ...
 

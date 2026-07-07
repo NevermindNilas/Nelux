@@ -66,7 +66,8 @@ PYBIND11_MODULE(_nelux, m)
                     int cuda_device_index,
                     std::optional<std::pair<int, int>> resize, bool prefetch,
                     std::optional<int> convert_workers,
-                    const std::string& color_format)
+                    const std::string& color_format,
+                    const std::string& resize_filter)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -95,7 +96,8 @@ PYBIND11_MODULE(_nelux, m)
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
-                         cuda_device_index, rw, rh, prefetch, cw, color_format);
+                         cuda_device_index, rw, rh, prefetch, cw, color_format,
+                         resize_filter);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
@@ -104,6 +106,7 @@ PYBIND11_MODULE(_nelux, m)
              py::arg("resize") = py::none(), py::arg("prefetch") = false,
              py::arg("convert_workers") = py::none(),
              py::arg("color_format") = "rgb",
+             py::arg("resize_filter") = "bilinear",
              R"doc(Open a video file for reading.
 
 Args:
@@ -141,6 +144,14 @@ Args:
         colorspace/range by libswscale (BT.601/709-correct, not a naive channel
         average). Grayscale is CPU-decode only (decode_accelerator="cpu") and is
         not supported by decode_batch().
+    resize_filter (str, optional): libswscale scaling kernel used for the
+        decoder-side resize. Only takes effect when resize is set. Accepts the
+        same scaler names as ffmpeg's -sws_flags: "fast_bilinear", "bilinear"
+        (default), "bicubic", "experimental", "neighbor", "area", "bicublin",
+        "gauss", "sinc", "lanczos", "spline". Cost scales with the kernel's tap
+        count (bilinear < bicubic < lanczos); the choice only affects spatial
+        rescaling, never the color conversion. CPU-decode only — the NVDEC path
+        scales with cuvid's own hardware scaler and rejects a non-default value.
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

@@ -44,7 +44,8 @@ class VideoReader
                 int cuda_device_index = 0, int resizeWidth = 0,
                 int resizeHeight = 0, bool prefetch = true,
                 int convertWorkers = -1,
-                const std::string& color_format = "rgb");
+                const std::string& color_format = "rgb",
+                const std::string& resize_filter = "bilinear");
 
     /**
      * @brief Destructor for VideoReader.
@@ -452,6 +453,9 @@ class VideoReader
     int cudaDeviceIndex = 0;
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;
+    // libswscale scaling kernel (SWS_* flag) selected via the resize_filter
+    // ctor arg. Only used on the CPU path when a resize is active.
+    int resizeFilter_ = SWS_BILINEAR;
     bool prefetch = true;
 
     // ML output mode

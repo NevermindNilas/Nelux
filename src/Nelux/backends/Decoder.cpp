@@ -226,6 +226,7 @@ void Decoder::initialize(const std::string& filePath)
     converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     converter->setForce8Bit(force_8bit);
     converter->setGrayscale(grayscale_);
+    converter->setResizeFilter(resizeFlags_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
     {
         converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -724,6 +725,7 @@ void Decoder::syncConvertWorkerLoop()
     auto local_converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     local_converter->setForce8Bit(force_8bit);
     local_converter->setGrayscale(grayscale_);
+    local_converter->setResizeFilter(resizeFlags_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
         local_converter->setOutputSize(resizeWidth_, resizeHeight_);
 
@@ -1576,6 +1578,7 @@ void Decoder::reconfigure(const std::string& filePath)
     if (converter)
     {
         converter->setGrayscale(grayscale_);
+        converter->setResizeFilter(resizeFlags_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
             converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -1586,6 +1589,7 @@ void Decoder::reconfigure(const std::string& filePath)
         converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
         converter->setForce8Bit(force_8bit);
         converter->setGrayscale(grayscale_);
+        converter->setResizeFilter(resizeFlags_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
             converter->setOutputSize(resizeWidth_, resizeHeight_);
