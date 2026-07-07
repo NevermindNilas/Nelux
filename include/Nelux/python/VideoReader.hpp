@@ -4,6 +4,7 @@
 #include "Decoder.hpp"
 #include "Factory.hpp"
 #include <VideoEncoder.hpp>
+#include <optional>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
@@ -444,7 +445,12 @@ class VideoReader
     std::shared_ptr<nelux::Decoder> decoder;
     nelux::Decoder::VideoProperties properties;
 
-    torch::Tensor tensor;
+    // Shared output tensor for the PyTorch backend / NVDEC in-place write. Held
+    // in an optional so the NumPy CPU path leaves it disengaged: even the
+    // at::Tensor default constructor is an exported torch_cpu symbol, so a bare
+    // `torch::Tensor tensor;` member would fire a torch_cpu delay-load thunk on
+    // every reader and break the NumPy backend when PyTorch is absent.
+    std::optional<torch::Tensor> tensor;
 
     // Variables for frame range
     int start_frame = 0;

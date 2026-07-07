@@ -99,7 +99,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             tensor = torch::empty(
                 {properties.height, properties.width, 3},
                 torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-            CHECK_TENSOR(tensor);
+            CHECK_TENSOR(*tensor);
 
             NELUX_INFO("VideoReader initialized with HWC format, dtype={}",
                        torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
@@ -294,7 +294,7 @@ py::object VideoReader::decodeFrame()
             else
             {
                 // NVDEC / hardware path: in-place write into shared CUDA tensor.
-                success = decoder->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+                success = decoder->decodeNextFrame(tensor->data_ptr(), &frame_timestamp);
             }
         }
         catch (const std::exception& ex)
@@ -320,7 +320,7 @@ py::object VideoReader::decodeFrame()
                 current_timestamp);
     // CPU path returns a per-frame tensor (zero-copy from decoder pool).
     // GPU path still returns the shared `tensor` member.
-    return tensorToOutput(outTensor.defined() ? outTensor : tensor);
+    return tensorToOutput(outTensor.defined() ? outTensor : *tensor);
 }
 
 py::object VideoReader::emptyFrame() const
@@ -535,7 +535,7 @@ torch::Tensor VideoReader::makeLikeOutputTensor() const
 {
     return torch::empty(
         {properties.height, properties.width, 3},
-        torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+        torch::TensorOptions().dtype(tensor->dtype()).device(tensor->device()));
 }
 
 bool VideoReader::seek(double timestamp)
@@ -1345,21 +1345,26 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     start_time = -1.0;
     end_time = -1.0;
     
-    // Reallocate tensor if dimensions changed (always use BCHW format)
-    torch::Device torchDevice = tensor.device();
-    torch::Dtype torchDataType = findMLTypeFromBitDepth();
-    
-    if (tensor.size(2) != properties.height || 
-        tensor.size(3) != properties.width ||
-        tensor.dtype() != torchDataType)
+    // Reallocate tensor if dimensions changed (always use BCHW format). Only the
+    // PyTorch/NVDEC backends allocate the shared tensor; the NumPy CPU path
+    // leaves it disengaged (torch-free), so skip this entirely there.
+    if (tensor.has_value())
     {
-        tensor = torch::empty(
-            {1, 3, properties.height, properties.width},
-            torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-        NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)", 
-                    properties.width, properties.height);
+        torch::Device torchDevice = tensor->device();
+        torch::Dtype torchDataType = findMLTypeFromBitDepth();
+
+        if (tensor->size(2) != properties.height ||
+            tensor->size(3) != properties.width ||
+            tensor->dtype() != torchDataType)
+        {
+            tensor = torch::empty(
+                {1, 3, properties.height, properties.width},
+                torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+            NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)",
+                        properties.width, properties.height);
+        }
     }
-    
+
     NELUX_INFO("VideoReader reconfigured successfully for: {}", newFilePath);
 }
 
