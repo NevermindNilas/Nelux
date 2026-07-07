@@ -902,16 +902,34 @@ VideoReader& VideoReader::iter()
             currentIndex = 0;
             current_timestamp = 0.0;
         }
-        else if (start_frame == 0 &&
-                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
         {
             // The CPU sync path uses a frame-threaded codec context; seeking it
-            // (which flushes the decoder) trips an internal FFmpeg assertion --
-            // the no-range branch below documents and avoids the same hazard.
-            // A freshly prepared reader is already positioned at frame 0, so the
-            // seek is redundant: skip it and decode straight from the start.
+            // (which flushes the decoder via avcodec_flush_buffers) is unsafe
+            // under FF_THREAD_FRAME and trips an internal FFmpeg assertion --
+            // the no-range branch below documents the same hazard.
+            //
+            // A freshly prepared reader is already positioned at frame 0. For
+            // start_frame == 0 the seek is simply redundant. For start_frame > 0
+            // we advance by decoding and discarding frames (the timestamp range
+            // above uses the same discard strategy) instead of a flush-seek --
+            // this keeps the frame-threaded context intact at a linear decode
+            // cost to reach the start.
             currentIndex = 0;
             current_timestamp = 0.0;
+            for (int i = 0; i < start_frame; ++i)
+            {
+                torch::Tensor f = decodeFrame();
+                if (!f.defined() || f.numel() == 0)
+                {
+                    NELUX_WARN("Ran out of frames while discarding up to "
+                               "start_frame={} (stopped at index {})",
+                               start_frame, currentIndex);
+                    break;
+                }
+            }
+            // decodeFrame() advanced currentIndex/current_timestamp as it went,
+            // so the reader now sits at start_frame (or clamped at EOF).
         }
         else
         {

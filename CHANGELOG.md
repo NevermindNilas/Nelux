@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-07
+
 ### Added
 
 - **Motion vector export.** `VideoReader.read_frame_with_motion_vectors()` now
@@ -18,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decodes only the next frame's motion-vector side-data, skipping RGB
   conversion, and returns `(vectors, frame_type)` where `vectors` is an `int32`
   `[N, 10]` NumPy array.
+
+### Fixed
+
+- **`set_range(start > 0)` on the CPU decoder no longer crashes.** Iterating a
+  reader after `set_range()` with a non-zero start frame routed through a
+  keyframe seek that called `avcodec_flush_buffers()` on the frame-threaded
+  software decode context, tripping an FFmpeg assertion
+  (`fctx->async_lock`). The CPU sync path now advances to the start frame by
+  decoding and discarding intermediate frames instead of flush-seeking, so
+  arbitrary start frames work and yield the exact same frames as a sequential
+  read. NVDEC and prefetch paths are unchanged.
 
 ## [0.12.11] - 2026-06-27
 
