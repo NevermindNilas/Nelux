@@ -43,7 +43,8 @@ class VideoReader
                 const std::string& decode_accelerator = "cpu",
                 int cuda_device_index = 0, int resizeWidth = 0,
                 int resizeHeight = 0, bool prefetch = true,
-                int convertWorkers = -1);
+                int convertWorkers = -1,
+                const std::string& color_format = "rgb");
 
     /**
      * @brief Destructor for VideoReader.
@@ -442,6 +443,10 @@ class VideoReader
     std::string filePath;
     int numThreads;
     bool force_8bit = false;
+    // Output color format. grayscale_ selects single-channel GRAY output;
+    // outChannels_ (1 or 3) drives every tensor/array shape the reader builds.
+    bool grayscale_ = false;
+    int outChannels_ = 3;
     Backend backend = Backend::PyTorch; // Output backend selection
     nelux::DecodeAccelerator decodeAccelerator = nelux::DecodeAccelerator::CPU;
     int cudaDeviceIndex = 0;

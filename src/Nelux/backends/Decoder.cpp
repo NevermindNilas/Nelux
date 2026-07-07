@@ -225,6 +225,7 @@ void Decoder::initialize(const std::string& filePath)
 
     converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     converter->setForce8Bit(force_8bit);
+    converter->setGrayscale(grayscale_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
     {
         converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -238,7 +239,7 @@ void Decoder::initialize(const std::string& filePath)
     int bitDepth = getBitDepth();
     int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
     convertedFrameBytes = static_cast<size_t>(properties.width) *
-                          static_cast<size_t>(properties.height) * 3 *
+                          static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
 
     const AVCodecParameters* params = formatCtx->streams[videoStreamIndex]->codecpar;
@@ -651,11 +652,12 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
         // Fallback: legacy buffer queued before tensorHandoff_ flipped on.
         // Wrap or copy into a tensor.
         auto dtype = (cf.buffer.size() ==
-                      static_cast<size_t>(properties.width) * properties.height * 3)
+                      static_cast<size_t>(properties.width) * properties.height *
+                          static_cast<size_t>(outChannels_))
                          ? torch::kUInt8
                          : torch::kUInt16;
         torch::Tensor t = torch::empty(
-            {properties.height, properties.width, 3},
+            {properties.height, properties.width, outChannels_},
             torch::TensorOptions().dtype(dtype).device(torch::kCPU));
         std::memcpy(t.data_ptr(), cf.buffer.data(), cf.buffer.size());
         {
@@ -684,7 +686,7 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
         (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
     const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
     torch::Tensor t = torch::empty(
-        {properties.height, properties.width, 3},
+        {properties.height, properties.width, outChannels_},
         torch::TensorOptions().dtype(dtype).device(torch::kCPU));
     if (converter)
         converter->convert(frame, t.data_ptr());
@@ -721,6 +723,7 @@ void Decoder::syncConvertWorkerLoop()
 {
     auto local_converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     local_converter->setForce8Bit(force_8bit);
+    local_converter->setGrayscale(grayscale_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
         local_converter->setOutputSize(resizeWidth_, resizeHeight_);
 
@@ -747,7 +750,7 @@ void Decoder::syncConvertWorkerLoop()
         const int elemSize =
             (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
         const size_t nbytes = static_cast<size_t>(properties.width) *
-                              static_cast<size_t>(properties.height) * 3 *
+                              static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                               static_cast<size_t>(elemSize);
         SyncConvertOutEntry entry;
         entry.buffer = acquireOutputBuffer(nbytes);
@@ -841,7 +844,7 @@ torch::Tensor Decoder::tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf)
     const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
     const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
     const size_t nbytes = static_cast<size_t>(properties.width) *
-                          static_cast<size_t>(properties.height) * 3 *
+                          static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
     // The deleter captures the pool by shared_ptr so recycling works even if
     // the Decoder is destroyed while Python still holds frames. It runs on
@@ -865,7 +868,7 @@ torch::Tensor Decoder::tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf)
         delete[] bytes;
     };
     return torch::from_blob(
-        raw, {properties.height, properties.width, 3}, std::move(deleter),
+        raw, {properties.height, properties.width, outChannels_}, std::move(deleter),
         torch::TensorOptions().dtype(dtype).device(torch::kCPU));
 }
 
@@ -921,7 +924,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                     (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
                 const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
                 torch::Tensor t = torch::empty(
-                    {properties.height, properties.width, 3},
+                    {properties.height, properties.width, outChannels_},
                     torch::TensorOptions().dtype(dtype).device(torch::kCPU));
                 if (converter)
                     converter->convert(syncFrame_, t.data_ptr());
@@ -1462,6 +1465,25 @@ void Decoder::setForce8Bit(bool enabled)
     }
 }
 
+void Decoder::setColorFormat(bool grayscale)
+{
+    grayscale_ = grayscale;
+    outChannels_ = grayscale ? 1 : 3;
+    if (converter)
+    {
+        converter->setGrayscale(grayscale);
+    }
+    // Resize the pooled convert buffers for the new channel count. Any
+    // previously sized pool buffers are dropped by acquireOutputBuffer when the
+    // byte count no longer matches, so this stays correct across a switch.
+    const int bitDepth = getBitDepth();
+    const int elemSize = (force_8bit || bitDepth <= 8) ? 1 : 2;
+    convertedFrameBytes = static_cast<size_t>(properties.width) *
+                          static_cast<size_t>(properties.height) *
+                          static_cast<size_t>(outChannels_) *
+                          static_cast<size_t>(elemSize);
+}
+
 void Decoder::setPrefetchSize(size_t size)
 {
     NELUX_DEBUG("Setting prefetch buffer size to {}", size);
@@ -1553,6 +1575,7 @@ void Decoder::reconfigure(const std::string& filePath)
     // Update converter if needed
     if (converter)
     {
+        converter->setGrayscale(grayscale_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
             converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -1562,6 +1585,7 @@ void Decoder::reconfigure(const std::string& filePath)
     {
         converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
         converter->setForce8Bit(force_8bit);
+        converter->setGrayscale(grayscale_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
             converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -1576,7 +1600,7 @@ void Decoder::reconfigure(const std::string& filePath)
     int bitDepth_r = getBitDepth();
     int elemSize_r = (force_8bit || bitDepth_r <= 8) ? 1 : 2;
     convertedFrameBytes = static_cast<size_t>(properties.width) *
-                          static_cast<size_t>(properties.height) * 3 *
+                          static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize_r);
 
     // Restart prefetch thread (skip in sync mode -- sync owns the ctx).
@@ -1737,7 +1761,7 @@ void Decoder::decodingLoop()
                 if (convertedFrameBytes == 0)
                 {
                     convertedFrameBytes = static_cast<size_t>(properties.width) *
-                                          static_cast<size_t>(properties.height) * 3 *
+                                          static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                                           static_cast<size_t>(elemSize);
                 }
 
@@ -1761,7 +1785,7 @@ void Decoder::decodingLoop()
                     // frame (~2.7 MB for 720p RGB).
                     auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
                     cf.tensor = torch::empty(
-                        {properties.height, properties.width, 3},
+                        {properties.height, properties.width, outChannels_},
                         torch::TensorOptions().dtype(dtype).device(torch::kCPU));
                     converter->convert(localFrame, cf.tensor.data_ptr());
                     std::unique_lock<std::mutex> lock(queueMutex);
@@ -1958,7 +1982,7 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         BatchDecoder::Config config{
             properties.height,           // height
             properties.width,            // width
-            3,                           // channels
+            outChannels_,                // channels (grayscale batch is rejected upstream)
             force_8bit ? torch::kUInt8 : // dtype
                 (properties.bitDepth <= 8 ? torch::kUInt8 : torch::kUInt16),
             torch::kCPU, // device - always decode to CPU first
