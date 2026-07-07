@@ -22,10 +22,14 @@ class Decoder : public nelux::Decoder
     }
 
     Decoder(const std::string& filePath, int numThreads, int resizeWidth,
-            int resizeHeight, bool syncMode = false, bool grayscale = false)
+            int resizeHeight, bool syncMode = false, bool grayscale = false,
+            int resizeFilter = SWS_BILINEAR)
         : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
     {
         if (grayscale) { grayscale_ = true; outChannels_ = 1; }
+        // Set the scaling kernel BEFORE initialize() so the converter and the
+        // convert-worker pool bake it into their sws contexts on first build.
+        if (resizeFilter > 0) resizeFlags_ = resizeFilter;
         if (syncMode)
             setSyncMode(true);
         initialize(filePath);

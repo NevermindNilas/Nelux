@@ -1,4 +1,13 @@
 
+### **Version 0.15.0 (2026-07-07)**
+
+#### **Feature: selectable resize filter (`resize_filter`)**
+- **Added:** `VideoReader(..., resize_filter="lanczos")` selects the libswscale scaling kernel used for the decoder-side `resize`. Accepts the same scaler names as ffmpeg's `-sws_flags`: `fast_bilinear`, `bilinear` (default, unchanged behavior), `bicubic`, `experimental`, `neighbor`, `area`, `bicublin`, `gauss`, `sinc`, `lanczos`, `spline`. The filter governs spatial rescaling only — the color-conversion matrix is set separately (`sws_setColorspaceDetails`) and is untouched — and is only consulted when a resize is actually active; native-resolution decodes keep the `SWS_BILINEAR` chroma path that matches ffmpeg/torchcodec byte output. Cost tracks the kernel's tap count (`bilinear` < `bicubic` < `lanczos`); there is no extra fast-path penalty since any resize already leaves swscale's unscaled converter.
+- **Scope:** CPU decode only. The NVDEC path scales with cuvid's own internal hardware scaler (no swscale algorithm knob), so a non-default `resize_filter` combined with `decode_accelerator="nvdec"` raises a clear error rather than being silently ignored (mirrors the grayscale+nvdec rejection). Encode is unaffected — the encoder does not resize (input dims must equal output dims), so a scaling filter there would be a dead no-op.
+- **Plumbed through** `AutoToRGBConverter` (`setResizeFilter`, honored only when `resize_active`), `nelux::Decoder` (`resizeFlags_`, applied at all three converter-config sites: main convert, sync convert-worker pool, and `reconfigure`), the CPU `Decoder` subclass ctor, `Factory::createDecoder`, `VideoReader` (+ random-access decoder), and the pybind11 `VideoReader.__init__` signature (`resize_filter: str = "bilinear"`).
+
+---
+
 ### **Version 0.14.1 (2026-07-07)**
 
 #### **Fix: verbatim full-range / 16-bit grayscale encode (depth maps)**

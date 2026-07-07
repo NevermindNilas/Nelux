@@ -294,6 +294,11 @@ class Decoder
     // Decoder-side resize target. 0 means disabled (output = source dims).
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;
+    // libswscale scaling kernel (SWS_* flag) applied when a resize is active.
+    // Set by the subclass ctor before initialize() so the converter and the
+    // convert-worker pool all pick it up. Default matches the previous
+    // hardcoded SWS_BILINEAR behavior.
+    int resizeFlags_ = SWS_BILINEAR;
 
     // Synchronous decode mode (no producer thread / no queue).
     bool syncMode_ = false;

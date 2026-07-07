@@ -69,7 +69,12 @@ VideoReader(
     backend: Literal["pytorch", "numpy"] = "pytorch",
     decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
     cuda_device_index: int = 0,
+    resize: tuple[int, int] | None = None,
     color_format: Literal["rgb", "gray"] = "rgb",
+    resize_filter: Literal[
+        "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
+        "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
+    ] = "bilinear",
 )
 ```
 
@@ -77,6 +82,7 @@ VideoReader(
 - `decode_accelerator="nvdec"` → frames stay on GPU as CUDA tensors. Auto-falls back to CPU on NVDEC failure.
 - `force_8bit=True` → output always `uint8` regardless of source bit depth.
 - `color_format="rgb"` (default) → 3-channel HWC `[H, W, 3]`; `color_format="gray"` (aliases `"grayscale"`, `"l"`) → single-channel HWC `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only; not supported by `decode_batch()`.
+- `resize=(w, h)` scales frames during decode (CPU: libswscale; NVDEC: cuvid `resize=WxH`). Reported dims and frame shapes reflect the target. `resize_filter` picks the CPU-path scaling kernel (ffmpeg `-sws_flags` names: `bilinear` default, `bicubic`, `lanczos`, `area`, `spline`, …); it governs spatial rescaling only, never color conversion, and is CPU-decode only (NVDEC rejects a non-default value — cuvid uses its own hardware scaler).
 
 ### Properties (read-only)
 

@@ -61,6 +61,17 @@ class AutoToRGBConverter
         out_height = (width > 0 && height > 0) ? height : 0;
     }
 
+    // Select the libswscale scaling kernel (SWS_BILINEAR / SWS_BICUBIC /
+    // SWS_LANCZOS / ...). This governs spatial rescaling only; it is honored
+    // exclusively when an actual resize is active (see convert()). Must be set
+    // before the first convert() call — it is baked into the cached sws context
+    // on the first build and never changes for the life of the converter.
+    void setResizeFilter(int swsFlags)
+    {
+        if (swsFlags > 0)
+            resize_flags_ = swsFlags;
+    }
+
     void convert(nelux::Frame& frame, void* buffer)
     {
         AVFrame* av_frame = frame.get();
@@ -163,11 +174,13 @@ class AutoToRGBConverter
             src_color_range != last_src_color_range || width != last_width ||
             height != last_height || dst_w != last_out_width || dst_h != last_out_height)
         {
-            // Plain SWS_BILINEAR matches ffmpeg's default chroma path. Adding
-            // SWS_ACCURATE_RND / SWS_FULL_CHR_{H,V}_INT here would diverge from
-            // ffmpeg / torchcodec byte-output and add measurable latency
-            // (see tests/output/pixfmt_matrix/REPORT.md).
-            int flags = SWS_BILINEAR;
+            // Scaling kernel. When resizing, honor the caller-selected filter
+            // (resize_flags_, default SWS_BILINEAR). When NOT resizing, force
+            // SWS_BILINEAR: the flag then only affects chroma upsampling for
+            // subsampled YUV, and plain BILINEAR matches ffmpeg's default chroma
+            // path / torchcodec byte-output (SWS_ACCURATE_RND / FULL_CHR would
+            // diverge and add latency — see tests/output/pixfmt_matrix/REPORT.md).
+            int flags = resize_active ? resize_flags_ : SWS_BILINEAR;
 
             // Only use POINT (nearest neighbor) if dimensions match AND we are
             // likely just shuffling channels (RGB/BGR/BGRA etc.). Using POINT
@@ -256,6 +269,9 @@ class AutoToRGBConverter
     bool force_8bit;
     int out_width, out_height;
     bool grayscale_ = false;
+    // libswscale scaling kernel used when a resize is active. Default matches
+    // the historical hardcoded behavior.
+    int resize_flags_ = SWS_BILINEAR;
 };
 
 } // namespace cpu

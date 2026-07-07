@@ -38,7 +38,8 @@ inline std::shared_ptr<Decoder>
 createDecoder(const std::string& filename, int numThreads,
               DecodeAccelerator accelerator = DecodeAccelerator::CPU,
               int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
-              bool syncMode = false, bool grayscale = false)
+              bool syncMode = false, bool grayscale = false,
+              int resizeFilter = SWS_BILINEAR)
 {
     switch (accelerator)
     {
@@ -47,15 +48,20 @@ createDecoder(const std::string& filename, int numThreads,
             // thread can start (it starts inside the ctor's initialize() when
             // syncMode is false), so it is passed into the ctor rather than set
             // afterward — otherwise the producer races on the channel count.
+            // resizeFilter (SWS_* scaling kernel) is passed for the same reason.
             if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
                     filename, numThreads, resizeWidth, resizeHeight, syncMode,
-                    grayscale);
+                    grayscale, resizeFilter);
             return std::make_shared<nelux::backends::cpu::Decoder>(
                 filename, numThreads, syncMode, grayscale);
 
         case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA
+            // NVDEC scales via cuvid's internal hardware scaler; the swscale
+            // resizeFilter does not apply. The VideoReader layer rejects a
+            // non-default resize_filter combined with nvdec so this is never
+            // reached with a filter the caller expects to take effect.
             return std::make_shared<nelux::backends::cuda::Decoder>(
                 filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
 #else

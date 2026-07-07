@@ -22,11 +22,40 @@ namespace py = pybind11;
         throw std::runtime_error("Invalid tensor: undefined or empty");                \
     }
 
+namespace
+{
+// Map an ffmpeg swscale scaler name to its SWS_* flag. The accepted names
+// mirror ffmpeg's own -sws_flags scaler options so callers can reuse the exact
+// vocabulary they already know. Throws std::invalid_argument on an unknown name.
+int swsFlagFromResizeFilter(const std::string& name)
+{
+    std::string n = name;
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (n.empty() || n == "bilinear")                      return SWS_BILINEAR;
+    if (n == "fast_bilinear" || n == "fastbilinear")       return SWS_FAST_BILINEAR;
+    if (n == "bicubic")                                    return SWS_BICUBIC;
+    if (n == "experimental" || n == "x")                   return SWS_X;
+    if (n == "neighbor" || n == "point" || n == "nearest") return SWS_POINT;
+    if (n == "area")                                       return SWS_AREA;
+    if (n == "bicublin")                                   return SWS_BICUBLIN;
+    if (n == "gauss" || n == "gaussian")                   return SWS_GAUSS;
+    if (n == "sinc")                                       return SWS_SINC;
+    if (n == "lanczos")                                    return SWS_LANCZOS;
+    if (n == "spline")                                     return SWS_SPLINE;
+    throw std::invalid_argument(
+        "Unknown resize_filter: '" + name +
+        "'. Valid options: fast_bilinear, bilinear, bicubic, experimental, "
+        "neighbor, area, bicublin, gauss, sinc, lanczos, spline.");
+}
+} // namespace
+
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
                          int cuda_device_index, int resizeWidth, int resizeHeight,
                          bool prefetch, int convertWorkers,
-                         const std::string& color_format)
+                         const std::string& color_format,
+                         const std::string& resize_filter)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -75,6 +104,19 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             "color_format='gray' is only supported with decode_accelerator='cpu'; "
             "NVDEC decode outputs RGB.");
 
+    // Resolve the scaling kernel. resize_filter selects the libswscale scaler
+    // used for the decoder-side resize on the CPU path. NVDEC scales with
+    // cuvid's own internal hardware scaler, which is not swscale and exposes no
+    // algorithm knob — so a non-default filter with nvdec is rejected up front
+    // rather than silently ignored (mirrors the grayscale+nvdec rejection).
+    resizeFilter_ = swsFlagFromResizeFilter(resize_filter);
+    if (resizeFilter_ != SWS_BILINEAR &&
+        decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        throw std::invalid_argument(
+            "resize_filter is only supported with decode_accelerator='cpu'; the "
+            "NVDEC path scales via cuvid's internal hardware scaler, which cannot "
+            "select a swscale algorithm. Use the default 'bilinear' with nvdec.");
+
     try
     {
         torch::Device torchDevice =
@@ -95,7 +137,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // for the CPU path (NVDEC + grayscale is rejected above).
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
-            resizeWidth_, resizeHeight_, syncMode, grayscale_);
+            resizeWidth_, resizeHeight_, syncMode, grayscale_, resizeFilter_);
         decoder->setForce8Bit(force_8bit);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
@@ -724,7 +766,7 @@ void VideoReader::ensureRandDecoder()
         // decoder — no post-construction channel switch.
         rand_decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_);
+            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_, resizeFilter_);
         rand_decoder->setForce8Bit(force_8bit);
     }
 }
