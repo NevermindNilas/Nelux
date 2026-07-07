@@ -127,7 +127,6 @@ def test_numpy_backend_frames_do_not_alias_memory():
     print("✓ NumPy backend frames use independent memory")
 
 
-@pytest.mark.skip(reason="frame_at secondary decoder hangs in this environment")
 def test_numpy_backend_frame_at():
     """Test that frame_at with numpy backend returns numpy.ndarray."""
     vr = VideoReader(VIDEO_PATH, backend="numpy")
@@ -147,7 +146,6 @@ def test_numpy_backend_frame_at():
     print(f"✓ NumPy backend frame_at: returns numpy.ndarray")
 
 
-@pytest.mark.skip(reason="integer/timestamp getitem uses the hanging frame_at path")
 def test_numpy_backend_getitem():
     """Test that __getitem__ with numpy backend returns numpy.ndarray."""
     vr = VideoReader(VIDEO_PATH, backend="numpy")
