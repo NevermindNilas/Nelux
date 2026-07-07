@@ -166,6 +166,36 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
             std::to_string(height) + "x" + std::to_string(width) +
             " grayscale)");
 
+    // The element count alone does not pin down the layout: a CHW [3,H,W] frame,
+    // a transposed [W,H], or a mismatched-but-equal-area shape would pass the
+    // count check and then be memcpy'd as HWC, producing scrambled output.
+    // Require the documented HWC layout — [H,W,3], [H,W,1], or [H,W] — while
+    // still accepting a flat 1-D buffer (count already validated) for callers
+    // that pass raw contiguous bytes.
+    {
+        const int64_t d = frame.dim();
+        bool shapeOk = false;
+        if (d == 1)
+            shapeOk = true;
+        else if (d == 2)
+            shapeOk = (frame.size(0) == height && frame.size(1) == width);
+        else if (d == 3)
+            shapeOk = (frame.size(0) == height && frame.size(1) == width &&
+                       (frame.size(2) == 3 || frame.size(2) == 1));
+        if (!shapeOk)
+        {
+            std::string got;
+            for (int64_t i = 0; i < d; ++i)
+                got += (i ? "x" : "") + std::to_string(frame.size(i));
+            throw std::invalid_argument(
+                "encode_frame: expected HWC layout [" + std::to_string(height) +
+                "x" + std::to_string(width) + "x3], [" + std::to_string(height) +
+                "x" + std::to_string(width) + "x1], or [" +
+                std::to_string(height) + "x" + std::to_string(width) +
+                "] (grayscale); got shape [" + got + "]");
+        }
+    }
+
 #ifdef NELUX_ENABLE_CUDA
     // Free GPU tensors retired by the submit thread, here while pybind still
     // holds the GIL (torch CUDA dealloc can need it). Moving this off the submit

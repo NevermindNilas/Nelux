@@ -109,6 +109,29 @@ def test_encode_grayscale_input_hw_2d():
     assert os.path.getsize(out) > 0
 
 
+def test_gray_prefetch_true_stays_single_channel():
+    """prefetch=True starts the producer thread in the ctor; grayscale must be
+    configured before it runs (no channel-count race)."""
+    vr = VideoReader(VIDEO_PATH, color_format="gray", prefetch=True)
+    count = 0
+    for fr in vr:
+        assert fr.shape[2] == 1
+        count += 1
+        if count >= 8:
+            break
+    assert count == 8
+
+
+def test_encode_rejects_wrong_layout():
+    """A CHW [3,H,W] frame has the right element count but wrong layout."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, "layout.mp4")
+    h, w = 128, 160
+    enc = VideoEncoder(out, codec="libx264", width=w, height=h, fps=25)
+    with pytest.raises(ValueError):
+        enc.encode_frame(torch.zeros((3, h, w), dtype=torch.uint8))  # CHW, not HWC
+
+
 def test_invalid_color_format_raises():
     with pytest.raises(ValueError):
         VideoReader(VIDEO_PATH, color_format="bogus")
@@ -116,7 +139,7 @@ def test_invalid_color_format_raises():
 
 def test_gray_rejects_decode_batch():
     vr = VideoReader(VIDEO_PATH, color_format="gray")
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="color_format='gray'"):
         vr.decode_batch([0, 1, 2])
 
 

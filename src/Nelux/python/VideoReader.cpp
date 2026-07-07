@@ -89,15 +89,14 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // Set decode_accelerator='cpu' explicitly to opt into software decode.
         const bool syncMode =
             !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
+        // Grayscale is passed into createDecoder so the CPU decoder configures
+        // its channel count before the producer thread can start (avoids a race
+        // on the channel count when prefetch=true). grayscale_ is only ever true
+        // for the CPU path (NVDEC + grayscale is rejected above).
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
-            resizeWidth_, resizeHeight_, syncMode);
+            resizeWidth_, resizeHeight_, syncMode, grayscale_);
         decoder->setForce8Bit(force_8bit);
-        // Apply the output color format before the first decode so the converter
-        // and pooled buffers are sized for the right channel count. NVDEC decode
-        // stays RGB (guarded above), so only touch the CPU decoder here.
-        if (grayscale_ && decodeAccelerator == nelux::DecodeAccelerator::CPU)
-            decoder->setColorFormat(true);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
 
@@ -401,9 +400,13 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         // Return empty tensor/array based on backend with proper shape
         if (backend == Backend::NumPy)
         {
-            // Return an empty numpy array with the expected shape (0, width, C)
-            return py::array(py::dtype::of<uint8_t>(),
-                             {0, properties.width, outChannels_});
+            // Match the dtype of non-empty frames: uint16 for >8-bit sources
+            // (unless force_8bit), else uint8 — so the EOF sentinel doesn't
+            // silently differ from the frames that preceded it.
+            const bool sixteen = (!force_8bit && properties.bitDepth > 8);
+            py::dtype dt =
+                sixteen ? py::dtype::of<uint16_t>() : py::dtype::of<uint8_t>();
+            return py::array(dt, {0, properties.width, outChannels_});
         }
         return py::cast(torch::Tensor());
     }
@@ -716,14 +719,13 @@ void VideoReader::ensureRandDecoder()
         // async fanout producer instead routes every frame to the convert-worker
         // map (syncConvertOutMap_, only decodeNextFrameTensor reads it), so those
         // queues never fill and frame_at() deadlocks. Sync mode disables fanout.
+        // Match the main decoder's channel count (caller buffers are sized for
+        // outChannels_). Passed into the ctor for the same reason as the main
+        // decoder — no post-construction channel switch.
         rand_decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_, /*syncMode=*/true);
+            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_);
         rand_decoder->setForce8Bit(force_8bit);
-        // Random-access frames must match the main decoder's channel count, or
-        // the caller buffers (sized for outChannels_) would overflow/underflow.
-        if (grayscale_ && decodeAccelerator == nelux::DecodeAccelerator::CPU)
-            rand_decoder->setColorFormat(true);
     }
 }
 
