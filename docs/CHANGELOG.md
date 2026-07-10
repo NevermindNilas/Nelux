@@ -1,5 +1,10 @@
 
-### **Version 0.15.0 (2026-07-07)**
+### **Version 0.14.2 (2026-07-10)**
+
+#### **Dependency: PyTorch 2.13.0**
+- **Changed:** CI/build workflows (Windows, Linux, macOS) now build against PyTorch 2.13.0 / torchvision 0.28.0 (Windows + Linux keep the CUDA 13.2 `cu132` wheel index; macOS remains CPU/MPS-only from PyPI). Previous: 2.12.0 / 0.27.0. Runtime `torch` remains unpinned — the wheel excludes torch and links against the user's installed version.
+- **Changed:** Release wheels carry the build-time PyTorch ABI as their wheel build tag (`nelux-0.14.2-213torch-cp313-cp313-win_amd64.whl`) and `nelux.__torch_abi__` now reports `2.13`. Importing a 2.13-built wheel under a different PyTorch minor still raises a clear `ImportError`, so users on PyTorch 2.12 must stay on a `212torch` wheel until they upgrade.
+- **Changed:** Recommended PyTorch updated to 2.13.0 in `README.md` + `llms.txt`.
 
 #### **Feature: selectable resize filter (`resize_filter`)**
 - **Added:** `VideoReader(..., resize_filter="lanczos")` selects the libswscale scaling kernel used for the decoder-side `resize`. Accepts the same scaler names as ffmpeg's `-sws_flags`: `fast_bilinear`, `bilinear` (default, unchanged behavior), `bicubic`, `experimental`, `neighbor`, `area`, `bicublin`, `gauss`, `sinc`, `lanczos`, `spline`. The filter governs spatial rescaling only — the color-conversion matrix is set separately (`sws_setColorspaceDetails`) and is untouched — and is only consulted when a resize is actually active; native-resolution decodes keep the `SWS_BILINEAR` chroma path that matches ffmpeg/torchcodec byte output. Cost tracks the kernel's tap count (`bilinear` < `bicubic` < `lanczos`); there is no extra fast-path penalty since any resize already leaves swscale's unscaled converter.

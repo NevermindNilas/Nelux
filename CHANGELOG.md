@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-07-10
+
+### Added
+
+- **Selectable resize filter.** `VideoReader(..., resize_filter="lanczos")`
+  selects the libswscale scaling kernel used for the decoder-side `resize`,
+  accepting the same scaler names as ffmpeg's `-sws_flags` (`fast_bilinear`,
+  `bilinear` (default, unchanged), `bicubic`, `experimental`, `neighbor`,
+  `area`, `bicublin`, `gauss`, `sinc`, `lanczos`, `spline`). The filter governs
+  spatial rescaling only — the color-conversion matrix is untouched — and is
+  consulted only when a resize is active, so native-resolution decodes keep the
+  `SWS_BILINEAR` chroma path that matches ffmpeg/torchcodec byte output. CPU
+  decode only: combining a non-default `resize_filter` with
+  `decode_accelerator="nvdec"` raises a clear error, since cuvid scales with its
+  own internal hardware scaler.
+
+### Changed
+
+- **Build dependency bumped to PyTorch 2.13.0 / torchvision 0.28.0** across the
+  Windows, Linux and macOS workflows (Windows + Linux keep the CUDA 13.2
+  `cu132` wheel index; macOS remains CPU/MPS-only from PyPI). Runtime `torch`
+  stays unpinned — wheels exclude torch and link against the installed copy.
+  Release wheels are build-tagged with the PyTorch ABI (`213torch`) and
+  `nelux.__torch_abi__` now reports `2.13`; importing under a different PyTorch
+  minor still raises a clear `ImportError`, so PyTorch 2.12 users must stay on a
+  `212torch` wheel until they upgrade.
+
 ## [0.14.1] - 2026-07-07
 
 ### Fixed

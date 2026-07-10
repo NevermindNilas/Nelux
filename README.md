@@ -326,7 +326,7 @@ VideoReader(
 ## Requirements
 
 - **Python**: 3.13+ (see `pyproject.toml` `requires-python`)
-- **PyTorch**: 2.12+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
+- **PyTorch**: 2.13+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
 - **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
 - **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 12+ (Apple Silicon, CPU only)
 
