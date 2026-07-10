@@ -47,7 +47,12 @@ endif()
 set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CXX_STANDARD        17)
+# C++20 is required by the PyTorch 2.13 headers: c10/util/StringUtil.h uses
+# designated initializers and c10/core/AutogradState.h uses default member
+# initializers for bit-fields. GCC/Clang accept both as C++17 extensions, so
+# only MSVC rejects them (C7555 / C7582), and C++17 additionally leaves
+# HeaderOnlyArrayRef's operator== ambiguous there (C2666).
+set(CMAKE_CXX_STANDARD        20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -407,7 +412,7 @@ if(NELUX_ENABLE_CUDA)
     set_target_properties(NeluxCuda PROPERTIES
       CUDA_SEPARABLE_COMPILATION OFF
       POSITION_INDEPENDENT_CODE ON
-      CUDA_STANDARD 17
+      CUDA_STANDARD 20
       CUDA_RUNTIME_LIBRARY Static
     )
     target_include_directories(NeluxCuda PUBLIC

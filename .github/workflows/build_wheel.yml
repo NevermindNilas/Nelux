@@ -7,7 +7,11 @@ env:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # Pinned to windows-2022 (VS2022) to match createRelease.yaml: `windows-latest`
+    # migrated to VS2026 (MSVC 19.5x), which the pinned CUDA 13.1 toolkit rejects
+    # in crt/host_config.h. Keeping these in sync is what makes a manual dispatch
+    # of this workflow a valid pre-tag smoke test for the release build.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:

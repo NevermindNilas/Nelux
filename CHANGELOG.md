@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nelux.__torch_abi__` now reports `2.13`; importing under a different PyTorch
   minor still raises a clear `ImportError`, so PyTorch 2.12 users must stay on a
   `212torch` wheel until they upgrade.
+- **C++ standard raised to C++20** (from C++17), required by the PyTorch 2.13
+  headers: `c10/util/StringUtil.h` uses designated initializers and
+  `c10/core/AutogradState.h` uses default member initializers for bit-fields.
+  GCC/Clang accept both as C++17 extensions, so only MSVC rejected them
+  (`C7555`/`C7582`, plus a `C2666` ambiguity on
+  `c10::HeaderOnlyArrayRef::operator==`). Affects source builds only.
 
 ## [0.14.1] - 2026-07-07
 
