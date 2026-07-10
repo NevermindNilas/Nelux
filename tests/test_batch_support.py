@@ -3,7 +3,7 @@
 import pytest
 import torch
 import numpy as np
-from nelux import VideoReader
+from nelux import VideoReader, __cuda_support__
 from tests.utils.video_downloader import get_video
 
 VIDEO_PATH = get_video("lite")
@@ -211,6 +211,33 @@ class TestBatchVsSequential:
                 assert mean_diff < 5.0, (
                     f"Frame {idx}: mean difference {mean_diff} too large"
                 )
+
+
+@pytest.mark.skipif(
+    not (__cuda_support__ and torch.cuda.is_available()),
+    reason="CUDA/NVDEC build not available",
+)
+def test_nvdec_batch_is_exact_and_deterministic():
+    """NVDEC batch frames must exactly match true sequential frame indices."""
+    video_path = get_video("full")
+    indices = [1, 61, 121, 181, 42, 42, 7]
+
+    reference_reader = VideoReader(video_path, decode_accelerator="nvdec")
+    wanted = set(indices)
+    reference = {}
+    for i, frame in enumerate(reference_reader):
+        if i in wanted:
+            reference[i] = frame.cpu().clone()
+        if i >= max(wanted):
+            break
+    expected = torch.stack([reference[i] for i in indices])
+
+    # Fresh decoders caught the old cross-stream source-buffer race reliably:
+    # the same request returned a neighbouring or torn frame across runs.
+    for _ in range(4):
+        reader = VideoReader(video_path, decode_accelerator="nvdec")
+        actual = reader.get_batch(indices).cpu()
+        assert torch.equal(actual, expected)
 
 
 class TestBatchProperties:

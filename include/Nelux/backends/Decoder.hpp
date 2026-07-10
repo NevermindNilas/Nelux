@@ -248,6 +248,9 @@ class Decoder
     std::condition_variable queueCond;
     std::condition_variable producerCond;
     size_t maxQueueSize = 20;
+    // Derived consumers can hold the producer after popping a frame when the
+    // backing storage remains producer-owned (for example NVDEC surfaces).
+    std::atomic<bool> producerBlocked_{false};
     bool isFinished = false;
     std::atomic<bool> preconvertEnabled{false};
     // When true (and syncConvertWorkerCount_>0), the async producer pushes

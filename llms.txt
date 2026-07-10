@@ -486,6 +486,7 @@ def process_video(input_path, output_path, model):
 
 ## Version History Highlights
 
+- **0.14.3** (2026-07-10): Fixed NVDEC batched decode returning the wrong frame — `get_batch()` (and slice/list indexing) with `decode_accelerator="nvdec"` intermittently returned a neighbouring or torn frame due to a cross-context CUDA surface race; `frame_at` had the same ±1 flicker. The hw decoder now shares PyTorch's CUDA context and synchronizes cuvid's producer stream before conversion, so NVDEC `get_batch`/`frame_at`/iteration are bit-exact and deterministic. CPU decode was unaffected.
 - **0.14.2** (2026-07-10): `VideoReader(..., resize_filter=...)` selects the libswscale scaling kernel for the decoder-side `resize` (ffmpeg `-sws_flags` names; CPU decode only, rejected with `decode_accelerator="nvdec"`). Build dependency bumped to PyTorch 2.13.0 / torchvision 0.28.0 (Windows + Linux on the CUDA 13.2 `cu132` wheel index); wheels are ABI-tagged `213torch` and refuse to import under a different PyTorch minor.
 - **0.12.2** (2026-05-28): Fixed Windows CUDA wheels failing to import (`ImportError: DLL load failed ... WinError 1114`) — the release `delvewheel` repair step now excludes `c10_cuda.dll` so it is no longer double-vendored alongside torch's copy. No API or runtime behavior change.
 - **0.12.1** (2026-05-28): Build dependency bumped to PyTorch 2.12.0 / torchvision 0.27.0 (Windows + Linux build against the CUDA 13.2 `cu132` wheel index). Runtime `torch` stays unpinned — wheels exclude torch and use the installed copy.

@@ -1650,6 +1650,7 @@ void Decoder::clearQueue()
         std::swap(frameQueue, empty);
         std::queue<ConvertedFrame> emptyConverted;
         std::swap(convertedQueue, emptyConverted);
+        producerBlocked_.store(false, std::memory_order_release);
         isFinished = false;
     }
     // Fanout state cleanup so a restart starts fresh.
@@ -1723,7 +1724,10 @@ void Decoder::decodingLoop()
                                   size_t qsize = preconvertEnabled
                                                      ? convertedQueue.size()
                                                      : frameQueue.size();
-                                  return qsize < maxQueueSize || stopDecoding;
+                                  return (qsize < maxQueueSize &&
+                                          !producerBlocked_.load(
+                                              std::memory_order_acquire)) ||
+                                         stopDecoding;
                               });
         }
 

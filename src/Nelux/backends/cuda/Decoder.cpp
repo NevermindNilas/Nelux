@@ -71,6 +71,7 @@ extern void launchNv12ToRgb24Separate(const uint8_t* pY, const uint8_t* pUV,
                                       int nRgbPitch, int nWidth, int nHeight,
                                       int colorSpace, int colorRange,
                                       cudaStream_t stream);
+extern void invalidateColorSpaceMatrixCache(cudaStream_t stream);
 
 // P016 (4:2:0, 10/16-bit)
 extern void launchP016ToRgb24(const uint8_t* pP016, int nP016Pitch, uint8_t* pRgb,
@@ -186,6 +187,44 @@ static int mapColorRange(AVColorRange cr)
     return (cr == AVCOL_RANGE_JPEG) ? ColorRange_Full : ColorRange_Limited;
 }
 
+// Wait for the CUDA stream that CUVID used to produce this frame's surface.
+//
+// cuvid issues its output-surface copy on the frame's AVCUDADeviceContext stream
+// (see cuvid_output_frame). avcodec_receive_frame() can return before that copy
+// completes, so converting immediately reads a surface still being written —
+// yielding the previous frame or a torn frame. The streaming path otherwise only
+// avoids this by the incidental delay of the queue handoff. Because the hw device
+// is bound to our own CUDA context (initHardwareContext uses the current context),
+// synchronizing that stream here waits on cuvid's write deterministically.
+static void waitForFrameProducerStream(AVFrame* frame)
+{
+    if (!frame || !frame->hw_frames_ctx)
+        return;
+
+    auto* framesCtx = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
+    if (!framesCtx || !framesCtx->device_ctx)
+        return;
+
+    auto* cudaDevCtx =
+        static_cast<AVCUDADeviceContext*>(framesCtx->device_ctx->hwctx);
+    if (!cudaDevCtx)
+        return;
+
+    // cudaStream_t and CUstream are the same underlying handle. cuvid's device
+    // context commonly leaves stream == NULL, i.e. it copies the output surface
+    // on the default stream; cudaStreamSynchronize(NULL) waits on exactly that.
+    // Skipping the NULL case (as an earlier version did) left the wait a no-op,
+    // so conversion still raced cuvid's write. This is only correct when cuvid
+    // shares our CUDA context (see initHardwareContext's use-current-context).
+    cudaError_t err =
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(cudaDevCtx->stream));
+    if (err != cudaSuccess)
+    {
+        throw CxException(std::string("CUDA DECODER: Producer stream sync failed: ") +
+                          cudaGetErrorString(err));
+    }
+}
+
 static bool isDeviceAccessiblePointer(const void* ptr)
 {
     if (!ptr)
@@ -232,6 +271,12 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
     // Async fanout uses CPU libswscale convert workers; CUDA decoder produces
     // AV_PIX_FMT_CUDA frames that cannot be fed to libswscale on the host. Disable.
     asyncFanoutEnabled_ = false;
+    // A queued AV_PIX_FMT_CUDA frame refers to an NVDEC-owned decode surface.
+    // Keep a single surface in flight and release the producer only after the
+    // consumer's conversion stream has finished reading it.  Waking the
+    // producer as soon as the frame was popped allowed CUVID to recycle the
+    // surface during conversion, yielding neighbouring or torn frames.
+    maxQueueSize = 1;
     NELUX_DEBUG("CUDA DECODER: Constructing with device index {}, resize={}x{}",
                 cudaDeviceIndex, resizeWidth, resizeHeight);
     NELUX_INFO("CUDA DECODER BUILD: 2026-02-06T22:49:00 RGB24-BYTE-BY-BYTE-FIX-ACTIVE");
@@ -273,6 +318,7 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
     }
 
     initialize(filePath);
+    cachedFilePath_ = filePath;
 
     // Enable ML output mode by default for optimal BCHW format
     // This will be configured with appropriate dtype (FP16/FP32) based on bit depth
@@ -397,8 +443,18 @@ void Decoder::initHardwareContext()
     char deviceStr[16];
     snprintf(deviceStr, sizeof(deviceStr), "%d", cudaDeviceIndex_);
 
+    // Bind FFmpeg/cuvid to the *current* CUDA context — the primary context that
+    // PyTorch and our own cudaStream_/cudaMalloc use. With flags=0 FFmpeg creates
+    // a separate context, so cuvid decodes the output surface on a stream in that
+    // other context and our cudaDeviceSynchronize()/stream syncs never wait on
+    // it; conversion then races cuvid's write and returns the previous or a torn
+    // frame (the batch path exposed this). Priming the primary context via a
+    // trivial runtime call makes it current, then USE_CURRENT_CONTEXT shares it.
+    cudaSetDevice(cudaDeviceIndex_);
+    cudaFree(nullptr); // force primary-context creation/binding on this thread
+
     int ret = av_hwdevice_ctx_create(&hwDeviceCtx_, AV_HWDEVICE_TYPE_CUDA, deviceStr,
-                                     nullptr, 0);
+                                     nullptr, AV_CUDA_USE_CURRENT_CONTEXT);
     if (ret < 0)
     {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -824,19 +880,6 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                           cudaGetErrorString(device_err));
     }
 
-    // CRITICAL: Synchronize ALL CUDA streams before overwriting the output buffer.
-    // The caller may have launched async GPU ops (e.g., frame.float(), conv2d, etc.)
-    // on PyTorch's CUDA stream that are still reading from `buffer`. We must wait
-    // for those to complete before we write new frame data into the same memory.
-    //
-    // Diagnostic / sweep override: set NELUX_NVDEC_SKIP_ENTRY_SYNC=1 to bypass
-    // this sync (UNSAFE — caller must guarantee no in-flight reads of buffer).
-    if (const char* env = std::getenv("NELUX_NVDEC_SKIP_ENTRY_SYNC");
-        !env || std::atoi(env) == 0)
-    {
-        cudaDeviceSynchronize();
-    }
-
     // Use the base class decoding thread infrastructure, but with our conversion
     if (!decodingThread.joinable())
     {
@@ -854,8 +897,28 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
     Frame frame = std::move(frameQueue.front());
     frameQueue.pop();
-    producerCond.notify_one();
+    producerBlocked_.store(true, std::memory_order_release);
     lock.unlock();
+
+    // avcodec_receive_frame may publish an NVDEC surface before work on
+    // FFmpeg/CUVID's CUDA stream has completed.  Synchronize only after the
+    // frame is dequeued: doing this before waiting on frameQueue leaves a race
+    // where the producer submits the decode after the synchronization point.
+    // This also preserves the original protection against overwriting a shared
+    // output tensor while a caller still has GPU work reading it.
+    //
+    // Diagnostic / sweep override: set NELUX_NVDEC_SKIP_ENTRY_SYNC=1 to bypass
+    // this sync (UNSAFE — caller must provide both decode and consumer ordering).
+    if (const char* env = std::getenv("NELUX_NVDEC_SKIP_ENTRY_SYNC");
+        !env || std::atoi(env) == 0)
+    {
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess)
+        {
+            throw CxException(std::string("CUDA DECODER: Device sync failed: ") +
+                              cudaGetErrorString(sync_err));
+        }
+    }
 
     if (frame_timestamp)
     {
@@ -886,6 +949,9 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         }
 
         const bool outputOnDevice = isDeviceAccessiblePointer(buffer);
+
+        // Wait for cuvid's producer stream before reading the decode surface.
+        waitForFrameProducerStream(frame.get());
 
         // 1. Convert to aligned GPU buffer
         transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
@@ -954,6 +1020,15 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     {
         cudaEventRecord(decodeCompleteEvent_, cudaStream_);
     }
+
+    // Conversion is complete and no longer reads the NVDEC surface.  The
+    // producer may now receive/decode the next frame and reuse that surface.
+    // Drop the AVFrame reference before releasing the producer; otherwise a
+    // small CUVID surface pool can advance/duplicate display output while the
+    // just-consumed surface is still retained until this function returns.
+    av_frame_unref(frame.get());
+    producerBlocked_.store(false, std::memory_order_release);
+    producerCond.notify_one();
 
     return true;
 }
@@ -1052,6 +1127,7 @@ void Decoder::close()
     // Destroy CUDA stream
     if (cudaStream_)
     {
+        invalidateColorSpaceMatrixCache(cudaStream_);
         cudaStreamDestroy(cudaStream_);
         cudaStream_ = nullptr;
     }
@@ -1196,8 +1272,19 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
 
     Frame frame = std::move(frameQueue.front());
     frameQueue.pop();
-    producerCond.notify_one();
+    producerBlocked_.store(true, std::memory_order_release);
     lock.unlock();
+
+    if (const char* env = std::getenv("NELUX_NVDEC_SKIP_ENTRY_SYNC");
+        !env || std::atoi(env) == 0)
+    {
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess)
+        {
+            throw CxException(std::string("CUDA DECODER ML: Device sync failed: ") +
+                              cudaGetErrorString(sync_err));
+        }
+    }
 
     if (frame_timestamp)
     {
@@ -1209,6 +1296,9 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
     // Convert and transfer the frame using unified two-step approach
     if (frame.get()->format == AV_PIX_FMT_CUDA || rawPassthroughMode_)
     {
+        // Wait for cuvid's producer stream before reading the decode surface.
+        waitForFrameProducerStream(frame.get());
+
         // Unified two-step conversion for ALL formats:
         // Step 1: Convert any format (NV12, P010, YUV444, etc.) to RGB24 using existing
         // kernels Step 2: Convert RGB24 (HWC) to BCHW with normalization
@@ -1320,6 +1410,10 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         cudaEventRecord(decodeCompleteEvent_, cudaStream_);
     }
 
+    av_frame_unref(frame.get());
+    producerBlocked_.store(false, std::memory_order_release);
+    producerCond.notify_one();
+
     return true;
 }
 
@@ -1417,7 +1511,8 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Restart decoding thread
     hwInitialized_ = true;
-    startDecodingThread();
+    if (!syncMode_)
+        startDecodingThread();
 
     NELUX_INFO("CUDA DECODER: Reconfigured successfully for: {}", filePath);
 }
@@ -1434,20 +1529,8 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
                                 .device(torch::kCUDA, cudaDeviceIndex_));
     }
 
-    // Sort and group indices
-    int64_t total_frames = 0;
-    // Get frame count (cached or calculated)
-    if (formatCtx->streams[videoStreamIndex]->nb_frames > 0)
-    {
-        total_frames = formatCtx->streams[videoStreamIndex]->nb_frames;
-    }
-    else
-    {
-        double fps = av_q2d(formatCtx->streams[videoStreamIndex]->avg_frame_rate);
-        total_frames = static_cast<int64_t>(properties.duration * fps);
-    }
-
-    // Validate indices and build map
+    // Group requested positions by frame index (dedups, sorts, and records every
+    // output slot each unique frame must be copied to).
     std::map<int64_t, std::vector<size_t>> position_map;
     for (size_t i = 0; i < indices.size(); i++)
     {
@@ -1478,98 +1561,73 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         {static_cast<int64_t>(indices.size()), properties.height, properties.width, 3},
         options);
 
-    // Temp GPU buffer for a single frame
+    // Match normal NVDEC iteration by decoding every frame into one stable
+    // destination.  Copies into the batch are issued and synchronized on the
+    // decoder stream before this buffer is reused; unlike the old copy_ path,
+    // no work is left pending on PyTorch's unrelated current stream.
     size_t frame_size_bytes = static_cast<size_t>(properties.width) *
                               static_cast<size_t>(properties.height) * 3 * elemSize;
+    torch::Tensor frame_buffer = torch::empty(
+        {properties.height, properties.width, 3}, options);
 
-    void* d_frame_buffer = nullptr;
-    cudaError_t err = cudaMalloc(&d_frame_buffer, frame_size_bytes);
-    if (err != cudaSuccess)
+    // NVDEC seek/flush timestamps are not a reliable frame ordinal around
+    // keyframe boundaries, and flushing the live CUVID context to zero can
+    // duplicate an early display frame.  Use a fresh, isolated NVDEC decoder
+    // and count its ordered outputs from frame zero, matching normal iteration
+    // without disturbing this reader's streaming state.
+    if (decodingThread.joinable())
     {
-        throw CxException("Failed to allocate temp buffer for batch decoding");
+        stopDecodingThread();
+        clearQueue();
     }
+    Decoder batchDecoder(cachedFilePath_, numThreads, cudaDeviceIndex_,
+                         resizeWidth_, resizeHeight_);
+    batchDecoder.setForce8Bit(force_8bit);
+    const std::string batchFilePath = cachedFilePath_;
+    batchDecoder.reconfigure(batchFilePath);
 
-    // RAII for cudaFree
-    struct CudaFreer
+    // Drive the isolated decoder through the same streaming decode+convert path
+    // that normal iteration uses (decodeNextFrame). That path pops each frame
+    // from the producer thread and, before converting, waits on cuvid's own
+    // producer stream (see waitForFrameProducerStream) then synchronizes the
+    // conversion — so every returned frame is complete and correct. Hand-driving
+    // avcodec_receive_frame + transferAndConvertFrame here instead raced cuvid's
+    // surface writes (previous/torn frames). Count ordered outputs from frame
+    // zero and copy out the requested targets, duplicates included.
+    int64_t decoded_frame = -1;
+    double frame_ts = 0.0;
+
+    for (int64_t target_frame : sorted_frames)
     {
-        void* ptr;
-        ~CudaFreer()
+        const auto& positions = position_map[target_frame];
+
+        while (decoded_frame < target_frame)
         {
-            if (ptr)
-                cudaFree(ptr);
-        }
-    } freer{d_frame_buffer};
-
-    // Decoding loop
-    int64_t current_frame = -1;
-    bool need_seek = true;
-    double fps = av_q2d(formatCtx->streams[videoStreamIndex]->avg_frame_rate);
-    const int64_t SEQUENTIAL_THRESHOLD = 30;
-
-    try
-    {
-        for (int64_t target_frame : sorted_frames)
-        {
-            // Check if we need to seek
-            bool seek_required = need_seek || target_frame < current_frame ||
-                                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD;
-
-            if (seek_required)
+            if (!batchDecoder.decodeNextFrame(frame_buffer.data_ptr(), &frame_ts))
             {
-                double target_ts = static_cast<double>(target_frame) / fps;
-                if (!seek(target_ts))
-                {
-                    NELUX_WARN("Batch seek failed for frame {}", target_frame);
-                    // Try to continue, maybe next seek works
-                    continue;
-                }
-                current_frame = -1; // Reset estimation
+                throw CxException("CUDA batch decode reached EOF before frame " +
+                                  std::to_string(target_frame));
             }
+            ++decoded_frame;
+        }
 
-            // Decode until target
-            while (true)
+        // frame_buffer now holds target_frame, fully converted and synchronized
+        // by decodeNextFrame. Copy it (and any duplicate positions) into the
+        // batch output; decodeNextFrame's entry synchronization orders the next
+        // frame's write after these device-to-device copies complete.
+        for (size_t pos : positions)
+        {
+            cudaError_t copy_err = cudaMemcpy(output[pos].data_ptr(),
+                                              frame_buffer.data_ptr(), frame_size_bytes,
+                                              cudaMemcpyDeviceToDevice);
+            if (copy_err != cudaSuccess)
             {
-                double frame_ts = 0.0;
-                // Decode into temp buffer
-                bool ok = decodeNextFrame(d_frame_buffer, &frame_ts);
-                if (!ok)
-                {
-                    NELUX_WARN("Failed to decode frame while seeking target {}",
-                               target_frame);
-                    break;
-                }
-
-                // Estimate frame index from timestamp
-                int64_t decoded_idx = static_cast<int64_t>(frame_ts * fps + 0.5);
-                current_frame = decoded_idx;
-
-                if (current_frame >= target_frame)
-                {
-                    // Match found (or passed closely)
-                    const auto& positions = position_map[target_frame];
-
-                    // Create tensor wrapper for device-to-device copy
-                    auto frame_tensor = torch::from_blob(
-                        d_frame_buffer, {properties.height, properties.width, 3},
-                        options);
-
-                    for (size_t pos : positions)
-                    {
-                        output[pos].copy_(frame_tensor);
-                    }
-
-                    need_seek = false;
-                    break;
-                }
+                throw CxException(std::string("CUDA batch copy failed: ") +
+                                  cudaGetErrorString(copy_err));
             }
         }
     }
-    catch (...)
-    {
-        throw;
-    }
 
-    // d_frame_buffer freed by RAII
     return output;
 }
 

@@ -227,15 +227,13 @@ static const float kMatFCCLimited[3][3] = {
 static std::mutex g_matCacheMu;
 static int g_matCachedMatrix = -1;
 static int g_matCachedRange = -1;
+static cudaStream_t g_matCachedStream = nullptr;
 
 void SetMatYuv2Rgb(int iMatrix, int colorRange, cudaStream_t stream) {
-    {
-        std::lock_guard<std::mutex> lk(g_matCacheMu);
-        if (iMatrix == g_matCachedMatrix && colorRange == g_matCachedRange)
-            return;  // Same matrix already in constant memory — skip H2D.
-        g_matCachedMatrix = iMatrix;
-        g_matCachedRange = colorRange;
-    }
+    std::lock_guard<std::mutex> lk(g_matCacheMu);
+    if (stream == g_matCachedStream && iMatrix == g_matCachedMatrix &&
+        colorRange == g_matCachedRange)
+        return;  // Same matrix already in constant memory — skip H2D.
 
     const float (*mat)[3] = nullptr;
 
@@ -270,7 +268,18 @@ void SetMatYuv2Rgb(int iMatrix, int colorRange, cudaStream_t stream) {
             break;
     }
     
-    cudaMemcpyToSymbolAsync(matYuv2Rgb, mat, sizeof(float) * 9, 0, cudaMemcpyHostToDevice, stream);
+    // Constant memory and this cache are shared across decoder streams.  The
+    // old async upload published the cache keys before the copy completed, so
+    // another decoder could observe a cache hit and launch its kernel against
+    // stale coefficients.  Matrix changes are rare; make the update complete
+    // before publishing it.
+    cudaError_t err = cudaMemcpyToSymbol(
+        matYuv2Rgb, mat, sizeof(float) * 9, 0, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) {
+        g_matCachedStream = stream;
+        g_matCachedMatrix = iMatrix;
+        g_matCachedRange = colorRange;
+    }
 }
 
 // Overload for backwards compatibility (defaults to limited range)
@@ -933,6 +942,15 @@ void initColorSpaceMatrix(int colorSpace, int colorRange, cudaStream_t stream) {
 // Backwards compatible overload
 void initColorSpaceMatrix(int colorSpace, cudaStream_t stream) {
     SetMatYuv2Rgb(colorSpace, ColorRange_Limited, stream);
+}
+
+void invalidateColorSpaceMatrixCache(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_matCacheMu);
+    if (stream == g_matCachedStream) {
+        g_matCachedStream = nullptr;
+        g_matCachedMatrix = -1;
+        g_matCachedRange = -1;
+    }
 }
 
 //------------------------------------------------------------------------------

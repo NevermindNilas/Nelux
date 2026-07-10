@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-07-10
+
+### Fixed
+
+- **NVDEC batched decode returned wrong frames.** `VideoReader(..., decode_accelerator="nvdec").get_batch(...)` (and slice/list indexing that routes through it) intermittently returned a neighbouring frame — usually the one before the requested index — or an occasional torn frame, and the exact set of wrong indices varied run to run. The root cause was a cross-context CUDA race: FFmpeg's CUDA hardware context was created separately from the context PyTorch and nelux use, so cuvid wrote each decode surface on a stream our synchronizations never waited on, and conversion could read the surface before cuvid finished writing it. The streaming/iteration path only avoided this by the incidental delay of its producer/consumer queue handoff, which the tight batch loop removed. Fixes: the hardware decoder is now bound to the current (shared) CUDA context; cuvid's producer stream is synchronized before every surface conversion; and `decode_batch` decodes through the same streaming path normal iteration uses. NVDEC `get_batch`, `frame_at`, and iteration are now bit-exact and deterministic. The CPU decode path was never affected.
+
 ## [0.14.2] - 2026-07-10
 
 ### Added

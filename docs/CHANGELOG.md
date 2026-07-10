@@ -1,4 +1,14 @@
 
+### **Version 0.14.3 (2026-07-10)**
+
+#### **Fix: NVDEC batched decode returned the wrong frame**
+- **Fixed:** `VideoReader(..., decode_accelerator="nvdec").get_batch(...)` (and the slice/list `__getitem__` forms that call it) intermittently returned a neighbouring frame — most often the frame *before* the requested index — or, less often, a torn frame blending two frames. The failure was nondeterministic: the set of wrong indices changed from run to run, and roughly 5–13% of requested frames were affected. NVDEC `frame_at` showed the same ±1 flicker. CPU decode was never affected and stayed bit-exact throughout.
+- **Root cause:** a cross-context CUDA surface race. `av_hwdevice_ctx_create` was called with default flags, so FFmpeg/cuvid ran in a **separate CUDA context** from the one PyTorch and nelux's own streams use. cuvid issues its output-surface copy asynchronously on a stream in that other context, so `cudaDeviceSynchronize()`/stream syncs in our context never waited on it, and the NV12→RGB conversion could read a surface cuvid had not finished writing — yielding the previous frame's pixels (clean `-1`) or a partial/torn frame. The streaming iteration path only survived because the producer→consumer queue handoff happened to give cuvid enough time; the batch path's tight decode loop closed that gap and exposed the race.
+- **Fixes:** (1) the hardware decoder now binds to the **current CUDA context** (`AV_CUDA_USE_CURRENT_CONTEXT`, after priming the primary context) so cuvid, PyTorch, and our conversion streams share one context and a sync in our context actually covers cuvid's decode work; (2) cuvid's producer stream is synchronized before every surface conversion (handling the common `stream == NULL`/default-stream case that an earlier attempt skipped); (3) `decode_batch` was rewritten to decode through the **same streaming `decodeNextFrame` path** normal iteration uses — counting ordered outputs from frame zero — instead of hand-driving `avcodec_receive_frame` + conversion, which raced cuvid's writes. A related constant-memory colour-matrix cache race (async upload published before the copy completed, shared across decoder streams) was also closed.
+- **Result:** NVDEC `get_batch`, `frame_at`, and iteration are now bit-exact against the true frame indices and deterministic across runs, verified frame-by-frame and under a multi-threaded decode→upscale→encode pipeline. No API or behaviour change on the CPU path.
+
+---
+
 ### **Version 0.14.2 (2026-07-10)**
 
 #### **Dependency: PyTorch 2.13.0**
