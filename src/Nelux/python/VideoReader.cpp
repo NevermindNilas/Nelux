@@ -599,8 +599,13 @@ py::dict VideoReader::getProperties() const
 
     // Exact rates: expose both the reduced string ("24000/1001") and the raw
     // numerator/denominator so callers can feed encoders without float drift.
+    // Frame rates use ffmpeg's "num/den" convention; aspect ratios use the
+    // "num:den" convention that ffprobe reports (e.g. "16:9").
     auto ratStr = [](int num, int den) {
         return std::to_string(num) + "/" + std::to_string(den);
+    };
+    auto aspectStr = [](int num, int den) {
+        return std::to_string(num) + ":" + std::to_string(den);
     };
     props["avg_frame_rate"] = ratStr(properties.avgFrameRateNum, properties.avgFrameRateDen);
     props["r_frame_rate"] = ratStr(properties.rFrameRateNum, properties.rFrameRateDen);
@@ -618,8 +623,8 @@ py::dict VideoReader::getProperties() const
     props["color_range"] = properties.colorRange;
 
     // Aspect ratios
-    props["sample_aspect_ratio"] = ratStr(properties.sarNum, properties.sarDen);
-    props["display_aspect_ratio"] = ratStr(properties.darNum, properties.darDen);
+    props["sample_aspect_ratio"] = aspectStr(properties.sarNum, properties.sarDen);
+    props["display_aspect_ratio"] = aspectStr(properties.darNum, properties.darDen);
 
     // Bitrates / timing / container
     props["bit_rate"] = properties.bitRate;

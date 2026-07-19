@@ -2,6 +2,7 @@
 #include "Decoder.hpp"
 #include "BatchDecoder.hpp"
 #include "conversion/cpu/AutoToRGB.hpp"
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 
@@ -182,11 +183,27 @@ void Decoder::setProperties()
     properties.min_fps = properties.fps; // Initialize min fps
     properties.max_fps = properties.fps; // Initialize max fps
 
-    // Exact frame rates as rationals (avoid float rounding of 24000/1001 etc.)
-    properties.avgFrameRateNum = stream->avg_frame_rate.num;
-    properties.avgFrameRateDen = stream->avg_frame_rate.den;
-    properties.rFrameRateNum = stream->r_frame_rate.num;
-    properties.rFrameRateDen = stream->r_frame_rate.den;
+    // Exact frame rates as REDUCED rationals (avoid float rounding of
+    // 24000/1001 etc.). FFmpeg does not guarantee the stored rate is already in
+    // lowest terms (e.g. 48/2), so reduce before exposing num/den + string.
+    {
+        auto reduceRate = [](AVRational r, int& num, int& den) {
+            if (r.den == 0)  // unset/degenerate rate: pass through, don't reduce
+            {
+                num = r.num;
+                den = r.den;
+                return;
+            }
+            int n = 0, d = 1;
+            av_reduce(&n, &d, r.num, r.den, INT_MAX);
+            num = n;
+            den = d;
+        };
+        reduceRate(stream->avg_frame_rate, properties.avgFrameRateNum,
+                   properties.avgFrameRateDen);
+        reduceRate(stream->r_frame_rate, properties.rFrameRateNum,
+                   properties.rFrameRateDen);
+    }
     // VFR heuristic: base (r_frame_rate) differs from averaged rate. Compare as
     // reduced rationals so 24/1 vs 48/2 don't read as VFR.
     {
@@ -2084,8 +2101,10 @@ int64_t Decoder::get_frame_count()
     // fps*duration path only estimates. Cached, so paid at most once.
     if (!cachedFilePath_.empty())
     {
+        // countVideoPacketsExact returns -1 on failure and the true count
+        // (which may legitimately be 0 for an empty video stream) otherwise.
         int64_t packetCount = countVideoPacketsExact();
-        if (packetCount > 0)
+        if (packetCount >= 0)
         {
             cached_frame_count_ = packetCount;
             NELUX_DEBUG("Frame count from packet demux pass: {}", cached_frame_count_);

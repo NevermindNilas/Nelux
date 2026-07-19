@@ -4,7 +4,14 @@ Walks the generated corpus under tests/data/metadata_corpus, extracts metadata t
 ways (ffprobe JSON = ground truth, nelux = libav-direct), compares every field, and
 times both. ffprobe pays a subprocess spawn per file; nelux reads libav in-process.
 
-Run:
+This is a local verification harness, not a portable unit test: it needs a
+locally generated corpus (video files are gitignored, not checked in) and a
+matching nelux build. It is written to be inert under pytest collection on any
+machine — the Windows-only DLL setup and the torch/nelux imports happen lazily
+inside main(), and the pytest entry point below skips when prerequisites are
+absent rather than erroring at import time.
+
+Run standalone:
     <py3.14-with-torch-2.13> tests/test_metadata_probe.py
 """
 import os
@@ -15,22 +22,31 @@ import glob
 import subprocess
 from fractions import Fraction
 
-os.add_dll_directory(r"D:\Nelux\external\ffmpeg\bin")
-import torch  # noqa: F401  (ABI: import before nelux)
-
-sys.path.insert(0, r"D:\Nelux")
-import nelux  # noqa: E402
+REPO = r"D:\Nelux"
 
 # Use nelux's bundled FFmpeg so the ground-truth libav version matches nelux's;
 # a mismatched external ffprobe build differs on version-heuristic fields
 # (e.g. ProRes color_range). Falls back to PATH ffprobe if the bundle is absent.
-FFPROBE = r"D:\Nelux\external\ffmpeg\bin\ffprobe.exe"
+FFPROBE = os.path.join(REPO, "external", "ffmpeg", "bin", "ffprobe.exe")
 if not os.path.exists(FFPROBE):
     FFPROBE = "ffprobe"
 
-CORPUS = r"D:\Nelux\tests\data\metadata_corpus"
-REPORT = r"D:\Nelux\tests\output\metadata_probe_report.json"
+CORPUS = os.path.join(REPO, "tests", "data", "metadata_corpus")
+REPORT = os.path.join(REPO, "tests", "output", "metadata_probe_report.json")
 BENCH_ITERS = 5
+
+
+def _import_nelux():
+    """Windows-only DLL setup + torch/nelux import, done lazily so module
+    import (and pytest collection) never touches platform-specific paths."""
+    dll = os.path.join(REPO, "external", "ffmpeg", "bin")
+    if sys.platform == "win32" and os.path.isdir(dll):
+        os.add_dll_directory(dll)
+    import torch  # noqa: F401  (ABI: import before nelux)
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import nelux
+    return nelux
 
 # libav "unspecified" spellings collapse to a single sentinel so ffprobe's
 # omitted keys and nelux's "unknown" compare equal.
@@ -192,7 +208,7 @@ def time_ffprobe(path):
     return best[len(best) // 2]
 
 
-def time_nelux(path):
+def time_nelux(nelux, path):
     best = []
     for _ in range(BENCH_ITERS):
         t = time.perf_counter()
@@ -205,6 +221,7 @@ def time_nelux(path):
 
 
 def main():
+    nelux = _import_nelux()
     files = sorted(
         f for f in glob.glob(os.path.join(CORPUS, "*", "*"))
         if not f.endswith(".jsonl")
@@ -260,7 +277,7 @@ def main():
 
         # timing
         try:
-            tn = time_nelux(path)
+            tn = time_nelux(nelux, path)
             tf = time_ffprobe(path)
             nx_total += tn
             fp_total += tf
@@ -304,6 +321,21 @@ def main():
         }, fh, indent=2)
     print(f"\nReport -> {REPORT}")
     return 1 if files_fail else 0
+
+
+def test_metadata_probe():
+    """pytest entry point. Skips (never errors) when the local prerequisites
+    are absent: a generated corpus, a matching nelux build, and ffprobe."""
+    import pytest
+
+    if not os.path.isdir(CORPUS) or not glob.glob(os.path.join(CORPUS, "*", "*")):
+        pytest.skip("metadata corpus not generated locally")
+    try:
+        _import_nelux()
+    except Exception as e:  # missing/mismatched build or torch
+        pytest.skip(f"nelux not importable in this environment: {e}")
+
+    assert main() == 0, "metadata fields diverged from ffprobe (see stdout)"
 
 
 if __name__ == "__main__":
