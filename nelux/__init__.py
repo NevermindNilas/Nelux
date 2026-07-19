@@ -218,6 +218,7 @@ try:
         LogLevel,
         get_available_encoders,
         get_nvenc_encoders,
+        probe,
     )
 except ImportError as e:
     if os.name == "nt":
@@ -297,5 +298,6 @@ __all__ = [
     "LogLevel",
     "get_available_encoders",
     "get_nvenc_encoders",
+    "probe",
     "diagnose_runtime_dlls",
 ]

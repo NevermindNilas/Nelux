@@ -572,9 +572,8 @@ std::vector<std::string> VideoReader::supportedCodecs()
     }
     return codecs;
 }
-py::dict VideoReader::getProperties() const
+py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties)
 {
-    NELUX_TRACE("getProperties() called");
     py::dict props;
     props["width"] = properties.width;
     props["height"] = properties.height;
@@ -642,8 +641,13 @@ py::dict VideoReader::getProperties() const
     props["audio_channel_layout"] = properties.audioChannelLayout;
     props["audio_bit_rate"] = properties.audioBitRate;
 
-    NELUX_INFO("Video properties retrieved and converted to Python dict");
     return props;
+}
+
+py::dict VideoReader::getProperties() const
+{
+    NELUX_TRACE("getProperties() called");
+    return videoPropertiesToDict(properties);
 }
 
 py::object VideoReader::operator[](py::object key)

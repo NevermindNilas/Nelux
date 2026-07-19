@@ -103,6 +103,12 @@ class Decoder
         int64_t audioBitRate = 0;
     };
 
+    // Fill VideoProperties from a demuxed container + codec parameters WITHOUT
+    // opening a decoder (no avcodec_open2, no resolution-sized allocation).
+    // Shared by the live decoder and the decode-free probe path.
+    static void extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
+                                       VideoProperties& properties);
+
     Decoder() = default;
     Decoder(int numThreads);
     Decoder(int numThreads, int resizeWidth, int resizeHeight);
@@ -430,4 +436,13 @@ class Decoder
      */
     void setSyncConvertWorkers(int n);
 };
+
+// Decode-free metadata probe. Opens the container and reads stream info only —
+// no decoder, no resolution-sized buffer, no threads — then returns the full
+// VideoProperties. Skips the per-open decode setup a Decoder/VideoReader pays,
+// so it is much cheaper for metadata-only opens (though not constant-time: the
+// underlying stream analysis still scales with content). Throws CxException on
+// open/stream-info failure or when the file has no video stream.
+Decoder::VideoProperties probeFile(const std::string& filePath);
+
 } // namespace nelux

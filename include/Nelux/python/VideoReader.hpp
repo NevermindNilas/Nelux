@@ -19,6 +19,10 @@ enum class Backend
     NumPy    // Return frames as numpy.ndarray
 };
 
+// Convert a VideoProperties struct to the Python metadata dict. Shared by
+// VideoReader.get_properties()/.properties and the module-level probe().
+py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties);
+
 class VideoReader
 {
   public:

@@ -33,7 +33,7 @@ Backend backendFromString(const std::string& backend_str)
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.15.0";
+    m.attr("__version__") = "0.15.1";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Expose CUDA build status
@@ -501,6 +501,21 @@ Example:
              });
 
     // ---------- Module-level functions -----------
+    m.def(
+        "probe",
+        [](const std::string& path) -> py::dict
+        {
+            // Decode-free metadata probe: opens the container and reads stream
+            // info only (no decoder, no resolution-sized buffer, no threads).
+            // Returns the same dict as VideoReader.properties.
+            return videoPropertiesToDict(nelux::probeFile(path));
+        },
+        py::arg("path"),
+        "Read full video metadata without decoding. Returns the same dict as "
+        "VideoReader.properties but skips decoder init, frame-buffer allocation, "
+        "and thread startup, and avoids the process spawn an external ffprobe "
+        "call pays, so it is much faster for metadata-only opens.");
+
     m.def(
         "get_available_encoders",
         []() -> py::list

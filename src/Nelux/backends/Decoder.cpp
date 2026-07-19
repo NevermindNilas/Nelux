@@ -137,25 +137,66 @@ static const char* safeStr(const char* s)
     return s ? s : "unknown";
 }
 
-void Decoder::setProperties()
+// Select the decoder nelux will actually use for a codec id. AV1 is forced to a
+// software decoder (preferring libdav1d) to avoid the built-in decoder's
+// hardware-first path failing on unsupported platforms; everything else uses the
+// default decoder. Shared by initCodecContext() (which opens it) and
+// extractVideoProperties() (which reports its name), so probe() and the live
+// decoder always agree on the reported `codec`.
+static const AVCodec* selectDecoderForId(AVCodecID codec_id)
 {
-    AVStream* stream = formatCtx->streams[videoStreamIndex];
+    const AVCodec* codec = nullptr;
+    if (codec_id == AV_CODEC_ID_AV1)
+    {
+        const char* av1_decoders[] = {"libdav1d", "libaom-av1", "av1", nullptr};
+        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i)
+        {
+            codec = avcodec_find_decoder_by_name(av1_decoders[i]);
+        }
+    }
+    if (!codec)
+    {
+        codec = avcodec_find_decoder(codec_id);
+    }
+    return codec;
+}
+
+// Bit depth of the first component of a pixel format (8 when unknown).
+static int bitDepthFromFormat(int fmt)
+{
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(AVPixelFormat(fmt));
+    return desc ? desc->comp[0].depth : 8;
+}
+
+// Fill VideoProperties entirely from the demuxer + codec parameters, without
+// opening (or needing) a decoder. This is the shared core used both by the live
+// decoder (Decoder::setProperties) and the decode-free probe path
+// (nelux::probeFile): every field is derived from AVFormatContext / AVStream /
+// AVCodecParameters, never from an AVCodecContext, so no avcodec_open2 (and its
+// resolution-sized reference-frame allocation) is required.
+void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
+                                     VideoProperties& properties)
+{
+    AVStream* stream = formatCtx->streams[vIdx];
     const AVCodecParameters* vpar = stream->codecpar;
 
-    // Set basic video properties
-    properties.codec = codecCtx->codec->name;
-    properties.codecLongName =
-        codecCtx->codec->long_name ? codecCtx->codec->long_name : "";
-    properties.width = codecCtx->width;
-    properties.height = codecCtx->height;
+    properties.width = vpar->width;
+    properties.height = vpar->height;
 
     // Canonical codec name (from codec_id), matching ffprobe's codec_name.
-    // `codec` above is the decoder implementation name (e.g. "libdav1d"),
-    // which differs for wrapped decoders; codecName is the format name ("av1").
     {
         const AVCodecDescriptor* vdesc = avcodec_descriptor_get(vpar->codec_id);
-        properties.codecName = vdesc ? vdesc->name : properties.codec;
+        properties.codecName = vdesc ? vdesc->name : "";
     }
+
+    // Codec identity. `codec` is the decoder-implementation name; use the SAME
+    // decoder selection the live decoder opens (see selectDecoderForId) so
+    // probe() and VideoReader.properties always agree. Fall back to the
+    // canonical codecName when no decoder is installed, so a metadata-only probe
+    // still reports a non-empty codec.
+    const AVCodec* dec = selectDecoderForId(vpar->codec_id);
+    properties.codec = dec && dec->name ? dec->name : properties.codecName;
+    properties.codecLongName = dec && dec->long_name ? dec->long_name : "";
 
     // Codec profile/level. Prefer the human name; when the codec has no named
     // profile (e.g. VP8) but a numeric profile is set, fall back to the integer
@@ -214,11 +255,10 @@ void Decoder::setProperties()
     }
 
     // Ensure duration is calculated properly
-    if (formatCtx->streams[videoStreamIndex]->duration != AV_NOPTS_VALUE)
+    if (stream->duration != AV_NOPTS_VALUE)
     {
-        properties.duration =
-            static_cast<double>(formatCtx->streams[videoStreamIndex]->duration) *
-            av_q2d(formatCtx->streams[videoStreamIndex]->time_base);
+        properties.duration = static_cast<double>(stream->duration) *
+                              av_q2d(stream->time_base);
     }
     else if (formatCtx->duration != AV_NOPTS_VALUE)
     {
@@ -229,18 +269,9 @@ void Decoder::setProperties()
         properties.duration = 0.0; // Unknown duration
     }
 
-    // Set pixel format and bit depth
-    properties.pixelFormat = codecCtx->pix_fmt;
-    properties.bitDepth = getBitDepth();
-
-    // If decoder-side resize is active, report the resized output dims as the
-    // canonical width/height. Downstream buffer sizing, converter setup, and
-    // tensor allocation all key off properties.width/height.
-    if (resizeWidth_ > 0 && resizeHeight_ > 0)
-    {
-        properties.width = resizeWidth_;
-        properties.height = resizeHeight_;
-    }
+    // Set pixel format and bit depth (from codec parameters; no decoder needed).
+    properties.pixelFormat = AVPixelFormat(vpar->format);
+    properties.bitDepth = bitDepthFromFormat(vpar->format);
 
     // Detect audio stream presence and capture the first audio track's details.
     properties.hasAudio = false;
@@ -303,7 +334,7 @@ void Decoder::setProperties()
 
     // Sample-aspect-ratio and derived display-aspect-ratio.
     {
-        AVRational sar = av_guess_sample_aspect_ratio(formatCtx.get(), stream, nullptr);
+        AVRational sar = av_guess_sample_aspect_ratio(formatCtx, stream, nullptr);
         if (sar.num == 0 || sar.den == 0)
         {
             sar = AVRational{1, 1};
@@ -312,8 +343,8 @@ void Decoder::setProperties()
         properties.sarDen = sar.den;
         int darNum = 0, darDen = 1;
         av_reduce(&darNum, &darDen,
-                  static_cast<int64_t>(codecCtx->width) * sar.num,
-                  static_cast<int64_t>(codecCtx->height) * sar.den,
+                  static_cast<int64_t>(vpar->width) * sar.num,
+                  static_cast<int64_t>(vpar->height) * sar.den,
                   1024 * 1024);
         properties.darNum = darNum;
         properties.darDen = darDen;
@@ -345,13 +376,68 @@ void Decoder::setProperties()
             formatCtx->iformat->long_name ? formatCtx->iformat->long_name : "";
     }
     properties.nbStreams = static_cast<int>(formatCtx->nb_streams);
+}
 
-    // Log the video properties
+void Decoder::setProperties()
+{
+    extractVideoProperties(formatCtx.get(), videoStreamIndex, properties);
+
+    // If decoder-side resize is active, report the resized output dims as the
+    // canonical width/height. Downstream buffer sizing, converter setup, and
+    // tensor allocation all key off properties.width/height, so override after
+    // the shared extractor (which reports the true source dims) and recompute
+    // the derived display/pixel aspect ratio.
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    {
+        properties.width = resizeWidth_;
+        properties.height = resizeHeight_;
+        properties.aspectRatio =
+            properties.height > 0
+                ? static_cast<double>(properties.width) / properties.height
+                : 0.0;
+    }
+
     NELUX_INFO(
         "Video properties: width={}, height={}, fps={}, duration={}, totalFrames={}, "
         "aspectRatio={}",
         properties.width, properties.height, properties.fps, properties.duration,
         properties.totalFrames, properties.aspectRatio);
+}
+
+// Decode-free metadata probe: open the container, read stream info, and extract
+// the full VideoProperties without opening a decoder, allocating any
+// resolution-sized buffer, or spawning threads. Skips all of the per-open decode
+// setup a VideoReader pays for a metadata-only open. The remaining cost is
+// libav's avformat_find_stream_info stream analysis (shared with ffprobe), which
+// scales with content, so this is cheaper but not constant-time.
+Decoder::VideoProperties probeFile(const std::string& filePath)
+{
+    AVFormatContext* raw = nullptr;
+    int ret = avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr);
+    if (ret < 0)
+    {
+        throw CxException("Failed to open input file for probe: " + filePath +
+                          ": " + errorToString(ret));
+    }
+    std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
+
+    ret = avformat_find_stream_info(fmt.get(), nullptr);
+    if (ret < 0)
+    {
+        throw CxException("Failed to find stream info for probe: " + filePath +
+                          ": " + errorToString(ret));
+    }
+
+    int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
+                                   nullptr, 0);
+    if (vIdx < 0)
+    {
+        throw CxException("No video stream found for probe: " + filePath);
+    }
+
+    Decoder::VideoProperties properties{};
+    Decoder::extractVideoProperties(fmt.get(), vIdx, properties);
+    return properties;
 }
 
 void Decoder::initialize(const std::string& filePath)
@@ -445,46 +531,15 @@ void Decoder::findVideoStream()
 
 void Decoder::initCodecContext()
 {
-    const AVCodec* codec = nullptr;
     AVCodecID codec_id = formatCtx->streams[videoStreamIndex]->codecpar->codec_id;
 
-    // For AV1, we MUST use a software decoder to avoid hardware acceleration issues
-    // The built-in "av1" decoder tries hardware first and fails on unsupported
-    // platforms
-    if (codec_id == AV_CODEC_ID_AV1)
+    // For AV1 this prefers a software decoder (libdav1d) over the built-in "av1"
+    // decoder's hardware-first path. Shared with extractVideoProperties so the
+    // reported `codec` matches the decoder actually opened here.
+    const AVCodec* codec = selectDecoderForId(codec_id);
+    if (codec && codec_id == AV_CODEC_ID_AV1)
     {
-        // Try software decoders in order of preference
-        const char* av1_decoders[] = {
-            "libdav1d",   // Best performance, most compatible
-            "libaom-av1", // Reference implementation, slower but reliable
-            "av1",        // FFmpeg's internal decoder (last resort)
-            nullptr};
-
-        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i)
-        {
-            codec = avcodec_find_decoder_by_name(av1_decoders[i]);
-            if (codec)
-            {
-                NELUX_INFO("Using {} for AV1 decoding", av1_decoders[i]);
-            }
-        }
-
-        if (!codec)
-        {
-            // Final fallback: try generic lookup but warn user
-            codec = avcodec_find_decoder(codec_id);
-            if (codec)
-            {
-                NELUX_WARN("No preferred AV1 software decoder found, using: {}. "
-                           "Consider installing libdav1d for better AV1 support.",
-                           codec->name);
-            }
-        }
-    }
-
-    if (!codec)
-    {
-        codec = avcodec_find_decoder(codec_id);
+        NELUX_INFO("Using {} for AV1 decoding", codec->name);
     }
 
     NELUX_DEBUG("BASE DECODER: Initializing codec context");

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-07-19
+
+### Added
+
+- **`nelux.probe(path)` — decode-free metadata.** A module-level function that
+  returns the same dict as `VideoReader.properties` but opens the container and
+  reads stream info only: no decoder is opened (`avcodec_open2`), no
+  resolution-sized frame tensor is allocated, no converter is built, and no
+  worker threads are spawned. Use it for metadata-only opens. It removes nelux's
+  per-open decode setup (a flat ~2 ms, including the output tensor which is up to
+  ~24 MB at 4K) and avoids the process spawn an external `ffprobe` call pays, so
+  it is consistently faster than `ffprobe` for metadata reads: about 37x at 360p
+  and 2.2x at 4K in local benchmarks, with output verified identical to
+  `VideoReader.properties` field-for-field across the 135-clip corpus. The
+  residual open cost is `libav`'s `avformat_find_stream_info` stream analysis,
+  which both nelux and `ffprobe` perform.
+
+### Changed
+
+- The metadata extraction in `Decoder::setProperties` was refactored into a
+  shared `extractVideoProperties` helper that reads entirely from the demuxer and
+  codec parameters (no `AVCodecContext`), so the live decoder and `probe()` share
+  one implementation. Behavior is unchanged: the full decode path still reports
+  identical metadata (135/135 vs ffprobe).
+
 ## [0.15.0] - 2026-07-19
 
 ### Added
