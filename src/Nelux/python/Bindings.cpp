@@ -175,9 +175,10 @@ Args:
         are available. CPU-decode only: combining motion_vectors=True with
         decode_accelerator='nvdec' or 'qsv' is rejected, since hardware decoders
         do not export MVs.
-    device (str, optional): Where returned tensors live. "" (default) keeps the
-        pipeline's native placement: CPU tensors for "cpu"/"qsv" decode, CUDA
-        tensors for "nvdec". "xpu" or "xpu:N" copies every returned tensor to
+    device (str, optional): Where returned tensors live. "" (default) and its
+        explicit alias "cpu" keep the pipeline's native placement: CPU tensors
+        for "cpu"/"qsv" decode, CUDA tensors for "nvdec". "xpu" or "xpu:N"
+        copies every returned tensor to
         torch's XPU (Intel GPU) backend after decode; requires an XPU-enabled
         torch build, otherwise construction raises a clear error (decoding
         itself never needs XPU). Requires backend="pytorch"; rejected with

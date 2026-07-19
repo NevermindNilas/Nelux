@@ -151,9 +151,23 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         const auto colon = dev.find(':');
         if (colon != std::string::npos)
         {
+            // Strict parse: everything after the colon must be a non-empty,
+            // all-digit, non-negative index. std::stoi alone would accept
+            // "xpu:0:1" (stops at ':') and "xpu:-1" (negative index means
+            // "current device" to torch — surprising as an explicit arg).
+            const std::string idxStr = dev.substr(colon + 1);
+            const bool allDigits =
+                !idxStr.empty() &&
+                std::all_of(idxStr.begin(), idxStr.end(),
+                            [](unsigned char c) { return std::isdigit(c); });
+            if (!allDigits)
+                throw std::invalid_argument("Invalid device index in device='" +
+                                            device +
+                                            "'; expected 'xpu:N' with N a "
+                                            "non-negative integer.");
             try
             {
-                devIndex = std::stoi(dev.substr(colon + 1));
+                devIndex = std::stoi(idxStr);
             }
             catch (const std::exception&)
             {
@@ -545,8 +559,19 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         return py::array(numpy_dtype, shape, strides, cpu_tensor.data_ptr(), base);
     }
 
-    // Default: return as torch::Tensor
-    return py::cast(maybeToDevice(t));
+    // Default: return as torch::Tensor. The optional host->device copy
+    // (device="xpu") is blocking, so drop the GIL around it — decodeBatch
+    // already calls maybeToDevice inside its own GIL-released scope.
+    if (moveOutputToDevice_ && t.defined() && t.numel() != 0)
+    {
+        torch::Tensor moved;
+        {
+            py::gil_scoped_release release;
+            moved = maybeToDevice(t);
+        }
+        return py::cast(moved);
+    }
+    return py::cast(t);
 }
 
 torch::Tensor VideoReader::makeLikeOutputTensor() const

@@ -18,7 +18,10 @@ def _qsv_reader(**kwargs):
     try:
         return nelux.VideoReader(DATA, decode_accelerator="qsv", **kwargs)
     except RuntimeError as e:
-        if "Quick Sync" in str(e) or "QSV" in str(e):
+        # Covers every QSV-unavailability error the backend raises: device
+        # creation failure ("Quick Sync (QSV) device"), FFmpeg built without
+        # *_qsv decoders ("does not provide h264_qsv"), and codec-open failure.
+        if "qsv" in str(e).lower() or "quick sync" in str(e).lower():
             pytest.skip(f"QSV unavailable on this machine: {e}")
         raise
 
@@ -169,6 +172,11 @@ class TestDeviceArgument:
     def test_unknown_device_rejected(self):
         with pytest.raises(Exception, match="Unknown device"):
             nelux.VideoReader(DATA, device="tpu")
+
+    def test_malformed_device_index_rejected(self):
+        for bad in ("xpu:0:1", "xpu:-1", "xpu:", "xpu:abc"):
+            with pytest.raises(Exception, match="Invalid device index"):
+                nelux.VideoReader(DATA, device=bad)
 
     def test_device_cpu_noop(self):
         r = nelux.VideoReader(DATA, device="cpu")

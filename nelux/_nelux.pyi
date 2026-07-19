@@ -110,8 +110,9 @@ class VideoReader:
                 resolution, ~+25% throughput at 4K) and read_frame_with_motion_vectors()
                 raises. Set True to use motion vectors. Never changes decoded pixels.
                 CPU-decode only; rejected with "nvdec"/"qsv" (hardware decoders export no MVs).
-            device (str, optional): Output tensor placement. "" (default) = native
-                placement (CPU for "cpu"/"qsv", CUDA for "nvdec"). "xpu"/"xpu:N" copies
+            device (str, optional): Output tensor placement. "" (default) and its
+                explicit alias "cpu" = native placement (CPU for "cpu"/"qsv", CUDA
+                for "nvdec"). "xpu"/"xpu:N" copies
                 returned tensors to torch's XPU (Intel GPU) backend; requires an
                 XPU-enabled torch build (raises otherwise) and backend="pytorch".
                 Rejected with "nvdec".
