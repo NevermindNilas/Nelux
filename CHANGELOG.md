@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-19
+
+### Changed
+
+- **Motion-vector export is now opt-in.** `VideoReader` gained a
+  `motion_vectors: bool = False` parameter. With it disabled (the default) the
+  CPU decoder no longer enables `AV_CODEC_FLAG2_EXPORT_MVS`, so it skips
+  libavcodec's per-frame motion-vector side-data construction. Measured CPU
+  decode throughput on an RTX 3090: 720p +6.6%, 1080p +17.1%, 4K +18.5% (the
+  gain scales with resolution). Decoded pixels are unchanged (byte-identical to
+  `ffmpeg -vf format=rgb24`).
+
+### Removed
+
+- **BREAKING: the motion-vector read API is consolidated to a single method.**
+  `read_frame_with_motion_vectors()` is now the only reader. `read_motion_vectors()`
+  and the `motion_vectors` / `motion_vectors_array` properties are removed; the
+  last decoded frame's type stays on the `frame_type` property. Motion vectors
+  require `VideoReader(motion_vectors=True)`, and combining that with
+  `decode_accelerator="nvdec"` is rejected (NVDEC does not export motion vectors).
+
+### Fixed
+
+- RGB to P210 (10-bit 4:2:2) encode conversion shifted 8-bit samples by `<<6`
+  instead of `<<8`, capping output at ~25% of full scale; it now matches the
+  P010 and P216 conversions.
+- NVENC `b_ref_mode="middle"` is now set only when B-frames are enabled
+  (`max_b_frames > 0`), so it can no longer hard-reject at `avcodec_open2` on
+  encoders or GPUs without B-frame-as-reference support.
+- Removed a dead, write-only `thread_local` decoder callback pointer.
+
 ## [0.15.1] - 2026-07-19
 
 ### Added

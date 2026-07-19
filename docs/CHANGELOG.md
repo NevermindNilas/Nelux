@@ -1,4 +1,19 @@
 
+### **Version 0.16.0 (2026-07-19)**
+
+#### **Change: motion-vector export is opt-in (faster default decode)**
+- **Changed:** `VideoReader` gained a `motion_vectors: bool = False` parameter. With it off (the default), the CPU decoder no longer enables `AV_CODEC_FLAG2_EXPORT_MVS`, so it skips libavcodec's per-frame motion-vector side-data construction. Measured CPU decode throughput on an RTX 3090 (Python 3.14 / torch 2.13): **720p +6.6%, 1080p +17.1%, 4K +18.5%** — the gain scales with macroblock count. Decoded output is byte-identical to `ffmpeg -vf format=rgb24`; the flag only affects side-data, never pixels, frame count, order, or timing.
+
+#### **Breaking: single motion-vector reader**
+- **Removed:** `read_motion_vectors()` and the `motion_vectors` / `motion_vectors_array` properties. `read_frame_with_motion_vectors()` is now the only motion-vector reader (returns `(frame, list-of-per-block-dicts)`); the last decoded frame's type stays on the separate `frame_type` property. Motion vectors now require `VideoReader(motion_vectors=True)` — the reader raises a clear error otherwise instead of returning empty data — and combining `motion_vectors=True` with `decode_accelerator="nvdec"` is rejected up front, since NVDEC does not export motion vectors.
+
+#### **Fixed**
+- RGB to P210 (10-bit 4:2:2) encode conversion left-shifted 8-bit samples by 6 instead of 8, capping output at ~25% of full 10-bit scale; it now matches the P010 and P216 conversions.
+- NVENC `b_ref_mode="middle"` is set only when B-frames are enabled (`max_b_frames > 0`), so it can no longer be hard-rejected at `avcodec_open2` on encoders/GPUs that lack B-frame-as-reference support.
+- Removed a dead, write-only `thread_local` decoder callback pointer (`getHwFormat` is stateless).
+
+---
+
 ### **Version 0.15.1 (2026-07-19)**
 
 #### **Feature: `nelux.probe()` — decode-free metadata**
