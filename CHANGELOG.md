@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Intel Quick Sync (QSV) decode support.** `VideoReader` now accepts
+  `decode_accelerator="qsv"`, decoding on the Intel GPU via FFmpeg's `*_qsv`
+  decoders (oneVPL; D3D11VA child device on Windows). Frames come back to
+  system memory through GPU-assisted copyback (`gpu_copy=on`), so the entire
+  CPU pipeline — grayscale, resize + `resize_filter`, 8/10-bit, numpy backend,
+  prefetch/sync modes, `frame_at`, `decode_batch` — works unchanged. Supported
+  codecs: h264, hevc, av1, vp9, vp8, mpeg2video, mjpeg, vc1, vvc. Decoded YUV
+  is bit-exact with software decode; RGB output can differ by a few LSBs
+  because libswscale converts NV12 input through a different chroma-upsampling
+  path than YUV420P (10-bit P010 output is byte-identical). Measured 488 fps at
+  720p on an Intel UHD 770 (vs 331 fps for `ffmpeg -c:v h264_qsv`); the win
+  over software decode is CPU offload, not raw throughput.
+  `motion_vectors=True` is rejected with `"qsv"` (hardware decoders export no
+  MVs).
+- **`device=` output placement for `VideoReader`.** New `device: str = ""`
+  parameter: `"xpu"`/`"xpu:N"` copies every returned tensor (including
+  `decode_batch`) to torch's XPU (Intel GPU) backend after decode. Requires an
+  XPU-enabled torch build — construction raises an actionable error otherwise —
+  and `backend="pytorch"`; rejected with `"nvdec"` (already CUDA-resident).
+  Decode itself never needs XPU, so `"qsv"` decode works with plain CPU
+  tensors when torch lacks the backend.
+
 ## [0.16.0] - 2026-07-19
 
 ### Changed

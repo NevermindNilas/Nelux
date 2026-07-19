@@ -67,7 +67,8 @@ PYBIND11_MODULE(_nelux, m)
                     std::optional<std::pair<int, int>> resize, bool prefetch,
                     std::optional<int> convert_workers,
                     const std::string& color_format,
-                    const std::string& resize_filter, bool motion_vectors)
+                    const std::string& resize_filter, bool motion_vectors,
+                    const std::string& device)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -97,7 +98,7 @@ PYBIND11_MODULE(_nelux, m)
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
                          cuda_device_index, rw, rh, prefetch, cw, color_format,
-                         resize_filter, motion_vectors);
+                         resize_filter, motion_vectors, device);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
@@ -108,6 +109,7 @@ PYBIND11_MODULE(_nelux, m)
              py::arg("color_format") = "rgb",
              py::arg("resize_filter") = "bilinear",
              py::arg("motion_vectors") = false,
+             py::arg("device") = "",
              R"doc(Open a video file for reading.
 
 Args:
@@ -118,9 +120,20 @@ Args:
     backend (str, optional): Output backend type. Either "pytorch" (default) or "numpy".
         - "pytorch": Returns frames as torch.Tensor
         - "numpy": Returns frames as numpy.ndarray (preserving dtype, e.g., uint8)
-    decode_accelerator (str, optional): Decode acceleration type. Either "cpu" (default) or "nvdec".
+    decode_accelerator (str, optional): Decode acceleration type: "cpu" (default),
+        "nvdec" or "qsv".
         - "cpu": Software decoding on CPU (default)
         - "nvdec": NVIDIA hardware decoding via NVDEC. Frames remain on GPU as CUDA tensors.
+        - "qsv": Intel Quick Sync hardware decoding (oneVPL; requires an Intel GPU
+          and the FFmpeg *_qsv decoders). The bitstream is decoded on the Intel
+          GPU; frames are copied back to system memory (GPU-assisted copy) and
+          returned as CPU tensors, so grayscale, resize, resize_filter and the
+          numpy backend all work as with "cpu". Combine with device="xpu" to
+          receive tensors on torch's XPU backend. Supported codecs: h264, hevc,
+          av1, vp9, vp8, mpeg2video, mjpeg, vc1, vvc. The decoded YUV is
+          bit-exact with software decode; RGB output can differ from the "cpu"
+          path by a few LSBs because libswscale converts NV12 input through a
+          different chroma-upsampling path than YUV420P.
     cuda_device_index (int, optional): CUDA device index for NVDEC. Defaults to 0.
     resize (tuple[int, int], optional): Decoder-side resize target as (width, height).
         When set, frames are scaled during decode:
@@ -160,7 +173,16 @@ Args:
         (the single motion-vector reader) raises a clear error. Set True to use it.
         Enabling it never changes the decoded pixels, only whether motion vectors
         are available. CPU-decode only: combining motion_vectors=True with
-        decode_accelerator='nvdec' is rejected, since NVDEC does not export MVs.
+        decode_accelerator='nvdec' or 'qsv' is rejected, since hardware decoders
+        do not export MVs.
+    device (str, optional): Where returned tensors live. "" (default) and its
+        explicit alias "cpu" keep the pipeline's native placement: CPU tensors
+        for "cpu"/"qsv" decode, CUDA tensors for "nvdec". "xpu" or "xpu:N"
+        copies every returned tensor to
+        torch's XPU (Intel GPU) backend after decode; requires an XPU-enabled
+        torch build, otherwise construction raises a clear error (decoding
+        itself never needs XPU). Requires backend="pytorch"; rejected with
+        "nvdec" (already CUDA-resident).
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

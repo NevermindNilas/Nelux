@@ -55,7 +55,8 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
                          int cuda_device_index, int resizeWidth, int resizeHeight,
                          bool prefetch, int convertWorkers,
                          const std::string& color_format,
-                         const std::string& resize_filter, bool motion_vectors)
+                         const std::string& resize_filter, bool motion_vectors,
+                         const std::string& device)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -73,14 +74,14 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
         filePath, decode_accelerator, resizeWidth_, resizeHeight_);
 
-    // Motion-vector export is a CPU-decode feature: NVDEC/cuvid does not produce
-    // AV_FRAME_DATA_MOTION_VECTORS side-data, so reject the combination up front
-    // rather than silently returning empty vectors (mirrors the grayscale+nvdec
-    // and resize_filter+nvdec rejections below).
-    if (motion_vectors && decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+    // Motion-vector export is a CPU-decode feature: hardware decoders (NVDEC,
+    // QSV) do not produce AV_FRAME_DATA_MOTION_VECTORS side-data, so reject the
+    // combination up front rather than silently returning empty vectors
+    // (mirrors the grayscale+nvdec and resize_filter+nvdec rejections below).
+    if (motion_vectors && decodeAccelerator != nelux::DecodeAccelerator::CPU)
         throw std::invalid_argument(
             "motion_vectors=True is only supported with decode_accelerator='cpu'; "
-            "the NVDEC decode path does not export motion vectors.");
+            "hardware decode paths (nvdec, qsv) do not export motion vectors.");
 
     if (numThreads > std::thread::hardware_concurrency())
         throw std::invalid_argument(
@@ -127,6 +128,71 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
             "NVDEC path scales via cuvid's internal hardware scaler, which cannot "
             "select a swscale algorithm. Use the default 'bilinear' with nvdec.");
 
+    // Resolve optional output-tensor placement (device="xpu"/"xpu:N"). This is
+    // a post-decode copy of each returned tensor, aimed at QSV/CPU decode
+    // feeding models on torch's XPU backend. It is deliberately decoupled from
+    // decode: QSV decode works fine with CPU tensors when torch has no XPU
+    // support, so a missing XPU backend must not take down the decode path —
+    // the caller just omits device=.
+    if (!device.empty() && device != "cpu")
+    {
+        if (backend == Backend::NumPy)
+            throw std::invalid_argument(
+                "device= requires backend='pytorch'; numpy arrays are always "
+                "host memory.");
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+            throw std::invalid_argument(
+                "device= is not supported with decode_accelerator='nvdec'; "
+                "NVDEC output is already on CUDA (select the GPU with "
+                "cuda_device_index).");
+
+        std::string dev = device;
+        int devIndex = 0;
+        const auto colon = dev.find(':');
+        if (colon != std::string::npos)
+        {
+            // Strict parse: everything after the colon must be a non-empty,
+            // all-digit, non-negative index. std::stoi alone would accept
+            // "xpu:0:1" (stops at ':') and "xpu:-1" (negative index means
+            // "current device" to torch — surprising as an explicit arg).
+            const std::string idxStr = dev.substr(colon + 1);
+            const bool allDigits =
+                !idxStr.empty() &&
+                std::all_of(idxStr.begin(), idxStr.end(),
+                            [](unsigned char c) { return std::isdigit(c); });
+            if (!allDigits)
+                throw std::invalid_argument("Invalid device index in device='" +
+                                            device +
+                                            "'; expected 'xpu:N' with N a "
+                                            "non-negative integer.");
+            try
+            {
+                devIndex = std::stoi(idxStr);
+            }
+            catch (const std::exception&)
+            {
+                throw std::invalid_argument("Invalid device index in device='" +
+                                            device + "'");
+            }
+            dev = dev.substr(0, colon);
+        }
+        if (dev != "xpu")
+            throw std::invalid_argument(
+                "Unknown device: '" + device +
+                "'. Valid options: 'cpu', 'xpu', 'xpu:N'. (For CUDA-resident "
+                "frames use decode_accelerator='nvdec'.)");
+        if (!at::hasXPU())
+            throw std::runtime_error(
+                "device='" + device +
+                "' requested but this torch build has no XPU backend "
+                "available. Install an XPU-enabled torch (and Intel GPU "
+                "drivers), or drop the device argument to receive CPU "
+                "tensors — decoding (including decode_accelerator='qsv') "
+                "works without XPU.");
+        outputDevice_ = torch::Device(torch::kXPU, devIndex);
+        moveOutputToDevice_ = true;
+    }
+
     try
     {
         torch::Device torchDevice =
@@ -139,8 +205,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // for hardware decode and silent fallback has historically masked
         // configuration mistakes (wrong device, missing codec support, etc.).
         // Set decode_accelerator='cpu' explicitly to opt into software decode.
-        const bool syncMode =
-            !prefetch && decodeAccelerator == nelux::DecodeAccelerator::CPU;
+        const bool syncMode = !prefetch && isSoftwareFramePath();
         // Grayscale is passed into createDecoder so the CPU decoder configures
         // its channel count before the producer thread can start (avoids a race
         // on the channel count when prefetch=true). grayscale_ is only ever true
@@ -317,7 +382,7 @@ torch::Tensor VideoReader::decodeFrame()
     // to software decode explicitly.
     try
     {
-        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        if (isSoftwareFramePath())
         {
             outTensor = prefetch
                             ? decoder->decodeNextFrameTensor(&frame_timestamp)
@@ -395,6 +460,15 @@ std::string VideoReader::getFrameType() const
         return "";
     char t = decoder->getLastFrameType();
     return t == '?' ? "" : std::string(1, t);
+}
+
+torch::Tensor VideoReader::maybeToDevice(const torch::Tensor& t) const
+{
+    if (!moveOutputToDevice_ || !t.defined() || t.numel() == 0)
+        return t;
+    // Blocking copy: the source is a pooled/reused CPU buffer, so the copy
+    // must complete before the decode path can recycle it.
+    return t.to(outputDevice_, /*non_blocking=*/false);
 }
 
 py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
@@ -485,7 +559,18 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         return py::array(numpy_dtype, shape, strides, cpu_tensor.data_ptr(), base);
     }
 
-    // Default: return as torch::Tensor
+    // Default: return as torch::Tensor. The optional host->device copy
+    // (device="xpu") is blocking, so drop the GIL around it — decodeBatch
+    // already calls maybeToDevice inside its own GIL-released scope.
+    if (moveOutputToDevice_ && t.defined() && t.numel() != 0)
+    {
+        torch::Tensor moved;
+        {
+            py::gil_scoped_release release;
+            moved = maybeToDevice(t);
+        }
+        return py::cast(moved);
+    }
     return py::cast(t);
 }
 
@@ -941,8 +1026,7 @@ VideoReader& VideoReader::iter()
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
         }
-        else if (start_time <= 0.0 &&
-                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (start_time <= 0.0 && isSoftwareFramePath() && !prefetch)
         {
             // CPU sync path: seeking flushes a frame-threaded codec context and
             // trips an internal FFmpeg assertion (see the no-range branch). The
@@ -1006,7 +1090,7 @@ VideoReader& VideoReader::iter()
             currentIndex = 0;
             current_timestamp = 0.0;
         }
-        else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (isSoftwareFramePath() && !prefetch)
         {
             // The CPU sync path uses a frame-threaded codec context; seeking it
             // (which flushes the decoder via avcodec_flush_buffers) is unsafe
@@ -1058,7 +1142,7 @@ VideoReader& VideoReader::iter()
         // trips an internal assertion. Since iter() at this branch is only
         // hit when no range is set and we have not decoded anything yet,
         // skipping the seek-to-zero is correct.
-        if (!(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch))
+        if (!(isSoftwareFramePath() && !prefetch))
         {
             bool success = seek(0.0);
             if (!success)
@@ -1258,6 +1342,7 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
     {
         py::gil_scoped_release release;
         batch = decoder->decode_batch(indices);
+        batch = maybeToDevice(batch);
     }
 
     return batch;

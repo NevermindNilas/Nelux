@@ -15,12 +15,13 @@ namespace nelux
 enum class DecodeAccelerator
 {
     CPU,    ///< Software decoding on CPU (default)
-    NVDEC   ///< NVIDIA hardware decoding via NVDEC
+    NVDEC,  ///< NVIDIA hardware decoding via NVDEC
+    QSV     ///< Intel hardware decoding via Quick Sync Video (oneVPL)
 };
 
 /**
  * @brief Convert string to DecodeAccelerator enum
- * @param str String representation ("cpu" or "nvdec")
+ * @param str String representation ("cpu", "nvdec" or "qsv")
  * @return DecodeAccelerator enum value
  */
 inline DecodeAccelerator stringToDecodeAccelerator(const std::string& str)
@@ -29,9 +30,12 @@ inline DecodeAccelerator stringToDecodeAccelerator(const std::string& str)
         return DecodeAccelerator::CPU;
     else if (str == "nvdec" || str == "NVDEC" || str == "cuda" || str == "CUDA")
         return DecodeAccelerator::NVDEC;
+    else if (str == "qsv" || str == "QSV" || str == "quicksync" ||
+             str == "QuickSync" || str == "qsv_decode")
+        return DecodeAccelerator::QSV;
     else
-        throw std::invalid_argument("Unknown decode_accelerator: " + str + 
-                                    ". Valid options: 'cpu', 'nvdec'");
+        throw std::invalid_argument("Unknown decode_accelerator: " + str +
+                                    ". Valid options: 'cpu', 'nvdec', 'qsv'");
 }
 
 inline std::shared_ptr<Decoder>
@@ -55,6 +59,18 @@ createDecoder(const std::string& filename, int numThreads,
                     filename, numThreads, resizeWidth, resizeHeight, syncMode,
                     grayscale, resizeFilter, motionVectors);
             return std::make_shared<nelux::backends::cpu::Decoder>(
+                filename, numThreads, syncMode, grayscale, motionVectors);
+
+        case DecodeAccelerator::QSV:
+            // The QSV decoder emits software NV12/P010 frames (GPU-assisted
+            // copyback), so the whole CPU convert pipeline — grayscale, swscale
+            // resize with a selectable kernel, sync mode — applies unchanged.
+            // Same ctor-ordering contract as the CPU decoder above.
+            if (resizeWidth > 0 && resizeHeight > 0)
+                return std::make_shared<nelux::backends::qsv::Decoder>(
+                    filename, numThreads, resizeWidth, resizeHeight, syncMode,
+                    grayscale, resizeFilter, motionVectors);
+            return std::make_shared<nelux::backends::qsv::Decoder>(
                 filename, numThreads, syncMode, grayscale, motionVectors);
 
         case DecodeAccelerator::NVDEC:

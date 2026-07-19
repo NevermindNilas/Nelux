@@ -45,7 +45,7 @@ class VideoReader:
         num_threads: int = 0,
         force_8bit: bool = False,
         backend: Literal["pytorch", "numpy"] = "pytorch",
-        decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
+        decode_accelerator: Literal["cpu", "nvdec", "qsv"] = "cpu",
         cuda_device_index: int = 0,
         resize: Optional[Tuple[int, int]] = None,
         prefetch: bool = False,
@@ -56,6 +56,7 @@ class VideoReader:
             "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
         ] = "bilinear",
         motion_vectors: bool = False,
+        device: str = "",
     ) -> None:
         """
         Open a video file for reading.
@@ -67,9 +68,15 @@ class VideoReader:
             backend (str, optional): Output backend type. Either "pytorch" (default) or "numpy".
                 - "pytorch": Returns frames as torch.Tensor
                 - "numpy": Returns frames as numpy.ndarray (preserving dtype, e.g., uint8)
-            decode_accelerator (str, optional): Decode acceleration type. Either "cpu" (default) or "nvdec".
+            decode_accelerator (str, optional): Decode acceleration type: "cpu" (default),
+                "nvdec" or "qsv".
                 - "cpu": Software decoding on CPU (default)
                 - "nvdec": NVIDIA hardware decoding via NVDEC. Frames remain on GPU as CUDA tensors.
+                - "qsv": Intel Quick Sync hardware decoding (oneVPL). Decodes on the Intel
+                  GPU, returns CPU tensors (GPU-assisted copyback); grayscale, resize,
+                  resize_filter and the numpy backend work as with "cpu". Combine with
+                  device="xpu" to get tensors on torch's XPU backend. Supported codecs:
+                  h264, hevc, av1, vp9, vp8, mpeg2video, mjpeg, vc1, vvc.
             cuda_device_index (int, optional): CUDA device index for NVDEC. Defaults to 0.
             resize (tuple[int, int] | None, optional): Decoder-side resize target as (width, height).
                 CPU path uses libswscale; NVDEC path uses the cuvid ``resize=WxH`` option for
@@ -102,6 +109,13 @@ class VideoReader:
                 side-data construction (a real decode-time cost that grows with
                 resolution, ~+25% throughput at 4K) and read_frame_with_motion_vectors()
                 raises. Set True to use motion vectors. Never changes decoded pixels.
+                CPU-decode only; rejected with "nvdec"/"qsv" (hardware decoders export no MVs).
+            device (str, optional): Output tensor placement. "" (default) and its
+                explicit alias "cpu" = native placement (CPU for "cpu"/"qsv", CUDA
+                for "nvdec"). "xpu"/"xpu:N" copies
+                returned tensors to torch's XPU (Intel GPU) backend; requires an
+                XPU-enabled torch build (raises otherwise) and backend="pytorch".
+                Rejected with "nvdec".
         """
         ...
 
