@@ -49,7 +49,8 @@ class VideoReader
                 int resizeHeight = 0, bool prefetch = true,
                 int convertWorkers = -1,
                 const std::string& color_format = "rgb",
-                const std::string& resize_filter = "bilinear");
+                const std::string& resize_filter = "bilinear",
+                bool motion_vectors = false);
 
     /**
      * @brief Destructor for VideoReader.
@@ -128,10 +129,9 @@ class VideoReader
      * backend).
      */
     py::object readFrame();
+    // The single motion-vector reader: decodes the next frame and returns
+    // (frame, list-of-per-block-vector-dicts). Requires motion_vectors=True.
     py::tuple readFrameWithMotionVectors();
-    py::list getMotionVectors() const;
-    py::array_t<int32_t> getMotionVectorsArray() const;
-    py::tuple readMotionVectors();
     std::string getFrameType() const;
 
     /**
@@ -376,6 +376,19 @@ class VideoReader
     bool isMLOutputMode() const { return mlOutputMode_; }
 
   private:
+    // Guard the motion-vector read APIs: MV export is opt-in at construction
+    // (motion_vectors=True) because it costs real decode time. Raise a clear,
+    // actionable error rather than silently returning empty vectors when the
+    // reader was built without it.
+    void requireMotionVectors() const
+    {
+        if (!motionVectorsEnabled_)
+            throw std::runtime_error(
+                "Motion vectors are disabled for this VideoReader. Construct it "
+                "with motion_vectors=True (e.g. VideoReader(path, "
+                "motion_vectors=True)) to enable motion-vector export.");
+    }
+
     void ensureRandDecoder();
     bool seekToFrame(int frame_number);
     torch::ScalarType findTypeFromBitDepth();
@@ -461,6 +474,10 @@ class VideoReader
     // ctor arg. Only used on the CPU path when a resize is active.
     int resizeFilter_ = SWS_BILINEAR;
     bool prefetch = true;
+    // Opt-in motion-vector export (VideoReader motion_vectors=True). When false,
+    // the decoder skips MV side-data construction (faster decode) and the MV
+    // read APIs raise a clear error instead of silently returning empty data.
+    bool motionVectorsEnabled_ = false;
 
     // ML output mode
     bool mlOutputMode_ = false;

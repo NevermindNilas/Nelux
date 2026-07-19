@@ -55,6 +55,7 @@ class VideoReader:
             "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
             "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
         ] = "bilinear",
+        motion_vectors: bool = False,
     ) -> None:
         """
         Open a video file for reading.
@@ -96,6 +97,11 @@ class VideoReader:
                 "spline". Cost scales with tap count (bilinear < bicubic < lanczos); affects
                 spatial rescaling only, never color conversion. CPU-decode only — the NVDEC
                 path uses cuvid's hardware scaler and rejects a non-default value.
+            motion_vectors (bool, optional): Enable per-frame motion-vector export.
+                Defaults to False. When False the decoder skips FFmpeg's motion-vector
+                side-data construction (a real decode-time cost that grows with
+                resolution, ~+25% throughput at 4K) and read_frame_with_motion_vectors()
+                raises. Set True to use motion vectors. Never changes decoded pixels.
         """
         ...
 
@@ -184,24 +190,11 @@ class VideoReader:
 
     def read_frame_with_motion_vectors(self) -> Tuple[Union[torch.Tensor, NDArray], List[dict]]:
         """
-        Decode the next frame and return ``(frame, motion_vectors)``.
+        Decode the next frame and return ``(frame, motion_vectors)``, where
+        ``motion_vectors`` is a list of per-block dicts. The single motion-vector
+        reader; requires ``motion_vectors=True`` at construction (otherwise
+        raises). Read the last frame's type via the ``frame_type`` property.
         """
-        ...
-
-    def read_motion_vectors(self) -> Tuple[NDArray, str]:
-        """
-        Decode only the next frame's motion-vector side-data.
-        """
-        ...
-
-    @property
-    def motion_vectors(self) -> List[dict]:
-        """Motion vectors exported for the last decoded frame."""
-        ...
-
-    @property
-    def motion_vectors_array(self) -> NDArray:
-        """Motion vectors for the last decoded frame as an int32 [N, 10] array."""
         ...
 
     @property

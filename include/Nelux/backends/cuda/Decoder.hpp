@@ -214,10 +214,7 @@ private:
     
     // For the decoding thread
     bool hwInitialized_;
-    
-    // Static helper to store 'this' pointer for callback
-    static thread_local Decoder* currentInstance_;
-    
+
     // ML output mode
     bool mlOutputMode_;
     bool mlUseFP16_;     // Use float16 (half) instead of float32

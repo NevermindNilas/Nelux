@@ -1173,8 +1173,14 @@ void Encoder::initVideoStream()
             av_dict_set_int(&opts, "qp", properties.cq, 0);
         }
 
-        // Enable B-frames for better compression (NVENC supports this)
-        av_dict_set(&opts, "b_ref_mode", "middle", 0);
+        // Use B-frames as references for better compression. This is only valid
+        // when B-frames are actually enabled — b_ref_mode is meaningless (and, on
+        // NVENC codecs/GPUs without B-frame-as-reference support, HARD-REJECTED
+        // at avcodec_open2) when max_b_frames == 0. Guard it the same way the
+        // intra-only max_b_frames zeroing above is guarded. extraOptions can
+        // still override this (applied after these defaults).
+        if (videoCodecCtx->max_b_frames > 0)
+            av_dict_set(&opts, "b_ref_mode", "middle", 0);
 
         NELUX_INFO("NVENC: Using hardware-accelerated encoding");
     }

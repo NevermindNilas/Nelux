@@ -55,7 +55,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
                          int cuda_device_index, int resizeWidth, int resizeHeight,
                          bool prefetch, int convertWorkers,
                          const std::string& color_format,
-                         const std::string& resize_filter)
+                         const std::string& resize_filter, bool motion_vectors)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
             rangeFrameLimit_(-1), rangeFramesEmitted_(0),
@@ -68,9 +68,19 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
       resizeHeight_((resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0),
       prefetch(prefetch)
 {
+    motionVectorsEnabled_ = motion_vectors;
     NELUX_INFO(
         "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
         filePath, decode_accelerator, resizeWidth_, resizeHeight_);
+
+    // Motion-vector export is a CPU-decode feature: NVDEC/cuvid does not produce
+    // AV_FRAME_DATA_MOTION_VECTORS side-data, so reject the combination up front
+    // rather than silently returning empty vectors (mirrors the grayscale+nvdec
+    // and resize_filter+nvdec rejections below).
+    if (motion_vectors && decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        throw std::invalid_argument(
+            "motion_vectors=True is only supported with decode_accelerator='cpu'; "
+            "the NVDEC decode path does not export motion vectors.");
 
     if (numThreads > std::thread::hardware_concurrency())
         throw std::invalid_argument(
@@ -137,7 +147,8 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // for the CPU path (NVDEC + grayscale is rejected above).
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
-            resizeWidth_, resizeHeight_, syncMode, grayscale_, resizeFilter_);
+            resizeWidth_, resizeHeight_, syncMode, grayscale_, resizeFilter_,
+            motionVectorsEnabled_);
         decoder->setForce8Bit(force_8bit);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
@@ -353,78 +364,29 @@ py::object VideoReader::readFrame()
 
 py::tuple VideoReader::readFrameWithMotionVectors()
 {
+    requireMotionVectors();
     torch::Tensor frame = decodeFrame();
-    if (!frame.defined() || frame.numel() == 0)
-        return py::make_tuple(tensorToOutput(frame), py::list());
-    return py::make_tuple(tensorToOutput(frame), getMotionVectors());
-}
-
-py::tuple VideoReader::readMotionVectors()
-{
-    if (decodeAccelerator != nelux::DecodeAccelerator::CPU)
-        throw std::runtime_error("read_motion_vectors() requires decode_accelerator='cpu'");
-
-    double frame_timestamp = 0.0;
-    char frame_type = '?';
-    bool ok = false;
+    py::list vectors;
+    if (frame.defined() && frame.numel() != 0 && decoder)
     {
-        py::gil_scoped_release release;
-        ok = decoder->decodeNextMotionVectors(&frame_timestamp, &frame_type);
+        for (const auto& mv : decoder->getLastMotionVectors())
+        {
+            py::dict item;
+            item["source"] = mv.source;
+            item["w"] = static_cast<int>(mv.w);
+            item["h"] = static_cast<int>(mv.h);
+            item["src_x"] = mv.src_x;
+            item["src_y"] = mv.src_y;
+            item["dst_x"] = mv.dst_x;
+            item["dst_y"] = mv.dst_y;
+            item["flags"] = mv.flags;
+            item["motion_x"] = mv.motion_x;
+            item["motion_y"] = mv.motion_y;
+            item["motion_scale"] = static_cast<int>(mv.motion_scale);
+            vectors.append(item);
+        }
     }
-    if (!ok)
-        return py::make_tuple(getMotionVectorsArray(), std::string());
-    current_timestamp = frame_timestamp;
-    currentIndex++;
-    return py::make_tuple(getMotionVectorsArray(), std::string(1, frame_type));
-}
-
-py::list VideoReader::getMotionVectors() const
-{
-    py::list result;
-    if (!decoder)
-        return result;
-    for (const auto& mv : decoder->getLastMotionVectors())
-    {
-        py::dict item;
-        item["source"] = mv.source;
-        item["w"] = static_cast<int>(mv.w);
-        item["h"] = static_cast<int>(mv.h);
-        item["src_x"] = mv.src_x;
-        item["src_y"] = mv.src_y;
-        item["dst_x"] = mv.dst_x;
-        item["dst_y"] = mv.dst_y;
-        item["flags"] = mv.flags;
-        item["motion_x"] = mv.motion_x;
-        item["motion_y"] = mv.motion_y;
-        item["motion_scale"] = static_cast<int>(mv.motion_scale);
-        result.append(item);
-    }
-    return result;
-}
-
-py::array_t<int32_t> VideoReader::getMotionVectorsArray() const
-{
-    std::vector<nelux::Decoder::MotionVector> vectors =
-        decoder ? decoder->getLastMotionVectors() : std::vector<nelux::Decoder::MotionVector>();
-    std::vector<py::ssize_t> shape = {
-        static_cast<py::ssize_t>(vectors.size()), static_cast<py::ssize_t>(10)};
-    py::array_t<int32_t> out(shape);
-    auto r = out.mutable_unchecked<2>();
-    for (py::ssize_t i = 0; i < static_cast<py::ssize_t>(vectors.size()); ++i)
-    {
-        const auto& mv = vectors[static_cast<size_t>(i)];
-        r(i, 0) = mv.source;
-        r(i, 1) = mv.w;
-        r(i, 2) = mv.h;
-        r(i, 3) = mv.src_x;
-        r(i, 4) = mv.src_y;
-        r(i, 5) = mv.dst_x;
-        r(i, 6) = mv.dst_y;
-        r(i, 7) = mv.motion_x;
-        r(i, 8) = mv.motion_y;
-        r(i, 9) = mv.motion_scale;
-    }
-    return out;
+    return py::make_tuple(tensorToOutput(frame), vectors);
 }
 
 std::string VideoReader::getFrameType() const
@@ -821,7 +783,8 @@ void VideoReader::ensureRandDecoder()
         // decoder — no post-construction channel switch.
         rand_decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_, resizeFilter_);
+            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_, resizeFilter_,
+            motionVectorsEnabled_);
         rand_decoder->setForce8Bit(force_8bit);
     }
 }

@@ -39,7 +39,7 @@ createDecoder(const std::string& filename, int numThreads,
               DecodeAccelerator accelerator = DecodeAccelerator::CPU,
               int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
               bool syncMode = false, bool grayscale = false,
-              int resizeFilter = SWS_BILINEAR)
+              int resizeFilter = SWS_BILINEAR, bool motionVectors = false)
 {
     switch (accelerator)
     {
@@ -48,13 +48,14 @@ createDecoder(const std::string& filename, int numThreads,
             // thread can start (it starts inside the ctor's initialize() when
             // syncMode is false), so it is passed into the ctor rather than set
             // afterward — otherwise the producer races on the channel count.
-            // resizeFilter (SWS_* scaling kernel) is passed for the same reason.
+            // resizeFilter (SWS_* scaling kernel) and motionVectors (opt-in MV
+            // export flag, consumed at codec-open) are passed for the same reason.
             if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
                     filename, numThreads, resizeWidth, resizeHeight, syncMode,
-                    grayscale, resizeFilter);
+                    grayscale, resizeFilter, motionVectors);
             return std::make_shared<nelux::backends::cpu::Decoder>(
-                filename, numThreads, syncMode, grayscale);
+                filename, numThreads, syncMode, grayscale, motionVectors);
 
         case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA

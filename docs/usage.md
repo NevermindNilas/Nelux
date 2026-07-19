@@ -268,20 +268,20 @@ with VideoReader("video.mp4") as reader:
 ### Motion Vectors
 
 ```python
-reader = VideoReader("video.mp4", decode_accelerator="cpu")
+# Motion-vector export is opt-in (off by default for decode speed).
+reader = VideoReader("video.mp4", decode_accelerator="cpu", motion_vectors=True)
 
 frame, vectors = reader.read_frame_with_motion_vectors()
-dense_vectors, frame_type = reader.read_motion_vectors()
-last_vectors = reader.motion_vectors
-last_dense_vectors = reader.motion_vectors_array
+frame_type = reader.frame_type   # "I" | "P" | "B", or "" if unknown
 ```
 
 Each vector is a dict with `source`, `w`, `h`, `src_x`, `src_y`, `dst_x`,
 `dst_y`, `flags`, `motion_x`, `motion_y`, and `motion_scale`. This uses FFmpeg
 decoder side-data; codecs or decoder builds that do not export motion vectors
-return an empty list. `read_motion_vectors()` skips RGB conversion and returns
-an `int32` `[N, 10]` array plus frame type (`I`, `P`, `B`). Dense columns are
-`source, w, h, src_x, src_y, dst_x, dst_y, motion_x, motion_y, motion_scale`.
+return an empty list. `read_frame_with_motion_vectors()` is the single
+motion-vector reader — it requires `motion_vectors=True` at construction and
+raises a clear error otherwise; the last frame's type is on the separate
+`frame_type` property.
 
 ---
 
