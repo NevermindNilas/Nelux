@@ -50,7 +50,8 @@ class VideoReader
                 int convertWorkers = -1,
                 const std::string& color_format = "rgb",
                 const std::string& resize_filter = "bilinear",
-                bool motion_vectors = false);
+                bool motion_vectors = false,
+                const std::string& device = "");
 
     /**
      * @brief Destructor for VideoReader.
@@ -484,6 +485,22 @@ class VideoReader
     bool mlUseFP16_ = false;
     std::vector<float> mlMean_;
     std::vector<float> mlStd_;
+
+    // Software-frame pipeline = every accelerator whose decoder emits
+    // system-memory frames through the base Decoder convert path (CPU and
+    // QSV). NVDEC is the only device-memory pipeline.
+    bool isSoftwareFramePath() const
+    {
+        return decodeAccelerator != nelux::DecodeAccelerator::NVDEC;
+    }
+
+    // Optional output-tensor placement (device= ctor arg, e.g. "xpu"). When
+    // set, every returned tensor is copied to outputDevice_ after decode.
+    // Decode itself is unaffected — this exists so QSV (or CPU) decode can
+    // hand frames to models living on torch's XPU backend.
+    torch::Tensor maybeToDevice(const torch::Tensor& t) const;
+    bool moveOutputToDevice_ = false;
+    torch::Device outputDevice_{torch::kCPU};
 };
 
 #endif // VIDEOREADER_HPP

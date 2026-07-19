@@ -4,6 +4,7 @@
 
 #include <backends/Decoder.hpp>
 #include <backends/cpu/Decoder.hpp>
+#include <backends/qsv/Decoder.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <backends/cuda/Decoder.hpp>
