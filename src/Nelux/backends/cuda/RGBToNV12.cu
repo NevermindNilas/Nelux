@@ -108,7 +108,7 @@ static const float kOffsetBT2020Full[3] = {0.0f, 128.0f, 128.0f};
 void SetMatRgb2Yuv(int iMatrix, int colorRange, cudaStream_t stream) {
     const float (*mat)[3] = nullptr;
     const float *offset = nullptr;
-    
+
     bool isFullRange = (colorRange == ColorRange_Full);
     
     switch (iMatrix) {
@@ -898,10 +898,13 @@ __global__ void Rgb24ToP210Kernel(
     RgbToYuv(pSrc0[0], pSrc0[1], pSrc0[2], y0, u0, v0);
     RgbToYuv(pSrc1[0], pSrc1[1], pSrc1[2], y1, u1, v1);
     
-    // Convert to 10-bit (left-shifted by 6 for MSB alignment in 16-bit)
+    // Convert 8-bit to 10-bit MSB-aligned in a 16-bit word: expand 8->10 bit
+    // (<<2) then MSB-align the 10-bit value in 16 bits (<<6) = <<8. This matches
+    // the P010 (4:2:0 10-bit) and P216 siblings; the previous <<6 left the top
+    // two bits zero, capping output at ~25% of full 10-bit scale.
     auto toP210 = [](float val) -> uint16_t {
         int v = static_cast<int>(Clamp(val + 0.5f, 0.0f, 255.0f));
-        return static_cast<uint16_t>(v << 6);  // 8-bit to 10-bit MSB aligned
+        return static_cast<uint16_t>(v << 8);  // 8-bit -> 10-bit MSB aligned
     };
     
     // Write Y plane (16-bit values)

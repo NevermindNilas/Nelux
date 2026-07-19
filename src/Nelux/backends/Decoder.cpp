@@ -590,8 +590,17 @@ void Decoder::initCodecContext()
                 "thread_type={}",
                 codecCtx->thread_count, codecCtx->thread_type);
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
-    codecCtx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
-    codecCtx->export_side_data |= AV_CODEC_EXPORT_DATA_MVS;
+    // Motion-vector export is opt-in. Enabling AV_CODEC_FLAG2_EXPORT_MVS makes
+    // libavcodec compute + retain per-block motion vectors every frame — a real
+    // per-frame cost that grows with resolution (~+25% decode throughput at 4K
+    // when left off). Only request it when the caller opted in via
+    // VideoReader(motion_vectors=True); the MV read APIs raise otherwise. This
+    // flag affects only side-data population, never the reconstructed pixels.
+    if (motionVectorsEnabled_)
+    {
+        codecCtx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
+        codecCtx->export_side_data |= AV_CODEC_EXPORT_DATA_MVS;
+    }
 
     // Allow experimental compliance (needed for some AV1 implementations)
     codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
@@ -1538,78 +1547,6 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     // If all timestamp fields are invalid, log a warning and handle accordingly
     NELUX_WARN("Frame has no valid timestamp. Returning -1.0");
     return -1.0;
-}
-
-bool Decoder::decodeNextMotionVectors(double* frame_timestamp, char* frame_type)
-{
-    if (decodingThread.joinable())
-    {
-        stopDecodingThread();
-        stopSyncConvertWorkers();
-        clearQueue();
-    }
-    if (syncDrained_)
-    {
-        setLastMotionVectors({});
-        lastFrameType_ = '?';
-        return false;
-    }
-
-    AVFrame* f = syncFrame_.get();
-    while (true)
-    {
-        while (!syncEofReached_)
-        {
-            int rret = av_read_frame(formatCtx.get(), pkt.get());
-            if (rret < 0)
-            {
-                syncEofReached_ = true;
-                break;
-            }
-            if (pkt->stream_index != videoStreamIndex)
-            {
-                av_packet_unref(pkt.get());
-                continue;
-            }
-            int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
-            av_packet_unref(pkt.get());
-            if (sret == AVERROR(EAGAIN))
-                break;
-            if (sret < 0)
-            {
-                syncDrained_ = true;
-                setLastMotionVectors({});
-                lastFrameType_ = '?';
-                return false;
-            }
-            break;
-        }
-        if (syncEofReached_ && !syncFlushSent_)
-        {
-            avcodec_send_packet(codecCtx.get(), nullptr);
-            syncFlushSent_ = true;
-        }
-
-        int ret = avcodec_receive_frame(codecCtx.get(), f);
-        if (ret == 0)
-        {
-            if (frame_timestamp)
-                *frame_timestamp = getFrameTimestamp(f);
-            setLastMotionVectors(extractMotionVectors(f));
-            setLastFrameType(f);
-            if (frame_type)
-                *frame_type = lastFrameType_;
-            av_frame_unref(f);
-            return true;
-        }
-        if (ret == AVERROR_EOF || ret != AVERROR(EAGAIN))
-        {
-            syncDrained_ = true;
-            setLastMotionVectors({});
-            lastFrameType_ = '?';
-            return false;
-        }
-    }
 }
 
 std::vector<Decoder::MotionVector>

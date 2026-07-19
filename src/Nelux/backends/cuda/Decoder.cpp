@@ -61,9 +61,6 @@ static void ffmpegLogCallback(void* ptr, int level, const char* fmt, va_list vl)
     }
 }
 
-// Thread-local storage for static callback
-thread_local Decoder* Decoder::currentInstance_ = nullptr;
-
 // Forward declarations of CUDA kernels (defined in NV12ToRGB.cu)
 // NV12 (4:2:0, 8-bit)
 extern void launchNv12ToRgb24Separate(const uint8_t* pY, const uint8_t* pUV,
@@ -594,9 +591,9 @@ void Decoder::initCodecContextWithHwAccel()
         throw CxException("Failed to reference hardware device context");
     }
 
-    // Set the callback for pixel format selection
-    // Store current instance for static callback
-    currentInstance_ = this;
+    // Set the callback for pixel format selection. getHwFormat is a stateless
+    // static (it only scans pix_fmts for AV_PIX_FMT_CUDA), so no instance
+    // pointer needs to be stashed for it.
     codecCtx->get_format = getHwFormat;
 
     // NVDEC/CUVID decoders already manage decode parallelism internally.

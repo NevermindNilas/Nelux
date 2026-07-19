@@ -67,7 +67,7 @@ PYBIND11_MODULE(_nelux, m)
                     std::optional<std::pair<int, int>> resize, bool prefetch,
                     std::optional<int> convert_workers,
                     const std::string& color_format,
-                    const std::string& resize_filter)
+                    const std::string& resize_filter, bool motion_vectors)
                  {
                      int rw = 0, rh = 0;
                      if (resize.has_value())
@@ -97,7 +97,7 @@ PYBIND11_MODULE(_nelux, m)
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
                          cuda_device_index, rw, rh, prefetch, cw, color_format,
-                         resize_filter);
+                         resize_filter, motion_vectors);
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
@@ -107,6 +107,7 @@ PYBIND11_MODULE(_nelux, m)
              py::arg("convert_workers") = py::none(),
              py::arg("color_format") = "rgb",
              py::arg("resize_filter") = "bilinear",
+             py::arg("motion_vectors") = false,
              R"doc(Open a video file for reading.
 
 Args:
@@ -152,18 +153,23 @@ Args:
         count (bilinear < bicubic < lanczos); the choice only affects spatial
         rescaling, never the color conversion. CPU-decode only — the NVDEC path
         scales with cuvid's own hardware scaler and rejects a non-default value.
+    motion_vectors (bool, optional): Enable per-frame motion-vector export.
+        Defaults to False. When False, the decoder skips libavcodec's motion-
+        vector side-data construction — a real decode-time cost that grows with
+        resolution (~+25% throughput at 4K) — and the motion-vector read APIs
+        (read_frame_with_motion_vectors, read_motion_vectors, the motion_vectors
+        / motion_vectors_array properties) raise a clear error. Set True to use
+        them. Enabling it never changes the decoded pixels, only whether motion
+        vectors are available. CPU-decode only (NVDEC never exports MVs).
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "
              "based on backend).")
         .def("read_frame_with_motion_vectors", &VideoReader::readFrameWithMotionVectors,
-             "Decode the next frame and return (frame, motion_vectors).")
-        .def("read_motion_vectors", &VideoReader::readMotionVectors,
-             "Decode the next frame's motion vectors only, returning (vectors, frame_type).")
-        .def_property_readonly("motion_vectors", &VideoReader::getMotionVectors,
-             "Motion vectors exported for the last decoded frame.")
-        .def_property_readonly("motion_vectors_array", &VideoReader::getMotionVectorsArray,
-             "Motion vectors for the last decoded frame as an int32 [N,10] array.")
+             "Decode the next frame and return (frame, motion_vectors), where "
+             "motion_vectors is a list of per-block dicts. The single motion-"
+             "vector reader; requires motion_vectors=True at construction. Read "
+             "the last frame's type separately via the frame_type property.")
         .def_property_readonly("frame_type", &VideoReader::getFrameType,
              "Frame type for the last decoded frame: I, P, B, or empty if unknown.")
         .def_property_readonly("properties", &VideoReader::getProperties)

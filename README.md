@@ -106,16 +106,16 @@ nelux-drawn motion-vector field](docs/images/motion_vectors.png)
 import torch  # must be imported before nelux
 from nelux import VideoReader
 
-vr = VideoReader("video.mp4", decode_accelerator="cpu")
+# Motion-vector export costs decode time, so it is opt-in — enable it here.
+vr = VideoReader("video.mp4", decode_accelerator="cpu", motion_vectors=True)
 
-# Frame + vectors together — vectors is a list[dict] (one entry per block).
+# The single motion-vector reader — vectors is a list[dict] (one per block).
 frame, vectors = vr.read_frame_with_motion_vectors()
 for mv in vectors:
     print(mv["src_x"], mv["src_y"], "->", mv["dst_x"], mv["dst_y"])
 
-# Vectors only — skips RGB conversion entirely; ~2-3x faster on inter frames.
-# Returns (int32 [N, 10] array, frame_type) where frame_type is "I" | "P" | "B".
-dense, frame_type = vr.read_motion_vectors()
+# The last frame's type ("I" | "P" | "B") is a separate property.
+print(vr.frame_type)
 ```
 
 **Field schema.** Each entry in `vectors` (and each row of the dense array)
@@ -136,12 +136,13 @@ has these 10 columns, matching FFmpeg's `AV_FRAME_DATA_MOTION_VECTORS`:
 
 To recover pixel-space displacement, divide `motion_x`/`motion_y` by
 `motion_scale`. I-frames (and codecs/decoder builds that don't export the
-side-data, e.g. some `mpeg4` builds) return an empty list / zero-row array;
-`frame_type` lets you branch on that without inspecting the array.
+side-data, e.g. some `mpeg4` builds) return an empty list; the `frame_type`
+property lets you branch on that without inspecting the vectors.
 
-**Tip.** `read_motion_vectors()` is the hot path when you only need the flow
-field — it skips libswscale RGB conversion and the host tensor copy, so on a
-typical 1080p P-frame it returns in a fraction of the `read_frame()` time.
+**Note.** Motion-vector export is off by default because it makes the decoder
+compute per-block vectors on every frame (measurably slower, especially at 4K).
+Pass `motion_vectors=True` to `VideoReader` to enable it; the motion-vector
+reader raises a clear error otherwise.
 
 ### Video Encoding
 
@@ -193,7 +194,7 @@ per encoder; a second call raises.
 - **RGB or Grayscale Output**: `color_format="rgb"` (default) or `color_format="gray"` for single-channel `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only. `encode_frame` also accepts single-channel input (`[H, W, 1]` or `[H, W]`). With a grayscale output `pixel_format` (`"gray"`/`"gray16le"`) it's a **verbatim, full-range data path** — values stored exactly, up to true 16-bit, with a lossless (`ffv1`) round-trip — ideal for depth maps and masks; with a color `pixel_format` the gray input is replicated to RGB
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
-- **Motion Vector Export**: `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; `read_motion_vectors()` skips RGB conversion and returns a dense `[N, 10]` array plus frame type. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
+- **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
 
 ### Performance Knobs
