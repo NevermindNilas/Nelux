@@ -108,3 +108,16 @@ def test_motion_vectors_disabled_by_default(tmp_path: Path):
     # The single motion-vector reader must raise a clear error when disabled.
     with pytest.raises(RuntimeError, match="motion_vectors=True"):
         reader.read_frame_with_motion_vectors()
+
+
+def test_motion_vectors_nvdec_rejected(tmp_path: Path):
+    """motion_vectors=True is a CPU-decode feature; NVDEC does not export MVs, so
+    the combination must be rejected at construction (not silently empty)."""
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    import nelux
+
+    with pytest.raises((ValueError, RuntimeError), match="cpu"):
+        nelux.VideoReader(str(tmp_path / "x.mp4"),
+                          decode_accelerator="nvdec", motion_vectors=True)

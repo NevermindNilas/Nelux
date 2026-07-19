@@ -156,11 +156,11 @@ Args:
     motion_vectors (bool, optional): Enable per-frame motion-vector export.
         Defaults to False. When False, the decoder skips libavcodec's motion-
         vector side-data construction — a real decode-time cost that grows with
-        resolution (~+25% throughput at 4K) — and the motion-vector read APIs
-        (read_frame_with_motion_vectors, read_motion_vectors, the motion_vectors
-        / motion_vectors_array properties) raise a clear error. Set True to use
-        them. Enabling it never changes the decoded pixels, only whether motion
-        vectors are available. CPU-decode only (NVDEC never exports MVs).
+        resolution (~+25% throughput at 4K) — and read_frame_with_motion_vectors()
+        (the single motion-vector reader) raises a clear error. Set True to use it.
+        Enabling it never changes the decoded pixels, only whether motion vectors
+        are available. CPU-decode only: combining motion_vectors=True with
+        decode_accelerator='nvdec' is rejected, since NVDEC does not export MVs.
 )doc")
         .def("read_frame", &VideoReader::readFrame,
              "Decode and return the next frame as a H×W×3 array (tensor or ndarray "

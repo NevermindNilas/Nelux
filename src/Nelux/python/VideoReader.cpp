@@ -73,6 +73,15 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
         filePath, decode_accelerator, resizeWidth_, resizeHeight_);
 
+    // Motion-vector export is a CPU-decode feature: NVDEC/cuvid does not produce
+    // AV_FRAME_DATA_MOTION_VECTORS side-data, so reject the combination up front
+    // rather than silently returning empty vectors (mirrors the grayscale+nvdec
+    // and resize_filter+nvdec rejections below).
+    if (motion_vectors && decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        throw std::invalid_argument(
+            "motion_vectors=True is only supported with decode_accelerator='cpu'; "
+            "the NVDEC decode path does not export motion vectors.");
+
     if (numThreads > std::thread::hardware_concurrency())
         throw std::invalid_argument(
             "Number of threads cannot exceed hardware concurrency");
