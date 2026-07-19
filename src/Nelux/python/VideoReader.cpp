@@ -591,6 +591,57 @@ py::dict VideoReader::getProperties() const
     props["aspect_ratio"] = properties.aspectRatio; // New property
     props["codec"] = properties.codec;
 
+    // --- Extended metadata (ffprobe-equivalent, read straight from libav) ---
+    props["codec_name"] = properties.codecName; // canonical (ffprobe codec_name)
+    props["codec_long_name"] = properties.codecLongName;
+    props["profile"] = properties.profile;
+    props["level"] = properties.level;
+
+    // Exact rates: expose both the reduced string ("24000/1001") and the raw
+    // numerator/denominator so callers can feed encoders without float drift.
+    // Frame rates use ffmpeg's "num/den" convention; aspect ratios use the
+    // "num:den" convention that ffprobe reports (e.g. "16:9").
+    auto ratStr = [](int num, int den) {
+        return std::to_string(num) + "/" + std::to_string(den);
+    };
+    auto aspectStr = [](int num, int den) {
+        return std::to_string(num) + ":" + std::to_string(den);
+    };
+    props["avg_frame_rate"] = ratStr(properties.avgFrameRateNum, properties.avgFrameRateDen);
+    props["r_frame_rate"] = ratStr(properties.rFrameRateNum, properties.rFrameRateDen);
+    props["avg_frame_rate_num"] = properties.avgFrameRateNum;
+    props["avg_frame_rate_den"] = properties.avgFrameRateDen;
+    props["r_frame_rate_num"] = properties.rFrameRateNum;
+    props["r_frame_rate_den"] = properties.rFrameRateDen;
+    props["is_vfr"] = properties.isVfr;
+    props["nb_frames"] = properties.nbFrames;
+
+    // Color metadata
+    props["color_primaries"] = properties.colorPrimaries;
+    props["color_transfer"] = properties.colorTransfer;
+    props["color_space"] = properties.colorSpace;
+    props["color_range"] = properties.colorRange;
+
+    // Aspect ratios
+    props["sample_aspect_ratio"] = aspectStr(properties.sarNum, properties.sarDen);
+    props["display_aspect_ratio"] = aspectStr(properties.darNum, properties.darDen);
+
+    // Bitrates / timing / container
+    props["bit_rate"] = properties.bitRate;
+    props["format_bit_rate"] = properties.formatBitRate;
+    props["start_time"] = properties.startTime;
+    props["field_order"] = properties.fieldOrder;
+    props["format_name"] = properties.formatName;
+    props["format_long_name"] = properties.formatLongName;
+    props["nb_streams"] = properties.nbStreams;
+
+    // First audio stream
+    props["audio_codec"] = properties.audioCodec;
+    props["audio_sample_rate"] = properties.audioSampleRate;
+    props["audio_channels"] = properties.audioChannels;
+    props["audio_channel_layout"] = properties.audioChannelLayout;
+    props["audio_bit_rate"] = properties.audioBitRate;
+
     NELUX_INFO("Video properties retrieved and converted to Python dict");
     return props;
 }

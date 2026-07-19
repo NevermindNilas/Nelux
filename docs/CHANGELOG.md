@@ -1,4 +1,17 @@
 
+### **Version 0.15.0 (2026-07-19)**
+
+#### **Feature: full container/stream metadata (ffprobe-equivalent)**
+- **Added:** `VideoReader.properties` (and `get_properties()`) now returns an ffprobe-equivalent superset of container and stream metadata, read **in-process from libav** — nelux does not shell out to `ffprobe` and adds no dependency; it uses the same bundled FFmpeg DLLs it always has. New keys: `codec_name` (the **canonical** codec name from the codec descriptor, e.g. `av1` / `h264` — distinct from `codec`, which is the decoder-implementation name and can read `libdav1d`), `codec_long_name`, `profile`, `level`; `r_frame_rate` and `avg_frame_rate` kept as **exact reduced rationals** (`"24000/1001"`, never rounded) with raw `r_frame_rate_num`/`_den` + `avg_frame_rate_num`/`_den` integers alongside; `is_vfr`; raw container `nb_frames` (0 when absent, kept distinct from the estimated `total_frames`); `color_primaries`, `color_transfer`, `color_space`, `color_range`; `sample_aspect_ratio` + `display_aspect_ratio`; `bit_rate` + `format_bit_rate`; `start_time`; `field_order`; `format_name` + `format_long_name`; `nb_streams`; and first-audio-stream `audio_codec`, `audio_sample_rate`, `audio_channels`, `audio_channel_layout`, `audio_bit_rate`.
+- **Verified:** field-for-field against ffprobe (matched to nelux's own bundled FFmpeg build) across a **135-clip corpus** spanning codec×container matrices, fractional/NTSC and genuinely variable frame rates, GOP/keyframe structures, 8/10/12-bit and RGB/gray pixel formats, explicit color tags, and audio layouts — **135/135 fields match**.
+- **Speed:** because it avoids the per-call subprocess spawn that `ffprobe` pays, metadata retrieval measured **~12–14× faster than an equivalent `ffprobe -show_format -show_streams` invocation** over the same corpus (median-of-5 per file).
+
+#### **Change: exact frame count when the container omits `nb_frames`**
+- **Changed:** `get_frame_count()` and `len(reader)` now return an **exact** frame count for containers that do not carry `nb_frames` (common for MKV / WebM / VFR), where they previously returned an `fps × duration` **estimate**. The new fallback performs a demux-only packet pass — no decoding — over a **fresh throwaway format context**, so it never disturbs the live decode/producer state on the main context, and the result is cached after the first call. This matches `ffprobe -count_packets` exactly (verified 49/49 on the corpus files that omit `nb_frames`). The `fps × duration` estimate is retained only as a last resort when demuxing is unavailable.
+- **Unchanged:** `properties["total_frames"]` remains the fast estimate, so the metadata probe path itself pays **no** decode/demux cost — the exact count is paid only when `get_frame_count()`/`len()` is actually called.
+
+---
+
 ### **Version 0.14.3 (2026-07-10)**
 
 #### **Fix: NVDEC batched decode returned the wrong frame**
