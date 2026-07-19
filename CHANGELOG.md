@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-19
+
+### Added
+
+- **Full container/stream metadata on `VideoReader.properties`.** The properties
+  dict now exposes an ffprobe-equivalent superset, read in-process from libav (no
+  `ffprobe` subprocess, no new dependency — the same bundled FFmpeg DLLs). New
+  keys: `codec_name` (canonical codec from the codec descriptor, e.g. `av1`,
+  distinct from the decoder-implementation name in `codec` such as `libdav1d`),
+  `codec_long_name`, `profile`, `level`; exact frame rates `r_frame_rate` and
+  `avg_frame_rate` as reduced rational strings (`"24000/1001"`) plus their raw
+  `*_num`/`*_den` integers so no precision is lost to float rounding; `is_vfr`;
+  raw container `nb_frames` (0 when the container omits it, distinct from the
+  estimated `total_frames`); color metadata `color_primaries`, `color_transfer`,
+  `color_space`, `color_range`; `sample_aspect_ratio` and `display_aspect_ratio`;
+  `bit_rate` and `format_bit_rate`; `start_time`; `field_order`; `format_name`
+  and `format_long_name`; `nb_streams`; and first-audio-stream details
+  `audio_codec`, `audio_sample_rate`, `audio_channels`, `audio_channel_layout`,
+  `audio_bit_rate`. Verified field-for-field against ffprobe across a 135-clip
+  corpus (varied codecs, containers, frame rates incl. VFR, GOP structures,
+  pixel formats, color tags, and audio); metadata retrieval measured **~12–14×
+  faster than an `ffprobe` invocation** since it avoids the per-call subprocess
+  spawn.
+
+### Changed
+
+- **`get_frame_count()` / `len(reader)` now return an exact count when the
+  container omits `nb_frames`.** Previously such containers (common for MKV /
+  WebM / VFR) fell back to an `fps × duration` estimate. The count now falls back
+  to a demux-only packet pass (no decoding, over a fresh throwaway format context
+  that never disturbs live decode state, cached after the first call) — matching
+  `ffprobe -count_packets` exactly (verified 49/49 on the `nb_frames`-absent
+  corpus files). The `fps × duration` estimate remains only as a last resort when
+  demuxing is unavailable. `properties["total_frames"]` is unchanged — it stays
+  the fast estimate so the metadata probe itself pays no decode/demux cost.
+
 ## [0.14.3] - 2026-07-10
 
 ### Fixed

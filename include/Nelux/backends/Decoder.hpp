@@ -51,6 +51,56 @@ class Decoder
         double aspectRatio;
         double min_fps;
         double max_fps;
+
+        // --- Extended container/stream metadata (ffprobe-equivalent) ---
+        // Codec identity
+        std::string codecName;       // canonical codec (codec_id) name, e.g. "av1"
+                                     // — matches ffprobe codec_name, unlike the
+                                     // decoder-implementation name in `codec`.
+        std::string codecLongName;   // codec->long_name
+        std::string profile;         // avcodec_profile_name (e.g. "High")
+        int level = 0;               // codecpar->level (-99 if unset)
+
+        // Exact frame rates kept as rationals so callers never lose precision
+        // to floating-point rounding (e.g. 24000/1001). avg_frame_rate is the
+        // container's averaged rate; r_frame_rate is the base (lowest) rate.
+        int avgFrameRateNum = 0;
+        int avgFrameRateDen = 0;
+        int rFrameRateNum = 0;
+        int rFrameRateDen = 0;
+        bool isVfr = false;          // r_frame_rate != avg_frame_rate
+
+        // Raw container frame count (0 if the container does not carry it);
+        // distinct from totalFrames, which falls back to fps*duration.
+        int64_t nbFrames = 0;
+
+        // Color metadata (names as ffprobe reports them: "bt709", "tv", ...)
+        std::string colorPrimaries;
+        std::string colorTransfer;
+        std::string colorSpace;
+        std::string colorRange;
+
+        // Sample- and display-aspect-ratio as rationals
+        int sarNum = 0;
+        int sarDen = 1;
+        int darNum = 0;
+        int darDen = 1;
+
+        // Bitrates / timing / container
+        int64_t bitRate = 0;         // video stream bitrate (bits/s), 0 if unknown
+        int64_t formatBitRate = 0;   // whole-container bitrate
+        double startTime = 0.0;      // video stream start_time (seconds)
+        std::string fieldOrder;      // "progressive", "tt", "bb", "tb", "bt", "unknown"
+        std::string formatName;      // demuxer short name (e.g. "mov,mp4,...")
+        std::string formatLongName;  // demuxer long name
+        int nbStreams = 0;           // total streams in the container
+
+        // First audio stream (empty/zero if no audio)
+        std::string audioCodec;
+        int audioSampleRate = 0;
+        int audioChannels = 0;
+        std::string audioChannelLayout;
+        int64_t audioBitRate = 0;
     };
 
     Decoder() = default;
@@ -181,6 +231,11 @@ class Decoder
 
     // Batch decoding support
     int64_t get_frame_count();
+    // Exact video frame count via a demux-only packet pass over a fresh format
+    // context (no decode, no disturbance to live decode state). Returns -1 on
+    // failure. Used as the get_frame_count() fallback when the container omits
+    // nb_frames. See ffprobe -count_packets.
+    int64_t countVideoPacketsExact();
     virtual torch::Tensor decode_batch(const std::vector<int64_t>& indices);
     std::vector<MotionVector> getLastMotionVectors() const;
     char getLastFrameType() const;

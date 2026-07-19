@@ -130,17 +130,71 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
     return *this;
 }
 
+// Return a non-null C string for libav name lookups that may yield nullptr.
+static const char* safeStr(const char* s)
+{
+    return s ? s : "unknown";
+}
+
 void Decoder::setProperties()
 {
+    AVStream* stream = formatCtx->streams[videoStreamIndex];
+    const AVCodecParameters* vpar = stream->codecpar;
+
     // Set basic video properties
     properties.codec = codecCtx->codec->name;
+    properties.codecLongName =
+        codecCtx->codec->long_name ? codecCtx->codec->long_name : "";
     properties.width = codecCtx->width;
     properties.height = codecCtx->height;
 
+    // Canonical codec name (from codec_id), matching ffprobe's codec_name.
+    // `codec` above is the decoder implementation name (e.g. "libdav1d"),
+    // which differs for wrapped decoders; codecName is the format name ("av1").
+    {
+        const AVCodecDescriptor* vdesc = avcodec_descriptor_get(vpar->codec_id);
+        properties.codecName = vdesc ? vdesc->name : properties.codec;
+    }
+
+    // Codec profile/level. Prefer the human name; when the codec has no named
+    // profile (e.g. VP8) but a numeric profile is set, fall back to the integer
+    // so the value still matches ffprobe.
+    {
+        const char* prof =
+            avcodec_profile_name(vpar->codec_id, vpar->profile);
+        if (prof)
+        {
+            properties.profile = prof;
+        }
+        else if (vpar->profile != AV_PROFILE_UNKNOWN)
+        {
+            properties.profile = std::to_string(vpar->profile);
+        }
+        else
+        {
+            properties.profile = "";
+        }
+        properties.level = vpar->level;
+    }
+
     // Frame rate calculation
-    properties.fps = av_q2d(formatCtx->streams[videoStreamIndex]->avg_frame_rate);
+    properties.fps = av_q2d(stream->avg_frame_rate);
     properties.min_fps = properties.fps; // Initialize min fps
     properties.max_fps = properties.fps; // Initialize max fps
+
+    // Exact frame rates as rationals (avoid float rounding of 24000/1001 etc.)
+    properties.avgFrameRateNum = stream->avg_frame_rate.num;
+    properties.avgFrameRateDen = stream->avg_frame_rate.den;
+    properties.rFrameRateNum = stream->r_frame_rate.num;
+    properties.rFrameRateDen = stream->r_frame_rate.den;
+    // VFR heuristic: base (r_frame_rate) differs from averaged rate. Compare as
+    // reduced rationals so 24/1 vs 48/2 don't read as VFR.
+    {
+        AVRational a = stream->avg_frame_rate;
+        AVRational r = stream->r_frame_rate;
+        properties.isVfr = (a.num > 0 && r.num > 0) &&
+                           (av_cmp_q(a, r) != 0);
+    }
 
     // Ensure duration is calculated properly
     if (formatCtx->streams[videoStreamIndex]->duration != AV_NOPTS_VALUE)
@@ -171,21 +225,37 @@ void Decoder::setProperties()
         properties.height = resizeHeight_;
     }
 
-    // Detect audio stream presence only (no audio decoding)
+    // Detect audio stream presence and capture the first audio track's details.
     properties.hasAudio = false;
     for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
     {
-        if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        const AVCodecParameters* apar = formatCtx->streams[i]->codecpar;
+        if (apar->codec_type == AVMEDIA_TYPE_AUDIO)
         {
             properties.hasAudio = true;
+            const AVCodecDescriptor* adesc =
+                avcodec_descriptor_get(apar->codec_id);
+            properties.audioCodec = adesc ? adesc->name : "";
+            properties.audioSampleRate = apar->sample_rate;
+            properties.audioChannels = apar->ch_layout.nb_channels;
+            properties.audioBitRate = apar->bit_rate;
+            char layout[128] = {0};
+            if (av_channel_layout_describe(&apar->ch_layout, layout,
+                                           sizeof(layout)) > 0)
+            {
+                properties.audioChannelLayout = layout;
+            }
             break;
         }
     }
 
+    // Raw container frame count (0 when the container omits it).
+    properties.nbFrames = stream->nb_frames > 0 ? stream->nb_frames : 0;
+
     // Calculate total frames
-    if (formatCtx->streams[videoStreamIndex]->nb_frames > 0)
+    if (stream->nb_frames > 0)
     {
-        properties.totalFrames = formatCtx->streams[videoStreamIndex]->nb_frames;
+        properties.totalFrames = static_cast<int>(stream->nb_frames);
     }
     else if (properties.fps > 0 && properties.duration > 0)
     {
@@ -196,7 +266,7 @@ void Decoder::setProperties()
         properties.totalFrames = 0; // Unknown total frames
     }
 
-    // Calculate aspect ratio
+    // Calculate aspect ratio (storage/pixel ratio via width/height)
     if (properties.width > 0 && properties.height > 0)
     {
         properties.aspectRatio =
@@ -206,6 +276,58 @@ void Decoder::setProperties()
     {
         properties.aspectRatio = 0.0; // Unknown aspect ratio
     }
+
+    // Color metadata (names as ffprobe reports them: "bt709", "smpte170m",
+    // "tv"/"pc", ...). Read from codecpar so it reflects the container/stream.
+    properties.colorPrimaries = safeStr(av_color_primaries_name(vpar->color_primaries));
+    properties.colorTransfer = safeStr(av_color_transfer_name(vpar->color_trc));
+    properties.colorSpace = safeStr(av_color_space_name(vpar->color_space));
+    properties.colorRange = safeStr(av_color_range_name(vpar->color_range));
+
+    // Sample-aspect-ratio and derived display-aspect-ratio.
+    {
+        AVRational sar = av_guess_sample_aspect_ratio(formatCtx.get(), stream, nullptr);
+        if (sar.num == 0 || sar.den == 0)
+        {
+            sar = AVRational{1, 1};
+        }
+        properties.sarNum = sar.num;
+        properties.sarDen = sar.den;
+        int darNum = 0, darDen = 1;
+        av_reduce(&darNum, &darDen,
+                  static_cast<int64_t>(codecCtx->width) * sar.num,
+                  static_cast<int64_t>(codecCtx->height) * sar.den,
+                  1024 * 1024);
+        properties.darNum = darNum;
+        properties.darDen = darDen;
+    }
+
+    // Bitrates / timing / field order.
+    properties.bitRate = vpar->bit_rate;
+    properties.formatBitRate = formatCtx->bit_rate;
+    if (stream->start_time != AV_NOPTS_VALUE)
+    {
+        properties.startTime =
+            static_cast<double>(stream->start_time) * av_q2d(stream->time_base);
+    }
+    switch (vpar->field_order)
+    {
+    case AV_FIELD_PROGRESSIVE: properties.fieldOrder = "progressive"; break;
+    case AV_FIELD_TT: properties.fieldOrder = "tt"; break;
+    case AV_FIELD_BB: properties.fieldOrder = "bb"; break;
+    case AV_FIELD_TB: properties.fieldOrder = "tb"; break;
+    case AV_FIELD_BT: properties.fieldOrder = "bt"; break;
+    default: properties.fieldOrder = "unknown"; break;
+    }
+
+    // Container-level metadata.
+    if (formatCtx->iformat)
+    {
+        properties.formatName = formatCtx->iformat->name ? formatCtx->iformat->name : "";
+        properties.formatLongName =
+            formatCtx->iformat->long_name ? formatCtx->iformat->long_name : "";
+    }
+    properties.nbStreams = static_cast<int>(formatCtx->nb_streams);
 
     // Log the video properties
     NELUX_INFO(
@@ -218,6 +340,9 @@ void Decoder::setProperties()
 void Decoder::initialize(const std::string& filePath)
 {
     NELUX_DEBUG("BASE DECODER: Initializing decoder with file: {}", filePath);
+    // Cache the path up front so get_frame_count()'s exact packet-count
+    // fallback can reopen the file when the container omits nb_frames.
+    cachedFilePath_ = filePath;
     openFile(filePath);
     findVideoStream();
     initCodecContext();
@@ -1950,13 +2075,32 @@ int64_t Decoder::get_frame_count()
         duration = formatCtx->duration / static_cast<double>(AV_TIME_BASE);
     }
 
+    // Exact fallback: the container did not carry nb_frames (common for MKV /
+    // WebM / VFR). Count video packets in a single demux-only pass over a fresh
+    // throwaway format context — no decoding (fast, ~demux speed) and no
+    // disturbance to the live decode/producer state on this->formatCtx. For
+    // virtually all video streams one packet == one frame (this is exactly what
+    // `ffprobe -count_packets` reports), so this is authoritative where the
+    // fps*duration path only estimates. Cached, so paid at most once.
+    if (!cachedFilePath_.empty())
+    {
+        int64_t packetCount = countVideoPacketsExact();
+        if (packetCount > 0)
+        {
+            cached_frame_count_ = packetCount;
+            NELUX_DEBUG("Frame count from packet demux pass: {}", cached_frame_count_);
+            return cached_frame_count_;
+        }
+    }
+
+    // Last resort: estimate from duration * frame rate.
     double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate
                                                        : stream->r_frame_rate);
 
     if (duration > 0.0 && fps > 0.0)
     {
         cached_frame_count_ = static_cast<int64_t>(duration * fps + 0.5);
-        NELUX_DEBUG("Frame count from duration*fps: {}", cached_frame_count_);
+        NELUX_DEBUG("Frame count from duration*fps (estimate): {}", cached_frame_count_);
     }
     else
     {
@@ -1965,6 +2109,48 @@ int64_t Decoder::get_frame_count()
     }
 
     return cached_frame_count_;
+}
+
+int64_t Decoder::countVideoPacketsExact()
+{
+    // Open the file independently so we never touch the live formatCtx (which
+    // may be mid-decode on the producer thread). Demux only; never send packets
+    // to a decoder.
+    AVFormatContext* raw = nullptr;
+    if (avformat_open_input(&raw, cachedFilePath_.c_str(), nullptr, nullptr) < 0)
+    {
+        return -1;
+    }
+    std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
+
+    if (avformat_find_stream_info(fmt.get(), nullptr) < 0)
+    {
+        return -1;
+    }
+
+    int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
+                                   nullptr, 0);
+    if (vIdx < 0)
+    {
+        return -1;
+    }
+
+    std::unique_ptr<AVPacket, AVPacketDeleter> localPkt(av_packet_alloc());
+    if (!localPkt)
+    {
+        return -1;
+    }
+
+    int64_t count = 0;
+    while (av_read_frame(fmt.get(), localPkt.get()) >= 0)
+    {
+        if (localPkt->stream_index == vIdx)
+        {
+            ++count;
+        }
+        av_packet_unref(localPkt.get());
+    }
+    return count;
 }
 
 torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)

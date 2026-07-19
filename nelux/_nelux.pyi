@@ -134,6 +134,43 @@ class VideoReader:
         """True if an audio track is present in the source."""
         ...
 
+    @property
+    def properties(self) -> Dict[str, object]:
+        """
+        Full container/stream metadata read directly from libav (no ffprobe
+        subprocess). Superset of the individual ``@property`` accessors.
+
+        Keys:
+            width, height (int)
+            fps, min_fps, max_fps (float)          - avg_frame_rate as double
+            duration, start_time (float, seconds)
+            total_frames (int)                     - nb_frames, else fps*duration
+            nb_frames (int)                        - raw container count, 0 if absent
+            avg_frame_rate, r_frame_rate (str)     - exact rationals "24000/1001"
+            avg_frame_rate_num/den, r_frame_rate_num/den (int)
+            is_vfr (bool)                          - r_frame_rate != avg_frame_rate
+            codec, codec_name (str)                - short name (aliases)
+            codec_long_name, profile (str)
+            level (int)
+            pixel_format (str)
+            bit_depth (int)
+            color_primaries, color_transfer, color_space, color_range (str)
+            aspect_ratio (float)                   - width/height
+            sample_aspect_ratio, display_aspect_ratio (str) - "1:1"-style rationals
+            bit_rate, format_bit_rate (int, bits/s)
+            field_order (str)                      - progressive/tt/bb/tb/bt/unknown
+            format_name, format_long_name (str)    - demuxer
+            nb_streams (int)
+            has_audio (bool)
+            audio_codec, audio_channel_layout (str)
+            audio_sample_rate, audio_channels, audio_bit_rate (int)
+        """
+        ...
+
+    def get_properties(self) -> Dict[str, object]:
+        """Alias of the :attr:`properties` dict."""
+        ...
+
     def read_frame(self) -> Union[torch.Tensor, NDArray]:
         """
         Decode and return the next frame as a 3-channel, HWC array.

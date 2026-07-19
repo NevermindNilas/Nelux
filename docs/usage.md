@@ -143,6 +143,73 @@ reader.properties     # dict: All properties in a dictionary
 reader.get_properties()  # Same as above
 ```
 
+#### Full metadata dict
+
+`reader.properties` returns an ffprobe-equivalent superset of container and
+stream metadata, read in-process from libav (no `ffprobe` subprocess). It is a
+strict superset of the individual read-only attributes above:
+
+```python
+p = reader.properties
+
+# Dimensions / aspect
+p["width"], p["height"]                 # int
+p["aspect_ratio"]                       # float: width / height
+p["sample_aspect_ratio"]                # str:  e.g. "1:1"  (SAR)
+p["display_aspect_ratio"]               # str:  e.g. "16:9" (DAR)
+
+# Frame rates (exact — never rounded)
+p["fps"], p["min_fps"], p["max_fps"]    # float: avg_frame_rate as a double
+p["avg_frame_rate"]                     # str:  "24000/1001"
+p["r_frame_rate"]                       # str:  "24000/1001"
+p["avg_frame_rate_num"], p["avg_frame_rate_den"]  # int
+p["r_frame_rate_num"], p["r_frame_rate_den"]      # int
+p["is_vfr"]                             # bool: r_frame_rate != avg_frame_rate
+
+# Timing / counts
+p["duration"]                           # float: seconds
+p["start_time"]                         # float: seconds
+p["total_frames"]                       # int:  nb_frames, else fps*duration estimate
+p["nb_frames"]                          # int:  raw container count (0 if absent)
+
+# Codec
+p["codec"]                              # str:  decoder impl name (e.g. "libdav1d")
+p["codec_name"]                         # str:  canonical codec  (e.g. "av1")
+p["codec_long_name"]                    # str
+p["profile"], p["level"]                # str, int
+p["pixel_format"]                       # str:  e.g. "yuv420p"
+p["bit_depth"]                          # int
+p["field_order"]                        # str:  progressive/tt/bb/tb/bt/unknown
+
+# Color
+p["color_primaries"]                    # str:  e.g. "bt709"
+p["color_transfer"]                     # str:  e.g. "bt709" / "smpte2084"
+p["color_space"]                        # str:  e.g. "bt709" / "bt2020nc"
+p["color_range"]                        # str:  "tv" / "pc" / "unknown"
+
+# Bitrate / container
+p["bit_rate"]                           # int:  video stream bits/s (0 if unknown)
+p["format_bit_rate"]                    # int:  whole-container bits/s
+p["format_name"], p["format_long_name"] # str:  demuxer
+p["nb_streams"]                         # int
+
+# Audio (first audio stream; empty/0 if none)
+p["has_audio"]                          # bool
+p["audio_codec"]                        # str
+p["audio_sample_rate"]                  # int
+p["audio_channels"]                     # int
+p["audio_channel_layout"]               # str:  e.g. "stereo", "5.1"
+p["audio_bit_rate"]                     # int
+```
+
+> **Exact frame count.** `total_frames` (and `p["total_frames"]`) is fast but
+> falls back to an `fps × duration` **estimate** when the container omits
+> `nb_frames` (common for MKV / WebM / VFR). For an **exact** count in those
+> cases, call `reader.get_frame_count()` or `len(reader)` — they perform a
+> demux-only packet pass (no decoding, cached) that matches
+> `ffprobe -count_packets`. Use `p["nb_frames"] > 0` to tell whether the
+> container-reported count is authoritative without triggering the pass.
+
 ---
 
 ### Reading Frames
