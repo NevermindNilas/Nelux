@@ -366,6 +366,26 @@ class VideoEncoder:
         """True if using hardware-accelerated encoding (NVENC)."""
         ...
 
+def probe(path: str) -> Dict[str, object]:
+    """
+    Read full video metadata without decoding.
+
+    Opens the container and reads stream info only — no decoder is opened, no
+    resolution-sized buffer is allocated, and no threads are spawned — then
+    returns the same dict as :attr:`VideoReader.properties`. Use this for
+    metadata-only opens: it strips the decoder-init/allocation overhead of
+    constructing a ``VideoReader`` and avoids the subprocess spawn that an
+    external ``ffprobe`` call pays.
+
+    Args:
+        path (str): Path to the video file.
+
+    Returns:
+        Dict[str, object]: Metadata dict, identical in shape to
+        :attr:`VideoReader.properties`.
+    """
+    ...
+
 def get_available_encoders() -> List[dict]:
     """
     Get a list of available video encoders with their properties.

@@ -137,21 +137,33 @@ static const char* safeStr(const char* s)
     return s ? s : "unknown";
 }
 
-void Decoder::setProperties()
+// Bit depth of the first component of a pixel format (8 when unknown).
+static int bitDepthFromFormat(int fmt)
 {
-    AVStream* stream = formatCtx->streams[videoStreamIndex];
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(AVPixelFormat(fmt));
+    return desc ? desc->comp[0].depth : 8;
+}
+
+// Fill VideoProperties entirely from the demuxer + codec parameters, without
+// opening (or needing) a decoder. This is the shared core used both by the live
+// decoder (Decoder::setProperties) and the decode-free probe path
+// (nelux::probeFile): every field is derived from AVFormatContext / AVStream /
+// AVCodecParameters, never from an AVCodecContext, so no avcodec_open2 (and its
+// resolution-sized reference-frame allocation) is required.
+void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
+                                     VideoProperties& properties)
+{
+    AVStream* stream = formatCtx->streams[vIdx];
     const AVCodecParameters* vpar = stream->codecpar;
 
-    // Set basic video properties
-    properties.codec = codecCtx->codec->name;
-    properties.codecLongName =
-        codecCtx->codec->long_name ? codecCtx->codec->long_name : "";
-    properties.width = codecCtx->width;
-    properties.height = codecCtx->height;
+    // Codec identity. `codec` is the decoder-implementation name (matching the
+    // decoder that would be opened); codecName is the canonical codec name.
+    const AVCodec* dec = avcodec_find_decoder(vpar->codec_id);
+    properties.codec = dec && dec->name ? dec->name : "";
+    properties.codecLongName = dec && dec->long_name ? dec->long_name : "";
+    properties.width = vpar->width;
+    properties.height = vpar->height;
 
-    // Canonical codec name (from codec_id), matching ffprobe's codec_name.
-    // `codec` above is the decoder implementation name (e.g. "libdav1d"),
-    // which differs for wrapped decoders; codecName is the format name ("av1").
     {
         const AVCodecDescriptor* vdesc = avcodec_descriptor_get(vpar->codec_id);
         properties.codecName = vdesc ? vdesc->name : properties.codec;
@@ -214,11 +226,10 @@ void Decoder::setProperties()
     }
 
     // Ensure duration is calculated properly
-    if (formatCtx->streams[videoStreamIndex]->duration != AV_NOPTS_VALUE)
+    if (stream->duration != AV_NOPTS_VALUE)
     {
-        properties.duration =
-            static_cast<double>(formatCtx->streams[videoStreamIndex]->duration) *
-            av_q2d(formatCtx->streams[videoStreamIndex]->time_base);
+        properties.duration = static_cast<double>(stream->duration) *
+                              av_q2d(stream->time_base);
     }
     else if (formatCtx->duration != AV_NOPTS_VALUE)
     {
@@ -229,18 +240,9 @@ void Decoder::setProperties()
         properties.duration = 0.0; // Unknown duration
     }
 
-    // Set pixel format and bit depth
-    properties.pixelFormat = codecCtx->pix_fmt;
-    properties.bitDepth = getBitDepth();
-
-    // If decoder-side resize is active, report the resized output dims as the
-    // canonical width/height. Downstream buffer sizing, converter setup, and
-    // tensor allocation all key off properties.width/height.
-    if (resizeWidth_ > 0 && resizeHeight_ > 0)
-    {
-        properties.width = resizeWidth_;
-        properties.height = resizeHeight_;
-    }
+    // Set pixel format and bit depth (from codec parameters; no decoder needed).
+    properties.pixelFormat = AVPixelFormat(vpar->format);
+    properties.bitDepth = bitDepthFromFormat(vpar->format);
 
     // Detect audio stream presence and capture the first audio track's details.
     properties.hasAudio = false;
@@ -303,7 +305,7 @@ void Decoder::setProperties()
 
     // Sample-aspect-ratio and derived display-aspect-ratio.
     {
-        AVRational sar = av_guess_sample_aspect_ratio(formatCtx.get(), stream, nullptr);
+        AVRational sar = av_guess_sample_aspect_ratio(formatCtx, stream, nullptr);
         if (sar.num == 0 || sar.den == 0)
         {
             sar = AVRational{1, 1};
@@ -312,8 +314,8 @@ void Decoder::setProperties()
         properties.sarDen = sar.den;
         int darNum = 0, darDen = 1;
         av_reduce(&darNum, &darDen,
-                  static_cast<int64_t>(codecCtx->width) * sar.num,
-                  static_cast<int64_t>(codecCtx->height) * sar.den,
+                  static_cast<int64_t>(vpar->width) * sar.num,
+                  static_cast<int64_t>(vpar->height) * sar.den,
                   1024 * 1024);
         properties.darNum = darNum;
         properties.darDen = darDen;
@@ -345,13 +347,62 @@ void Decoder::setProperties()
             formatCtx->iformat->long_name ? formatCtx->iformat->long_name : "";
     }
     properties.nbStreams = static_cast<int>(formatCtx->nb_streams);
+}
 
-    // Log the video properties
+void Decoder::setProperties()
+{
+    extractVideoProperties(formatCtx.get(), videoStreamIndex, properties);
+
+    // If decoder-side resize is active, report the resized output dims as the
+    // canonical width/height. Downstream buffer sizing, converter setup, and
+    // tensor allocation all key off properties.width/height, so override after
+    // the shared extractor (which reports the true source dims) and recompute
+    // the derived display/pixel aspect ratio.
+    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    {
+        properties.width = resizeWidth_;
+        properties.height = resizeHeight_;
+        properties.aspectRatio =
+            properties.height > 0
+                ? static_cast<double>(properties.width) / properties.height
+                : 0.0;
+    }
+
     NELUX_INFO(
         "Video properties: width={}, height={}, fps={}, duration={}, totalFrames={}, "
         "aspectRatio={}",
         properties.width, properties.height, properties.fps, properties.duration,
         properties.totalFrames, properties.aspectRatio);
+}
+
+// Decode-free metadata probe: open the container, read stream info, and extract
+// the full VideoProperties without opening a decoder, allocating any
+// resolution-sized buffer, or spawning threads. Resolution-independent and
+// dramatically cheaper than constructing a VideoReader for a metadata-only open.
+Decoder::VideoProperties probeFile(const std::string& filePath)
+{
+    AVFormatContext* raw = nullptr;
+    if (avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr) < 0)
+    {
+        throw CxException("Failed to open input file for probe: " + filePath);
+    }
+    std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
+
+    if (avformat_find_stream_info(fmt.get(), nullptr) < 0)
+    {
+        throw CxException("Failed to find stream info for probe: " + filePath);
+    }
+
+    int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
+                                   nullptr, 0);
+    if (vIdx < 0)
+    {
+        throw CxException("No video stream found for probe: " + filePath);
+    }
+
+    Decoder::VideoProperties properties{};
+    Decoder::extractVideoProperties(fmt.get(), vIdx, properties);
+    return properties;
 }
 
 void Decoder::initialize(const std::string& filePath)

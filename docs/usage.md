@@ -202,6 +202,26 @@ p["audio_channel_layout"]               # str:  e.g. "stereo", "5.1"
 p["audio_bit_rate"]                     # int
 ```
 
+#### Metadata-only: `nelux.probe()`
+
+If you only need metadata and are **not** going to decode frames, use
+`nelux.probe(path)` instead of constructing a `VideoReader`. It returns the same
+dict as `properties`, but opens the container and reads stream info only, with no
+decoder init, no resolution-sized buffer allocation, and no worker threads:
+
+```python
+import nelux
+
+meta = nelux.probe("video.mp4")   # dict, same keys as VideoReader.properties
+print(meta["r_frame_rate"], meta["color_space"], meta["nb_frames"])
+```
+
+This is faster than a full open (it strips nelux's per-open decode setup) and
+avoids the subprocess spawn an external `ffprobe` call pays, so it is
+consistently faster than `ffprobe` for metadata-only reads. The residual open
+cost is `libav`'s stream analysis (it briefly inspects the stream to report an
+exact frame rate and pixel format); `ffprobe` performs the same analysis.
+
 > **Exact frame count.** `total_frames` (and `p["total_frames"]`) is fast but
 > falls back to an `fps × duration` **estimate** when the container omits
 > `nb_frames` (common for MKV / WebM / VFR). For an **exact** count in those

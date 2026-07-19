@@ -1,4 +1,13 @@
 
+### **Version 0.15.1 (2026-07-19)**
+
+#### **Feature: `nelux.probe()` — decode-free metadata**
+- **Added:** a module-level `nelux.probe(path)` that returns the same dict as `VideoReader.properties` but opens the container and reads stream info only. It opens **no decoder** (`avcodec_open2` is skipped), allocates **no** resolution-sized frame tensor, builds **no** converter, and spawns **no** worker threads. This strips nelux's per-open decode setup — a flat ~2 ms regardless of resolution, which includes the output frame tensor (up to ~24 MB at 4K) — and, being in-process, avoids the OS process-spawn cost that any external `ffprobe` invocation pays.
+- **Performance:** for metadata-only reads, `probe()` is consistently faster than an `ffprobe -show_format -show_streams` subprocess: ~37x at 360p and ~2.2x at 4K (median-of-15, local). A decomposition shows ~17 ms of every `ffprobe` call is pure process + DLL-load spawn (paid whether invoked as a subprocess or from a terminal); nelux pays none of it. The remaining, resolution-scaling cost is `libav`'s `avformat_find_stream_info` (a brief sample-analysis to report an exact frame rate and pixel format), which both nelux and `ffprobe` perform — and nelux is even marginally faster there since it skips JSON formatting. Output verified identical to `VideoReader.properties` field-for-field across the 135-clip corpus.
+- **Refactor:** `Decoder::setProperties` now delegates to a shared `extractVideoProperties` helper that derives every field from the demuxer + `AVCodecParameters` (no `AVCodecContext`), so the live decoder and `probe()` share one code path. No behavior change — the full decode path still reports metadata identical to ffprobe (135/135).
+
+---
+
 ### **Version 0.15.0 (2026-07-19)**
 
 #### **Feature: full container/stream metadata (ffprobe-equivalent)**
