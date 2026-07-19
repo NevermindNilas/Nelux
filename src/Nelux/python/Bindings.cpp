@@ -512,9 +512,9 @@ Example:
         },
         py::arg("path"),
         "Read full video metadata without decoding. Returns the same dict as "
-        "VideoReader.properties but skips decoder init and buffer allocation, "
-        "so it is resolution-independent and much faster for metadata-only "
-        "opens.");
+        "VideoReader.properties but skips decoder init, frame-buffer allocation, "
+        "and thread startup, and avoids the process spawn an external ffprobe "
+        "call pays, so it is much faster for metadata-only opens.");
 
     m.def(
         "get_available_encoders",

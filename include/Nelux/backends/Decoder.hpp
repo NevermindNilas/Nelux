@@ -439,8 +439,9 @@ class Decoder
 
 // Decode-free metadata probe. Opens the container and reads stream info only —
 // no decoder, no resolution-sized buffer, no threads — then returns the full
-// VideoProperties. Cheap and resolution-independent; use for metadata-only
-// opens instead of constructing a Decoder/VideoReader. Throws CxException on
+// VideoProperties. Skips the per-open decode setup a Decoder/VideoReader pays,
+// so it is much cheaper for metadata-only opens (though not constant-time: the
+// underlying stream analysis still scales with content). Throws CxException on
 // open/stream-info failure or when the file has no video stream.
 Decoder::VideoProperties probeFile(const std::string& filePath);
 

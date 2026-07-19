@@ -137,6 +137,30 @@ static const char* safeStr(const char* s)
     return s ? s : "unknown";
 }
 
+// Select the decoder nelux will actually use for a codec id. AV1 is forced to a
+// software decoder (preferring libdav1d) to avoid the built-in decoder's
+// hardware-first path failing on unsupported platforms; everything else uses the
+// default decoder. Shared by initCodecContext() (which opens it) and
+// extractVideoProperties() (which reports its name), so probe() and the live
+// decoder always agree on the reported `codec`.
+static const AVCodec* selectDecoderForId(AVCodecID codec_id)
+{
+    const AVCodec* codec = nullptr;
+    if (codec_id == AV_CODEC_ID_AV1)
+    {
+        const char* av1_decoders[] = {"libdav1d", "libaom-av1", "av1", nullptr};
+        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i)
+        {
+            codec = avcodec_find_decoder_by_name(av1_decoders[i]);
+        }
+    }
+    if (!codec)
+    {
+        codec = avcodec_find_decoder(codec_id);
+    }
+    return codec;
+}
+
 // Bit depth of the first component of a pixel format (8 when unknown).
 static int bitDepthFromFormat(int fmt)
 {
@@ -156,18 +180,23 @@ void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
     AVStream* stream = formatCtx->streams[vIdx];
     const AVCodecParameters* vpar = stream->codecpar;
 
-    // Codec identity. `codec` is the decoder-implementation name (matching the
-    // decoder that would be opened); codecName is the canonical codec name.
-    const AVCodec* dec = avcodec_find_decoder(vpar->codec_id);
-    properties.codec = dec && dec->name ? dec->name : "";
-    properties.codecLongName = dec && dec->long_name ? dec->long_name : "";
     properties.width = vpar->width;
     properties.height = vpar->height;
 
+    // Canonical codec name (from codec_id), matching ffprobe's codec_name.
     {
         const AVCodecDescriptor* vdesc = avcodec_descriptor_get(vpar->codec_id);
-        properties.codecName = vdesc ? vdesc->name : properties.codec;
+        properties.codecName = vdesc ? vdesc->name : "";
     }
+
+    // Codec identity. `codec` is the decoder-implementation name; use the SAME
+    // decoder selection the live decoder opens (see selectDecoderForId) so
+    // probe() and VideoReader.properties always agree. Fall back to the
+    // canonical codecName when no decoder is installed, so a metadata-only probe
+    // still reports a non-empty codec.
+    const AVCodec* dec = selectDecoderForId(vpar->codec_id);
+    properties.codec = dec && dec->name ? dec->name : properties.codecName;
+    properties.codecLongName = dec && dec->long_name ? dec->long_name : "";
 
     // Codec profile/level. Prefer the human name; when the codec has no named
     // profile (e.g. VP8) but a numeric profile is set, fall back to the integer
@@ -377,20 +406,26 @@ void Decoder::setProperties()
 
 // Decode-free metadata probe: open the container, read stream info, and extract
 // the full VideoProperties without opening a decoder, allocating any
-// resolution-sized buffer, or spawning threads. Resolution-independent and
-// dramatically cheaper than constructing a VideoReader for a metadata-only open.
+// resolution-sized buffer, or spawning threads. Skips all of the per-open decode
+// setup a VideoReader pays for a metadata-only open. The remaining cost is
+// libav's avformat_find_stream_info stream analysis (shared with ffprobe), which
+// scales with content, so this is cheaper but not constant-time.
 Decoder::VideoProperties probeFile(const std::string& filePath)
 {
     AVFormatContext* raw = nullptr;
-    if (avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr) < 0)
+    int ret = avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr);
+    if (ret < 0)
     {
-        throw CxException("Failed to open input file for probe: " + filePath);
+        throw CxException("Failed to open input file for probe: " + filePath +
+                          ": " + errorToString(ret));
     }
     std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
 
-    if (avformat_find_stream_info(fmt.get(), nullptr) < 0)
+    ret = avformat_find_stream_info(fmt.get(), nullptr);
+    if (ret < 0)
     {
-        throw CxException("Failed to find stream info for probe: " + filePath);
+        throw CxException("Failed to find stream info for probe: " + filePath +
+                          ": " + errorToString(ret));
     }
 
     int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
@@ -496,46 +531,15 @@ void Decoder::findVideoStream()
 
 void Decoder::initCodecContext()
 {
-    const AVCodec* codec = nullptr;
     AVCodecID codec_id = formatCtx->streams[videoStreamIndex]->codecpar->codec_id;
 
-    // For AV1, we MUST use a software decoder to avoid hardware acceleration issues
-    // The built-in "av1" decoder tries hardware first and fails on unsupported
-    // platforms
-    if (codec_id == AV_CODEC_ID_AV1)
+    // For AV1 this prefers a software decoder (libdav1d) over the built-in "av1"
+    // decoder's hardware-first path. Shared with extractVideoProperties so the
+    // reported `codec` matches the decoder actually opened here.
+    const AVCodec* codec = selectDecoderForId(codec_id);
+    if (codec && codec_id == AV_CODEC_ID_AV1)
     {
-        // Try software decoders in order of preference
-        const char* av1_decoders[] = {
-            "libdav1d",   // Best performance, most compatible
-            "libaom-av1", // Reference implementation, slower but reliable
-            "av1",        // FFmpeg's internal decoder (last resort)
-            nullptr};
-
-        for (int i = 0; av1_decoders[i] != nullptr && !codec; ++i)
-        {
-            codec = avcodec_find_decoder_by_name(av1_decoders[i]);
-            if (codec)
-            {
-                NELUX_INFO("Using {} for AV1 decoding", av1_decoders[i]);
-            }
-        }
-
-        if (!codec)
-        {
-            // Final fallback: try generic lookup but warn user
-            codec = avcodec_find_decoder(codec_id);
-            if (codec)
-            {
-                NELUX_WARN("No preferred AV1 software decoder found, using: {}. "
-                           "Consider installing libdav1d for better AV1 support.",
-                           codec->name);
-            }
-        }
-    }
-
-    if (!codec)
-    {
-        codec = avcodec_find_decoder(codec_id);
+        NELUX_INFO("Using {} for AV1 decoding", codec->name);
     }
 
     NELUX_DEBUG("BASE DECODER: Initializing codec context");
