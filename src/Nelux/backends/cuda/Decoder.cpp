@@ -857,6 +857,23 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     }
     }
 
+    // Kernel launches are asynchronous and report configuration//binary errors
+    // (notably cudaErrorNoKernelImageForDevice when the build's -gencode list
+    // omits this GPU's architecture) only via the sticky per-thread error.
+    // Without this check the launch silently no-ops and every decoded frame
+    // comes back as a fully black image.
+    cudaError_t launchErr = cudaGetLastError();
+    if (launchErr != cudaSuccess)
+    {
+        throw CxException(
+            std::string("CUDA DECODER: color-conversion kernel launch failed: ") +
+            cudaGetErrorString(launchErr) +
+            (launchErr == cudaErrorNoKernelImageForDevice
+                 ? ". This build contains no CUDA binary for the current GPU "
+                   "architecture; rebuild with CMAKE_CUDA_ARCHITECTURES covering it."
+                 : ""));
+    }
+
     // Note: We don't synchronize here - the stream ordering ensures
     // the conversion completes before the buffer is used
 }
