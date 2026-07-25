@@ -886,6 +886,12 @@ bool VideoReader::seekToFrame(int frame_number)
                     properties.totalFrames);
         return false;
     }
+    if (properties.fps <= 0.0)
+    {
+        NELUX_ERROR("Cannot seek to frame {}: stream reports fps={}", frame_number,
+                    properties.fps);
+        return false;
+    }
     double seek_timestamp = frame_number / properties.fps;
 
     // Seek to the closest keyframe first
@@ -896,12 +902,44 @@ bool VideoReader::seekToFrame(int frame_number)
         return false;
     }
 
-    // Decode frames until reaching the exact requested frame
-    int current_frame = static_cast<int>(current_timestamp * properties.fps);
-    while (current_frame < frame_number)
+    // Decode forward until the frame's own PTS reaches the target, then keep that
+    // frame buffered for next() to emit.
+    //
+    // A counted discard loop cannot work here: seekToNearestKeyframe lands on the
+    // enclosing keyframe K and reports neither K nor its timestamp, so there is
+    // no way to derive the correct discard count (frame_number - K). The previous
+    // code counted from `current_timestamp`, which iter() has just zeroed and
+    // which never reflects the post-seek position, so it discarded `frame_number`
+    // frames starting at K and left the reader at absolute K + frame_number --
+    // silently wrong pixels with a plausible frame count (GitHub #57).
+    //
+    // Comparing each decoded frame's real PTS avoids needing K at all. Half a
+    // frame of tolerance absorbs PTS rounding; this mirrors decodeFrameAt().
+    const double half = 0.5 / properties.fps;
+    while (true)
     {
-        readFrame();
-        current_frame++;
+        torch::Tensor f = decodeFrame(); // updates current_timestamp from the PTS
+        if (!f.defined() || f.numel() == 0)
+        {
+            // Ran out of decodable frames before reaching the target. Report
+            // success with nothing buffered rather than failing the seek: the
+            // caller turns a false into a hard exception, whereas the CPU
+            // discard path yields an empty range for the same input, and
+            // properties.totalFrames is only an estimate in some containers, so
+            // a reachable-looking index can legitimately sit past real EOF.
+            // next() will decode, get nothing, and stop cleanly.
+            NELUX_WARN("Ran out of frames while seeking to frame {} (stopped at "
+                       "index {})", frame_number, currentIndex);
+            return true;
+        }
+        if (current_timestamp + 1e-9 >= seek_timestamp - half)
+        {
+            bufferedFrame = f;
+            hasBufferedFrame = true;
+            // The buffered frame IS frame_number; next() emits currentIndex - 1.
+            currentIndex = frame_number + 1;
+            break;
+        }
     }
 
     NELUX_INFO("Exact seek to frame {} successful", frame_number);
@@ -941,13 +979,18 @@ VideoReader& VideoReader::iter()
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
         }
-        else if (start_time <= 0.0 &&
-                 decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
         {
             // CPU sync path: seeking flushes a frame-threaded codec context and
-            // trips an internal FFmpeg assertion (see the no-range branch). The
-            // reader is already at the start, so skip the redundant seek; the
-            // discard loop below still buffers the first in-range frame.
+            // trips an internal FFmpeg assertion (see the no-range branch), so
+            // never seek here -- for start_time <= 0 the seek is merely
+            // redundant, but for start_time > 0 it aborted the process with
+            // "Assertion fctx->async_lock failed at pthread_frame.c:171".
+            //
+            // The discard loop below already advances to the first frame at or
+            // after start_time by decoding, which is exactly what the frame-range
+            // branch does for start_frame > 0. Linear decode cost to reach the
+            // start, same as that path.
         }
         else
         {
@@ -1043,8 +1086,11 @@ VideoReader& VideoReader::iter()
                 NELUX_ERROR("Failed to seek to start_frame: {}", start_frame);
                 throw std::runtime_error("Failed to seek to start_frame.");
             }
-            currentIndex = start_frame;
-            current_timestamp = static_cast<double>(currentIndex) / properties.fps;
+            // seekToFrame leaves start_frame buffered and currentIndex /
+            // current_timestamp set from the frame's real PTS. Do not overwrite
+            // them here: fabricating the position is what hid #57, because
+            // next()'s `currentIndex - 1 > end_frame` test then counted out the
+            // right *number* of frames from the wrong place in the stream.
         }
     }
     else
