@@ -139,11 +139,38 @@ len(reader)                          # respects set_range
 ```python
 reader.set_range(100, 200)           # frames 100..199 (both int → indices)
 reader.set_range(5.0, 10.0)          # both float → seconds
+reader.set_range("0:00:05", "0:00:10")  # both str → "H:MM:SS[.ms]" timecode
 reader([100, 200])                   # shorthand for set_range(100, 200); returns self
 reader.reset()                       # back to start of active range
 ```
 
 Mixing int and float in `set_range` is an error. Negative indices are supported.
+
+### Multiple Segments (in/out point lists)
+
+```python
+reader.set_ranges([(0, 1000), (5000, 6000)])                        # frame indices
+reader.set_ranges([(0.0, 7200.0), (10800.0, 14400.0)])              # seconds
+reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])  # timecodes
+reader([(0, 1000), (5000, 6000)])    # __call__ shorthand; returns self
+
+for segment, frame in reader.iter_segments():   # (segment_index, frame)
+    out = effect_a(frame) if segment == 0 else effect_b(frame)
+
+for frame in reader:                 # unchanged: bare frames, segments back to back
+    print(reader.current_segment)    # 0, then 1, ...
+
+reader.ranges                        # [(0, 1000), (5000, 6000)] — frame ends exclusive
+reader.clear_ranges()                # back to the whole file
+```
+
+Rules: one unit for the whole list (mixing frames and times raises); segments must
+be ascending and non-overlapping (touching allowed, e.g. `[(0, 100), (100, 200)]`);
+negative frame indices count back from the end. Frame bounds are exact; time bounds
+carry one frame of slack on `end`, so adjacent *time* segments can repeat the seam
+frame. Gaps are seeked over when the backend allows it and the gap exceeds ~1s of
+frames, otherwise decoded through; with `prefetch=False` gaps are always decoded
+through (that path cannot seek).
 
 ### Prefetch API (Background Buffering)
 
@@ -402,6 +429,14 @@ with VideoEncoder("out.mp4", ...) as enc:
 reader.set_range(100, 10.0)       # Error: int + float
 reader.set_range(5.0, 10.0)       # OK (seconds)
 reader.set_range(100, 200)        # OK (frame indices)
+```
+
+### Out-of-order or overlapping segments
+```python
+reader.set_ranges([(200, 300), (0, 100)])   # Error: descending
+reader.set_ranges([(0, 100), (50, 150)])    # Error: overlapping
+reader.set_ranges([(0, 100), (20.0, 30.0)]) # Error: mixed units
+reader.set_ranges([(0, 100), (100, 200)])   # OK: touching is allowed
 ```
 
 ---

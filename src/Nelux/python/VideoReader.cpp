@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cmath>
 #include <cctype>
+#include <limits>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -49,6 +50,55 @@ int swsFlagFromResizeFilter(const std::string& name)
         "neighbor, area, bicublin, gauss, sinc, lanczos, spline.");
 }
 } // namespace
+
+double neluxParseTimecode(const std::string& timecode)
+{
+    // Split on ':' -- 1 to 3 components, coarsest first: "SS[.ms]",
+    // "MM:SS[.ms]" or "H:MM:SS[.ms]" (any number of hour digits).
+    std::vector<std::string> parts;
+    std::string cur;
+    for (char c : timecode)
+    {
+        if (c == ':')
+        {
+            parts.push_back(cur);
+            cur.clear();
+        }
+        else
+            cur.push_back(c);
+    }
+    parts.push_back(cur);
+
+    const std::string hint =
+        "'. Expected a timecode like '0:00:00', '1:30:05.5', '90:00' or '12.5'.";
+    if (parts.size() > 3)
+        throw std::invalid_argument("Invalid timecode '" + timecode + hint);
+
+    double total = 0.0;
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        const std::string& p = parts[i];
+        if (p.empty())
+            throw std::invalid_argument("Invalid timecode '" + timecode + hint);
+        // Digits only, plus at most one '.' and only in the seconds component.
+        size_t dots = 0;
+        for (char c : p)
+        {
+            if (c == '.')
+            {
+                ++dots;
+                if (dots > 1 || i + 1 != parts.size())
+                    throw std::invalid_argument("Invalid timecode '" + timecode + hint);
+            }
+            else if (!std::isdigit(static_cast<unsigned char>(c)))
+                throw std::invalid_argument("Invalid timecode '" + timecode + hint);
+        }
+        // Coarsest component first, so each step promotes what came before it:
+        // H:MM:SS folds to ((H * 60) + MM) * 60 + SS.
+        total = total * 60.0 + std::stod(p);
+    }
+    return total;
+}
 
 VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force_8bit,
                          Backend backend, const std::string& decode_accelerator,
@@ -274,6 +324,14 @@ void VideoReader::setRangeByFrames(int startFrame, int endFrame)
 
     start_frame = startFrame;
     end_frame = endFrame;
+    // Mirror the range into the segment list so iteration has a single code
+    // path: one range is just a one-element segment list.
+    RangeSegment seg;
+    seg.byFrames = true;
+    seg.startFrame = startFrame;
+    seg.endFrame = endFrame; // already made inclusive above
+    segments_ = {seg};
+    currentSegment_ = 0;
     NELUX_INFO("Frame range set: start_frame={}, end_frame={}", start_frame, end_frame);
 }
 
@@ -298,7 +356,318 @@ void VideoReader::setRangeByTimestamps(double startTime, double endTime)
     // Set the timestamp range
     start_time = startTime;
     end_time = endTime;
+    RangeSegment seg;
+    seg.byFrames = false;
+    seg.startTime = startTime;
+    seg.endTime = endTime;
+    segments_ = {seg};
+    currentSegment_ = 0;
     NELUX_INFO("Timestamp range set: start_time={}, end_time={}", start_time, end_time);
+}
+
+void VideoReader::setRangesByFrames(const std::vector<std::pair<int, int>>& ranges)
+{
+    if (ranges.empty())
+        throw std::invalid_argument(
+            "set_ranges requires at least one (start, end) pair; use clear_ranges() to "
+            "iterate the whole file.");
+
+    std::vector<RangeSegment> segs;
+    segs.reserve(ranges.size());
+    int prevEnd = 0; // exclusive end of the previous segment, in input space
+
+    for (size_t i = 0; i < ranges.size(); ++i)
+    {
+        int startFrame = ranges[i].first;
+        int endFrame = ranges[i].second;
+
+        // Negative indices count back from the end, as set_range() does.
+        if (startFrame < 0)
+            startFrame += properties.totalFrames;
+        if (endFrame < 0)
+            endFrame += properties.totalFrames;
+
+        const std::string where = "segment " + std::to_string(i) + ": ";
+        if (startFrame < 0 || endFrame < 0)
+            throw std::invalid_argument(where + "frame indices out of range after "
+                                               "negative-index adjustment (start=" +
+                                       std::to_string(startFrame) + ", end=" +
+                                       std::to_string(endFrame) + ").");
+        if (endFrame <= startFrame)
+            throw std::invalid_argument(where + "end (" + std::to_string(endFrame) +
+                                       ") must be greater than start (" +
+                                       std::to_string(startFrame) + ").");
+        if (i > 0 && startFrame < prevEnd)
+            throw std::invalid_argument(
+                where + "segments must be ascending and non-overlapping, but it starts "
+                        "at " +
+                std::to_string(startFrame) + " while segment " +
+                std::to_string(i - 1) + " ends at " + std::to_string(prevEnd) + ".");
+        prevEnd = endFrame;
+
+        RangeSegment seg;
+        seg.byFrames = true;
+        seg.startFrame = startFrame;
+        seg.endFrame = endFrame - 1; // end is exclusive on input, inclusive internally
+        segs.push_back(seg);
+    }
+
+    segments_ = std::move(segs);
+    currentSegment_ = 0;
+    applySegment(0);
+    NELUX_INFO("Frame segments set: {} segment(s), first=[{}, {}]", segments_.size(),
+               segments_.front().startFrame, segments_.front().endFrame);
+}
+
+void VideoReader::setRangesByTimestamps(
+    const std::vector<std::pair<double, double>>& ranges)
+{
+    if (ranges.empty())
+        throw std::invalid_argument(
+            "set_ranges requires at least one (start, end) pair; use clear_ranges() to "
+            "iterate the whole file.");
+
+    std::vector<RangeSegment> segs;
+    segs.reserve(ranges.size());
+    double prevEnd = 0.0;
+
+    for (size_t i = 0; i < ranges.size(); ++i)
+    {
+        const double startTime = ranges[i].first;
+        const double endTime = ranges[i].second;
+        const std::string where = "segment " + std::to_string(i) + ": ";
+
+        if (startTime < 0.0 || endTime < 0.0)
+            throw std::invalid_argument(where + "timestamps cannot be negative (start=" +
+                                       std::to_string(startTime) + ", end=" +
+                                       std::to_string(endTime) + ").");
+        if (endTime <= startTime)
+            throw std::invalid_argument(where + "end (" + std::to_string(endTime) +
+                                       ") must be greater than start (" +
+                                       std::to_string(startTime) + ").");
+        if (i > 0 && startTime < prevEnd)
+            throw std::invalid_argument(
+                where + "segments must be ascending and non-overlapping, but it starts "
+                        "at " +
+                std::to_string(startTime) + "s while segment " +
+                std::to_string(i - 1) + " ends at " + std::to_string(prevEnd) + "s.");
+        prevEnd = endTime;
+
+        RangeSegment seg;
+        seg.byFrames = false;
+        seg.startTime = startTime;
+        seg.endTime = endTime;
+        segs.push_back(seg);
+    }
+
+    segments_ = std::move(segs);
+    currentSegment_ = 0;
+    applySegment(0);
+    NELUX_INFO("Time segments set: {} segment(s), first=[{}s, {}s]", segments_.size(),
+               segments_.front().startTime, segments_.front().endTime);
+}
+
+void VideoReader::clearRanges()
+{
+    segments_.clear();
+    currentSegment_ = -1;
+    start_frame = 0;
+    end_frame = -1;
+    start_time = -1.0;
+    end_time = -1.0;
+    rangeFrameLimit_ = -1;
+    rangeFramesEmitted_ = 0;
+    NELUX_INFO("Ranges cleared; iteration will cover the whole file");
+}
+
+py::list VideoReader::getRanges() const
+{
+    py::list out;
+    for (const RangeSegment& seg : segments_)
+    {
+        if (seg.byFrames)
+            // Report the exclusive end the caller passed in, not the inclusive
+            // one stored internally.
+            out.append(py::make_tuple(seg.startFrame, seg.endFrame + 1));
+        else
+            out.append(py::make_tuple(seg.startTime, seg.endTime));
+    }
+    return out;
+}
+
+void VideoReader::applySegment(size_t index)
+{
+    const RangeSegment& seg = segments_.at(index);
+    if (seg.byFrames)
+    {
+        start_frame = seg.startFrame;
+        end_frame = seg.endFrame;
+        // Deactivate the timestamp range so the frame branch is the one taken.
+        start_time = -1.0;
+        end_time = -1.0;
+        rangeFrameLimit_ = -1;
+    }
+    else
+    {
+        start_time = seg.startTime;
+        end_time = seg.endTime;
+        // Deactivate the frame range.
+        start_frame = 0;
+        end_frame = -1;
+        // NVDEC time ranges are additionally bounded by a frame count derived
+        // from the span, because PTS-based end detection is unreliable on the
+        // hardware path. Same rule the single-range path has always used.
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && properties.fps > 0.0)
+        {
+            const double span = std::max(0.0, seg.endTime - seg.startTime);
+            rangeFrameLimit_ = static_cast<int>(std::ceil(span * properties.fps)) + 1;
+        }
+        else
+            rangeFrameLimit_ = -1;
+    }
+    rangeFramesEmitted_ = 0;
+}
+
+int VideoReader::classifyAgainstActiveRange() const
+{
+    if (start_time >= 0.0 && end_time > 0.0)
+    {
+        if (current_timestamp + 1e-9 < start_time)
+            return -1;
+        // One frame of slack on the upper bound, preserving the historical
+        // single-range behaviour (`end` is effectively inclusive). An unknown
+        // frame rate keeps the old infinite slack -- 1/0.0 is what the previous
+        // inline check computed -- so such streams still stop only at EOF.
+        const double slack = (properties.fps > 0.0)
+                                 ? 1.0 / properties.fps
+                                 : std::numeric_limits<double>::infinity();
+        if (current_timestamp > end_time + slack)
+            return 1;
+        return 0;
+    }
+    if (start_frame >= 0 && end_frame >= 0)
+    {
+        // currentIndex has already advanced past the frame just decoded, so the
+        // frame in hand is currentIndex - 1. end_frame is inclusive.
+        const int idx = currentIndex - 1;
+        if (idx < start_frame)
+            return -1;
+        if (idx > end_frame)
+            return 1;
+        return 0;
+    }
+    return 0; // No range configured: every frame is in range.
+}
+
+bool VideoReader::advanceToNextSegment()
+{
+    if (currentSegment_ < 0 ||
+        static_cast<size_t>(currentSegment_) + 1 >= segments_.size())
+        return false;
+
+    ++currentSegment_;
+    applySegment(static_cast<size_t>(currentSegment_));
+    NELUX_DEBUG("Advancing to segment {} of {}", currentSegment_, segments_.size());
+
+    // The frame already in hand may belong to the new segment: adjacent ranges
+    // such as [0, 100) and [100, 200) share frame 100, and the frame that ended
+    // the previous segment IS that seam frame. Only reposition when it sits
+    // before the new segment.
+    if (classifyAgainstActiveRange() < 0)
+        repositionToActiveSegment();
+    return true;
+}
+
+void VideoReader::rewindForFreshIteration()
+{
+    if (!streamTouched_)
+        return;
+    // A reconfigure tears the codec context down and rebuilds it instead of
+    // flushing it, which is what makes it safe under frame threading. Without
+    // this, a second iter() on the sync path silently carried on from wherever
+    // the previous pass had stopped while reporting index 0.
+    NELUX_DEBUG("Rewinding the sync CPU path via decoder reconfigure");
+    decoder->reconfigure(filePath);
+    currentIndex = 0;
+    current_timestamp = 0.0;
+    streamTouched_ = false;
+}
+
+void VideoReader::repositionToActiveSegment()
+{
+    // Whatever was held belongs to the previous segment's tail; it is before the
+    // new segment (checked by the caller), so dropping it is correct.
+    hasBufferedFrame = false;
+    bufferedFrame = torch::Tensor();
+
+    const bool seekable = canSeekMidStream();
+
+    if (start_time >= 0.0 && end_time > 0.0)
+    {
+        // Seek only for gaps big enough to pay for it: a keyframe seek can land
+        // well behind the target and re-decode more frames than it skipped.
+        const double gap = start_time - current_timestamp;
+        if (seekable && gap > 1.0)
+        {
+            // seekToNearestKeyframe directly rather than seek(): seek() decodes
+            // *past* the target and drops the frame it lands on, which would
+            // lose the segment's first frame.
+            if (!decoder->seekToNearestKeyframe(start_time))
+            {
+                NELUX_ERROR("Failed to seek to segment start_time {}", start_time);
+                throw std::runtime_error("Failed to seek to segment start_time.");
+            }
+        }
+        // Decode forward to the first frame at or after start_time and hold it.
+        while (true)
+        {
+            torch::Tensor f = decodeFrame();
+            if (!f.defined() || f.numel() == 0)
+            {
+                // EOF before the segment starts: next() decodes, gets nothing,
+                // and stops cleanly.
+                NELUX_WARN("Ran out of frames while advancing to segment start_time={}",
+                           start_time);
+                break;
+            }
+            if (current_timestamp >= start_time)
+            {
+                bufferedFrame = f;
+                hasBufferedFrame = true;
+                break;
+            }
+        }
+        current_timestamp = std::max(current_timestamp, start_time);
+    }
+    else if (start_frame >= 0 && end_frame >= 0)
+    {
+        const int gap = start_frame - currentIndex;
+        // Roughly one second of frames: below that, decoding forward beats a
+        // keyframe seek in most GOP structures.
+        const int seekThreshold =
+            (properties.fps > 0.0) ? static_cast<int>(properties.fps) : 30;
+        if (seekable && gap > seekThreshold)
+        {
+            if (!seekToFrame(start_frame))
+            {
+                NELUX_ERROR("Failed to seek to segment start_frame {}", start_frame);
+                throw std::runtime_error("Failed to seek to segment start_frame.");
+            }
+            // seekToFrame leaves start_frame buffered and currentIndex set.
+            return;
+        }
+        while (currentIndex < start_frame)
+        {
+            torch::Tensor f = decodeFrame();
+            if (!f.defined() || f.numel() == 0)
+            {
+                NELUX_WARN("Ran out of frames while advancing to segment "
+                           "start_frame={} (stopped at index {})",
+                           start_frame, currentIndex);
+                break;
+            }
+        }
+    }
 }
 
 torch::Tensor VideoReader::decodeFrame()
@@ -347,6 +716,7 @@ torch::Tensor VideoReader::decodeFrame()
     // Update current timestamp
     current_timestamp = frame_timestamp;
     currentIndex++;
+    streamTouched_ = true;
 
     NELUX_TRACE("Frame decoded successfully index={}, timestamp={}", currentIndex - 1,
                 current_timestamp);
@@ -751,7 +1121,15 @@ void VideoReader::reset()
     NELUX_TRACE("reset() called: Resetting VideoReader state");
     if (decoder)
     {
-        decoder->seek(0.0);
+        // The sync CPU path cannot be flush-seeked (frame-threaded context);
+        // rebuild the decoder instead, as iter() does.
+        if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+            rewindForFreshIteration();
+        else
+        {
+            decoder->seek(0.0);
+            streamTouched_ = false;
+        }
     }
     currentIndex = 0;
     current_timestamp = 0.0;
@@ -760,8 +1138,13 @@ void VideoReader::reset()
     rangeFrameLimit_ = -1;
     rangeFramesEmitted_ = 0;
     hasBufferedFrame = false;
-    // Reset range if needed, or keep it? Usually reset() implies full reset,
-    // but here we just reset iteration state.
+    // Configured ranges are kept; only iteration state resets. Rewind to the
+    // first segment so a following iter() replays the segment list from the top.
+    if (!segments_.empty())
+    {
+        currentSegment_ = 0;
+        applySegment(0);
+    }
 }
 
 void VideoReader::ensureRandDecoder()
@@ -956,6 +1339,17 @@ VideoReader& VideoReader::iter()
     bufferedFrame = torch::Tensor(); // Clear any old buffered frame
     hasBufferedFrame = false;
 
+    // Start from the first configured segment. A single set_range() stores one
+    // segment, so this branch also covers the single-range case; the positioning
+    // code below then only ever deals with one active range.
+    if (!segments_.empty())
+    {
+        currentSegment_ = 0;
+        applySegment(0);
+    }
+    else
+        currentSegment_ = -1;
+
     if (start_time >= 0.0 && end_time > 0.0)
     {
         // Using timestamp range
@@ -978,9 +1372,14 @@ VideoReader& VideoReader::iter()
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
             decoder->reconfigure(filePath);
+            streamTouched_ = false;
         }
         else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
         {
+            // Restart at frame 0 if a previous pass has already moved the
+            // stream: this path cannot seek, so the discard loop below would
+            // otherwise "advance to start_time" from an arbitrary position.
+            rewindForFreshIteration();
             // CPU sync path: seeking flushes a frame-threaded codec context and
             // trips an internal FFmpeg assertion (see the no-range branch), so
             // never seek here -- for start_time <= 0 the seek is merely
@@ -1048,6 +1447,7 @@ VideoReader& VideoReader::iter()
             decoder->reconfigure(filePath);
             currentIndex = 0;
             current_timestamp = 0.0;
+            streamTouched_ = false;
         }
         else if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
         {
@@ -1062,6 +1462,11 @@ VideoReader& VideoReader::iter()
             // above uses the same discard strategy) instead of a flush-seek --
             // this keeps the frame-threaded context intact at a linear decode
             // cost to reach the start.
+            //
+            // "Already positioned at frame 0" only holds on the first pass, so a
+            // reader that has decoded anything is rewound first; otherwise the
+            // discard loop counts start_frame frames from an arbitrary position.
+            rewindForFreshIteration();
             currentIndex = 0;
             current_timestamp = 0.0;
             for (int i = 0; i < start_frame; ++i)
@@ -1101,10 +1506,16 @@ VideoReader& VideoReader::iter()
         rangeFramesEmitted_ = 0;
         // Sync-mode CPU path uses a frame-threaded codec context; calling
         // avcodec_flush_buffers (inside seek) on such a context is unsafe and
-        // trips an internal assertion. Since iter() at this branch is only
-        // hit when no range is set and we have not decoded anything yet,
-        // skipping the seek-to-zero is correct.
-        if (!(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch))
+        // trips an internal assertion. It rewinds by rebuilding the decoder
+        // instead -- a no-op on a reader that has not decoded anything yet, and
+        // the only correct move on one that has (a second `for frame in reader`
+        // used to silently resume mid-stream, or yield nothing at all after a
+        // full pass).
+        if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
+        {
+            rewindForFreshIteration();
+        }
+        else
         {
             bool success = seek(0.0);
             if (!success)
@@ -1125,64 +1536,73 @@ py::object VideoReader::next()
 {
     NELUX_TRACE("next() called: Retrieving next frame");
 
-    if (rangeFrameLimit_ > 0 && rangeFramesEmitted_ >= rangeFrameLimit_)
+    // Loop rather than return straight away: finishing a segment is not
+    // necessarily the end of iteration, and the frame that ended it has to be
+    // re-tested against the segment that follows.
+    while (true)
     {
-        throw py::stop_iteration();
-    }
-
-    // If we have a buffered frame from the discard loop, consume it first.
-    torch::Tensor frame;
-    if (hasBufferedFrame)
-    {
-        frame = bufferedFrame;
-        hasBufferedFrame = false;
-        // current_timestamp is already set by decodeFrame() earlier.
-    }
-    else
-    {
-        // Otherwise decode the next frame
-        frame = decodeFrame();
-        if (!frame.defined() || frame.numel() == 0)
+        if (rangeFrameLimit_ > 0 && rangeFramesEmitted_ >= rangeFrameLimit_)
         {
-            NELUX_INFO("No more frames available (decode returned empty).");
-            throw py::stop_iteration();
+            // NVDEC time segments are bounded by a frame count; hitting it ends
+            // the segment, not the iteration.
+            if (!advanceToNextSegment())
+                throw py::stop_iteration();
+            continue;
         }
-    }
 
-    // -- Now check if we exceeded the time range AFTER decoding.
-    if (start_time >= 0.0 && end_time > 0.0)
-    {
-        // If the current frame's timestamp is >= end_time, skip/stop. end time + 1
-        // frame
-        if (current_timestamp > end_time + 1 / properties.fps)
+        // If we have a buffered frame from the discard loop, consume it first.
+        torch::Tensor frame;
+        if (hasBufferedFrame)
         {
-            NELUX_DEBUG("Frame timestamp {} >= end_time {}, skipping frame.",
-                        current_timestamp, end_time);
-            throw py::stop_iteration();
+            frame = bufferedFrame;
+            hasBufferedFrame = false;
+            // current_timestamp is already set by decodeFrame() earlier.
         }
-    }
-    else if (start_frame >= 0 && end_frame >= 0)
-    {
-        // currentIndex has already been advanced past the frame just decoded
-        // (the emitted frame's index is currentIndex - 1). end_frame is the last
-        // index to INCLUDE, so stop only once the decoded frame's index exceeds
-        // it. Using `currentIndex > end_frame` here dropped the final in-range
-        // frame (off-by-one).
-        if (currentIndex - 1 > end_frame)
+        else
         {
-            NELUX_DEBUG("Frame range exhausted: currentIndex={}, end_frame={}",
-                        currentIndex, end_frame);
-            throw py::stop_iteration();
+            // Otherwise decode the next frame
+            frame = decodeFrame();
+            if (!frame.defined() || frame.numel() == 0)
+            {
+                NELUX_INFO("No more frames available (decode returned empty).");
+                throw py::stop_iteration();
+            }
         }
-    }
 
-    NELUX_TRACE("next() returning frame index={}, timestamp={}", currentIndex - 1,
-                current_timestamp);
-    if (rangeFrameLimit_ > 0)
-    {
-        rangeFramesEmitted_++;
+        // -- Now place the decoded frame relative to the active range.
+        const int rel = classifyAgainstActiveRange();
+        if (rel < 0)
+        {
+            // Pre-roll: still short of the segment start, keep decoding.
+            NELUX_TRACE("Discarding frame index={} before segment start",
+                        currentIndex - 1);
+            continue;
+        }
+        if (rel > 0)
+        {
+            NELUX_DEBUG("Segment {} exhausted at frame index={}, timestamp={}",
+                        currentSegment_, currentIndex - 1, current_timestamp);
+            // Hold the frame: the next segment may start exactly here, since
+            // adjacent ranges share their seam frame.
+            bufferedFrame = frame;
+            hasBufferedFrame = true;
+            if (!advanceToNextSegment())
+            {
+                hasBufferedFrame = false;
+                bufferedFrame = torch::Tensor();
+                throw py::stop_iteration();
+            }
+            continue;
+        }
+
+        NELUX_TRACE("next() returning frame index={}, timestamp={}", currentIndex - 1,
+                    current_timestamp);
+        if (rangeFrameLimit_ > 0)
+        {
+            rangeFramesEmitted_++;
+        }
+        return tensorToOutput(frame);
     }
-    return tensorToOutput(frame);
 }
 
 void VideoReader::enter()
@@ -1383,11 +1803,8 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     rangeFramesEmitted_ = 0;
     
     // Clear any set ranges
-    start_frame = 0;
-    end_frame = -1;
-    start_time = -1.0;
-    end_time = -1.0;
-    
+    clearRanges();
+
     // Reallocate tensor if dimensions changed (always use BCHW format)
     torch::Device torchDevice = tensor.device();
     torch::Dtype torchDataType = findMLTypeFromBitDepth();

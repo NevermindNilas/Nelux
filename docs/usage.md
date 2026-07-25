@@ -366,6 +366,9 @@ reader.set_range(100, 200)  # Frames 100-199 (end is exclusive)
 # Set range by timestamps (seconds)
 reader.set_range(5.0, 10.0)  # 5s to 10s
 
+# Set range by timecode string
+reader.set_range("0:00:05", "0:00:10")
+
 # Using __call__ syntax
 reader([100, 200])       # Frame range
 reader([5.0, 10.0])      # Timestamp range (both must be same type)
@@ -374,7 +377,73 @@ reader([5.0, 10.0])      # Timestamp range (both must be same type)
 reader.reset()
 ```
 
-**Important:** Start and end must be the same type (both `int` or both `float`).
+**Important:** Start and end must be the same type (both `int`, both `float`, or
+both timecode strings).
+
+---
+
+### Multiple Segments (in/out point lists)
+
+`set_ranges` takes a list of `(in, out)` pairs so one pass over the file can
+cover several disjoint sections — useful when different parts of a clip need
+different processing.
+
+```python
+reader = VideoReader("video.mp4")
+
+reader.set_ranges([(0, 1000), (5000, 6000)])                       # frame indices
+reader.set_ranges([(0.0, 7200.0), (10800.0, 14400.0)])             # seconds
+reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])  # timecodes
+
+reader([(0, 1000), (5000, 6000)])   # __call__ shorthand, returns self
+```
+
+`iter_segments()` yields `(segment_index, frame)` so each section can take its
+own path:
+
+```python
+reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])
+
+for segment, frame in reader.iter_segments():
+    out = grade_daylight(frame) if segment == 0 else grade_night(frame)
+```
+
+Plain iteration is unchanged — it yields bare frames, with every segment's frames
+back to back. `current_segment` exposes the same index if you prefer a plain loop:
+
+```python
+for frame in reader:
+    print(reader.current_segment)   # 0, then 1, ...
+```
+
+Introspection and teardown:
+
+```python
+reader.ranges          # [(0, 1000), (5000, 6000)] — frame ends stay exclusive
+reader.current_segment # index into reader.ranges; -1 when no range is set
+reader.clear_ranges()  # back to iterating the whole file
+```
+
+**Rules:**
+
+- Every pair uses the same units. Mixing frame indices with times, inside a pair
+  or across the list, raises `ValueError`.
+- Segments must be **ascending and non-overlapping**. A segment may start exactly
+  where the previous one ends (`[(0, 100), (100, 200)]` is fine); going backwards
+  or overlapping raises. That restriction is what keeps playback to a single
+  forward pass, which is the only strategy available with `prefetch=False` (that
+  path uses a frame-threaded codec context that cannot be seeked safely).
+- Negative frame indices count back from the end, as in `set_range`.
+- Frame bounds are exact. Time bounds carry one frame of slack on `end` (the
+  long-standing `set_range` behaviour), so back-to-back *time* segments can repeat
+  the frame on the seam — use frame indices when the seam must be exact.
+- Gaps between segments are skipped with a seek when the backend allows it and the
+  gap exceeds roughly a second of frames; smaller gaps are decoded through, since
+  a keyframe seek can land further back than it skips. With `prefetch=False` gaps
+  are always decoded through, so a large gap costs linear decode time.
+
+**Timecode format:** `"H:MM:SS[.ms]"`, `"MM:SS[.ms]"` or `"SS[.ms]"` — e.g.
+`"1:30:05.5"`, `"90:00"`, `"12.5"`. Any number of hour digits.
 
 ---
 

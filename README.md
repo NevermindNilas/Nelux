@@ -83,6 +83,33 @@ print(len(vr))                              # Total frame count
 print(vr.shape)                             # (frames, H, W, 3)
 ```
 
+### In/Out Point Lists
+
+`set_ranges` takes a list of `(in, out)` pairs, so one pass can cover several
+disjoint sections of a file — for applying different processing per section.
+`iter_segments()` tells you which section each frame came from.
+
+```python
+from nelux import VideoReader
+
+vr = VideoReader("video.mp4")
+
+# Frame indices, seconds, or timecode strings — one unit throughout.
+vr.set_ranges([(0, 1000), (5000, 6000)])
+vr.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])
+
+for segment, frame in vr.iter_segments():
+    out = grade_daylight(frame) if segment == 0 else grade_night(frame)
+
+vr.ranges              # [(0.0, 7200.0), (10800.0, 14400.0)]
+vr.clear_ranges()      # back to the whole file
+```
+
+Segments must be ascending and non-overlapping (touching is fine). Plain
+`for frame in vr` still yields bare frames, all segments back to back. See
+[Multiple Segments](docs/usage.md#multiple-segments-inout-point-lists) for the
+seam and seek semantics.
+
 ### Motion Vectors
 
 NeLux exposes the per-frame motion-vector side-data that FFmpeg's CPU decoders
@@ -196,6 +223,7 @@ per encoder; a second call raises.
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
 - **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
+- **In/Out Point Lists**: `set_ranges([(in, out), ...])` restricts iteration to several ascending, non-overlapping segments in one forward pass; `iter_segments()` yields `(segment_index, frame)` so each section can take its own processing path. Frames, seconds, or `"H:MM:SS"` timecodes
 
 ### Performance Knobs
 
@@ -308,7 +336,9 @@ VideoReader(
 - `__getitem__(int | float | slice | list | range)` → single frame OR `[B, H, W, 3]` batch
 - `decode_batch(indices: list[int])` → C++ batch path; called by `get_batch` after validation
 - `get_batch(indices)` / `get_batch_range(start, end, step)` → batch decode with seek minimization
-- `set_range(start, end)` / `reset()` → bound iteration
+- `set_range(start, end)` / `reset()` → bound iteration (`int` frames, `float` seconds, or `"H:MM:SS"` timecode)
+- `set_ranges([(in, out), ...])` / `clear_ranges()` / `ranges` → several in/out segments in one pass
+- `iter_segments()` → yields `(segment_index, frame)`; `current_segment` for a plain loop
 - `reconfigure(...)` → reuse this VideoReader for a different file (10-50× faster than re-constructing)
 - `create_encoder(output_path)` → `VideoEncoder` pre-configured to this source's dims/fps/format
 - `start_prefetch()` / `stop_prefetch()` / `prefetch_buffered` / `is_prefetching` → runtime prefetch control

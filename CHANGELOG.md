@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`set_ranges([(in, out), ...])` — several in/out segments in one pass.** Takes a
+  list of `(start, end)` pairs (exclusive end, matching `set_range`) as frame
+  indices, seconds, or `"H:MM:SS[.ms]"` timecode strings, and iterates every
+  segment's frames back to back. `iter_segments()` yields `(segment_index, frame)`
+  so each section can take its own processing path; `current_segment` exposes the
+  same index to a plain loop, `ranges` reports the normalized list, and
+  `clear_ranges()` restores full-file iteration. `reader([(0, 100), (200, 300)])`
+  is accepted as shorthand, and a single `set_range` is now internally just a
+  one-element segment list, so both share one iteration path.
+
+  Segments must be ascending and non-overlapping (touching is allowed); mixed
+  units, reversed spans and unparseable timecodes raise `ValueError`. The ordering
+  rule keeps playback to a single forward pass, which is the only strategy
+  available on the default `prefetch=False` path — its frame-threaded codec context
+  cannot be flush-seeked. Gaps between segments are seeked over when the backend
+  allows it and the gap exceeds roughly a second of frames; smaller gaps are
+  decoded through, since a keyframe seek can land further back than it skips.
+- **Timecode strings for `set_range`.** `set_range("0:00:05", "0:00:10")` and
+  `reader(("0:00:05", "0:00:10"))` now parse `"H:MM:SS[.ms]"`, `"MM:SS[.ms]"` and
+  `"SS[.ms]"` into seconds.
+
+### Fixed
+
+- **Re-iterating a reader on the default CPU path silently returned the wrong
+  frames.** With `prefetch=False` (the default) a second `for frame in reader`
+  carried on from wherever the previous pass had stopped while reporting frame
+  index 0 — or yielded nothing at all once a full pass had drained the stream —
+  because that path deliberately never seeks (`avcodec_flush_buffers` on its
+  frame-threaded codec context trips an internal FFmpeg assertion) and `iter()`
+  only zeroed the counters. It now rewinds by rebuilding the decoder, the same
+  mechanism `iter()` already used to force NVDEC back to the true first frame.
+  `reset()` took the unsafe flush-seek on that path and now rewinds the same way.
+- **`VideoReader.reconfigure()` left the old file's ranges half-cleared,** zeroing
+  the frame/time bounds without resetting the rest of the range state.
+
+### Changed
+
+- `__next__` on a reader with an unknown frame rate (`fps <= 0`) and a *time* range
+  keeps stopping only at EOF, as before; the upper-bound slack is now written as an
+  explicit infinity rather than falling out of a `1 / 0.0` division.
+
 ## [0.17.0] - 2026-07-25
 
 ### Fixed

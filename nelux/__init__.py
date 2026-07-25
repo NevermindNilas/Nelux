@@ -287,6 +287,24 @@ class VideoReader(BatchMixin, _VideoReaderBase):
                 )
         super().__init__(*args, **kwargs)
 
+    def iter_segments(self):
+        """Iterate the configured segments as ``(segment_index, frame)`` tuples.
+
+        Pair with :meth:`set_ranges` to apply different processing per section::
+
+            reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])
+            for seg, frame in reader.iter_segments():
+                out = effect_a(frame) if seg == 0 else effect_b(frame)
+
+        ``segment_index`` is the reader's ``current_segment`` at the moment the
+        frame came out, so it indexes straight into ``reader.ranges``. With no
+        range configured every frame is reported as segment -1.
+
+        Plain ``for frame in reader`` is unaffected and still yields bare frames.
+        """
+        for frame in self:
+            yield self.current_segment, frame
+
 
 __all__ = [
     "__version__",

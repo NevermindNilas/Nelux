@@ -1,4 +1,5 @@
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from types import TracebackType
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 import os
 import torch
 import numpy as np
@@ -208,13 +209,67 @@ class VideoReader:
         """
         ...
 
-    def set_range(self, start: Union[int, float], end: Union[int, float]) -> None:
+    def set_range(
+        self, start: Union[int, float, str], end: Union[int, float, str]
+    ) -> None:
         """
-        Restrict playback to a frame or time range.
+        Restrict playback to a single frame or time range.
 
         Args:
-            start (int|float): Start frame index or timestamp (s).
-            end (int|float): End frame index or timestamp (s).
+            start (int|float|str): Start frame index, timestamp (s) or "H:MM:SS"
+                timecode. Both bounds must use the same units.
+            end (int|float|str): End frame index, timestamp (s) or timecode.
+        """
+        ...
+
+    def set_ranges(self, ranges: Sequence[Sequence[Union[int, float, str]]]) -> None:
+        """
+        Restrict iteration to several in/out segments, played back in order.
+
+        Each pair is (start, end) with an EXCLUSIVE end, in one unit throughout:
+
+            reader.set_ranges([(0, 1000), (5000, 6000)])                    # frames
+            reader.set_ranges([(0.0, 7200.0), (10800.0, 14400.0)])          # seconds
+            reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])
+
+        Segments must be ascending and non-overlapping; a segment may start
+        exactly where the previous one ends. Iterating yields every segment's
+        frames back to back -- use ``iter_segments()`` for
+        ``(segment_index, frame)`` tuples, or read ``current_segment``.
+
+        Frame bounds are exact. Time bounds carry one frame of slack on ``end``
+        (long-standing single-range behaviour), so back-to-back time segments can
+        repeat the frame on the seam.
+
+        Args:
+            ranges: Non-empty sequence of (start, end) pairs.
+
+        Raises:
+            ValueError: On an empty list, a reversed or overlapping segment, a
+                non-positive span, mixed units, or an unparseable timecode.
+        """
+        ...
+
+    def clear_ranges(self) -> None:
+        """Drop every configured range so iteration covers the whole file."""
+        ...
+
+    @property
+    def ranges(self) -> List[Union[Tuple[int, int], Tuple[float, float]]]:
+        """
+        Configured segments as (start, end) tuples (read-only).
+
+        Frame segments report the exclusive end that was passed in; time segments
+        report seconds. Empty when no range is set.
+        """
+        ...
+
+    @property
+    def current_segment(self) -> int:
+        """
+        Index into ``ranges`` for the segment the last emitted frame came from.
+
+        -1 when no range is configured. Read it straight after pulling a frame.
         """
         ...
 
@@ -245,6 +300,36 @@ class VideoReader:
         Returns:
             Union[torch.Tensor, numpy.ndarray]: The decoded frame based on backend setting.
         """
+        ...
+
+    def __call__(
+        self,
+        ranges: Union[
+            Sequence[Union[int, float, str]],
+            Sequence[Sequence[Union[int, float, str]]],
+        ],
+    ) -> "VideoReader":
+        """
+        Set a range (or a list of segments) and return self, for inline iteration.
+
+            for frame in reader([137, 140]):            ...  # one range
+            for frame in reader([(0, 100), (200, 300)]): ...  # segments
+
+        A flat pair goes to ``set_range``; a sequence of pairs to ``set_ranges``.
+        """
+        ...
+
+    def __enter__(self) -> "VideoReader":
+        """Enter the context manager and return self."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        """Close the reader and release decoder resources."""
         ...
 
     def supported_codecs(self) -> List[str]:

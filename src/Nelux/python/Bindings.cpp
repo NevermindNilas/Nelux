@@ -30,6 +30,113 @@ Backend backendFromString(const std::string& backend_str)
     }
 }
 
+namespace
+{
+// One end of a range, resolved to either a frame index or a time in seconds.
+struct RangeEndpoint
+{
+    bool isFrame = true;
+    int frame = 0;
+    double seconds = 0.0;
+};
+
+// int -> frame index; float or "H:MM:SS[.ms]" string -> seconds. numpy scalars
+// are accepted too: np.float64 subclasses Python float, and np.int64 exposes
+// __index__ even though it is not an int subclass.
+RangeEndpoint parseRangeEndpoint(py::handle o)
+{
+    if (py::isinstance<py::str>(o))
+        return {false, 0, neluxParseTimecode(o.cast<std::string>())};
+    if (py::isinstance<py::float_>(o))
+        return {false, 0, o.cast<double>()};
+    // bool passes PyIndex_Check, and True-as-frame-1 is never what anyone meant.
+    if (!py::isinstance<py::bool_>(o) && PyIndex_Check(o.ptr()))
+    {
+        py::object idx = py::reinterpret_steal<py::object>(PyNumber_Index(o.ptr()));
+        if (!idx)
+            throw py::error_already_set();
+        return {true, idx.cast<int>(), 0.0};
+    }
+    throw std::invalid_argument(
+        "Range bounds must be an int (frame index), a float (seconds) or a "
+        "\"H:MM:SS\" timecode string, got " +
+        py::cast<std::string>(py::str(py::type::handle_of(o).attr("__name__"))) + ".");
+}
+
+// Resolve one (start, end) pair, enforcing that both ends use the same units.
+std::pair<RangeEndpoint, RangeEndpoint> parseRangePair(py::handle pair,
+                                                       const std::string& where)
+{
+    if (!py::isinstance<py::list>(pair) && !py::isinstance<py::tuple>(pair))
+        throw std::invalid_argument(where + "expected a (start, end) list or tuple.");
+    auto seq = py::reinterpret_borrow<py::sequence>(pair);
+    if (py::len(seq) != 2)
+        throw std::invalid_argument(where + "expected exactly 2 elements, got " +
+                                    std::to_string(py::len(seq)) + ".");
+    RangeEndpoint a = parseRangeEndpoint(seq[0]);
+    RangeEndpoint b = parseRangeEndpoint(seq[1]);
+    if (a.isFrame != b.isFrame)
+        throw std::invalid_argument(
+            where + "start and end must use the same units -- both frame indices "
+                    "(int) or both times (float seconds / timecode string).");
+    return {a, b};
+}
+
+// Apply a sequence of (start, end) pairs as the reader's segment list. The whole
+// list must use one unit; mixing frame-based and time-based segments is an error
+// because the two are bounded by different machinery inside the reader.
+void applyRangeSequence(VideoReader& self, py::handle seq)
+{
+    std::vector<std::pair<int, int>> framePairs;
+    std::vector<std::pair<double, double>> secondPairs;
+    bool haveUnits = false;
+    bool byFrames = false;
+    size_t i = 0;
+
+    for (py::handle item : seq)
+    {
+        const std::string where = "segment " + std::to_string(i) + ": ";
+        auto [a, b] = parseRangePair(item, where);
+        if (!haveUnits)
+        {
+            haveUnits = true;
+            byFrames = a.isFrame;
+        }
+        else if (byFrames != a.isFrame)
+            throw std::invalid_argument(
+                where + "every segment must use the same units -- either frame "
+                        "indices (int) throughout or times (float seconds / timecode "
+                        "string) throughout.");
+
+        if (a.isFrame)
+            framePairs.emplace_back(a.frame, b.frame);
+        else
+            secondPairs.emplace_back(a.seconds, b.seconds);
+        ++i;
+    }
+
+    if (!haveUnits)
+        throw std::invalid_argument(
+            "set_ranges requires at least one (start, end) pair; use clear_ranges() to "
+            "iterate the whole file.");
+
+    if (byFrames)
+        self.setRangesByFrames(framePairs);
+    else
+        self.setRangesByTimestamps(secondPairs);
+}
+
+// True when the argument looks like a list OF pairs rather than a single pair,
+// which is how __call__ tells reader([(0, 10), (20, 30)]) from reader([0, 10]).
+bool looksLikeSegmentList(py::handle seq)
+{
+    if (py::len(seq) == 0)
+        return false;
+    py::object first = py::reinterpret_borrow<py::sequence>(seq)[0];
+    return py::isinstance<py::list>(first) || py::isinstance<py::tuple>(first);
+}
+} // namespace
+
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
@@ -220,47 +327,69 @@ Uses the secondary decoder; does not disturb iteration.)doc")
         .def("set_range", &VideoReader::setRange, py::arg("start"), py::arg("end"),
              "Set the range using either frame numbers (int) or timestamps (float).")
         .def(
+            "set_range",
+            [](VideoReader& self, const std::string& start, const std::string& end)
+            { self.setRangeByTimestamps(neluxParseTimecode(start),
+                                        neluxParseTimecode(end)); },
+            py::arg("start"), py::arg("end"),
+            "Set the range from \"H:MM:SS[.ms]\" timecode strings.")
+        .def(
+            "set_ranges",
+            [](VideoReader& self, py::object ranges) { applyRangeSequence(self, ranges); },
+            py::arg("ranges"),
+            R"doc(Restrict iteration to several in/out segments, played back in order.
+
+Takes a sequence of (start, end) pairs with an EXCLUSIVE end, in one unit:
+
+    reader.set_ranges([(0, 1000), (5000, 6000)])                     # frames
+    reader.set_ranges([(0.0, 7200.0), (10800.0, 14400.0)])           # seconds
+    reader.set_ranges([("0:00:00", "2:00:00"), ("3:00:00", "4:00:00")])  # timecode
+
+Segments must be ascending and non-overlapping; a segment may start exactly
+where the previous one ends. Mixing frame indices and times, in one pair or
+across the list, raises ValueError.
+
+Iterating then yields every segment's frames back to back. Use
+``iter_segments()`` to get ``(segment_index, frame)`` tuples, or read
+``current_segment`` after pulling a frame.
+
+Frame bounds are exact. Time bounds carry one frame of slack on ``end`` (the
+long-standing single-range behaviour), so back-to-back time segments can repeat
+the frame on the seam -- use frame indices when the seam has to be exact.
+)doc")
+        .def("clear_ranges", &VideoReader::clearRanges,
+             "Drop every configured range so iteration covers the whole file.")
+        .def_property_readonly(
+            "ranges", &VideoReader::getRanges,
+            R"doc(Configured segments as a list of (start, end) tuples (read-only).
+
+Frame segments report the exclusive end that was passed in; time segments report
+seconds. Empty when no range is set.)doc")
+        .def_property_readonly(
+            "current_segment", &VideoReader::getCurrentSegment,
+            R"doc(Index of the segment the last emitted frame came from (read-only).
+
+-1 when no range is configured. Read it straight after pulling a frame;
+iter_segments() wraps this into (segment_index, frame) tuples.)doc")
+        .def(
             "__call__",
             [](VideoReader& self, py::object arg) -> VideoReader&
             {
                 if (py::isinstance<py::list>(arg) || py::isinstance<py::tuple>(arg))
                 {
-                    auto range_list = arg.cast<std::vector<py::object>>();
-                    if (range_list.size() != 2)
+                    // A sequence of pairs is a segment list; a flat pair is the
+                    // single range this call has always accepted.
+                    if (looksLikeSegmentList(arg))
                     {
-                        throw std::runtime_error(
-                            "Range must be a list or tuple of two elements");
+                        applyRangeSequence(self, arg);
+                        return self;
                     }
-
-                    py::object start_obj = range_list[0];
-                    py::object end_obj = range_list[1];
-
-                    // ----------------------------
-                    // If both are ints => frames
-                    // ----------------------------
-                    if (py::isinstance<py::int_>(start_obj) &&
-                        py::isinstance<py::int_>(end_obj))
-                    {
-                        int start = start_obj.cast<int>();
-                        int end = end_obj.cast<int>();
-                        // Call the *frame-based* method
-                        self.setRangeByFrames(start, end);
-                    }
-                    // --------------------------------
-                    // If both are floats => timestamps
-                    // --------------------------------
-                    else if (py::isinstance<py::float_>(start_obj) &&
-                             py::isinstance<py::float_>(end_obj))
-                    {
-                        double start = start_obj.cast<double>();
-                        double end = end_obj.cast<double>();
-                        self.setRangeByTimestamps(start, end);
-                    }
+                    // Flat pair: ints => frames, floats/timecode strings => seconds.
+                    auto [start, end] = parseRangePair(arg, "range: ");
+                    if (start.isFrame)
+                        self.setRangeByFrames(start.frame, end.frame);
                     else
-                    {
-                        throw std::runtime_error(
-                            "Start and end must both be int or both be float");
-                    }
+                        self.setRangeByTimestamps(start.seconds, end.seconds);
                 }
                 else
                 {

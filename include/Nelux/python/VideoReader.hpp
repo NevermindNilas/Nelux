@@ -23,9 +23,32 @@ enum class Backend
 // VideoReader.get_properties()/.properties and the module-level probe().
 py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties);
 
+// Parse an "H:MM:SS[.ms]", "MM:SS[.ms]" or "SS[.ms]" timecode into seconds.
+// Shared by the range-setting bindings so set_range/set_ranges/__call__ all
+// accept the same timecode vocabulary. Throws std::invalid_argument on garbage.
+double neluxParseTimecode(const std::string& timecode);
+
 class VideoReader
 {
   public:
+    /**
+     * @brief One in/out segment of the source, as normalized by set_ranges().
+     *
+     * A segment list is homogeneous: either every segment is frame-based or
+     * every segment is time-based (the bindings reject mixed units). Frame
+     * bounds are stored with an INCLUSIVE endFrame, matching what
+     * setRangeByFrames() has always stored, while the public API takes an
+     * exclusive end.
+     */
+    struct RangeSegment
+    {
+        bool byFrames = true;
+        int startFrame = 0;
+        int endFrame = -1; // inclusive
+        double startTime = -1.0;
+        double endTime = -1.0;
+    };
+
     /**
      * @brief Constructs a VideoReader for a given input file.
      *
@@ -217,6 +240,57 @@ class VideoReader
     void setRangeByTimestamps(double startTime, double endTime);
 
     /**
+     * @brief Restrict iteration to several frame segments, played back in order.
+     *
+     * Each pair is (start, end) with an EXCLUSIVE end, the same convention
+     * setRangeByFrames() uses. Negative indices count back from the end.
+     * Segments must be ascending and non-overlapping (segment i+1 may start
+     * exactly where segment i ends); anything else throws. That restriction is
+     * what lets iteration run as one forward pass, which is the only strategy
+     * available on the CPU sync path (a mid-stream flush-seek there trips an
+     * internal FFmpeg assertion under frame threading).
+     *
+     * @param ranges Non-empty list of (start_frame, end_frame_exclusive) pairs.
+     */
+    void setRangesByFrames(const std::vector<std::pair<int, int>>& ranges);
+
+    /**
+     * @brief Restrict iteration to several time segments, played back in order.
+     *
+     * Same ordering rules as setRangesByFrames(). The upper bound carries the
+     * one-frame slack the single-range timestamp path has always applied, so
+     * back-to-back time segments can repeat the frame on the seam; frame-based
+     * segments are exact.
+     *
+     * @param ranges Non-empty list of (start_seconds, end_seconds) pairs.
+     */
+    void setRangesByTimestamps(const std::vector<std::pair<double, double>>& ranges);
+
+    /**
+     * @brief Drop every configured range so iteration covers the whole file.
+     */
+    void clearRanges();
+
+    /**
+     * @brief The configured segments as a list of (start, end) tuples.
+     *
+     * Frame segments report an exclusive end (as given); time segments report
+     * seconds. Empty when no range is set.
+     */
+    py::list getRanges() const;
+
+    /**
+     * @brief Index of the segment the last emitted frame belongs to.
+     *
+     * -1 when no range is configured. Read it right after pulling a frame;
+     * VideoReader.iter_segments() wraps this into (segment_index, frame) tuples.
+     */
+    int getCurrentSegment() const
+    {
+        return currentSegment_;
+    }
+
+    /**
      * @brief Get the frame at (or immediately after) a timestamp, in seconds.
      *        Uses a secondary decoder; does not disturb sequential iteration.
      * @param timestamp_seconds Timestamp in seconds (0 <= t <= duration).
@@ -393,6 +467,34 @@ class VideoReader
     bool seekToFrame(int frame_number);
     torch::ScalarType findTypeFromBitDepth();
 
+    // ---- Multi-segment iteration ----
+    // Load segments_[index] into the active start_frame/end_frame/start_time/
+    // end_time fields, so every existing single-range code path keeps working
+    // unchanged and only ever sees one range at a time.
+    void applySegment(size_t index);
+    // Move to the next segment, repositioning the decoder if needed. Returns
+    // false when the active segment was the last one.
+    bool advanceToNextSegment();
+    // Walk the decoder from wherever it currently is to the start of the active
+    // segment. Unlike iter()'s initial positioning this never assumes the
+    // reader sits at frame 0.
+    void repositionToActiveSegment();
+    // Where the frame that was just decoded sits relative to the active range:
+    // -1 before it (discard), 0 inside it (emit), 1 past it (segment finished).
+    int classifyAgainstActiveRange() const;
+    // The CPU sync path (prefetch=False) uses a frame-threaded codec context;
+    // avcodec_flush_buffers on such a context trips an internal FFmpeg
+    // assertion, so it can only ever move forward by decoding.
+    bool canSeekMidStream() const
+    {
+        return !(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch);
+    }
+    // Rewind the sync CPU path to the true first frame before a fresh
+    // iteration. Since it cannot seek, a full decoder reconfigure is the only
+    // safe rewind -- the same trick iter() already uses to force NVDEC back to
+    // frame 0. No-op when nothing has been decoded yet.
+    void rewindForFreshIteration();
+
     // ML output dtype. Currently always FP32 (FP16 path disabled due to artifacts).
     torch::ScalarType findMLTypeFromBitDepth();
     
@@ -438,13 +540,19 @@ class VideoReader
 
     torch::Tensor tensor;
 
-    // Variables for frame range
+    // Variables for the ACTIVE frame range (the segment currently being emitted)
     int start_frame = 0;
     int end_frame = -1; // -1 indicates no limit
 
-    // Variables for timestamp range
+    // Variables for the ACTIVE timestamp range
     double start_time = 0.0;
     double end_time = -1.0; // -1 indicates no limit
+
+    // Configured segments, in playback order. Empty = no range set. A single
+    // set_range() call stores one segment here, so iteration has one code path.
+    std::vector<RangeSegment> segments_;
+    // Index into segments_ for the segment being emitted; -1 when unrestricted.
+    int currentSegment_ = -1;
 
     // Iterator state
     int currentIndex;
@@ -453,6 +561,9 @@ class VideoReader
     bool nvdecTimestampOffsetInitialized_ = false;
     int rangeFrameLimit_ = -1;
     int rangeFramesEmitted_ = 0;
+    // True once a frame has been pulled from the main decoder, so a following
+    // iter() knows the stream no longer sits at frame 0. Cleared by any rewind.
+    bool streamTouched_ = false;
     // List of filters to be added before initialization
     torch::Tensor bufferedFrame; // The "first valid" frame, if we found it early
     bool hasBufferedFrame = false;
