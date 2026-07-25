@@ -203,11 +203,28 @@ public:
                 throw std::runtime_error("RGBToAutoGPUConverter: Unsupported format");
         }
         
+        // Kernel launches are asynchronous; configuration/binary failures
+        // (notably cudaErrorNoKernelImageForDevice when the build's -gencode
+        // list omits this GPU's architecture) surface only through the sticky
+        // per-thread error. Unchecked, the launch silently no-ops and the YUV
+        // surface is encoded as uninitialized garbage.
+        if (cudaError_t launchErr = cudaGetLastError(); launchErr != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("RGBToAutoGPUConverter: conversion kernel launch failed: ") +
+                cudaGetErrorString(launchErr) +
+                (launchErr == cudaErrorNoKernelImageForDevice
+                     ? ". This build contains no CUDA binary for the current GPU "
+                       "architecture; rebuild with CMAKE_CUDA_ARCHITECTURES covering it."
+                     : ""));
+        }
+
         // Synchronize to ensure conversion is complete
-        if (stream) {
-            cudaStreamSynchronize(stream);
-        } else {
-            cudaDeviceSynchronize();
+        cudaError_t syncErr = stream ? cudaStreamSynchronize(stream)
+                                     : cudaDeviceSynchronize();
+        if (syncErr != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("RGBToAutoGPUConverter: conversion kernel failed: ") +
+                cudaGetErrorString(syncErr));
         }
     }
     

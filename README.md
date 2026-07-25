@@ -329,6 +329,7 @@ VideoReader(
 - **Python**: 3.13+ (see `pyproject.toml` `requires-python`)
 - **PyTorch**: 2.13+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
 - **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
+- **GPU**: compute capability 7.5+ (Turing, GTX 16xx / RTX 20xx and newer) for the published CUDA wheels. CUDA 13 dropped Pascal and Volta, so Maxwell/Pascal/Volta cards need a source build against CUDA 12.x (`CUDAARCHS=61 pip install .`) even though they have NVDEC silicon.
 - **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 12+ (Apple Silicon, CPU only)
 
 ---

@@ -61,19 +61,27 @@ option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)
 option(NELUX_BUNDLE_FFMPEG_DLLS "Bundle FFmpeg runtime DLLs into Windows wheels" ON)
 
 # Host-side performance options
-# - AVX2: targets modern x86_64 CPUs; can be disabled for broader compatibility.
+# - AVX2: baked-in AVX2/FMA for Nelux's own host code. DEFAULT OFF, because it
+#   was measured to be worth nothing while costing real compatibility.
+#   A/B on an RTX 3090 box (h264 720p, 6 alternating process-level reps,
+#   AVX2 vs baseline ISA built from identical sources):
+#     streaming decode  ~3988 vs ~3993 fps   (no difference)
+#     decode_batch      ~2192 vs ~2173 fps   (no difference)
+#   That is expected: essentially all per-pixel work happens inside the
+#   prebuilt FFmpeg DLLs (libswscale/libavcodec already dispatch AVX2/AVX-512
+#   at runtime) or in CUDA kernels. Nelux's own ~17k lines are glue and do
+#   almost no vectorizable math, so /arch:AVX2 only adds a hard AVX2
+#   requirement — pre-Haswell Intel and pre-Excavator AMD get an illegal
+#   instruction. Turn ON only if profiling on your target shows a win.
 #   Auto-disabled on non-x86 architectures (e.g. Apple Silicon arm64).
 #   Applied to both CXX and CUDA host compilation.
 # - LTO: enables interprocedural optimization (IPO/LTO) in Release when supported.
 #   Applied to every Nelux target (NeluxLib, nelux, NeluxCuda).
+#   (MSVC PGO on top of this was also measured: no difference either, same
+#   reason as AVX2.)
 # - CUDA_FAST_MATH: passes --use_fast_math to nvcc; safe for the NV12<->RGB
 #   color-conversion kernels we ship.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i386|i686")
-  set(_NELUX_AVX2_DEFAULT ON)
-else()
-  set(_NELUX_AVX2_DEFAULT OFF)
-endif()
-option(NELUX_ENABLE_AVX2            "Enable AVX2/FMA for host code (x86 only)" ${_NELUX_AVX2_DEFAULT})
+option(NELUX_ENABLE_AVX2            "Enable AVX2/FMA for host code (x86 only; measured no-op, off by default)" OFF)
 option(NELUX_ENABLE_LTO             "Enable IPO/LTO for Release builds"        ON)
 option(NELUX_ENABLE_CUDA_FAST_MATH  "Pass --use_fast_math to nvcc"             ON)
 
@@ -166,14 +174,84 @@ if(NELUX_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    # Pick the architecture list BEFORE enable_language(CUDA).
+    #
+    # Under CMP0104, enable_language(CUDA) unconditionally defines
+    # CMAKE_CUDA_ARCHITECTURES from nvcc's single default architecture (75 for
+    # CUDA 13.2). Any `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)` guard placed
+    # after that call is therefore dead code, and the build silently ships a
+    # single-architecture module: that arch's SASS plus its PTX. PTX only JITs
+    # *forward*, so every GPU older than the build arch fails every kernel
+    # launch with cudaErrorNoKernelImageForDevice — which used to surface as
+    # fully black decoded frames. (The launch-error checks in
+    # backends/cuda/Decoder.cpp and conversion/gpu/RGBToAutoGPU.hpp now turn
+    # that failure into an exception rather than silent corruption.)
+    #
+    # Running the guard here instead means an explicit
+    # -DCMAKE_CUDA_ARCHITECTURES=... on the command line is still honored.
+    # CUDAToolkit_VERSION is not available yet, so query nvcc directly.
+    #
+    # The CUDAARCHS environment variable is normally consumed by
+    # enable_language(CUDA); since the guard now runs first it has to be checked
+    # here, or `CUDAARCHS=90 pip install .` would be silently discarded and
+    # build the full list anyway.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND DEFINED ENV{CUDAARCHS})
+      set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}"
+          CACHE STRING "CUDA architectures to build device code for")
+      set(_nelux_archs_from_env TRUE)
+    endif()
+
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      execute_process(
+        COMMAND "${CMAKE_CUDA_COMPILER}" --version
+        OUTPUT_VARIABLE _nvcc_version_out
+        ERROR_QUIET
+      )
+      if(_nvcc_version_out MATCHES "release ([0-9]+)\\.([0-9]+)")
+        set(_nvcc_ver "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+      else()
+        set(_nvcc_ver "12.0")
+        message(WARNING "Could not parse nvcc version; assuming CUDA ${_nvcc_ver} for architecture selection")
+      endif()
+
+      set(_nelux_cuda_archs "75;80;86;89;90")
+      if(_nvcc_ver VERSION_LESS 13.0)
+        # Pascal/Volta were removed in CUDA 13; only offer them on 11.x/12.x.
+        list(PREPEND _nelux_cuda_archs "60;70")
+      endif()
+      if(NOT _nvcc_ver VERSION_LESS 12.8)
+        # Blackwell (RTX 50-series / B100+). Needs CUDA 12.8 or newer.
+        list(APPEND _nelux_cuda_archs "100;120")
+      endif()
+
+      set(CMAKE_CUDA_ARCHITECTURES "${_nelux_cuda_archs}"
+          CACHE STRING "CUDA architectures to build device code for")
+      message(STATUS "CUDA architectures (nvcc ${_nvcc_ver}): ${CMAKE_CUDA_ARCHITECTURES}")
+    elseif(_nelux_archs_from_env)
+      message(STATUS "CUDA architectures (CUDAARCHS): ${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+      # Either the user passed -DCMAKE_CUDA_ARCHITECTURES, or this is a build
+      # tree configured before the fix above existed, whose cache still holds
+      # the single default arch written by a previous enable_language(CUDA).
+      # The two are indistinguishable here, so warn rather than claim the value
+      # was chosen deliberately: a stale single-arch cache produces a wheel that
+      # throws cudaErrorNoKernelImageForDevice on every other GPU.
+      message(STATUS "CUDA architectures (from cache or -D): ${CMAKE_CUDA_ARCHITECTURES}")
+      list(LENGTH CMAKE_CUDA_ARCHITECTURES _nelux_arch_count)
+      if(_nelux_arch_count LESS 2)
+        message(WARNING
+          "CMAKE_CUDA_ARCHITECTURES is set to a single architecture "
+          "(${CMAKE_CUDA_ARCHITECTURES}). If you did not pass this yourself, "
+          "this build tree predates Nelux's multi-arch default; delete "
+          "CMakeCache.txt and reconfigure, or the build will only run on that "
+          "one GPU architecture.")
+      endif()
+    endif()
+
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER}")
     message(STATUS "CUDA Toolkit: ${CUDAToolkit_VERSION}")
-    # Set CUDA architectures for common GPUs (can be overridden)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-      set(CMAKE_CUDA_ARCHITECTURES "60;70;75;80;86;89;90" CACHE STRING "CUDA architectures")
-    endif()
   else()
     message(FATAL_ERROR 
       "NELUX_ENABLE_CUDA is ON but no CUDA compiler found!\n"
