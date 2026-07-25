@@ -578,8 +578,11 @@ void Decoder::initCodecContext()
     // Enable FRAME threading (the big win for h264/hevc -- 4-8x). Falls back
     // to SLICE if frame threads aren't supported by this codec. Mixing both
     // sometimes makes ffmpeg pick the slower one; prefer frame-only when
-    // available. avcodec_flush_buffers under FF_THREAD_FRAME is unsafe, so
-    // batch/seek work uses a separate slice-only context (see decode_batch).
+    // available. seek() flushes this frame-threaded context (avcodec_flush_buffers)
+    // once the producer thread is stopped; that is safe. The documented crash
+    // was flushing while the async producer still had frame-thread workers in
+    // flight (the async_lock assert) -- a concurrency issue, not flush itself.
+    // decode_batch() likewise stops the producer and uses frame threading too.
     int supported_types = 0;
     if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS)
         supported_types = FF_THREAD_FRAME;
@@ -1699,7 +1702,21 @@ void Decoder::reconfigure(const std::string& filePath)
     if (batch_decoder_)
     {
         batch_decoder_.reset();
-        cached_frame_count_ = -1;
+    }
+    // Unconditionally, not just when a batch decoder exists: get_frame_count()
+    // populates this cache on its own (nb_frames / demux pass / duration*fps)
+    // and is reachable without ever touching batch decode, so gating the reset
+    // on batch_decoder_ left the old file's frame count live after a
+    // reconfigure -- reporting the wrong length and letting out-of-range
+    // indices through decode_batch's bounds check.
+    cached_frame_count_ = -1;
+    // The batch codec context is bound to the old file's stream parameters;
+    // drop it so decode_batch() rebuilds it for the new file. Leaving it stale
+    // made decode_batch() after a reconfigure to a different stream decode with
+    // the previous file's parameters (wrong frames / decode errors).
+    if (batchCodecCtx_)
+    {
+        batchCodecCtx_.reset();
     }
 
     // Re-initialize with new file (reusing existing converter settings if compatible)
@@ -2198,9 +2215,9 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         NELUX_DEBUG("Batch decoder initialized");
     }
 
-    // Lazily build a slice-only codec context dedicated to batch work. The
-    // main codecCtx is frame-threaded for fast sequential decode; flushing a
-    // frame-threaded codec under seek (as BatchDecoder does) is unsafe.
+    // Lazily build a codec context dedicated to batch work, kept separate from
+    // the streaming codecCtx so BatchDecoder's seeks and flushes cannot disturb
+    // an in-progress iteration. Threading for it is chosen below.
     if (!batchCodecCtx_)
     {
         AVStream* stream = formatCtx->streams[videoStreamIndex];
@@ -2220,17 +2237,39 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         if (ctx->codec_id == AV_CODEC_ID_AV1)
             ctx->thread_count = 1;
 
-        // Slice-only -- safe under avcodec_flush_buffers after seek.
+        // Threading for the batch/seek path. Frame threading decodes the
+        // keyframe->target run 2-5x faster than slice-only (which barely
+        // parallelizes single-slice H.264). decode_batch runs synchronously on
+        // the calling thread and stops the streaming producer above, so nothing
+        // else drives this context while BatchDecoder seeks it: the per-seek
+        // avcodec_flush_buffers lands on a quiescent decoder. (The documented
+        // async_lock crash was the *async* producer flushing with frame-thread
+        // workers still in flight.) This does NOT make concurrent decode_batch
+        // calls on one reader safe -- those already race on formatCtx and
+        // batchCodecCtx_, frame threads or not; one reader per thread.
+        // Mirror the main context: frame-only when available (both
+        // slice+frame can make ffmpeg pick the slower path), else slice.
+        // Validated byte-exact vs slice-only across h264/hevc/prores/ffv1/
+        // mpeg2/mpeg4/vp9 and 8/10/12-bit, incl. backward/out-of-order/dup
+        // indices and repeated batches. NELUX_BATCH_SLICE_ONLY=1 forces the old
+        // slice-only context (e.g. to bound threads under many concurrent readers).
+        const char* sliceOnlyEnv = std::getenv("NELUX_BATCH_SLICE_ONLY");
+        const bool sliceOnly = sliceOnlyEnv && std::atoi(sliceOnlyEnv) != 0;
         int batch_thread_types = 0;
-        if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
-            batch_thread_types |= FF_THREAD_SLICE;
+        if (!sliceOnly && (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS))
+            batch_thread_types = FF_THREAD_FRAME;
+        else if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
+            batch_thread_types = FF_THREAD_SLICE;
         ctx->thread_type = batch_thread_types;
         ctx->time_base = stream->time_base;
         ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
 
         FF_CHECK_MSG(avcodec_open2(ctx, codec, nullptr),
                      std::string("Failed to open batch codec context:"));
-        NELUX_DEBUG("Batch codec context allocated (slice-only)");
+        NELUX_DEBUG("Batch codec context allocated (thread_type={})",
+                    batch_thread_types == FF_THREAD_FRAME ? "frame"
+                    : batch_thread_types == FF_THREAD_SLICE ? "slice"
+                                                            : "none");
     }
 
     return batch_decoder_->decode_batch(

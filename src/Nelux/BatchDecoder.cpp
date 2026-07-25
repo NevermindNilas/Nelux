@@ -2,6 +2,7 @@
 #include "Logger.hpp"
 #include "error/CxException.hpp"
 #include <algorithm>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 
@@ -14,10 +15,29 @@ namespace nelux {
 BatchDecoder::BatchDecoder(const Config& config)
     : config_(config)
 {
+    // copyFrameToOutput converts to RGB24 and memcpys config_.height * width*3
+    // bytes per position. A channels value other than 3 would make the output
+    // tensor smaller than what is written, i.e. a heap overflow rather than
+    // merely wrong pixels. Grayscale batch decode is rejected in VideoReader;
+    // this is the load-bearing check for anyone reaching Decoder::decode_batch
+    // directly.
+    if (config_.channels != 3)
+        throw std::runtime_error(
+            "BatchDecoder: only 3-channel (RGB24) output is supported, got " +
+            std::to_string(config_.channels) + " channels");
+
     NELUX_DEBUG("BatchDecoder created: {}x{}x{}, dtype={}, device={}",
                 config_.width, config_.height, config_.channels,
                 static_cast<int>(config_.dtype),
                 config_.device.str());
+}
+
+BatchDecoder::~BatchDecoder()
+{
+    if (copySws_)
+        sws_freeContext(copySws_);
+    if (copyBuf_[0])
+        av_freep(&copyBuf_[0]);
 }
 
 void BatchDecoder::seekToFrame(
@@ -142,94 +162,120 @@ void BatchDecoder::copyFrameToOutput(
     SwsContext* sws_ctx)
 {
     NELUX_TRACE("Copying frame to {} positions", positions.size());
-    
+
     // Handle dimension mismatch by scaling (can happen after reconfigure with different video sizes)
     bool needsScaling = (frame->width != config_.width || frame->height != config_.height);
     if (needsScaling) {
         NELUX_WARN("Frame dimension mismatch: frame={}x{}, config={}x{}. Will scale to config dimensions.",
                    frame->width, frame->height, config_.width, config_.height);
     }
-    
-    // Allocate buffer for OUTPUT dimensions (config_) - not frame dimensions
-    int linesize[4] = {0};
-    uint8_t* dst_data[4] = {nullptr};
-    
-    int ret = av_image_alloc(dst_data, linesize, config_.width, config_.height,
-                            AV_PIX_FMT_RGB24, 1);
-    if (ret < 0) {
-        throw std::runtime_error("Failed to allocate image buffer");
-    }
 
-    // Convert frame to RGB, scaling if necessary
-    // Source dimensions: frame->width, frame->height (actual frame size)
-    // Dest dimensions: config_.width, config_.height (expected output size)
-    if (sws_ctx) {
-        // Use provided context (assumes it matches dimensions - this is risky!)
-        // Better to create a new context that handles the scaling
-        sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height,
-                 dst_data, linesize);
-    } else {
-        // Create context with proper source (frame) and dest (config) dimensions
-        SwsContext* temp_sws = sws_getContext(
+    // Convert to RGB24 at OUTPUT (config_) dimensions. The scaling context and
+    // the destination buffer are cached across frames — building an SwsContext
+    // and allocating the buffer per frame previously dominated batch decode.
+    // Rebuild only when the source geometry/format changes. An explicitly
+    // provided sws_ctx (unused by the current caller) still takes precedence.
+    const int srcFmt = static_cast<int>(frame->format);
+    const int srcCs = static_cast<int>(frame->colorspace);
+    AVColorRange srcRangeEnum = frame->color_range;
+    if (srcRangeEnum == AVCOL_RANGE_UNSPECIFIED)
+        srcRangeEnum = AVCOL_RANGE_MPEG;
+    const int srcRangeKey = static_cast<int>(srcRangeEnum);
+
+    if (!sws_ctx &&
+        (!copySws_ || copySwsSrcW_ != frame->width ||
+         copySwsSrcH_ != frame->height || copySwsSrcFmt_ != srcFmt ||
+         copySwsSrcCs_ != srcCs || copySwsSrcRange_ != srcRangeKey ||
+         copySwsDstW_ != config_.width || copySwsDstH_ != config_.height)) {
+        if (copySws_) {
+            sws_freeContext(copySws_);
+            copySws_ = nullptr;
+        }
+        // Keys are invalidated up front: if configuration below throws, the
+        // half-built context must not be reachable through a stale-key cache hit
+        // on a later call.
+        copySwsSrcW_ = copySwsSrcH_ = copySwsSrcFmt_ = -1;
+        copySwsSrcCs_ = copySwsSrcRange_ = -1;
+        copySwsDstW_ = copySwsDstH_ = -1;
+        copySws_ = sws_getContext(
             frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
             config_.width, config_.height, AV_PIX_FMT_RGB24,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
-        
-        if (!temp_sws) {
-            av_freep(&dst_data[0]);
+        if (!copySws_)
             throw std::runtime_error("Failed to create SwsContext");
-        }
 
-        // Propagate the frame's colour matrix / range. sws_getContext leaves the
-        // coefficients at SWS_CS_DEFAULT, which is ITU601, so without this every
-        // clip was converted with the BT.601 matrix regardless of its declared
-        // color_space -- a bt709 clip came out of the batch API mis-coloured by
-        // up to 40/255 while iterating the same reader was byte-exact against
-        // ffmpeg. Mirrors conversion/cpu/AutoToRGB.hpp so the batch and iterate
-        // paths cannot drift: UNSPECIFIED folds to BT.470BG (libswscale's own
-        // default, which is also what ffmpeg/torchcodec use for untagged clips),
-        // and the RGB destination is always full range.
+        // Propagate the frame's colour matrix / range. Without this the context
+        // keeps swscale's SWS_CS_DEFAULT (== ITU601) coefficients, so a bt709
+        // clip came out of the batch API mis-coloured by up to 40/255 while the
+        // iterate path on the same reader was byte-exact against ffmpeg.
+        // Mirrors conversion/cpu/AutoToRGB.hpp so the two paths cannot drift:
+        // UNSPECIFIED folds to BT.470BG (libswscale's own default, which is what
+        // ffmpeg/torchcodec do for untagged clips), and the RGB destination is
+        // always full range.
         AVColorSpace coeff_cs = frame->colorspace;
         if (coeff_cs == AVCOL_SPC_UNSPECIFIED)
             coeff_cs = AVCOL_SPC_BT470BG;
-        AVColorRange src_color_range = frame->color_range;
-        if (src_color_range == AVCOL_RANGE_UNSPECIFIED)
-            src_color_range = AVCOL_RANGE_MPEG;
+        const int* srcCoeffs = sws_getCoefficients(coeff_cs);
+        const int* dstCoeffs = sws_getCoefficients(AVCOL_SPC_BT709);
+        const int srcRange = (srcRangeEnum == AVCOL_RANGE_JPEG) ? 1 : 0;
 
-        int cs_ok = sws_setColorspaceDetails(
-            temp_sws, sws_getCoefficients(coeff_cs),
-            (src_color_range == AVCOL_RANGE_JPEG) ? 1 : 0,
-            sws_getCoefficients(AVCOL_SPC_BT709), 1, 0, 1 << 16, 1 << 16);
-        if (cs_ok < 0) {
-            sws_freeContext(temp_sws);
-            av_freep(&dst_data[0]);
+        int ok = sws_setColorspaceDetails(copySws_, srcCoeffs, srcRange, dstCoeffs,
+                                          1, 0, 1 << 16, 1 << 16);
+        if (ok < 0)
             throw std::runtime_error(
                 "BatchDecoder: Failed to configure color space details (error=" +
-                std::to_string(cs_ok) + ", colorspace=" +
-                std::to_string(static_cast<int>(frame->colorspace)) + ", range=" +
-                std::to_string(static_cast<int>(src_color_range)) + ")");
-        }
+                std::to_string(ok) + ", colorspace=" + std::to_string(srcCs) +
+                ", range=" + std::to_string(srcRangeKey) + ")");
 
-        sws_scale(temp_sws, frame->data, frame->linesize, 0, frame->height,
-                 dst_data, linesize);
-        sws_freeContext(temp_sws);
+        copySwsSrcW_ = frame->width;
+        copySwsSrcH_ = frame->height;
+        copySwsSrcFmt_ = srcFmt;
+        copySwsSrcCs_ = srcCs;
+        copySwsSrcRange_ = srcRangeKey;
+        copySwsDstW_ = config_.width;
+        copySwsDstH_ = config_.height;
     }
 
-    // Copy to all requested positions in output tensor
-    auto output_acc = output.accessor<uint8_t, 4>();
-    
+    // Allocate the config_-sized RGB24 scratch once, reallocating if the output
+    // geometry ever changes, so copyBuf_ always matches the sws destination size
+    // and sws_scale can never write past it. av_image_alloc with align=1 yields
+    // a row stride equal to width*3 for RGB24; the strided branch below only
+    // exists so a future alignment change cannot silently corrupt output.
+    if (!copyBuf_[0] || copyDstW_ != config_.width || copyDstH_ != config_.height) {
+        if (copyBuf_[0])
+            av_freep(&copyBuf_[0]);
+        int ret = av_image_alloc(copyBuf_, copyBufLines_, config_.width,
+                                 config_.height, AV_PIX_FMT_RGB24, 1);
+        if (ret < 0)
+            throw std::runtime_error("Failed to allocate image buffer");
+        copyDstW_ = config_.width;
+        copyDstH_ = config_.height;
+    }
+
+    SwsContext* use_sws = sws_ctx ? sws_ctx : copySws_;
+    sws_scale(use_sws, frame->data, frame->linesize, 0, frame->height,
+              copyBuf_, copyBufLines_);
+
+    // Copy the contiguous RGB24 rows into each requested [H,W,3] slice of the
+    // output tensor. output is a freshly allocated, contiguous uint8 [N,H,W,3]
+    // tensor, so each position is a H*rowBytes contiguous block; a per-row
+    // memcpy replaces the previous per-element 4D-accessor assignment.
+    const int rowBytes = config_.width * 3;
+    const int srcStride = copyBufLines_[0];
+    const size_t frameBytes = static_cast<size_t>(config_.height) * rowBytes;
+    uint8_t* out_base = output.data_ptr<uint8_t>();
+
     for (size_t pos : positions) {
-        for (int h = 0; h < config_.height; h++) {
-            for (int w = 0; w < config_.width; w++) {
-                for (int c = 0; c < config_.channels; c++) {
-                    int src_idx = h * linesize[0] + w * 3 + c;
-                    output_acc[pos][h][w][c] = dst_data[0][src_idx];
-                }
-            }
+        uint8_t* dst = out_base + pos * frameBytes;
+        if (srcStride == rowBytes) {
+            std::memcpy(dst, copyBuf_[0], frameBytes);
+        } else {
+            for (int h = 0; h < config_.height; ++h)
+                std::memcpy(dst + static_cast<size_t>(h) * rowBytes,
+                            copyBuf_[0] + static_cast<size_t>(h) * srcStride,
+                            rowBytes);
         }
     }
-
-    av_freep(&dst_data[0]);
 }
 
 torch::Tensor BatchDecoder::decode_batch(
