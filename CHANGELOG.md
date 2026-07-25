@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-25
+
+### Fixed
+
+- **CUDA device code is built for every supported architecture again.** The
+  `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)` guard sat *after*
+  `enable_language(CUDA)`, which under CMP0104 has already set the variable to
+  nvcc's single default architecture (75 on CUDA 13.2). The guard was dead code,
+  so every wheel shipped one architecture — that arch's SASS plus its PTX. PTX
+  only JITs forward, so **every older GPU failed every kernel launch** with
+  `cudaErrorNoKernelImageForDevice`, which surfaced as fully black decoded
+  frames. Architecture selection now runs before `enable_language(CUDA)` and
+  picks from the nvcc version: `75;80;86;89;90`, plus `60;70` on CUDA < 13 and
+  `100;120` on CUDA >= 12.8. `CUDAARCHS` is honoured explicitly.
+- **CUDA kernel launches are now error-checked.** `cudaGetLastError()` is checked
+  after the colour-conversion launches in the NVDEC decoder and the encoder-side
+  RGB converter, and the conversion sync result is checked. Launches are
+  asynchronous, so a configuration or binary failure was only visible in the
+  sticky per-thread error: unchecked, the launch silently no-opped and frames
+  came back black or as uninitialised garbage. They now throw, with a hint
+  pointing at `CMAKE_CUDA_ARCHITECTURES` for the no-kernel-image case.
+- **`set_range(start, end)` + iterate returned the wrong frames on NVDEC**
+  whenever `start` fell past the first keyframe, yielding absolute frames
+  `K + start ...` instead of `start ...` (K being the enclosing keyframe). The
+  seek landed on K and then discarded `start` more frames instead of `start - K`,
+  because the discard count came from `current_timestamp`, which `iter()` had
+  just zeroed and which nothing updates from the seek. Silent: the frame *count*
+  looked right, and when `K + start` ran past EOF iteration simply yielded a
+  short read or nothing. The counted loop is replaced with the
+  decode-until-PTS-matches pattern already used by `decodeFrameAt`, which needs
+  no knowledge of K. Also fixes the same defect on
+  `decode_accelerator="cpu", prefetch=True`. ([#57](https://github.com/NevermindNilas/Nelux/issues/57))
+- **`set_range(start_time > 0)` on the CPU backend aborted the process** with
+  `Assertion fctx->async_lock failed at pthread_frame.c:171`. The frame-thread
+  seek guard only covered `start_time <= 0`, so a positive start still flushed a
+  frame-threaded codec context. ([#60](https://github.com/NevermindNilas/Nelux/issues/60))
+- **CPU batch decode ignored the stream's colour matrix.** `decode_batch` /
+  `get_batch` / `get_batch_range` converted YUV→RGB with BT.601 regardless of the
+  declared `color_space`, while iterating the same reader honoured it — so one
+  file decoded to two different images depending on which API was used. For a
+  bt709 clip the batch output was off by up to 40/255 (mean 6.8), with 73% of
+  pixels differing, with no error or warning. `BatchDecoder::copyFrameToOutput`
+  never called `sws_setColorspaceDetails`, leaving the coefficients at
+  `SWS_CS_DEFAULT` (= `SWS_CS_ITU601`). `color_range` was latently wrong the same
+  way. Both are now propagated, mirroring `conversion/cpu/AutoToRGB.hpp` so the
+  batch and iterate paths cannot drift. NVDEC was unaffected.
+  ([#58](https://github.com/NevermindNilas/Nelux/issues/58))
+- `reconfigure()` left `batchCodecCtx_` bound to the previous file's stream
+  parameters, so a `decode_batch` after reconfiguring to a different stream
+  decoded with the old parameters and returned wrong frames or errored.
+- `reconfigure()` reset `cached_frame_count_` only when a batch decoder had been
+  created, but `get_frame_count()` populates that cache on its own, so the old
+  file's frame count could survive a reconfigure — misreporting the length and
+  letting out-of-range indices past `decode_batch`'s bounds check.
+
+### Changed
+
+- **Batch decode is 3-8x faster.** `copyFrameToOutput` built a fresh
+  `SwsContext` (scaling tables, SIMD init) and a fresh RGB24 buffer for *every*
+  decoded frame, then copied through a 4D accessor one element at a time. The
+  context and buffer are now cached on the `BatchDecoder` and rebuilt only when
+  the source geometry, pixel format, colour matrix or range changes, and the copy
+  is a per-row `memcpy` into the contiguous output slice. The batch codec context
+  also gains frame threading — it was slice-only, which barely parallelises
+  single-slice H.264, leaving the keyframe-to-target run effectively serial.
+  Byte-exact against the previous output across h264/hevc/prores/ffv1/mpeg2/
+  mpeg4/vp9 at 8/10/12-bit, including backward, out-of-order and duplicate
+  indices. `NELUX_BATCH_SLICE_ONLY=1` restores the old context for anyone who
+  needs to bound thread counts across many concurrent readers.
+- **AVX2 is now opt-in (`NELUX_ENABLE_AVX2` defaults to `OFF`).** An A/B from
+  identical sources showed no difference on streaming decode (~3988 vs ~3993 fps)
+  or `decode_batch` (~2192 vs ~2173 fps): the per-pixel work happens inside the
+  prebuilt FFmpeg DLLs, which already dispatch AVX2/AVX-512 at runtime, or in
+  CUDA kernels. The flag only added a hard AVX2 requirement, so pre-Haswell Intel
+  and pre-Excavator AMD got an illegal instruction for nothing. The
+  `x64-release-cpu-baseline` preset is renamed `x64-release-cpu-avx2` and now
+  *enables* the flag.
+- **Encoder convert workers are capped at 4 instead of 6.** One swscale RGB→YUV
+  costs ~1.4 ms at 720p and ~11 ms at 4K, so sustaining even the fastest encoder
+  needs only 2-3 converters in flight; workers beyond that take cores from the
+  encoder's own barrier-synchronised threads. Measured with a paired interleaved
+  A/B: 720p mpeg4 +2.0%, 1080p x264 +0.9%, 1080p mpeg4 +0.9%, 720p x264 +0.6%, 4K
+  neutral. The encoded elementary stream is byte-identical either way. Side
+  effect: in-flight depth drops from 8 to 6 slots, about 74 MB less pool memory
+  at 4K.
+
+### Documented
+
+- The published CUDA 13 wheels require **compute capability 7.5+** (Turing or
+  newer). Pre-Turing cards with NVDEC silicon need a source build against
+  CUDA 12.x.
+
 ## [0.16.0] - 2026-07-19
 
 ### Changed
