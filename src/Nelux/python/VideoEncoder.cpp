@@ -564,7 +564,17 @@ void VideoEncoder::startEncodeWorkersIfNeeded()
     {
         unsigned hc = std::thread::hardware_concurrency();
         int k = (hc > 0) ? static_cast<int>(hc) / 2 : 4;
-        numConvertWorkers = std::clamp(k, 2, 6);
+        // Capped at 4, not 6. One swscale RGB->YUV costs ~1.4 ms at 720p and
+        // ~11 ms at 4K, so sustaining even the fastest encoders needs only ~2-3
+        // converters in flight; workers past that just take cores away from the
+        // encoder's own (barrier-synchronised) worker threads and cost pool RAM.
+        // Measured paired A/B, 6 -> 4 workers: 720p mpeg4 +2.0% (8/8 pairs),
+        // 720p x264 +0.6%, 1080p x264/mpeg4 +0.9%, 4K neutral. The encoded
+        // elementary stream is byte-identical either way (verified across
+        // x264/x265/mpeg4/ffv1/mjpeg/prores) — worker count only decides which
+        // thread runs a given frame's convert, and the submit thread restores
+        // sequence order.
+        numConvertWorkers = std::clamp(k, 2, 4);
     }
     // workers + 2 keeps every convert worker fed (one filling, one draining)
     // without over-buffering. At 4K each in-flight slot costs ~24.8 MB RGB +
