@@ -180,6 +180,36 @@ void BatchDecoder::copyFrameToOutput(
             throw std::runtime_error("Failed to create SwsContext");
         }
 
+        // Propagate the frame's colour matrix / range. sws_getContext leaves the
+        // coefficients at SWS_CS_DEFAULT, which is ITU601, so without this every
+        // clip was converted with the BT.601 matrix regardless of its declared
+        // color_space -- a bt709 clip came out of the batch API mis-coloured by
+        // up to 40/255 while iterating the same reader was byte-exact against
+        // ffmpeg. Mirrors conversion/cpu/AutoToRGB.hpp so the batch and iterate
+        // paths cannot drift: UNSPECIFIED folds to BT.470BG (libswscale's own
+        // default, which is also what ffmpeg/torchcodec use for untagged clips),
+        // and the RGB destination is always full range.
+        AVColorSpace coeff_cs = frame->colorspace;
+        if (coeff_cs == AVCOL_SPC_UNSPECIFIED)
+            coeff_cs = AVCOL_SPC_BT470BG;
+        AVColorRange src_color_range = frame->color_range;
+        if (src_color_range == AVCOL_RANGE_UNSPECIFIED)
+            src_color_range = AVCOL_RANGE_MPEG;
+
+        int cs_ok = sws_setColorspaceDetails(
+            temp_sws, sws_getCoefficients(coeff_cs),
+            (src_color_range == AVCOL_RANGE_JPEG) ? 1 : 0,
+            sws_getCoefficients(AVCOL_SPC_BT709), 1, 0, 1 << 16, 1 << 16);
+        if (cs_ok < 0) {
+            sws_freeContext(temp_sws);
+            av_freep(&dst_data[0]);
+            throw std::runtime_error(
+                "BatchDecoder: Failed to configure color space details (error=" +
+                std::to_string(cs_ok) + ", colorspace=" +
+                std::to_string(static_cast<int>(frame->colorspace)) + ", range=" +
+                std::to_string(static_cast<int>(src_color_range)) + ")");
+        }
+
         sws_scale(temp_sws, frame->data, frame->linesize, 0, frame->height,
                  dst_data, linesize);
         sws_freeContext(temp_sws);
