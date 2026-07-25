@@ -41,13 +41,13 @@
       }
     },
     {
-      "name": "x64-release-cpu-baseline",
-      "displayName": "x64 Release (CPU, baseline ISA)",
+      "name": "x64-release-cpu-avx2",
+      "displayName": "x64 Release (CPU, AVX2 opt-in)",
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NELUX_ENABLE_CUDA": "OFF",
-        "NELUX_ENABLE_AVX2": "OFF"
+        "NELUX_ENABLE_AVX2": "ON"
       }
     },
     {

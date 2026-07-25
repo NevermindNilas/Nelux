@@ -38,6 +38,17 @@ public:
      */
     explicit BatchDecoder(const Config& config);
 
+    ~BatchDecoder();
+
+    // Owns raw SwsContext/av_image_alloc resources freed in the destructor, so
+    // the implicitly generated copy operations would double-free them (and two
+    // live copies would share one scratch buffer). Not needed -- the only
+    // instance lives in a unique_ptr.
+    BatchDecoder(const BatchDecoder&) = delete;
+    BatchDecoder& operator=(const BatchDecoder&) = delete;
+    BatchDecoder(BatchDecoder&&) = delete;
+    BatchDecoder& operator=(BatchDecoder&&) = delete;
+
     /**
      * @brief Decode a batch of frames at specified indices
      * 
@@ -70,6 +81,34 @@ private:
     // packets until it is re-seeked (which flushes its buffers), so decode_batch
     // must force a seek before the next target.
     bool decoderDrained_ = false;
+
+    // Cached RGB24 scaling context + scratch buffer for copyFrameToOutput.
+    // Building an SwsContext (scaling tables, SIMD init) and allocating the RGB
+    // buffer once per decoded frame dominated batch decode; both are reused and
+    // only rebuilt when the source frame geometry/format changes. Freed in dtor.
+    SwsContext* copySws_ = nullptr;
+    int copySwsSrcW_ = -1;
+    int copySwsSrcH_ = -1;
+    int copySwsSrcFmt_ = -1; // AVPixelFormat
+    // Colour matrix / range the cached context was configured for. Part of the
+    // key because the YUV->RGB coefficients are baked into the context by
+    // sws_setColorspaceDetails; a stream that changes its VUI mid-file (some
+    // H.264 encoders re-tag at an IDR) must not keep the stale matrix.
+    int copySwsSrcCs_ = -1;    // AVColorSpace
+    int copySwsSrcRange_ = -1; // AVColorRange (after UNSPECIFIED->MPEG folding)
+    // Destination geometry the cached context and the cached buffer were each
+    // built for. config_ is immutable for the life of a BatchDecoder today, but
+    // keying on it keeps the cache self-correcting if the output size ever
+    // changes under instance reuse. The two are tracked separately on purpose:
+    // an explicitly supplied sws_ctx skips the context rebuild but not the
+    // buffer realloc, so a single shared "dst" field could let a stale context
+    // scale into a differently sized buffer.
+    int copySwsDstW_ = -1;
+    int copySwsDstH_ = -1;
+    int copyDstW_ = -1;
+    int copyDstH_ = -1;
+    uint8_t* copyBuf_[4] = {nullptr, nullptr, nullptr, nullptr};
+    int copyBufLines_[4] = {0, 0, 0, 0};
 
     /**
      * @brief Seek to a specific frame index

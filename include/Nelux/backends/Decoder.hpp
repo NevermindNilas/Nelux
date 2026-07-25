@@ -352,9 +352,10 @@ class Decoder
     std::unique_ptr<BatchDecoder> batch_decoder_;
     int64_t cached_frame_count_ = -1;
 
-    // Separate slice-only codec context for batch/seek work, so the main
-    // codecCtx can stay frame-threaded (faster sequential decode) without
-    // tripping flush asserts. Lazily allocated on first decode_batch call.
+    // Separate codec context for batch/seek work, so BatchDecoder's seeks and
+    // per-seek flushes never touch the streaming codecCtx mid-iteration. Also
+    // frame-threaded (see decode_batch); NELUX_BATCH_SLICE_ONLY=1 forces the
+    // older slice-only configuration. Lazily allocated on first decode_batch.
     std::unique_ptr<AVCodecContext, AVCodecContextDeleter> batchCodecCtx_;
 
     // Cached file path for reconfiguration

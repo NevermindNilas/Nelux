@@ -492,7 +492,7 @@ for frame in reader:
 - YUV444, YUV444P16
 
 **Requirements:**
-- NVIDIA GPU with NVDEC support
+- NVIDIA GPU with NVDEC support, compute capability 7.5+ (Turing or newer) for the published wheels. Pre-Turing cards with NVDEC (Maxwell/Pascal/Volta) need a source build against CUDA 12.x, since CUDA 13 no longer targets those architectures.
 - CUDA toolkit installed
 - NeLux wheel built with CUDA support (`nelux.__cuda_support__ == True`)
 
