@@ -633,14 +633,18 @@ void VideoReader::rewindForFreshIteration()
     // which is what this always used to do, on the belief that the sync path
     // could not flush a frame-threaded context safely (see canSeekMidStream for
     // why that was actually a producer-restart race, now fixed).
-    if (canSeekMidStream() && decoder->seek(0.0))
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+
+    if (canSeekMidStream(dec) && dec->seek(0.0))
     {
         NELUX_DEBUG("Rewinding via seek to 0");
     }
     else
     {
         NELUX_DEBUG("Rewinding via decoder reconfigure");
-        decoder->reconfigure(filePath);
+        dec->reconfigure(filePath);
     }
     currentIndex = 0;
     current_timestamp = 0.0;
@@ -654,7 +658,12 @@ void VideoReader::repositionToActiveSegment()
     hasBufferedFrame = false;
     bufferedFrame = torch::Tensor();
 
-    const bool seekable = canSeekMidStream();
+    // Pinned for the whole function: the decode-forward loops below call
+    // decodeFrame(), which releases the GIL, so close() can run in between.
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+    const bool seekable = canSeekMidStream(dec);
 
     if (start_time >= 0.0 && end_time > 0.0)
     {
@@ -666,7 +675,7 @@ void VideoReader::repositionToActiveSegment()
             // seekToNearestKeyframe directly rather than seek(): seek() decodes
             // *past* the target and drops the frame it lands on, which would
             // lose the segment's first frame.
-            if (!decoder->seekToNearestKeyframe(start_time))
+            if (!dec->seekToNearestKeyframe(start_time))
             {
                 NELUX_ERROR("Failed to seek to segment start_time {}", start_time);
                 throw std::runtime_error("Failed to seek to segment start_time.");
@@ -1235,7 +1244,11 @@ void VideoReader::reset()
 
 void VideoReader::ensureRandDecoder()
 {
-    if (!rand_decoder)
+    {
+        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+        if (rand_decoder)
+            return;
+    }
     {
         NELUX_INFO("Initializing random-access decoder (lazy load)");
         // No silent NVDEC->CPU fallback for the random-access decoder either.
@@ -1250,18 +1263,28 @@ void VideoReader::ensureRandDecoder()
         // Match the main decoder's channel count (caller buffers are sized for
         // outChannels_). Passed into the ctor for the same reason as the main
         // decoder — no post-construction channel switch.
-        rand_decoder = nelux::createDecoder(
+        // Constructed OUTSIDE the lock (opening a file is slow and would block
+        // close()), then published under it. The re-check covers two threads
+        // racing to create it; the loser's decoder is simply dropped.
+        std::shared_ptr<nelux::Decoder> fresh = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
             resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_, resizeFilter_,
             motionVectorsEnabled_);
-        rand_decoder->setForce8Bit(force_8bit);
+        fresh->setForce8Bit(force_8bit);
+
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        if (!rand_decoder)
+            rand_decoder = std::move(fresh);
     }
 }
 
 torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 {
     ensureRandDecoder();
-    if (!rand_decoder)
+    // Pin it: this function releases the GIL around the seek and every decode,
+    // and close() can swap the member out during those windows.
+    std::shared_ptr<nelux::Decoder> rdec = pinRandDecoder();
+    if (!rdec)
         throw std::runtime_error("Random-access decoder not initialized");
 
     const double half = 0.5 * ((properties.fps > 0) ? 1.0 / properties.fps : 0.0);
@@ -1284,7 +1307,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     const bool decodeForward = randLastTs_ >= 0.0 &&
                                timestamp_seconds > randLastTs_ + half &&
                                (timestamp_seconds - randLastTs_) <= 1.0 &&
-                               rand_decoder->hasZeroBasedTimeline();
+                               rdec->hasZeroBasedTimeline();
     // Position is unknown until this call re-establishes it: any throw or
     // partial decode below must leave the next call re-seeking.
     randLastTs_ = -1.0;
@@ -1292,12 +1315,12 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     if (!decodeForward)
     {
         py::gil_scoped_release release;
-        if (!rand_decoder->seekToNearestKeyframe(timestamp_seconds))
+        if (!rdec->seekToNearestKeyframe(timestamp_seconds))
         {
             double backoff = std::max(0.0, timestamp_seconds - 2.0);
             NELUX_WARN("seekToNearestKeyframe({}) failed; retrying with {}",
                        timestamp_seconds, backoff);
-            if (!rand_decoder->seekToNearestKeyframe(backoff))
+            if (!rdec->seekToNearestKeyframe(backoff))
             {
                 throw std::runtime_error("Failed to seek in random decoder");
             }
@@ -1320,7 +1343,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         bool ok;
         {
             py::gil_scoped_release release;
-            ok = rand_decoder->decodeNextFrame(buf.data_ptr(), &ts);
+            ok = rdec->decodeNextFrame(buf.data_ptr(), &ts);
         }
         if (!ok)
             break;
@@ -1446,6 +1469,13 @@ bool VideoReader::seekToFrame(int frame_number)
 
 VideoReader& VideoReader::iter()
 {
+    // Pinned for the whole function: the discard loops below call decodeFrame(),
+    // which releases the GIL, so a concurrent close() could otherwise swap the
+    // decoder out between two `decoder->` uses here.
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+
     NELUX_TRACE("iter() called: Preparing VideoReader for iteration");
 
     // Reset iterator state
@@ -1492,10 +1522,10 @@ VideoReader& VideoReader::iter()
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_time <= 0.0)
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
-            decoder->reconfigure(filePath);
+            dec->reconfigure(filePath);
             streamTouched_ = false;
         }
-        else if (!canSeekMidStream())
+        else if (!canSeekMidStream(dec))
         {
             // Non-seekable path: restart at frame 0 if a previous pass has
             // already moved the stream, then let the discard loop below advance
@@ -1512,7 +1542,7 @@ VideoReader& VideoReader::iter()
             // against a sequential ground-truth decode.) The discard loop below
             // then advances from the keyframe to the first frame at or after
             // start_time and holds it.
-            if (!decoder->seekToNearestKeyframe(start_time))
+            if (!dec->seekToNearestKeyframe(start_time))
             {
                 NELUX_ERROR("Failed to seek to start_time: {}", start_time);
                 throw std::runtime_error("Failed to seek to start_time.");
@@ -1562,12 +1592,12 @@ VideoReader& VideoReader::iter()
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_frame <= 0)
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
-            decoder->reconfigure(filePath);
+            dec->reconfigure(filePath);
             currentIndex = 0;
             current_timestamp = 0.0;
             streamTouched_ = false;
         }
-        else if (!canSeekMidStream() || start_frame == 0)
+        else if (!canSeekMidStream(dec) || start_frame == 0)
         {
             // Either the path cannot seek, or there is nothing to seek to: a
             // freshly rewound reader already sits at frame 0. Advance by
@@ -1920,19 +1950,28 @@ void VideoReader::reconfigure(const std::string& newFilePath)
 {
     NELUX_INFO("Reconfiguring VideoReader with new file: {}", newFilePath);
     
-    // Reconfigure the main decoder
-    decoder->reconfigure(newFilePath);
-    
-    // Reset the random-access decoder if it was created
-    if (rand_decoder)
+    // Pin the main decoder and take the random-access one away under the
+    // lifecycle lock, the same handoff close() performs, so this cannot race a
+    // concurrent close().
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+
+    std::shared_ptr<nelux::Decoder> oldRand;
     {
-        rand_decoder->close();
-        rand_decoder.reset();
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        oldRand.swap(rand_decoder);
+        randLastTs_ = -1.0;
     }
-    randLastTs_ = -1.0;
-    
+
+    // Reconfigure the main decoder
+    dec->reconfigure(newFilePath);
+
+    if (oldRand)
+        oldRand->close();
+
     // Update properties from the new file
-    properties = decoder->getVideoProperties();
+    properties = dec->getVideoProperties();
     
     // Update internal file path
     filePath = newFilePath;

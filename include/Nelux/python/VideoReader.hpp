@@ -494,13 +494,32 @@ class VideoReader
     // Those restarts are now guarded by !syncMode_ (matching initialize() and
     // reconfigure()), so seeking is safe here and set_range no longer has to
     // decode and discard every frame from zero.
-    bool canSeekMidStream() const
+    // Takes the decoder the caller has already pinned, rather than reading the
+    // member: callers hold a pinned shared_ptr across a window in which the GIL
+    // is dropped and close() may swap the member out.
+    static bool canSeekMidStream(const std::shared_ptr<nelux::Decoder>& dec)
     {
         // Seeking needs frame indices and frame timestamps to share an origin;
         // on a container that starts at a non-zero timestamp they do not, and a
         // seek lands somewhere other than the requested frame. Those fall back
         // to decoding forward, exactly as this path always did.
-        return decoder && decoder->hasZeroBasedTimeline();
+        return dec && dec->hasZeroBasedTimeline();
+    }
+
+    // Copy a decoder out from under the lifecycle lock. Anything that
+    // dereferences a decoder across a point where the GIL is released — its own
+    // release, or a nested decodeFrame() — must hold the result for the whole
+    // span, otherwise close() can swap the member concurrently, which is a data
+    // race on the shared_ptr itself and can free the decoder mid-call.
+    std::shared_ptr<nelux::Decoder> pinDecoder() const
+    {
+        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+        return decoder;
+    }
+    std::shared_ptr<nelux::Decoder> pinRandDecoder() const
+    {
+        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+        return rand_decoder;
     }
     // Rewind the sync CPU path to the true first frame before a fresh
     // iteration. Since it cannot seek, a full decoder reconfigure is the only
