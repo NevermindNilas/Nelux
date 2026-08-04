@@ -200,6 +200,14 @@ PYBIND11_MODULE(_nelux, m)
                                  "auto-tuned default");
                          }
                      }
+                     // Opening a reader is milliseconds of pure FFmpeg work
+                     // (avformat_open_input + find_stream_info + avcodec_open2,
+                     // ~4.7 ms for a 1080p mp4) with no Python involvement, so
+                     // holding the GIL across it stalls every other thread in
+                     // the process. Arguments are already unpacked to C++ types
+                     // above; the exception translation on the way out
+                     // re-acquires the GIL by itself.
+                     py::gil_scoped_release release;
                      return std::make_shared<VideoReader>(
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
@@ -643,7 +651,16 @@ Example:
             // Decode-free metadata probe: opens the container and reads stream
             // info only (no decoder, no resolution-sized buffer, no threads).
             // Returns the same dict as VideoReader.properties.
-            return videoPropertiesToDict(nelux::probeFile(path));
+            //
+            // probeFile is ~4 ms of avformat_open_input +
+            // avformat_find_stream_info and touches nothing Python; only the
+            // dict construction afterwards needs the GIL back.
+            nelux::Decoder::VideoProperties props;
+            {
+                py::gil_scoped_release release;
+                props = nelux::probeFile(path);
+            }
+            return videoPropertiesToDict(props);
         },
         py::arg("path"),
         "Read full video metadata without decoding. Returns the same dict as "

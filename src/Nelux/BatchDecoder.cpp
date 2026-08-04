@@ -36,8 +36,6 @@ BatchDecoder::~BatchDecoder()
 {
     if (copySws_)
         sws_freeContext(copySws_);
-    if (copyBuf_[0])
-        av_freep(&copyBuf_[0]);
 }
 
 void BatchDecoder::seekToFrame(
@@ -236,46 +234,39 @@ void BatchDecoder::copyFrameToOutput(
         copySwsDstH_ = config_.height;
     }
 
-    // Allocate the config_-sized RGB24 scratch once, reallocating if the output
-    // geometry ever changes, so copyBuf_ always matches the sws destination size
-    // and sws_scale can never write past it. av_image_alloc with align=1 yields
-    // a row stride equal to width*3 for RGB24; the strided branch below only
-    // exists so a future alignment change cannot silently corrupt output.
-    if (!copyBuf_[0] || copyDstW_ != config_.width || copyDstH_ != config_.height) {
-        if (copyBuf_[0])
-            av_freep(&copyBuf_[0]);
-        int ret = av_image_alloc(copyBuf_, copyBufLines_, config_.width,
-                                 config_.height, AV_PIX_FMT_RGB24, 1);
-        if (ret < 0)
-            throw std::runtime_error("Failed to allocate image buffer");
-        copyDstW_ = config_.width;
-        copyDstH_ = config_.height;
-    }
-
-    SwsContext* use_sws = sws_ctx ? sws_ctx : copySws_;
-    sws_scale(use_sws, frame->data, frame->linesize, 0, frame->height,
-              copyBuf_, copyBufLines_);
-
-    // Copy the contiguous RGB24 rows into each requested [H,W,3] slice of the
-    // output tensor. output is a freshly allocated, contiguous uint8 [N,H,W,3]
-    // tensor, so each position is a H*rowBytes contiguous block; a per-row
-    // memcpy replaces the previous per-element 4D-accessor assignment.
+    // Scale STRAIGHT into the first requested slice of the output tensor rather
+    // than into a scratch buffer that is then memcpy'd out. `output` is a fresh
+    // contiguous uint8 [N,H,W,3] tensor, so slice `pos` is one H*rowBytes
+    // contiguous block with row stride exactly width*3 — the same layout
+    // av_image_alloc(align=1) produced for the old scratch. That removes a full
+    // W*H*3 read+write per decoded frame (2.7 MB at 720p, 6.2 MB at 1080p).
+    //
+    // libswscale writes exactly rowBytes per row here — verified directly
+    // against the shipped swscale by writing into a canary-filled buffer for
+    // yuv420p/422p/444p/nv12/yuv420p10le sources across a range of geometries
+    // (including odd widths and unaligned destination offsets) and confirming
+    // nothing lands past H*rowBytes. The streaming decode path has always
+    // scaled into an exactly-sized tensor, so this is the same contract, not a
+    // new one. SWS_DST_SLACK is belt-and-braces on top: it bounds an overshoot
+    // at the very end of the allocation. Note it does NOT cover the last row of
+    // a non-final slice, which would spill into the neighbouring slice — that
+    // only matters if the no-overshoot property above ever stops holding.
     const int rowBytes = config_.width * 3;
-    const int srcStride = copyBufLines_[0];
     const size_t frameBytes = static_cast<size_t>(config_.height) * rowBytes;
     uint8_t* out_base = output.data_ptr<uint8_t>();
 
-    for (size_t pos : positions) {
-        uint8_t* dst = out_base + pos * frameBytes;
-        if (srcStride == rowBytes) {
-            std::memcpy(dst, copyBuf_[0], frameBytes);
-        } else {
-            for (int h = 0; h < config_.height; ++h)
-                std::memcpy(dst + static_cast<size_t>(h) * rowBytes,
-                            copyBuf_[0] + static_cast<size_t>(h) * srcStride,
-                            rowBytes);
-        }
-    }
+    uint8_t* first = out_base + positions.front() * frameBytes;
+    uint8_t* dstData[4] = {first, nullptr, nullptr, nullptr};
+    int dstLines[4] = {rowBytes, 0, 0, 0};
+
+    SwsContext* use_sws = sws_ctx ? sws_ctx : copySws_;
+    sws_scale(use_sws, frame->data, frame->linesize, 0, frame->height,
+              dstData, dstLines);
+
+    // Duplicate indices in the request share one decode; fan the finished slice
+    // out to the remaining positions.
+    for (size_t i = 1; i < positions.size(); ++i)
+        std::memcpy(out_base + positions[i] * frameBytes, first, frameBytes);
 }
 
 torch::Tensor BatchDecoder::decode_batch(
@@ -284,7 +275,8 @@ torch::Tensor BatchDecoder::decode_batch(
     AVCodecContext* codec_ctx,
     int stream_idx,
     SwsContext* sws_ctx,
-    int64_t total_frames)
+    int64_t total_frames,
+    bool position_valid)
 {
     NELUX_INFO("Decoding batch of {} frames", indices.size());
     
@@ -318,10 +310,20 @@ torch::Tensor BatchDecoder::decode_batch(
     NELUX_DEBUG("Decoding {} unique frames from {} total requests",
                 sorted_frames.size(), indices.size());
 
-    // Allocate output tensor
-    torch::Tensor output = torch::empty(
-        {static_cast<int64_t>(indices.size()), config_.height, config_.width, config_.channels},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+    // Allocate output tensor. copyFrameToOutput runs sws_scale directly into
+    // these slices, so the storage carries SWS_DST_SLACK trailing bytes that the
+    // returned view never exposes — a scaler that overshoots the final row by a
+    // SIMD register writes into the slack instead of past the allocation. The
+    // narrow()+view() pair keeps the visible tensor an ordinary contiguous
+    // [N,H,W,C] uint8 tensor with the usual strides.
+    const int64_t visible = static_cast<int64_t>(indices.size()) *
+                            config_.height * config_.width * config_.channels;
+    torch::Tensor output =
+        torch::empty({visible + SWS_DST_SLACK},
+                     torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+            .narrow(0, 0, visible)
+            .view({static_cast<int64_t>(indices.size()), config_.height,
+                   config_.width, config_.channels});
 
     // Allocate frame for decoding
     AVFrame* frame = av_frame_alloc();
@@ -332,15 +334,31 @@ torch::Tensor BatchDecoder::decode_batch(
     AVStream* stream = fmt_ctx->streams[stream_idx];
     double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
     
-    int64_t current_frame = -1;
-    bool need_seek = true;
+    // Resume from wherever the previous call left the stream when the caller
+    // vouches that nothing else has read from fmt_ctx since. The seek decision
+    // below is unchanged — a backward target or a gap wider than
+    // SEQUENTIAL_THRESHOLD still seeks — so this only removes seeks that were
+    // provably redundant.
+    int64_t current_frame = position_valid ? retainedFrame_ : -1;
+    bool need_seek = (current_frame < 0);
+    retainedFrame_ = -1; // no valid position until this call completes
 
     try {
         for (int64_t target_frame : sorted_frames) {
             NELUX_TRACE("Processing target frame {}, current={}", target_frame, current_frame);
 
-            // Decide if we need to seek
-            if (need_seek || decoderDrained_ || target_frame < current_frame ||
+            // Decide if we need to seek.
+            //
+            // `<=`, not `<`: current_frame names a frame that has ALREADY been
+            // emitted, and decodeUntilFrame only returns once it decodes a
+            // frame with `current_frame >= target_frame`, so it always advances
+            // at least one frame. Asking again for the frame we are sitting on
+            // therefore has to re-seek — decoding forward would hand back
+            // target+1 and shift every later target in the batch with it.
+            // Within one call `sorted_frames` is strictly ascending so this can
+            // only fire on the first target, i.e. on a position carried over
+            // from the previous call.
+            if (need_seek || decoderDrained_ || target_frame <= current_frame ||
                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD) {
                 seekToFrame(fmt_ctx, codec_ctx, stream_idx, target_frame, fps);
                 current_frame = -1;
@@ -366,6 +384,10 @@ torch::Tensor BatchDecoder::decode_batch(
     }
 
     av_frame_free(&frame);
+
+    // Publish the position for the next call. A drained decoder cannot accept
+    // packets again until a seek flushes it, so leave the position unknown.
+    retainedFrame_ = decoderDrained_ ? -1 : current_frame;
 
     // Move to target device if needed
     if (config_.device.is_cuda()) {

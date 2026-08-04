@@ -122,6 +122,20 @@ class Decoder
     Decoder(Decoder&&) noexcept;
     Decoder& operator=(Decoder&&) noexcept;
     bool seekFrame(int frameIndex);
+
+    // True when frame timestamps and frame indices share an origin, i.e. the
+    // stream's first timestamp is zero (or absent).
+    //
+    // Nelux mixes the two timelines: getFrameTimestamp() reports RAW container
+    // timestamps, while frame indices and `duration` are spans counted from the
+    // start of the stream. They agree only when the first timestamp is zero,
+    // which is the ordinary case. When it is not -- MPEG-TS is the common
+    // offender, and its start_time comes from the first DTS, which is not even
+    // the first frame's PTS -- an index-derived seek target and a decoded
+    // frame's timestamp are in different frames of reference, so seeking cannot
+    // be trusted to land on the requested frame. Callers that can fall back to
+    // decoding forward should do so instead.
+    bool hasZeroBasedTimeline() const;
     virtual bool decodeNextFrame(void* buffer, double* frame_timestamp = nullptr);
 
     // Zero-copy variant: returns the next decoded frame as a fresh
@@ -357,6 +371,15 @@ class Decoder
     // frame-threaded (see decode_batch); NELUX_BATCH_SLICE_ONLY=1 forces the
     // older slice-only configuration. Lazily allocated on first decode_batch.
     std::unique_ptr<AVCodecContext, AVCodecContextDeleter> batchCodecCtx_;
+
+    // decode_batch shares formatCtx with the streaming path, so it can only
+    // resume from where the previous batch left the demuxer if nothing else has
+    // read a packet or seeked since. Every site that moves the shared read
+    // position sets this; decode_batch clears it once it owns the position
+    // again. Starts dirty because nothing has established a position yet.
+    // Atomic only because the producer thread is one of the writers; the batch
+    // path reads it after the producer has been stopped and joined.
+    std::atomic<bool> sharedStreamDirty_{true};
 
     // Cached file path for reconfiguration
     std::string cachedFilePath_;

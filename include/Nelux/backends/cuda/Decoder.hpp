@@ -205,8 +205,6 @@ private:
     AVPixelFormat hwPixFmt_;
     
     // Intermediate buffers for GPU processing
-    void* nv12Buffer_;          // GPU buffer for NV12 data
-    size_t nv12BufferSize_;
     
     // Temporary RGB24 buffer for two-step conversion (non-NV12 formats)
     void* rgb24Buffer_;         // GPU buffer for RGB24 intermediate

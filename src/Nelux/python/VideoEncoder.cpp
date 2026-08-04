@@ -897,6 +897,29 @@ void VideoEncoder::stopEncodeWorkers()
 
 void VideoEncoder::close()
 {
+    // Whole-teardown lock. close() is Python-callable, runs from __exit__ and
+    // from the destructor, and now releases the GIL for the codec drain — so
+    // the GIL no longer serialises it and a second caller could otherwise run
+    // stopEncodeWorkers() and the drain concurrently with the first. A second
+    // caller blocks here, then finds `encoder` already swapped out and does
+    // nothing.
+    //
+    // The GIL MUST be dropped while waiting for it. The first caller holds this
+    // lock while joining the encode workers, and those workers can need the GIL
+    // to free torch tensors (see stopEncodeWorkers). A second caller that waited
+    // here still holding the GIL would therefore deadlock the first — which is
+    // exactly what happened before this release was added.
+    std::unique_lock<std::mutex> closeLock(closeMu, std::defer_lock);
+    if (PyGILState_Check())
+    {
+        py::gil_scoped_release rel;
+        closeLock.lock();
+    }
+    else
+    {
+        closeLock.lock();
+    }
+
     // Drain + join the encode workers FIRST so every queued frame is sent to the
     // codec before we flush. Flushing (encoder->close sends a null frame) must
     // happen only after the last real frame.
@@ -916,10 +939,29 @@ void VideoEncoder::close()
     }
 #endif
 
-    if (encoder)
+    // Claim ownership so a later close() has nothing to drain.
+    std::unique_ptr<nelux::Encoder> enc;
+    enc.swap(encoder);
+
+    if (enc)
     {
-        encoder->close();
-        encoder.reset();
+        // enc->close() drains the codec (an x264/x265 close flushes the entire
+        // lookahead — tens of frames of real encode work), muxes those packets
+        // and writes the trailer, which for mp4 rewrites the moov box. None of
+        // it touches Python, so holding the GIL through it stalls every other
+        // thread for the whole flush. Guarded like stopEncodeWorkers() above,
+        // because this also runs from ~VideoEncoder, which can fire from a
+        // non-Python thread or during interpreter finalisation.
+        if (PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            enc->close();
+        }
+        else
+        {
+            enc->close();
+        }
+        enc.reset();
     }
 
 #ifdef NELUX_ENABLE_CUDA

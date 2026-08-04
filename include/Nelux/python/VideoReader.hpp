@@ -6,6 +6,7 @@
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <shared_mutex>
 
 
 namespace py = pybind11;
@@ -482,12 +483,24 @@ class VideoReader
     // Where the frame that was just decoded sits relative to the active range:
     // -1 before it (discard), 0 inside it (emit), 1 past it (segment finished).
     int classifyAgainstActiveRange() const;
-    // The CPU sync path (prefetch=False) uses a frame-threaded codec context;
-    // avcodec_flush_buffers on such a context trips an internal FFmpeg
-    // assertion, so it can only ever move forward by decoding.
+    // Every path can seek. The CPU sync path (prefetch=False) used to be
+    // excluded on the theory that avcodec_flush_buffers on a frame-threaded
+    // codec context trips FFmpeg's `fctx->async_lock` assertion — but the flush
+    // was never the problem. Decoder::seek/seekToNearestKeyframe stop the
+    // producer, flush on a quiesced context, and then unconditionally called
+    // startDecodingThread() again, putting the async producer back onto the
+    // same AVFormatContext/AVCodecContext that the sync consumer drives on the
+    // caller thread. Two threads on one context is what tripped the assertion.
+    // Those restarts are now guarded by !syncMode_ (matching initialize() and
+    // reconfigure()), so seeking is safe here and set_range no longer has to
+    // decode and discard every frame from zero.
     bool canSeekMidStream() const
     {
-        return !(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch);
+        // Seeking needs frame indices and frame timestamps to share an origin;
+        // on a container that starts at a non-zero timestamp they do not, and a
+        // seek lands somewhere other than the requested frame. Those fall back
+        // to decoding forward, exactly as this path always did.
+        return decoder && decoder->hasZeroBasedTimeline();
     }
     // Rewind the sync CPU path to the true first frame before a fresh
     // iteration. Since it cannot seek, a full decoder reconfigure is the only
@@ -503,6 +516,30 @@ class VideoReader
         return (properties.fps > 0.0) ? 1.0 / properties.fps : 0.0;
     }
     std::shared_ptr<nelux::Decoder> rand_decoder;
+
+    // Guards the decoder OWNERSHIP handoff, not decoding itself.
+    //
+    // close() used to be serialised for free: it ran entirely under the GIL, so
+    // a second Python thread calling close() (or __exit__, or read_frame)
+    // simply could not run until the first finished. Now that teardown releases
+    // the GIL, that exclusion has to be explicit — without it two threads both
+    // saw a non-null `decoder`, both called Decoder::close(), and both joined
+    // the same std::thread (reproducible: "no such process" every time).
+    //
+    // Readers take a shared lock and copy the shared_ptr before doing any long
+    // work with the GIL released; close() takes the unique lock, swaps the
+    // owners out, and only then does the actual teardown. So a second closer
+    // finds nullptr and returns, and a decode either runs to completion before
+    // teardown starts or observes nullptr and raises instead of dereferencing a
+    // freed decoder.
+    mutable std::shared_mutex lifecycleMu_;
+
+    // Timestamp of the last frame decodeFrameAt() returned from rand_decoder,
+    // or -1 when its position is unknown. Lets a forward request that is only a
+    // few frames ahead decode straight on instead of seeking back to the
+    // keyframe and re-decoding the whole GOP prefix. Reset whenever
+    // rand_decoder is destroyed or the file changes.
+    double randLastTs_ = -1.0;
 
     torch::Tensor makeLikeOutputTensor() const;
     /**

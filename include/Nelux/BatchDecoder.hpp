@@ -58,6 +58,10 @@ public:
      * @param stream_idx Video stream index
      * @param sws_ctx SwsContext for pixel format conversion (can be nullptr)
      * @param total_frames Total number of frames in the video
+     * @param position_valid True when nothing has moved fmt_ctx's read position
+     *        since the previous decode_batch call, so the remembered position
+     *        may be reused instead of seeking. The caller owns this decision
+     *        because fmt_ctx is shared with the streaming decode path.
      * @return torch::Tensor Output tensor of shape [B, H, W, C] where B = indices.size()
      * @throws std::runtime_error on decode failures or invalid indices
      */
@@ -67,7 +71,8 @@ public:
         AVCodecContext* codec_ctx,
         int stream_idx,
         SwsContext* sws_ctx,
-        int64_t total_frames);
+        int64_t total_frames,
+        bool position_valid = false);
 
 private:
     Config config_;
@@ -81,6 +86,14 @@ private:
     // packets until it is re-seeked (which flushes its buffers), so decode_batch
     // must force a seek before the next target.
     bool decoderDrained_ = false;
+
+    // Ordinal of the last frame this decoder left the (shared) demuxer and its
+    // batch codec context positioned on, or -1 when the position is unknown.
+    // Carried ACROSS calls: consecutive batches over adjacent index ranges — the
+    // ordinary dataloader pattern — otherwise re-seek to a keyframe and re-decode
+    // the whole GOP every call. Only honoured when the caller passes
+    // position_valid, since the demuxer is shared with the streaming path.
+    int64_t retainedFrame_ = -1;
 
     // Cached RGB24 scaling context + scratch buffer for copyFrameToOutput.
     // Building an SwsContext (scaling tables, SIMD init) and allocating the RGB
@@ -105,10 +118,10 @@ private:
     // scale into a differently sized buffer.
     int copySwsDstW_ = -1;
     int copySwsDstH_ = -1;
-    int copyDstW_ = -1;
-    int copyDstH_ = -1;
-    uint8_t* copyBuf_[4] = {nullptr, nullptr, nullptr, nullptr};
-    int copyBufLines_[4] = {0, 0, 0, 0};
+    // Trailing bytes reserved past the visible output so libswscale writing the
+    // final row of the final slice cannot run past the allocation. One AVX-512
+    // register is 64 bytes; double it and round up.
+    static constexpr int64_t SWS_DST_SLACK = 128;
 
     /**
      * @brief Seek to a specific frame index
