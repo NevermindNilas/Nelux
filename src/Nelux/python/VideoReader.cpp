@@ -1002,10 +1002,15 @@ bool VideoReader::seek(double timestamp)
         return false;
     }
 
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-    bool success = underReaderLock([&](nelux::Decoder& d) { return d.seekToNearestKeyframe(timestamp); });
+    bool success =
+        underReaderLock([&](nelux::Decoder& d) { return d.seekToNearestKeyframe(timestamp); });
+
+    // Mark the stream moved HERE, not after the decode loop below. That loop is
+    // skipped whenever current_timestamp already satisfies the target, and then
+    // nothing would record that the demuxer had been repositioned — a later
+    // iter() would skip its rewind and start mid-stream while reporting index 0.
+    streamTouched_ = true;
+
     if (!success)
     {
         NELUX_WARN("Seek to keyframe failed at timestamp {}", timestamp);
@@ -1474,13 +1479,12 @@ bool VideoReader::seekToFrame(int frame_number)
     }
     double seek_timestamp = frame_number / properties.fps;
 
-    // Seek to the closest keyframe first
-    std::shared_ptr<nelux::Decoder> seekDec = pinDecoder();
-    if (!seekDec)
-        throw std::runtime_error("VideoReader is closed");
+    // Seek to the closest keyframe first. underReaderLock does the closed-reader
+    // check itself, so no separate pin is needed.
     bool success =
         underReaderLock(
             [&](nelux::Decoder& d) { return d.seekToNearestKeyframe(seek_timestamp); });
+    streamTouched_ = true; // the stream moved; see VideoReader::seek
     if (!success)
     {
         NELUX_WARN("Seek to keyframe for frame {} failed", frame_number);
