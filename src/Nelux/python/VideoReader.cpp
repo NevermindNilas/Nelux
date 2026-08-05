@@ -834,35 +834,38 @@ py::tuple VideoReader::readFrameWithMotionVectors()
     requireMotionVectors();
     torch::Tensor frame = decodeFrame();
     py::list vectors;
-    // Pin rather than test-then-dereference the member: decodeFrame() above has
-    // already released the lock, so close() can null it between the check and
-    // the use.
+    // Read the vectors under the lock rather than off the member: decodeFrame()
+    // above has already released it, so close() can tear the decoder down
+    // between the two. An empty result covers both the closed reader and the
+    // no-frame case, so the loop below needs no further guard.
     std::vector<nelux::Decoder::MotionVector> mvs;
     if (frame.defined() && frame.numel() != 0)
+    {
         mvs = underReaderLockRead(
             [](nelux::Decoder* d)
             {
                 return d ? d->getLastMotionVectors()
                          : std::vector<nelux::Decoder::MotionVector>{};
             });
-    {
-        for (const auto& mv : mvs)
-        {
-            py::dict item;
-            item["source"] = mv.source;
-            item["w"] = static_cast<int>(mv.w);
-            item["h"] = static_cast<int>(mv.h);
-            item["src_x"] = mv.src_x;
-            item["src_y"] = mv.src_y;
-            item["dst_x"] = mv.dst_x;
-            item["dst_y"] = mv.dst_y;
-            item["flags"] = mv.flags;
-            item["motion_x"] = mv.motion_x;
-            item["motion_y"] = mv.motion_y;
-            item["motion_scale"] = static_cast<int>(mv.motion_scale);
-            vectors.append(item);
-        }
     }
+
+    for (const auto& mv : mvs)
+    {
+        py::dict item;
+        item["source"] = mv.source;
+        item["w"] = static_cast<int>(mv.w);
+        item["h"] = static_cast<int>(mv.h);
+        item["src_x"] = mv.src_x;
+        item["src_y"] = mv.src_y;
+        item["dst_x"] = mv.dst_x;
+        item["dst_y"] = mv.dst_y;
+        item["flags"] = mv.flags;
+        item["motion_x"] = mv.motion_x;
+        item["motion_y"] = mv.motion_y;
+        item["motion_scale"] = static_cast<int>(mv.motion_scale);
+        vectors.append(item);
+    }
+
     return py::make_tuple(tensorToOutput(frame), vectors);
 }
 
