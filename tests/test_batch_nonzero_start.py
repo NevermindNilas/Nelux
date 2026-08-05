@@ -204,6 +204,51 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
         with VideoReader(path) as r:
             return _hash(r.decode_batch([absent, index])[1])
 
+    def test_dropped_frame_fixture_really_has_an_absent_ordinal(
+            self, gappy_clips):
+        """Guard the guard.
+
+        Ordinal 42 is absent only because one source frame was dropped while
+        keeping the original timestamps, so the derived ordinal 42 has no
+        frame and a request for it must return ordinal 43 -- which is
+        sequential frame 42, everything after the gap having shifted down by
+        one. If a future ffmpeg re-timestamps instead of leaving a hole, the
+        premise dies and every test in this class passes vacuously.
+        """
+        path = gappy_clips["dropped_frame"]
+        sequential = _sequential_hashes(path)
+        with VideoReader(path) as r:
+            at_42 = _hash(r.decode_batch([42])[0])
+        assert at_42 != sequential[41], "ordinal 42 resolves to ordinal 41"
+        assert at_42 == sequential[42], (
+            "ordinal 42 is no longer absent; the dropped-frame fixture has "
+            "stopped exercising the absent-ordinal path"
+        )
+
+    def test_vfr_fixture_really_has_gaps(self, gappy_clips):
+        """Guard the guard.
+
+        This clip keeps every third frame at its original timestamps, so with
+        avg_frame_rate reported as 30 the derived ordinals are 0, 3, 6, ... and
+        most are absent. TS frame-rate detection is heuristic; if a future
+        ffmpeg reports the average as 10 instead -- arithmetically just as
+        defensible -- ordinals become dense, nothing is absent, and this whole
+        class stops testing what it says it does.
+        """
+        path = gappy_clips["vfr"]
+        sequential = _sequential_hashes(path)
+        with VideoReader(path) as r:
+            n = len(r)
+        # Consecutive ordinals must collide, because they resolve to the same
+        # surviving frame. Dense ordinals would make every one distinct.
+        with VideoReader(path) as r:
+            batch = r.decode_batch([100, 101])
+        assert _hash(batch[0]) == _hash(batch[1]), (
+            "consecutive ordinals resolve to different frames; the vfr fixture "
+            "no longer has absent ordinals"
+        )
+        assert n < len(sequential) * 2, "unexpected frame-count/ordinal mapping"
+
     @pytest.mark.parametrize("index", [43, 200, 600, 900])
     def test_absent_ordinal_first_does_not_change_a_later_index(
             self, gappy_clips, index):
@@ -222,31 +267,52 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
         with VideoReader(path) as r:
             n = len(r)
         probes = [i for i in (100, 300, 600) if i < n]
+        assert len(probes) == 3, (
+            f"clip has only {n} frames; the probe indices no longer fit and "
+            f"this test would assert nothing"
+        )
         alone = [self._one(path, i) for i in probes]
         with VideoReader(path) as r:
             batch = r.decode_batch([1] + probes)
         together = [_hash(batch[k + 1]) for k in range(len(probes))]
         assert together == alone
 
-    def test_batch_cost_does_not_scale_with_index_count(self, gappy_clips):
-        """Bound the recovery's cost, which is the reason it is conditional.
+    def test_clustered_targets_agree_with_individual_requests(self, gappy_clips):
+        """Adjacent indices over a stream whose ordinals are mostly absent.
 
-        Recovering by rescanning from frame 0 for every target is O(K*N) in the
-        index count. Comparing two batches with the same spread over the same
-        clip and only the index count differing makes machine speed cancel out,
-        which an absolute time budget cannot do on a shared box:
-
-          - rescan per target: work scales with K, measured 4.46x for 4 -> 32
-          - single forward pass: both batches cost about one pass, measured 1.16x
-
-        The threshold sits between the two with room on both sides.
+        Every target after the first lands on `target <= current_frame`, which
+        is the path that reuses the frame already decoded instead of seeking.
+        That reuse is on the answer path, not just the cost path, so it is
+        checked against the same index requested on its own.
         """
         path = gappy_clips["vfr"]
         with VideoReader(path) as r:
             n = len(r)
+        indices = list(range(600, 640))
+        assert indices[-1] < n
+        with VideoReader(path) as r:
+            batch = r.decode_batch(indices)
+        got = [_hash(batch[k]) for k in range(batch.shape[0])]
+        assert got == [self._one(path, i) for i in indices]
 
-        def cost(k):
-            indices = [i * (n // k) for i in range(k)]
+    def test_clustered_batch_cost_does_not_scale_with_index_count(
+            self, gappy_clips):
+        """Bound the recovery's cost, which is the reason it is conditional.
+
+        Every target of a clustered batch on a gappy stream lands behind the
+        frame already in hand. Re-seeking and rescanning from frame 0 for each
+        of them is O(K*N); reusing the decoded frame is O(1) after the first.
+
+        Comparing two batches over the same clip with the same span, differing
+        only in how many indices fill that span, makes machine speed cancel out
+        — which an absolute time budget cannot do on a shared box. Measured on
+        this fixture: 33x before reuse, 1.0x after.
+        """
+        path = gappy_clips["vfr"]
+        with VideoReader(path) as r:
+            assert len(r) > 700
+
+        def cost(indices):
             best = float("inf")
             for _ in range(3):  # best-of-3, so a scheduling hiccup cannot fail it
                 t0 = time.perf_counter()
@@ -255,9 +321,43 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
                 best = min(best, time.perf_counter() - t0)
             return best
 
-        few, many = cost(4), cost(32)
-        assert many < few * 2.5, (
-            f"32 indices cost {many:.4f}s against {few:.4f}s for 4 "
+        # Same span (600..699), 4 indices versus 100.
+        few = cost(list(range(600, 700, 25)))
+        many = cost(list(range(600, 700)))
+        assert many < few * 3.0, (
+            f"100 clustered indices cost {many:.4f}s against {few:.4f}s for 4 "
+            f"over the same span ({many / few:.2f}x) -- cost is scaling with "
+            f"the index count, so targets behind the decoded frame are being "
+            f"re-sought instead of reusing it"
+        )
+
+    def test_spread_batch_cost_does_not_scale_with_index_count(self, gappy_clips):
+        """The same bound for spread targets, which take the seek path.
+
+        Both index counts are chosen so their spacing exceeds the decoder's
+        sequential-decode threshold, so both genuinely exercise seeking rather
+        than one of them quietly decoding straight through.
+        """
+        path = gappy_clips["vfr"]
+        with VideoReader(path) as r:
+            n = len(r)
+        # 900 frames: steps of 225 and 45, both well above the 30-frame
+        # threshold below which the decoder never seeks at all.
+        assert n // 20 > 30, f"clip too short ({n}) for both batches to seek"
+
+        def cost(k):
+            indices = [i * (n // k) for i in range(k)]
+            best = float("inf")
+            for _ in range(3):
+                t0 = time.perf_counter()
+                with VideoReader(path) as r:
+                    r.decode_batch(indices)
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        few, many = cost(4), cost(20)
+        assert many < few * 3.0, (
+            f"20 spread indices cost {many:.4f}s against {few:.4f}s for 4 "
             f"({many / few:.2f}x) -- cost is scaling with the index count, so "
             f"the overshoot recovery is rescanning from the stream start once "
             f"per index"

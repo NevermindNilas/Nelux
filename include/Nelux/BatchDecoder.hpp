@@ -128,24 +128,45 @@ private:
     // 0, which makes the arithmetic bit-for-bit what it was before the origin
     // existed. Resolved once per file (Decoder::reconfigure drops the whole
     // BatchDecoder) by resolvePtsOrigin().
+    //
+    // Known limit: this assumes one monotonically increasing timeline. A
+    // concatenated MPEG-TS with a PTS discontinuity, or one running long enough
+    // to wrap the 33-bit PCR, has several, and every ordinal after the break is
+    // computed against the wrong origin. Ordinals were equally wrong there
+    // before origins existed, so this is not a regression, but nothing here
+    // detects it either.
     int64_t ptsOrigin_ = 0;
     bool ptsOriginResolved_ = false;
 
-    // Set once a rewind-and-scan has been needed, i.e. this stream's seeks land
-    // somewhere a forward scan improves on. From then on the optional
-    // gap-based seek is skipped and later targets are reached by decoding
-    // forward. Purely a cost decision: ordinals are monotonic in output order
-    // and both routes stop at the first ordinal >= target, so scanning forward
-    // returns exactly the frame a seek-then-rescan would, starting closer.
-    // Mandatory seeks (backwards, drained decoder, unknown position) are
-    // unaffected.
+    // Set once a rewind-and-scan has beaten a genuine mid-file seek, i.e. this
+    // stream's seeks land somewhere a forward scan improves on. From then on
+    // the optional gap-based seek is skipped for gaps up to
+    // FORWARD_SCAN_MAX_GAP and those targets are reached by decoding forward.
+    // Purely a cost decision: ordinals are monotonic in output order and both
+    // routes stop at the first ordinal >= target, so scanning forward returns
+    // exactly the frame a seek-then-rescan would, starting closer. Mandatory
+    // seeks (backwards, drained decoder, unknown position) are unaffected.
     bool forwardScanPreferred_ = false;
 
-    // Upper bound on packets resolvePtsOrigin() will demux looking for the first
-    // timestamped frame. The answer normally arrives in the first packet or two;
-    // this only stops a stream that declares a non-zero start_time and then
-    // carries no frame PTS at all from being decoded end to end.
+    // How far forwardScanPreferred_ is willing to scan rather than seek. The
+    // preference is inferred from one stream's behaviour, so it can be wrong;
+    // this bounds what being wrong costs. Without it, a reader that touched a
+    // low index and then jumped to the far end of a long file would walk every
+    // frame in between. Chosen so that scanning is plausibly competitive with a
+    // seek plus a one-GOP overshoot recovery, and so that being wrong costs a
+    // bounded constant rather than the length of the file.
+    static constexpr int64_t FORWARD_SCAN_MAX_GAP = 512;
+
+    // Upper bound on video packets resolvePtsOrigin() will demux looking for the
+    // first timestamped frame. The answer normally arrives in the first packet
+    // or two; this only stops a stream that declares a non-zero start_time and
+    // then carries no frame PTS at all from being decoded end to end.
     static constexpr int64_t PROBE_PACKET_LIMIT = 1024;
+
+    // Companion bound for a file that declares a non-zero start_time and then
+    // has no packets on the video stream at all, where the video budget above
+    // would never be reached and the probe would demux to EOF.
+    static constexpr int64_t PROBE_TOTAL_PACKET_LIMIT = 65536;
 
     /**
      * @brief Establish ptsOrigin_ for this stream, once.

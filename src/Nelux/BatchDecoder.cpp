@@ -81,22 +81,37 @@ bool BatchDecoder::rewindToStreamStart(
     // below therefore falls back to start_time rather than saturating to it.
     AVStream* stream = fmt_ctx->streams[stream_idx];
     const bool haveStart = stream->start_time != AV_NOPTS_VALUE;
+    // A degenerate time_base would make the margin 0, which would silently turn
+    // attempt 1 into the exact start_time this is trying not to use. One tick
+    // is a poor margin but it is still strictly below the start, which is the
+    // property that matters.
     const int64_t margin = (stream->time_base.num > 0 && stream->time_base.den > 0)
-                               ? av_rescale_q(1, AVRational{1, 1}, stream->time_base)
-                               : 0;
+                               ? std::max<int64_t>(
+                                     av_rescale_q(1, AVRational{1, 1},
+                                                  stream->time_base), 1)
+                               : 1;
     const int64_t floor_ts =
         haveStart ? ((stream->start_time < INT64_MIN + margin)
                          ? stream->start_time
                          : stream->start_time - margin)
                   : 0;
 
-    // Ordered safest first. start_time is deliberately last: it is the value
-    // measured above to land past the opening keyframe, so it is a fallback of
-    // last resort rather than the natural second guess. Duplicates are skipped
-    // so a failure is not retried with an identical argument.
-    const int64_t attempts[] = {floor_ts, 0, haveStart ? stream->start_time : 0};
+    // Ordered nearest-below-the-start first, then progressively blunter.
+    // start_time is deliberately last: it is the value measured above to land
+    // past the opening keyframe, so it is a fallback of last resort rather than
+    // the natural second guess. For a negative start_time, 0 is *further* above
+    // the stream start than start_time is, so it is the worse of the two —
+    // hence the ordering flips. Duplicates are skipped so a failure is never
+    // retried with an identical argument.
+    const int64_t fallbackA = haveStart && stream->start_time < 0
+                                  ? stream->start_time
+                                  : 0;
+    const int64_t fallbackB = haveStart && stream->start_time < 0
+                                  ? 0
+                                  : (haveStart ? stream->start_time : 0);
+    const int64_t attempts[] = {floor_ts, fallbackA, fallbackB};
     int ret = -1;
-    for (size_t i = 0; i < 3 && ret < 0; ++i) {
+    for (size_t i = 0; i < std::size(attempts) && ret < 0; ++i) {
         bool duplicate = false;
         for (size_t j = 0; j < i; ++j)
             duplicate = duplicate || attempts[j] == attempts[i];
@@ -161,15 +176,21 @@ bool BatchDecoder::resolvePtsOrigin(
     // PTS at all would otherwise demux and decode the entire file before falling
     // back to origin 0. A few GOPs is far more than the answer can legitimately
     // take, and giving up early only costs the fallback we would reach anyway.
+    // Two bounds, because they fail differently. The video-packet budget is the
+    // real one: it says how much of the video stream may be decoded looking for
+    // a timestamp. Counting every packet against it instead would let a file
+    // with many audio or data streams exhaust the budget on packets that could
+    // never produce a frame. But a video budget alone is no bound at all on a
+    // file that declares a non-zero start_time and then carries no video
+    // packets, so total packets are capped too, generously.
     bool found = false;
     int64_t videoPacketsRead = 0;
+    int64_t packetsRead = 0;
     while (!found && videoPacketsRead < PROBE_PACKET_LIMIT &&
+           packetsRead < PROBE_TOTAL_PACKET_LIMIT &&
            av_read_frame(fmt_ctx, pkt) >= 0) {
+        ++packetsRead;
         if (pkt->stream_index == stream_idx) {
-            // Counted here, not per packet read: the limit is meant to bound
-            // how much of the *video* stream is decoded, and a file with many
-            // audio or data streams would otherwise exhaust it on packets that
-            // were never going to produce a frame.
             ++videoPacketsRead;
             int ret = avcodec_send_packet(codec_ctx, pkt);
             if (ret >= 0 || ret == AVERROR(EAGAIN)) {
@@ -527,9 +548,39 @@ torch::Tensor BatchDecoder::decode_batch(
         throw std::runtime_error("Failed to allocate AVFrame");
     }
 
+    // True once this call has decoded a frame, which is what licenses the reuse
+    // below: it means current_frame was produced by scanning from the previous
+    // target of THIS call, not carried in from a previous one.
+    bool haveDecodedFrame = false;
+
     try {
         for (int64_t target_frame : sorted_frames) {
             NELUX_TRACE("Processing target frame {}, current={}", target_frame, current_frame);
+
+            // The frame already in hand is frequently the answer, and on a
+            // stream with skipped ordinals it is the answer often enough that
+            // not noticing was the dominant cost.
+            //
+            // current_frame is the first ordinal >= the previous target of this
+            // call. sorted_frames is strictly ascending, so
+            //     previous target < target_frame <= current_frame,
+            // and no ordinal lies between the previous target and current_frame
+            // (that is what "first ordinal >=" means). Every ordinal below
+            // current_frame is therefore below the previous target, hence below
+            // target_frame — so current_frame is also the first ordinal >=
+            // target_frame. The frame in hand is exactly what a seek and rescan
+            // would spend a pass over the file to re-derive.
+            //
+            // Restricted to targets after the first of the call. current_frame
+            // carried over from a PREVIOUS call says nothing about the ordinals
+            // between it and a new lower target, so that case must still seek.
+            if (haveDecodedFrame && target_frame <= current_frame) {
+                NELUX_TRACE("Target {} already satisfied by frame {} in hand",
+                            target_frame, current_frame);
+                copyFrameToOutput(frame, output, position_map[target_frame],
+                                  sws_ctx);
+                continue;
+            }
 
             // Decide if we need to seek.
             //
@@ -539,20 +590,21 @@ torch::Tensor BatchDecoder::decode_batch(
             // at least one frame. Asking again for the frame we are sitting on
             // therefore has to re-seek — decoding forward would hand back
             // target+1 and shift every later target in the batch with it.
-            // Within one call `sorted_frames` is strictly ascending so this can
-            // only fire on the first target, i.e. on a position carried over
-            // from the previous call.
+            // Reachable only on the first target of the call now, since the
+            // reuse above absorbs the rest.
             //
             // The gap test is only an optimisation — decoding forward would
-            // reach the target either way — so it is dropped once this stream
-            // has shown that its seeks land badly (see forwardScanPreferred_).
-            // The other three conditions are not optional: there is no forward
-            // path to a target behind us, or through a drained decoder, or from
-            // an unknown position.
+            // reach the target either way — so it is skipped for gaps this
+            // stream has shown it can scan more cheaply than it can seek (see
+            // forwardScanPreferred_). The other three conditions are not
+            // optional: there is no forward path to a target behind us, or
+            // through a drained decoder, or from an unknown position.
+            const int64_t gap = target_frame - current_frame;
             const bool mustSeek = need_seek || decoderDrained_ ||
                                   target_frame <= current_frame;
-            const bool gapSeek = !forwardScanPreferred_ &&
-                                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD;
+            const bool preferScan =
+                forwardScanPreferred_ && gap <= FORWARD_SCAN_MAX_GAP;
+            const bool gapSeek = !preferScan && gap > SEQUENTIAL_THRESHOLD;
             bool seeked = false;
             if (mustSeek || gapSeek) {
                 seekToFrame(fmt_ctx, codec_ctx, stream_idx, target_frame, fps);
@@ -591,25 +643,38 @@ torch::Tensor BatchDecoder::decode_batch(
                 NELUX_DEBUG("Seek landed on frame {} for target {}; rescanning "
                             "from the stream start",
                             current_frame, target_frame);
-                rewindToStreamStart(fmt_ctx, codec_ctx, stream_idx);
+                // A failed rewind leaves the demuxer wherever the bad seek put
+                // it. Scanning forward from there would quietly return a frame
+                // later than the target — the exact failure this branch exists
+                // to prevent — so refuse rather than guess.
+                if (!rewindToStreamStart(fmt_ctx, codec_ctx, stream_idx))
+                    throw std::runtime_error(
+                        "Failed to rewind to the stream start while recovering "
+                        "frame " + std::to_string(target_frame));
                 current_frame = -1;
                 reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
                                            target_frame, current_frame, frame);
 
-                // A rescan is proof that seeking is worse than scanning on this
-                // stream, so stop taking the optional gap-based seek from here
-                // on and decode forward to later targets instead.
+                // A rescan that beat a genuine mid-file seek is evidence that
+                // scanning is the cheaper route on this stream, so stop taking
+                // the optional gap-based seek for comparable gaps.
                 //
-                // This is a pure cost decision, not a correctness one, which is
-                // what makes it safe to keep for the life of the file. Ordinals
-                // are monotonic in output order, and both routes stop at the
-                // first ordinal >= target, so scanning forward from wherever we
-                // are returns exactly the frame a fresh rewind-and-scan would —
-                // it just starts closer and does strictly less work. Rescans
-                // then stop recurring on ascending targets because there is no
-                // seek left to overshoot, which is what bounds the whole batch
-                // to one pass over the file rather than one pass per index.
-                if (reached)
+                // "Genuine mid-file" is the load-bearing part. A seek to the
+                // very start of the file is a different animal: seekToFrame
+                // targets ptsOrigin_ itself, which on MPEG-TS is a byte-search
+                // boundary that lands a GOP late almost by construction (see
+                // rewindToStreamStart). Letting that one seek speak for the
+                // whole file would generalise the least representative sample
+                // there is, and any batch touching a low index would take it.
+                //
+                // The preference is a pure cost decision, never a correctness
+                // one: ordinals are monotonic in output order and both routes
+                // stop at the first ordinal >= target, so scanning forward
+                // returns exactly the frame a seek-and-rescan would. It is
+                // additionally capped by distance (FORWARD_SCAN_MAX_GAP) so
+                // that even a preference set in error cannot turn one far jump
+                // into a walk over the whole file.
+                if (reached && target_frame > SEQUENTIAL_THRESHOLD)
                     forwardScanPreferred_ = true;
             }
 
@@ -621,8 +686,13 @@ torch::Tensor BatchDecoder::decode_batch(
             // Copy frame to all requesting positions
             const std::vector<size_t>& positions = position_map[target_frame];
             copyFrameToOutput(frame, output, positions, sws_ctx);
-            
-            av_frame_unref(frame);
+            haveDecodedFrame = true;
+
+            // Deliberately not unref'd here: the next target may be satisfied
+            // by this very frame (see the reuse at the top of the loop), so its
+            // buffer has to outlive the iteration. avcodec_receive_frame unrefs
+            // its destination before filling it, so decoding the next frame
+            // still releases this one; av_frame_free below covers the rest.
         }
     } catch (...) {
         av_frame_free(&frame);
