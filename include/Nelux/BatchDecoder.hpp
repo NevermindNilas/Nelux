@@ -120,6 +120,96 @@ private:
     // register is 64 bytes; double it and round up.
     static constexpr int64_t SWS_DST_SLACK = 128;
 
+    // PTS of the stream's first presented frame, i.e. the timestamp that frame
+    // ordinal 0 sits at. Every ordinal in this class is (pts - ptsOrigin_)
+    // converted to seconds and multiplied by fps, and every seek target is
+    // ptsOrigin_ plus the same conversion run backwards. Containers whose
+    // timeline starts at zero -- the overwhelming majority -- keep an origin of
+    // 0, which makes the arithmetic bit-for-bit what it was before the origin
+    // existed. Resolved once per file (Decoder::reconfigure drops the whole
+    // BatchDecoder) by resolvePtsOrigin().
+    //
+    // Known limit: this assumes one monotonically increasing timeline. A
+    // concatenated MPEG-TS with a PTS discontinuity, or one running long enough
+    // to wrap the 33-bit PCR, has several, and every ordinal after the break is
+    // computed against the wrong origin. Ordinals were equally wrong there
+    // before origins existed, so this is not a regression, but nothing here
+    // detects it either.
+    int64_t ptsOrigin_ = 0;
+    bool ptsOriginResolved_ = false;
+
+    // Set once a rewind-and-scan has beaten a genuine mid-file seek, i.e. this
+    // stream's seeks land somewhere a forward scan improves on. From then on
+    // the optional gap-based seek is skipped for gaps up to
+    // FORWARD_SCAN_MAX_GAP and those targets are reached by decoding forward.
+    // Purely a cost decision: ordinals are monotonic in output order and both
+    // routes stop at the first ordinal >= target, so scanning forward returns
+    // exactly the frame a seek-then-rescan would, starting closer. Mandatory
+    // seeks (backwards, drained decoder, unknown position) are unaffected.
+    bool forwardScanPreferred_ = false;
+
+    // How far forwardScanPreferred_ is willing to scan rather than seek.
+    //
+    // Worth being honest about what this does and does not buy. It only applies
+    // once the preference is set, i.e. on a stream where a mid-file seek has
+    // already overshot and a scan from ordinal 0 was the repair. On such a
+    // stream a far seek will most likely overshoot again and be repaired the
+    // same way, which costs target_frame frames — no cheaper than scanning the
+    // gap, and usually dearer. So for the population this actually governs, the
+    // capped branch is not expected to win; the 9000-frame MPEG-TS measured
+    // during review behaved exactly that way, seeking and rescanning the whole
+    // file either way.
+    //
+    // It is kept as a bound on being wrong, not as an optimisation: the
+    // preference is inferred from one seek's behaviour, and if that inference
+    // is bad on a stream whose far seeks are in fact fine, this stops one long
+    // jump from walking the entire file. Nothing currently exercises the
+    // boundary — the widest gap under test is 225.
+    static constexpr int64_t FORWARD_SCAN_MAX_GAP = 512;
+
+    // Upper bound on video packets resolvePtsOrigin() will demux looking for the
+    // first timestamped frame. The answer normally arrives in the first packet
+    // or two; this only stops a stream that declares a non-zero start_time and
+    // then carries no frame PTS at all from being decoded end to end.
+    static constexpr int64_t PROBE_PACKET_LIMIT = 1024;
+
+    // Companion bound for a file that declares a non-zero start_time and then
+    // has no packets on the video stream at all, where the video budget above
+    // would never be reached and the probe would demux to EOF.
+    static constexpr int64_t PROBE_TOTAL_PACKET_LIMIT = 65536;
+
+    /**
+     * @brief Establish ptsOrigin_ for this stream, once.
+     *
+     * Cheap and behaviour-preserving for zero-based containers; for everything
+     * else it decodes the stream's first frame to read the origin off it rather
+     * than trusting the container's advertised start_time.
+     *
+     * @return true if it actually probed, i.e. left the demuxer and codec
+     *         context moved, so the caller must not reuse a retained position.
+     */
+    bool resolvePtsOrigin(
+        AVFormatContext* fmt_ctx,
+        AVCodecContext* codec_ctx,
+        int stream_idx);
+
+    /**
+     * @brief Put the demuxer and codec context back at the stream's first frame.
+     * @return false if every seek attempt failed.
+     */
+    bool rewindToStreamStart(
+        AVFormatContext* fmt_ctx,
+        AVCodecContext* codec_ctx,
+        int stream_idx);
+
+    /**
+     * @brief Frame ordinal for a decoded frame's PTS, relative to ptsOrigin_.
+     */
+    int64_t frameOrdinalFromPts(
+        int64_t pts,
+        const AVStream* stream,
+        double fps) const;
+
     /**
      * @brief Seek to a specific frame index
      * @param fmt_ctx Format context
