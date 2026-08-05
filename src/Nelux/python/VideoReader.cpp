@@ -2006,7 +2006,12 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
     // own counters are serialised by the GIL, not by lifecycleMu_ — iter() and
     // next() read them holding nothing else. Writing this one with the GIL
     // dropped would be the single site that mixes the two disciplines.
-    streamTouched_ = true;
+    //
+    // An empty batch is exempt: both decode_batch overrides return before they
+    // touch the demuxer, so the stream really has not moved and a rewind would
+    // be pure waste — a full reconfigure on NVDEC.
+    if (!indices.empty())
+        streamTouched_ = true;
 
     torch::Tensor batch;
     {

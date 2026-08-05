@@ -2241,6 +2241,25 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("decode_batch called with {} indices", indices.size());
 
+    // An empty batch has nothing to decode, so it must not disturb anything
+    // either: return before the producer is stopped, the queue is cleared, the
+    // batch contexts are built and sharedStreamDirty_ is consumed. Otherwise
+    // decode_batch({}) silently drops the frames the producer had already
+    // buffered and leaves the demuxer ahead of them, which is a real move of
+    // the stream and forces the reader to rewind. The CUDA override has always
+    // returned here; this makes the software path agree. Shape, dtype and
+    // device match what BatchDecoder returns for a non-empty batch.
+    if (indices.empty())
+    {
+        return torch::empty(
+            {0, properties.height, properties.width, outChannels_},
+            torch::TensorOptions()
+                .dtype(force_8bit ? torch::kUInt8
+                                  : (properties.bitDepth <= 8 ? torch::kUInt8
+                                                              : torch::kUInt16))
+                .device(torch::kCPU));
+    }
+
     // The batch path shares formatCtx with the producer thread. Concurrent
     // av_read_frame on the same context is unsafe; stop the producer (and
     // its convert workers under fan-out) so the batch decoder owns the file
