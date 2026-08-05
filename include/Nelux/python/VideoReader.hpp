@@ -537,6 +537,33 @@ class VideoReader
     //
     // Wrap ONLY the FFmpeg call. The lock is not recursive, so a region that
     // also runs decodeFrame() (every discard loop does) would deadlock.
+    // Read-only counterpart of underReaderLock. Takes a SHARED lock — concurrent
+    // readers do not disturb each other, and the exclusive holders (the decode
+    // entry points, close(), and every underReaderLock mutation) are excluded,
+    // which is the whole point: queries like getBitDepth()/get_frame_count()/
+    // isPrefetching() read the decoder's AVFormatContext or its producer thread,
+    // and a pinned shared_ptr does not protect either from a concurrent close()
+    // or a prefetch restart.
+    //
+    // The callback gets a possibly-null Decoder* so each caller decides what a
+    // closed reader means — the plain getters return a default, the rest throw.
+    template <class Fn>
+    auto underReaderLockRead(Fn&& fn) const
+        -> decltype(fn(std::declval<nelux::Decoder*>()))
+    {
+        auto run = [&]() -> decltype(fn(std::declval<nelux::Decoder*>()))
+        {
+            std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+            return fn(decoder.get());
+        };
+        if (PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            return run();
+        }
+        return run();
+    }
+
     // The callback receives the LIVE decoder, read from the member under the
     // lock — never a pointer the caller pinned beforehand. A pre-lock pin keeps
     // the object alive but says nothing about whether it is still open: close()

@@ -837,10 +837,16 @@ py::tuple VideoReader::readFrameWithMotionVectors()
     // Pin rather than test-then-dereference the member: decodeFrame() above has
     // already released the lock, so close() can null it between the check and
     // the use.
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (frame.defined() && frame.numel() != 0 && dec)
+    std::vector<nelux::Decoder::MotionVector> mvs;
+    if (frame.defined() && frame.numel() != 0)
+        mvs = underReaderLockRead(
+            [](nelux::Decoder* d)
+            {
+                return d ? d->getLastMotionVectors()
+                         : std::vector<nelux::Decoder::MotionVector>{};
+            });
     {
-        for (const auto& mv : dec->getLastMotionVectors())
+        for (const auto& mv : mvs)
         {
             py::dict item;
             item["source"] = mv.source;
@@ -862,10 +868,8 @@ py::tuple VideoReader::readFrameWithMotionVectors()
 
 std::string VideoReader::getFrameType() const
 {
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        return "";
-    char t = dec->getLastFrameType();
+    char t = underReaderLockRead([](nelux::Decoder* d)
+                                 { return d ? d->getLastFrameType() : '?'; });
     return t == '?' ? "" : std::string(1, t);
 }
 
@@ -1018,10 +1022,13 @@ bool VideoReader::seek(double timestamp)
 std::vector<std::string> VideoReader::supportedCodecs()
 {
     NELUX_TRACE("supportedCodecs() called");
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-    std::vector<std::string> codecs = dec->listSupportedDecoders();
+    std::vector<std::string> codecs = underReaderLockRead(
+        [](nelux::Decoder* d) -> std::vector<std::string>
+        {
+            if (!d)
+                throw std::runtime_error("VideoReader is closed");
+            return d->listSupportedDecoders();
+        });
     NELUX_INFO("Number of supported decoders: {}", codecs.size());
     for (const auto& codec : codecs)
     {
@@ -1832,10 +1839,15 @@ torch::ScalarType VideoReader::findTypeFromBitDepth()
                     force_8bit);
         return torch::kUInt8;
     }
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-    int bit_depth = dec->getBitDepth();
+    // getBitDepth() dereferences formatCtx/streams, so it is read under the
+    // lock rather than through a pin.
+    int bit_depth = underReaderLockRead(
+        [](nelux::Decoder* d) -> int
+        {
+            if (!d)
+                throw std::runtime_error("VideoReader is closed");
+            return d->getBitDepth();
+        });
     NELUX_INFO("Bit depth of video: {}", bit_depth);
     torch::ScalarType torchDataType;
     switch (bit_depth)
@@ -1896,10 +1908,15 @@ std::string VideoReader::getPixelFormat() const
 
 int64_t VideoReader::getFrameCount() const
 {
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-    return dec->get_frame_count();
+    // Locked, not pinned: get_frame_count() walks formatCtx/streams, which a
+    // concurrent close()/reconfigure() can reset.
+    return underReaderLockRead(
+        [](nelux::Decoder* d) -> int64_t
+        {
+            if (!d)
+                throw std::runtime_error("VideoReader is closed");
+            return d->get_frame_count();
+        });
 }
 
 torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
@@ -1928,8 +1945,6 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
     // Without this, iter() saw streamTouched_ == false, skipped the rewind, and
     // a following `for frame in reader` started from wherever the batch left
     // the stream while reporting index 0.
-    streamTouched_ = true;
-
     torch::Tensor batch;
     {
         // EXCLUSIVE, not shared. decode_batch drives the shared AVFormatContext
@@ -1945,6 +1960,11 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
         std::shared_ptr<nelux::Decoder> dec = decoder;
         if (!dec)
             throw std::runtime_error("VideoReader is closed");
+
+        // Under the lock and BEFORE the decode, so it is synchronised with the
+        // other operations on this reader and is still set on the paths that
+        // throw part way through.
+        streamTouched_ = true;
 
         batch = dec->decode_batch(indices);
     }
@@ -2007,20 +2027,22 @@ void VideoReader::stopPrefetch()
 
 size_t VideoReader::getPrefetchBufferedCount() const
 {
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    return dec ? dec->getPrefetchBufferedCount() : 0;
+    // Locked: these read producer-thread state that start/stop_prefetch mutates
+    // (isPrefetching inspects decodingThread.joinable(), which races a join).
+    return underReaderLockRead([](nelux::Decoder* d) -> size_t
+                               { return d ? d->getPrefetchBufferedCount() : 0; });
 }
 
 bool VideoReader::isPrefetching() const
 {
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    return dec ? dec->isPrefetching() : false;
+    return underReaderLockRead([](nelux::Decoder* d)
+                               { return d ? d->isPrefetching() : false; });
 }
 
 size_t VideoReader::getPrefetchSize() const
 {
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    return dec ? dec->getPrefetchSize() : 0;
+    return underReaderLockRead([](nelux::Decoder* d) -> size_t
+                               { return d ? d->getPrefetchSize() : 0; });
 }
 
 // ----------------------------------
