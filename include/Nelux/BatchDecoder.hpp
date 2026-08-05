@@ -131,6 +131,20 @@ private:
     int64_t ptsOrigin_ = 0;
     bool ptsOriginResolved_ = false;
 
+    // Set once a rewind-and-scan has failed to improve on what a seek produced,
+    // which means the requested ordinal is absent from the stream rather than
+    // merely hidden behind an inaccurate seek. That is a property of the stream
+    // (VFR, dropped capture timestamps, an avg_frame_rate that does not map 1:1
+    // onto PTS spacing), so once it is observed the recovery is abandoned for
+    // this file instead of being re-attempted, and paid for, on every target.
+    bool rescanIneffective_ = false;
+
+    // Upper bound on packets resolvePtsOrigin() will demux looking for the first
+    // timestamped frame. The answer normally arrives in the first packet or two;
+    // this only stops a stream that declares a non-zero start_time and then
+    // carries no frame PTS at all from being decoded end to end.
+    static constexpr int64_t PROBE_PACKET_LIMIT = 1024;
+
     /**
      * @brief Establish ptsOrigin_ for this stream, once.
      *

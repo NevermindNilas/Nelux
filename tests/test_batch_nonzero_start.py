@@ -74,6 +74,13 @@ def clips(tmp_path_factory):
     }
 
 
+def _zero_based_clip():
+    path = os.path.join(os.path.dirname(__file__), "data", "test_1080p.mp4")
+    if not os.path.exists(path):
+        pytest.skip("tests/data/test_1080p.mp4 not present")
+    return path
+
+
 def _index_patterns(n):
     return {
         "dense": list(range(min(12, n))),
@@ -107,6 +114,22 @@ class TestNonZeroStartTimeline:
         "clip",
         ["offset_mp4", "offset_mp4_bframes", "ts", "offset_ts", "offset_mkv"],
     )
+    def test_fixture_really_has_a_nonzero_start(self, clips, clip):
+        """Guard the guard.
+
+        Every test below is only meaningful if its clip's timeline actually
+        starts somewhere other than zero. If a muxer ever stops writing the
+        offset, these clips would quietly become zero-based and exercise the
+        untouched path while still passing, so assert the premise directly.
+        """
+        with VideoReader(clips[clip]) as r:
+            start = r.get_properties()["start_time"]
+        assert start > 0, f"{clip} reports start_time={start}, no longer a fixture"
+
+    @pytest.mark.parametrize(
+        "clip",
+        ["offset_mp4", "offset_mp4_bframes", "ts", "offset_ts", "offset_mkv"],
+    )
     def test_batch_matches_sequential(self, clips, clip):
         _check(clips[clip])
 
@@ -125,7 +148,56 @@ class TestNonZeroStartTimeline:
 class TestZeroBasedControl:
 
     def test_zero_based_clip_unaffected(self):
-        path = os.path.join(os.path.dirname(__file__), "data", "test_1080p.mp4")
-        if not os.path.exists(path):
-            pytest.skip("tests/data/test_1080p.mp4 not present")
-        _check(path)
+        _check(_zero_based_clip())
+
+
+class TestReconfigureAcrossTimelines:
+    """A reader carried from one timeline to another must not keep the old origin.
+
+    Correct by construction -- reconfigure() destroys the whole BatchDecoder, so
+    the resolved origin goes with it -- but a stale origin is precisely the shape
+    of silent wrong-frame corruption this file exists to catch, so pin it.
+    """
+
+    def _batch_hashes(self, reader, indices):
+        batch = reader.decode_batch(indices)
+        return [_hash(batch[k]) for k in range(batch.shape[0])]
+
+    def test_nonzero_origin_then_zero_based(self, clips):
+        offset, zero = clips["offset_ts"], _zero_based_clip()
+        offset_expected = _sequential_hashes(offset)
+        zero_expected = _sequential_hashes(zero)
+
+        with VideoReader(offset) as r:
+            indices = [0, 7, 30]
+            assert self._batch_hashes(r, indices) == [offset_expected[i] for i in indices]
+
+            r.reconfigure(zero)
+            assert self._batch_hashes(r, indices) == [zero_expected[i] for i in indices]
+
+    def test_zero_based_then_nonzero_origin(self, clips):
+        offset, zero = clips["offset_ts"], _zero_based_clip()
+        offset_expected = _sequential_hashes(offset)
+        zero_expected = _sequential_hashes(zero)
+
+        with VideoReader(zero) as r:
+            indices = [0, 7, 30]
+            assert self._batch_hashes(r, indices) == [zero_expected[i] for i in indices]
+
+            r.reconfigure(offset)
+            assert self._batch_hashes(r, indices) == [offset_expected[i] for i in indices]
+
+    def test_between_two_different_nonzero_origins(self, clips):
+        a, b = clips["offset_ts"], clips["offset_mkv"]
+        a_expected = _sequential_hashes(a)
+        b_expected = _sequential_hashes(b)
+
+        with VideoReader(a) as r:
+            indices = [0, 7, 30]
+            assert self._batch_hashes(r, indices) == [a_expected[i] for i in indices]
+
+            r.reconfigure(b)
+            assert self._batch_hashes(r, indices) == [b_expected[i] for i in indices]
+
+            r.reconfigure(a)
+            assert self._batch_hashes(r, indices) == [a_expected[i] for i in indices]

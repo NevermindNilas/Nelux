@@ -2,6 +2,8 @@
 #include "Logger.hpp"
 #include "error/CxException.hpp"
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -45,7 +47,12 @@ int64_t BatchDecoder::frameOrdinalFromPts(
 {
     const double timestamp =
         static_cast<double>(pts - ptsOrigin_) * av_q2d(stream->time_base);
-    return static_cast<int64_t>(timestamp * fps + 0.5);
+    // llround, not `(int64_t)(x + 0.5)`. The latter truncates toward zero, so it
+    // rounds -0.5 .. -1.0 to 0 and collapses ordinal -1 onto ordinal 0. That was
+    // unreachable while ordinals were absolute and non-negative; subtracting an
+    // origin makes pts < ptsOrigin_ reachable, because the leading pictures of an
+    // open GOP can present before the frame the origin was read from.
+    return static_cast<int64_t>(std::llround(timestamp * fps));
 }
 
 bool BatchDecoder::rewindToStreamStart(
@@ -53,26 +60,36 @@ bool BatchDecoder::rewindToStreamStart(
     AVCodecContext* codec_ctx,
     int stream_idx)
 {
-    // Aim strictly BELOW where the stream begins. Asking for start_time exactly
-    // is not equivalent: MPEG-TS seeks by binary-searching byte positions, and a
-    // search for start_time can land just past the opening keyframe, in which
-    // case the decoder emits nothing until the next one and the "rewind" is a
-    // whole GOP late. Undershooting costs nothing — AVSEEK_FLAG_BACKWARD lands
-    // on the nearest keyframe at or before the target, and every demuxer clamps
-    // that to the first one.
+    // Aim strictly BELOW where the stream begins, whatever sign start_time has.
+    // Asking for start_time exactly is not equivalent: MPEG-TS seeks by
+    // binary-searching byte positions against DTS, and start_time is a
+    // presentation timestamp, so a search for it can land past the opening
+    // keyframe — the decoder then emits nothing until the next one and the
+    // "rewind" is a whole GOP late. One second of margin clears any plausible
+    // reorder delay while staying a real, in-range timestamp. Undershooting
+    // costs nothing: AVSEEK_FLAG_BACKWARD lands on the nearest keyframe at or
+    // before the target, and every demuxer clamps that to the first one.
     //
     // INT64_MIN would be the obvious way to say "as early as possible" and is
     // wrong: it overflows the rescale inside the MP4 seek and leaves the
     // demuxer at EOF, so the probe reads no frames at all.
     AVStream* stream = fmt_ctx->streams[stream_idx];
-    const int64_t floor_ts = (stream->start_time != AV_NOPTS_VALUE)
-                                 ? std::min<int64_t>(stream->start_time, 0)
-                                 : 0;
+    const bool haveStart = stream->start_time != AV_NOPTS_VALUE;
+    const int64_t margin = (stream->time_base.num > 0 && stream->time_base.den > 0)
+                               ? av_rescale_q(1, AVRational{1, 1}, stream->time_base)
+                               : 0;
+    const int64_t floor_ts =
+        haveStart ? ((stream->start_time < INT64_MIN + margin)
+                         ? INT64_MIN
+                         : stream->start_time - margin)
+                  : 0;
 
     int ret = av_seek_frame(fmt_ctx, stream_idx, floor_ts, AVSEEK_FLAG_BACKWARD);
-    if (ret < 0 && stream->start_time != AV_NOPTS_VALUE)
+    if (ret < 0 && haveStart)
         ret = av_seek_frame(fmt_ctx, stream_idx, stream->start_time,
                             AVSEEK_FLAG_BACKWARD);
+    if (ret < 0 && floor_ts != 0)
+        ret = av_seek_frame(fmt_ctx, stream_idx, 0, AVSEEK_FLAG_BACKWARD);
 
     avcodec_flush_buffers(codec_ctx);
     decoderDrained_ = false;
@@ -125,8 +142,16 @@ bool BatchDecoder::resolvePtsOrigin(
         throw std::runtime_error("Failed to allocate probe packet/frame");
     }
 
+    // Bounded. The first frame normally arrives within a packet or two, but a
+    // stream that declares a non-zero start_time and then carries no per-frame
+    // PTS at all would otherwise demux and decode the entire file before falling
+    // back to origin 0. A few GOPs is far more than the answer can legitimately
+    // take, and giving up early only costs the fallback we would reach anyway.
     bool found = false;
-    while (!found && av_read_frame(fmt_ctx, pkt) >= 0) {
+    int64_t packetsRead = 0;
+    while (!found && packetsRead < PROBE_PACKET_LIMIT &&
+           av_read_frame(fmt_ctx, pkt) >= 0) {
+        ++packetsRead;
         if (pkt->stream_index == stream_idx) {
             int ret = avcodec_send_packet(codec_ctx, pkt);
             if (ret >= 0 || ret == AVERROR(EAGAIN)) {
@@ -453,12 +478,6 @@ torch::Tensor BatchDecoder::decode_batch(
             .view({static_cast<int64_t>(indices.size()), config_.height,
                    config_.width, config_.channels});
 
-    // Allocate frame for decoding
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) {
-        throw std::runtime_error("Failed to allocate AVFrame");
-    }
-
     AVStream* stream = fmt_ctx->streams[stream_idx];
     double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
 
@@ -469,6 +488,9 @@ torch::Tensor BatchDecoder::decode_batch(
     // decodeUntilFrame's `current_frame >= target_frame` true on the very first
     // decoded frame and handed back frame 0 for every index in the batch.
     // A probe moves the demuxer, so it invalidates any retained position.
+    //
+    // Runs before the AVFrame below is allocated, because it can throw and
+    // nothing would free that frame yet.
     const bool probed = resolvePtsOrigin(fmt_ctx, codec_ctx, stream_idx);
 
     // Resume from wherever the previous call left the stream when the caller
@@ -479,6 +501,13 @@ torch::Tensor BatchDecoder::decode_batch(
     int64_t current_frame = (position_valid && !probed) ? retainedFrame_ : -1;
     bool need_seek = (current_frame < 0);
     retainedFrame_ = -1; // no valid position until this call completes
+
+    // Allocate frame for decoding. Everything between here and the try below
+    // must stay non-throwing, or the frame leaks.
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) {
+        throw std::runtime_error("Failed to allocate AVFrame");
+    }
 
     try {
         for (int64_t target_frame : sorted_frames) {
@@ -495,12 +524,14 @@ torch::Tensor BatchDecoder::decode_batch(
             // Within one call `sorted_frames` is strictly ascending so this can
             // only fire on the first target, i.e. on a position carried over
             // from the previous call.
+            bool seeked = false;
             if (need_seek || decoderDrained_ || target_frame <= current_frame ||
                 (target_frame - current_frame) > SEQUENTIAL_THRESHOLD) {
                 seekToFrame(fmt_ctx, codec_ctx, stream_idx, target_frame, fps);
                 current_frame = -1;
                 need_seek = false;
                 decoderDrained_ = false; // seekToFrame flushed the decoder
+                seeked = true;
             }
 
             // Decode until we reach target frame
@@ -514,12 +545,27 @@ torch::Tensor BatchDecoder::decode_batch(
             // the *next* keyframe and the frame handed back is a whole GOP too
             // late (or the file ends first). Ordinals are trustworthy here —
             // only the seek was — so recover by rewinding to the stream start
-            // and scanning forward, which needs no seek accuracy at all. Bounded
-            // to one retry per target, and deliberately confined to streams with
-            // a non-zero origin: a zero-based container has ptsOrigin_ == 0 by
-            // construction, so it cannot reach this branch and its behaviour is
-            // unchanged, overshoot detection included.
-            if (ptsOrigin_ != 0 && (!reached || current_frame > target_frame)) {
+            // and scanning forward, which needs no seek accuracy at all.
+            //
+            // Three things keep this from becoming a latency cliff:
+            //
+            //  - Only after a seek. A frame reached by decoding forward was not
+            //    positioned by any seek, so a seek cannot be what went wrong.
+            //    Without this, overshoot fires on every skipped ordinal — which
+            //    is normal for VFR or for any avg_frame_rate that does not map
+            //    1:1 onto PTS spacing — and rescanning re-derives the very same
+            //    frame, so the whole scan is waste.
+            //  - Only for a non-zero origin. A zero-based container has
+            //    ptsOrigin_ == 0 by construction, so it cannot reach this branch
+            //    and its behaviour is unchanged, overshoot detection included.
+            //  - Latched off the first time it does not help. A rewind-and-scan
+            //    is the most thorough recovery available; if the ordinal is
+            //    still missing afterwards it is missing from the stream, not
+            //    hidden behind a bad seek, and that is a property of the whole
+            //    stream rather than of this one target. Bounds the wasted work
+            //    to a single full scan per file instead of one per target.
+            if (ptsOrigin_ != 0 && seeked && !rescanIneffective_ &&
+                (!reached || current_frame > target_frame)) {
                 NELUX_DEBUG("Seek landed on frame {} for target {}; rescanning "
                             "from the stream start",
                             current_frame, target_frame);
@@ -527,6 +573,14 @@ torch::Tensor BatchDecoder::decode_batch(
                 current_frame = -1;
                 reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
                                            target_frame, current_frame, frame);
+
+                if (!reached || current_frame > target_frame) {
+                    NELUX_DEBUG("Rescan still landed on frame {} for target {}; "
+                                "this stream's ordinals are not seek-recoverable, "
+                                "disabling further rescans",
+                                current_frame, target_frame);
+                    rescanIneffective_ = true;
+                }
             }
 
             if (!reached) {
