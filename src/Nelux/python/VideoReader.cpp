@@ -2056,57 +2056,62 @@ void VideoReader::reconfigure(const std::string& newFilePath)
 {
     NELUX_INFO("Reconfiguring VideoReader with new file: {}", newFilePath);
     
-    // Pin the main decoder and take the random-access one away under the
-    // lifecycle lock, the same handoff close() performs, so this cannot race a
-    // concurrent close().
-    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-
+    // ONE exclusive critical section for the whole switch. Reconfiguring the
+    // decoder and rewriting the reader state that describes it (properties,
+    // filePath, the output tensor, the iteration counters) has to be atomic
+    // with respect to everything else: a decode holding the lock reads exactly
+    // those fields, and close() must not be able to tear the decoder down
+    // half-way through. Taking the old random-access decoder away here too
+    // mirrors the handoff close() performs.
     std::shared_ptr<nelux::Decoder> oldRand;
-    {
-        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-        oldRand.swap(rand_decoder);
-        randLastTs_.store(-1.0, std::memory_order_relaxed);
-    }
+    underReaderLock(
+        [&](nelux::Decoder& d)
+        {
+            oldRand.swap(rand_decoder);
+            randLastTs_.store(-1.0, std::memory_order_relaxed);
 
-    // Reconfigure the main decoder
-    underReaderLock([&](nelux::Decoder& d) { d.reconfigure(newFilePath); return 0; });
+            d.reconfigure(newFilePath);
 
+            // Read back from the decoder we just reconfigured, not through a
+            // pointer pinned before the lock.
+            properties = d.getVideoProperties();
+            filePath = newFilePath;
+
+            currentIndex = 0;
+            current_timestamp = 0.0;
+            nvdecTimestampOffset_ = 0.0;
+            nvdecTimestampOffsetInitialized_ = false;
+            rangeFrameLimit_ = -1;
+            rangeFramesEmitted_ = 0;
+            hasBufferedFrame = false;
+            bufferedFrame = torch::Tensor();
+            streamTouched_ = false;
+
+            clearRanges();
+
+            // Reallocate the output tensor if the geometry or dtype changed.
+            // findMLTypeFromBitDepth() is inlined here rather than called: it
+            // is safe to call only OUTSIDE the lock now that the reader's
+            // queries take it, and lifecycleMu_ is not recursive.
+            const torch::Device torchDevice = tensor.device();
+            const torch::Dtype torchDataType = torch::kFloat32; // FP16 disabled
+            if (tensor.dim() != 4 || tensor.size(2) != properties.height ||
+                tensor.size(3) != properties.width ||
+                tensor.dtype() != torchDataType)
+            {
+                tensor = torch::empty(
+                    {1, 3, properties.height, properties.width},
+                    torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+                NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)",
+                            properties.width, properties.height);
+            }
+            return 0;
+        });
+
+    // Outside the lock: the old random-access decoder is ours alone now, and
+    // its teardown joins threads.
     if (oldRand)
         oldRand->close();
-
-    // Update properties from the new file
-    properties = dec->getVideoProperties();
-    
-    // Update internal file path
-    filePath = newFilePath;
-    
-    // Reset iteration state
-    currentIndex = 0;
-    current_timestamp = 0.0;
-    nvdecTimestampOffset_ = 0.0;
-    nvdecTimestampOffsetInitialized_ = false;
-    rangeFrameLimit_ = -1;
-    rangeFramesEmitted_ = 0;
-    
-    // Clear any set ranges
-    clearRanges();
-
-    // Reallocate tensor if dimensions changed (always use BCHW format)
-    torch::Device torchDevice = tensor.device();
-    torch::Dtype torchDataType = findMLTypeFromBitDepth();
-    
-    if (tensor.size(2) != properties.height || 
-        tensor.size(3) != properties.width ||
-        tensor.dtype() != torchDataType)
-    {
-        tensor = torch::empty(
-            {1, 3, properties.height, properties.width},
-            torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-        NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)", 
-                    properties.width, properties.height);
-    }
     
     NELUX_INFO("VideoReader reconfigured successfully for: {}", newFilePath);
 }
