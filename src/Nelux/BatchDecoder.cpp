@@ -548,10 +548,14 @@ torch::Tensor BatchDecoder::decode_batch(
         throw std::runtime_error("Failed to allocate AVFrame");
     }
 
-    // True once this call has decoded a frame, which is what licenses the reuse
-    // below: it means current_frame was produced by scanning from the previous
-    // target of THIS call, not carried in from a previous one.
-    bool haveDecodedFrame = false;
+    // True while current_frame is PROVABLY the first ordinal >= the target it
+    // was decoded for, which is the precondition for reusing the frame in hand.
+    // Deliberately seeded false on every call: a position carried in through
+    // retainedFrame_ was established for some previous call's target, which says
+    // nothing about the ordinals between it and a new, lower target. That also
+    // makes the first target of a call ineligible for reuse, which is the same
+    // guarantee by a shorter route.
+    bool exactPosition = false;
 
     try {
         for (int64_t target_frame : sorted_frames) {
@@ -561,8 +565,9 @@ torch::Tensor BatchDecoder::decode_batch(
             // stream with skipped ordinals it is the answer often enough that
             // not noticing was the dominant cost.
             //
-            // current_frame is the first ordinal >= the previous target of this
-            // call. sorted_frames is strictly ascending, so
+            // Given exactPosition, current_frame is the first ordinal >= the
+            // previous target of this call. sorted_frames is strictly ascending,
+            // so
             //     previous target < target_frame <= current_frame,
             // and no ordinal lies between the previous target and current_frame
             // (that is what "first ordinal >=" means). Every ordinal below
@@ -571,10 +576,17 @@ torch::Tensor BatchDecoder::decode_batch(
             // target_frame. The frame in hand is exactly what a seek and rescan
             // would spend a pass over the file to re-derive.
             //
-            // Restricted to targets after the first of the call. current_frame
-            // carried over from a PREVIOUS call says nothing about the ordinals
-            // between it and a new lower target, so that case must still seek.
-            if (haveDecodedFrame && target_frame <= current_frame) {
+            // exactPosition is what makes that argument sound rather than
+            // merely plausible. An overshooting seek reports the first ordinal
+            // it happened to land on, skipping real ordinals in between, and
+            // "first ordinal >= previous target" is then false. The overshoot
+            // recovery repairs exactly that, but it only runs for a non-zero
+            // origin — so on a zero-based container with inaccurate seeks (a
+            // remuxed MPEG-TS, whose demuxer seeks by byte binary-search) the
+            // position after a seek is a guess. Reusing it there made
+            // decode_batch([600, 610]) disagree with decode_batch([610]) on
+            // such a clip. Verified, not hypothesised.
+            if (exactPosition && target_frame <= current_frame) {
                 NELUX_TRACE("Target {} already satisfied by frame {} in hand",
                             target_frame, current_frame);
                 copyFrameToOutput(frame, output, position_map[target_frame],
@@ -638,6 +650,7 @@ torch::Tensor BatchDecoder::decode_batch(
             //  - Only for a non-zero origin. A zero-based container has
             //    ptsOrigin_ == 0 by construction, so it cannot reach this branch
             //    and its behaviour is unchanged, overshoot detection included.
+            bool recoveryRescanned = false;
             if (ptsOrigin_ != 0 && seeked &&
                 (!reached || current_frame > target_frame)) {
                 NELUX_DEBUG("Seek landed on frame {} for target {}; rescanning "
@@ -654,6 +667,7 @@ torch::Tensor BatchDecoder::decode_batch(
                 current_frame = -1;
                 reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
                                            target_frame, current_frame, frame);
+                recoveryRescanned = true;
 
                 // A rescan that beat a genuine mid-file seek is evidence that
                 // scanning is the cheaper route on this stream, so stop taking
@@ -679,20 +693,42 @@ torch::Tensor BatchDecoder::decode_batch(
             }
 
             if (!reached) {
-                av_frame_free(&frame);
+                // The catch below frees the frame; doing it here as well would
+                // only make the ownership story longer.
                 throw std::runtime_error("Failed to decode frame " + std::to_string(target_frame));
             }
+
+            // Is current_frame provably the first ordinal >= target_frame?
+            //
+            //  - The recovery scans from ordinal 0, so it sees every ordinal on
+            //    the way and cannot skip one. Exact by construction.
+            //  - A seek without recovery is only exact if it landed on the
+            //    target itself; anything later may have jumped over ordinals
+            //    that were never emitted.
+            //  - No seek means we continued forward from the previous position
+            //    and saw every ordinal since, so exactness is inherited.
+            exactPosition = recoveryRescanned ||
+                            (seeked ? (current_frame == target_frame)
+                                    : exactPosition);
 
             // Copy frame to all requesting positions
             const std::vector<size_t>& positions = position_map[target_frame];
             copyFrameToOutput(frame, output, positions, sws_ctx);
-            haveDecodedFrame = true;
 
             // Deliberately not unref'd here: the next target may be satisfied
             // by this very frame (see the reuse at the top of the loop), so its
             // buffer has to outlive the iteration. avcodec_receive_frame unrefs
-            // its destination before filling it, so decoding the next frame
-            // still releases this one; av_frame_free below covers the rest.
+            // its destination before doing anything else, so decoding the next
+            // frame still releases this one on every return path; av_frame_free
+            // below covers the rest.
+            //
+            // The reference now also spans avcodec_flush_buffers (via a seek or
+            // a rewind on a later target), which it did not before. That is
+            // safe: decoders emit reference-counted frames whose buffers come
+            // from an AVBufferPool that outlives the codec context's flush, and
+            // frame-threaded decoders join their workers before flushing, so no
+            // worker can be writing into this buffer. The frame is only ever
+            // read (copyFrameToOutput) after that point, never re-decoded into.
         }
     } catch (...) {
         av_frame_free(&frame);

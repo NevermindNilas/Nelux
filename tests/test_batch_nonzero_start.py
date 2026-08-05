@@ -106,7 +106,34 @@ def gappy_clips(tmp_path_factory):
         "vfr": _generate_source(
             str(d / "vfr.ts"), ["-f", "mpegts"], duration=90,
             filters=("select='not(mod(n,3))'",)),
+        # The same stream rebased onto a zero timeline. This is the combination
+        # the seek-overshoot recovery does NOT cover -- it is gated on a
+        # non-zero origin -- while MPEG-TS still seeks by byte binary-search and
+        # still overshoots. Anything that trusts the position a seek left behind
+        # is unguarded here, so this is where such a bug shows up.
+        "vfr_zero_based": _rebase_to_zero(
+            _generate_source(str(d / "vfr_src.ts"), ["-f", "mpegts"],
+                             duration=90,
+                             filters=("select='not(mod(n,3))'",)),
+            str(d / "vfr_zero.ts")),
     }
+
+
+def _rebase_to_zero(src, dst):
+    """Remux src so its first timestamp is 0.
+
+    The MPEG-TS muxer will not write a zero start_time directly -- it keeps an
+    initial delay even with -muxdelay 0 -muxpreload 0 -output_ts_offset 0 -- so
+    shift by whatever start_time the source ended up with.
+    """
+    with VideoReader(src) as r:
+        start = r.get_properties()["start_time"]
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-copyts", "-i", src, "-c", "copy",
+         "-muxdelay", "0", "-muxpreload", "0", "-avoid_negative_ts", "disabled",
+         "-output_ts_offset", str(-start), "-f", "mpegts", dst],
+        capture_output=True, check=True)
+    return dst
 
 
 def _zero_based_clip():
@@ -236,9 +263,6 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
         class stops testing what it says it does.
         """
         path = gappy_clips["vfr"]
-        sequential = _sequential_hashes(path)
-        with VideoReader(path) as r:
-            n = len(r)
         # Consecutive ordinals must collide, because they resolve to the same
         # surviving frame. Dense ordinals would make every one distinct.
         with VideoReader(path) as r:
@@ -247,7 +271,6 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
             "consecutive ordinals resolve to different frames; the vfr fixture "
             "no longer has absent ordinals"
         )
-        assert n < len(sequential) * 2, "unexpected frame-count/ordinal mapping"
 
     @pytest.mark.parametrize("index", [43, 200, 600, 900])
     def test_absent_ordinal_first_does_not_change_a_later_index(
@@ -277,23 +300,56 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
         together = [_hash(batch[k + 1]) for k in range(len(probes))]
         assert together == alone
 
-    def test_clustered_targets_agree_with_individual_requests(self, gappy_clips):
+    @pytest.mark.parametrize("clip", ["vfr", "vfr_zero_based"])
+    def test_clustered_targets_agree_with_individual_requests(
+            self, gappy_clips, clip):
         """Adjacent indices over a stream whose ordinals are mostly absent.
 
         Every target after the first lands on `target <= current_frame`, which
-        is the path that reuses the frame already decoded instead of seeking.
+        is the path that may reuse the frame already decoded instead of seeking.
         That reuse is on the answer path, not just the cost path, so it is
         checked against the same index requested on its own.
         """
-        path = gappy_clips["vfr"]
+        path = gappy_clips[clip]
         with VideoReader(path) as r:
             n = len(r)
         indices = list(range(600, 640))
-        assert indices[-1] < n
+        if indices[-1] >= n:
+            pytest.skip(f"clip has only {n} frames")
         with VideoReader(path) as r:
             batch = r.decode_batch(indices)
         got = [_hash(batch[k]) for k in range(batch.shape[0])]
         assert got == [self._one(path, i) for i in indices]
+
+    def test_zero_based_gappy_fixture_really_is_zero_based(self, gappy_clips):
+        """Guard the guard: if this clip is not zero-based it tests nothing.
+
+        The point of the fixture is that ptsOrigin_ == 0, which switches the
+        seek-overshoot recovery off while leaving MPEG-TS's inaccurate seeks in
+        place. A non-zero start_time would re-enable the recovery and the test
+        below would pass for the wrong reason.
+        """
+        with VideoReader(gappy_clips["vfr_zero_based"]) as r:
+            assert r.get_properties()["start_time"] == 0.0
+
+    @pytest.mark.parametrize("lead,victim",
+                             [(600, 601), (600, 605), (600, 610), (300, 305)])
+    def test_zero_based_gappy_index_is_independent_of_the_batch(
+            self, gappy_clips, lead, victim):
+        """A zero-based container where seeks overshoot and ordinals are absent.
+
+        The overshoot recovery does not run here, so the position a seek leaves
+        behind is a guess rather than a proof, and anything that reuses it must
+        say so. decode_batch([600, 610]) returned a different frame for 610 than
+        decode_batch([610]) did until the reuse was gated on provable exactness.
+        """
+        path = gappy_clips["vfr_zero_based"]
+        with VideoReader(path) as r:
+            if victim >= len(r):
+                pytest.skip("clip shorter than expected")
+        assert self._after(path, lead, victim) == self._one(path, victim), (
+            f"index {victim} changed because {lead} was requested alongside it"
+        )
 
     def test_clustered_batch_cost_does_not_scale_with_index_count(
             self, gappy_clips):

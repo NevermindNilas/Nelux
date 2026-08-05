@@ -148,13 +148,23 @@ private:
     // seeks (backwards, drained decoder, unknown position) are unaffected.
     bool forwardScanPreferred_ = false;
 
-    // How far forwardScanPreferred_ is willing to scan rather than seek. The
-    // preference is inferred from one stream's behaviour, so it can be wrong;
-    // this bounds what being wrong costs. Without it, a reader that touched a
-    // low index and then jumped to the far end of a long file would walk every
-    // frame in between. Chosen so that scanning is plausibly competitive with a
-    // seek plus a one-GOP overshoot recovery, and so that being wrong costs a
-    // bounded constant rather than the length of the file.
+    // How far forwardScanPreferred_ is willing to scan rather than seek.
+    //
+    // Worth being honest about what this does and does not buy. It only applies
+    // once the preference is set, i.e. on a stream where a mid-file seek has
+    // already overshot and a scan from ordinal 0 was the repair. On such a
+    // stream a far seek will most likely overshoot again and be repaired the
+    // same way, which costs target_frame frames — no cheaper than scanning the
+    // gap, and usually dearer. So for the population this actually governs, the
+    // capped branch is not expected to win; the 9000-frame MPEG-TS measured
+    // during review behaved exactly that way, seeking and rescanning the whole
+    // file either way.
+    //
+    // It is kept as a bound on being wrong, not as an optimisation: the
+    // preference is inferred from one seek's behaviour, and if that inference
+    // is bad on a stream whose far seeks are in fact fine, this stops one long
+    // jump from walking the entire file. Nothing currently exercises the
+    // boundary — the widest gap under test is 225.
     static constexpr int64_t FORWARD_SCAN_MAX_GAP = 512;
 
     // Upper bound on video packets resolvePtsOrigin() will demux looking for the
