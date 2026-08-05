@@ -256,7 +256,7 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       cudaDeviceIndex_(cudaDeviceIndex),
       cudaStream_(nullptr), decodeCompleteEvent_(nullptr),
       consumerSyncEvent_(nullptr), hwDeviceCtx_(nullptr),
-      hwPixFmt_(AV_PIX_FMT_CUDA), nv12Buffer_(nullptr), nv12BufferSize_(0),
+      hwPixFmt_(AV_PIX_FMT_CUDA),
       rgb24Buffer_(nullptr), rgb24BufferSize_(0), hwInitialized_(false),
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
@@ -339,7 +339,6 @@ Decoder::Decoder(Decoder&& other) noexcept
       cudaStream_(other.cudaStream_), decodeCompleteEvent_(other.decodeCompleteEvent_),
       consumerSyncEvent_(other.consumerSyncEvent_),
       hwDeviceCtx_(other.hwDeviceCtx_), hwPixFmt_(other.hwPixFmt_),
-      nv12Buffer_(other.nv12Buffer_), nv12BufferSize_(other.nv12BufferSize_),
       rgb24Buffer_(other.rgb24Buffer_), rgb24BufferSize_(other.rgb24BufferSize_),
       hwInitialized_(other.hwInitialized_),
       rawPassthroughMode_(other.rawPassthroughMode_),
@@ -349,7 +348,6 @@ Decoder::Decoder(Decoder&& other) noexcept
     other.decodeCompleteEvent_ = nullptr;
     other.consumerSyncEvent_ = nullptr;
     other.hwDeviceCtx_ = nullptr;
-    other.nv12Buffer_ = nullptr;
     other.rgb24Buffer_ = nullptr;
     other.hwInitialized_ = false;
     other.rawPassthroughMode_ = false;
@@ -371,8 +369,6 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         consumerSyncEvent_ = other.consumerSyncEvent_;
         hwDeviceCtx_ = other.hwDeviceCtx_;
         hwPixFmt_ = other.hwPixFmt_;
-        nv12Buffer_ = other.nv12Buffer_;
-        nv12BufferSize_ = other.nv12BufferSize_;
         rgb24Buffer_ = other.rgb24Buffer_;
         rgb24BufferSize_ = other.rgb24BufferSize_;
         hwInitialized_ = other.hwInitialized_;
@@ -384,7 +380,6 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         other.decodeCompleteEvent_ = nullptr;
         other.consumerSyncEvent_ = nullptr;
         other.hwDeviceCtx_ = nullptr;
-        other.nv12Buffer_ = nullptr;
         other.rgb24Buffer_ = nullptr;
         other.hwInitialized_ = false;
         other.rawPassthroughMode_ = false;
@@ -411,19 +406,11 @@ void Decoder::initialize(const std::string& filePath)
     // Set properties
     setProperties();
 
-    // Allocate NV12 buffer on GPU
-    // NV12 format: height * 1.5 for Y plane + UV plane
-    size_t y_size = static_cast<size_t>(properties.width) * properties.height;
-    size_t uv_size = y_size / 2; // UV is half height, interleaved
-    nv12BufferSize_ = y_size + uv_size;
-
-    cudaError_t err = cudaMalloc(&nv12Buffer_, nv12BufferSize_);
-    if (err != cudaSuccess)
-    {
-        throw CxException(std::string("Failed to allocate NV12 buffer: ") +
-                          cudaGetErrorString(err));
-    }
-
+    // No staging NV12 buffer is allocated here. Decoded frames stay in the
+    // cuvid-owned hwframe and are read directly by the conversion kernels in
+    // transferAndConvertFrame(), so a separate 1.5*W*H device buffer would
+    // never be written or read — it only cost a synchronising cudaMalloc per
+    // decoder plus 3.1 MB resident at 1080p / 12.4 MB at 4K.
     hwInitialized_ = true;
 
     NELUX_INFO("CUDA DECODER: Initialized with NVDEC, codec: {}, resolution: {}x{}",
@@ -1091,13 +1078,6 @@ void Decoder::close()
     // Stop decoding thread first
     stopDecodingThread();
 
-    // Release NV12 buffer
-    if (nv12Buffer_)
-    {
-        cudaFree(nv12Buffer_);
-        nv12Buffer_ = nullptr;
-    }
-
     // Release RGB24 buffer
     if (rgb24Buffer_)
     {
@@ -1479,29 +1459,6 @@ void Decoder::reconfigure(const std::string& filePath)
     initCodecContextWithHwAccel();
     setProperties();
 
-    // Reallocate GPU buffers if dimensions changed
-    size_t newYSize = static_cast<size_t>(properties.width) * properties.height;
-    size_t newUvSize = newYSize / 2;
-    size_t newNv12Size = newYSize + newUvSize;
-
-    if (nv12BufferSize_ != newNv12Size)
-    {
-        if (nv12Buffer_)
-        {
-            cudaFree(nv12Buffer_);
-            nv12Buffer_ = nullptr;
-        }
-        nv12BufferSize_ = newNv12Size;
-        cudaError_t err = cudaMalloc(&nv12Buffer_, nv12BufferSize_);
-        if (err != cudaSuccess)
-        {
-            throw CxException(std::string("Failed to reallocate NV12 buffer: ") +
-                              cudaGetErrorString(err));
-        }
-        NELUX_DEBUG("CUDA DECODER: Reallocated NV12 buffer to {} bytes",
-                    nv12BufferSize_);
-    }
-
     // Reset RGB24 buffer - will be reallocated on demand
     if (rgb24Buffer_)
     {
@@ -1594,11 +1551,15 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         stopDecodingThread();
         clearQueue();
     }
+    // The constructor already ran initialize() on this exact path — opening the
+    // container, running find_stream_info, opening the codec and starting the
+    // producer. Reconfiguring to the same file immediately afterwards tore all
+    // of that down and rebuilt it, doubling the cost of every decode_batch call
+    // for identical resulting state (reconfigure preserves mlOutputMode_, and
+    // ML mode only gates decodeNextFrameML, which this path never calls).
     Decoder batchDecoder(cachedFilePath_, numThreads, cudaDeviceIndex_,
                          resizeWidth_, resizeHeight_);
     batchDecoder.setForce8Bit(force_8bit);
-    const std::string batchFilePath = cachedFilePath_;
-    batchDecoder.reconfigure(batchFilePath);
 
     // Drive the isolated decoder through the same streaming decode+convert path
     // that normal iteration uses (decodeNextFrame). That path pops each frame

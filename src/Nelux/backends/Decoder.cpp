@@ -1085,6 +1085,9 @@ torch::Tensor Decoder::tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf)
 
 torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
 {
+    // Reading packets moves the shared demuxer position, so a later
+    // decode_batch can no longer resume from where it left off.
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
     if (syncDrained_)
         return torch::Tensor();
 
@@ -1333,6 +1336,8 @@ bool Decoder::seekFrame(int frameIndex)
 
 bool Decoder::seek(double timestamp)
 {
+    // Seeking moves the shared demuxer position.
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
     stopDecodingThread();
     stopSyncConvertWorkers();
     clearQueue();
@@ -1347,7 +1352,11 @@ bool Decoder::seek(double timestamp)
     if (timestamp < 0 || timestamp > properties.duration)
     {
         NELUX_WARN("Timestamp out of bounds: {}", timestamp);
-        startDecodingThread();
+        // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+        // the async producer here would put two threads on one context
+        // (initialize() and reconfigure() already guard this the same way).
+        if (!syncMode_)
+            startDecodingThread();
         return false;
     }
 
@@ -1359,7 +1368,11 @@ bool Decoder::seek(double timestamp)
     if (ret < 0)
     {
         NELUX_DEBUG("Seek failed to timestamp: {}", timestamp);
-        startDecodingThread();
+        // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+        // the async producer here would put two threads on one context
+        // (initialize() and reconfigure() already guard this the same way).
+        if (!syncMode_)
+            startDecodingThread();
         return false;
     }
 
@@ -1367,7 +1380,11 @@ bool Decoder::seek(double timestamp)
     avcodec_flush_buffers(codecCtx.get());
     NELUX_TRACE("Seek successful, codec buffers flushed");
 
-    startDecodingThread();
+    // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+    // the async producer here would put two threads on one context
+    // (initialize() and reconfigure() already guard this the same way).
+    if (!syncMode_)
+        startDecodingThread();
     return true;
 }
 
@@ -1451,6 +1468,14 @@ int64_t Decoder::convertTimestamp(double timestamp) const
     NELUX_TRACE("Converted timestamp: {}", ts);
     return ts;
 }
+
+bool Decoder::hasZeroBasedTimeline() const
+{
+    if (!formatCtx || videoStreamIndex < 0)
+        return false;
+    const AVStream* stream = formatCtx->streams[videoStreamIndex];
+    return stream->start_time == AV_NOPTS_VALUE || stream->start_time == 0;
+}
 int Decoder::getBitDepth() const
 {
     NELUX_TRACE("Getting bit depth");
@@ -1469,6 +1494,8 @@ int Decoder::getBitDepth() const
 
 bool Decoder::seekToNearestKeyframe(double timestamp)
 {
+    // Seeking moves the shared demuxer position.
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
     stopDecodingThread();
     stopSyncConvertWorkers();
     clearQueue();
@@ -1483,7 +1510,11 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     if (timestamp < 0 || timestamp > properties.duration)
     {
         NELUX_WARN("Timestamp out of bounds: {}", timestamp);
-        startDecodingThread();
+        // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+        // the async producer here would put two threads on one context
+        // (initialize() and reconfigure() already guard this the same way).
+        if (!syncMode_)
+            startDecodingThread();
         return false;
     }
 
@@ -1496,7 +1527,11 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     if (ret < 0)
     {
         NELUX_DEBUG("Keyframe seek failed for timestamp: {}", timestamp);
-        startDecodingThread();
+        // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+        // the async producer here would put two threads on one context
+        // (initialize() and reconfigure() already guard this the same way).
+        if (!syncMode_)
+            startDecodingThread();
         return false;
     }
 
@@ -1504,7 +1539,11 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     avcodec_flush_buffers(codecCtx.get());
     NELUX_TRACE("Keyframe seek successful, codec buffers flushed");
 
-    startDecodingThread();
+    // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
+    // the async producer here would put two threads on one context
+    // (initialize() and reconfigure() already guard this the same way).
+    if (!syncMode_)
+        startDecodingThread();
     return true;
 }
 
@@ -1651,6 +1690,18 @@ size_t Decoder::getPrefetchBufferedCount() const
 
 void Decoder::startPrefetch()
 {
+    // Sync mode drives the codec context on the caller thread; starting the
+    // async producer as well puts two threads on one AVFormatContext and trips
+    // `Assertion fctx->async_lock failed at pthread_frame.c`. Same guard as
+    // initialize(), reconfigure() and the seek paths. Reachable from Python:
+    // VideoReader(path).start_prefetch(...) on a default (prefetch=False)
+    // reader aborted the process.
+    if (syncMode_)
+    {
+        NELUX_DEBUG("start_prefetch() ignored: reader is in synchronous mode "
+                    "(construct with prefetch=True to use a background decoder)");
+        return;
+    }
     NELUX_DEBUG("Explicitly starting prefetch with buffer size {}", maxQueueSize);
     startDecodingThread();
 }
@@ -1664,6 +1715,8 @@ void Decoder::stopPrefetch()
 
 void Decoder::reconfigure(const std::string& filePath)
 {
+    // A new container invalidates any remembered batch position.
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
     NELUX_INFO("Reconfiguring decoder with new file: {}", filePath);
 
     // Stop any running prefetch thread first
@@ -1829,6 +1882,9 @@ void Decoder::resetTimestampState()
 
 void Decoder::decodingLoop()
 {
+    // Reading packets moves the shared demuxer position, so a later
+    // decode_batch can no longer resume from where it left off.
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
     Frame localFrame;
     bool packetPending = false;
 
@@ -2185,6 +2241,25 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("decode_batch called with {} indices", indices.size());
 
+    // An empty batch has nothing to decode, so it must not disturb anything
+    // either: return before the producer is stopped, the queue is cleared, the
+    // batch contexts are built and sharedStreamDirty_ is consumed. Otherwise
+    // decode_batch({}) silently drops the frames the producer had already
+    // buffered and leaves the demuxer ahead of them, which is a real move of
+    // the stream and forces the reader to rewind. The CUDA override has always
+    // returned here; this makes the software path agree. Shape, dtype and
+    // device match what BatchDecoder returns for a non-empty batch.
+    if (indices.empty())
+    {
+        return torch::empty(
+            {0, properties.height, properties.width, outChannels_},
+            torch::TensorOptions()
+                .dtype(force_8bit ? torch::kUInt8
+                                  : (properties.bitDepth <= 8 ? torch::kUInt8
+                                                              : torch::kUInt16))
+                .device(torch::kCPU));
+    }
+
     // The batch path shares formatCtx with the producer thread. Concurrent
     // av_read_frame on the same context is unsafe; stop the producer (and
     // its convert workers under fan-out) so the batch decoder owns the file
@@ -2272,10 +2347,21 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
                                                             : "none");
     }
 
+    // Hand the batch decoder the right to resume from its previous position
+    // only if no streaming read or seek has moved formatCtx since the last
+    // batch. It re-establishes the position for the next call, so clear the
+    // flag before running (any throw leaves it clear, and BatchDecoder itself
+    // forgets its position on failure, so the next call re-seeks either way).
+    // (frame count resolved first: its MKV/VFR fallback demuxes a throwaway
+    // context today, but hoisting it keeps the flag honest if that ever changes)
+    const int64_t frameCount = get_frame_count();
+    const bool positionValid =
+        !sharedStreamDirty_.exchange(false, std::memory_order_relaxed);
+
     return batch_decoder_->decode_batch(
         indices, formatCtx.get(), batchCodecCtx_.get(), videoStreamIndex,
         nullptr, // SwsContext managed internally by BatchDecoder
-        get_frame_count());
+        frameCount, positionValid);
 }
 
 } // namespace nelux

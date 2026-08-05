@@ -6,6 +6,8 @@
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <atomic>
+#include <shared_mutex>
 
 
 namespace py = pybind11;
@@ -482,17 +484,118 @@ class VideoReader
     // Where the frame that was just decoded sits relative to the active range:
     // -1 before it (discard), 0 inside it (emit), 1 past it (segment finished).
     int classifyAgainstActiveRange() const;
-    // The CPU sync path (prefetch=False) uses a frame-threaded codec context;
-    // avcodec_flush_buffers on such a context trips an internal FFmpeg
-    // assertion, so it can only ever move forward by decoding.
-    bool canSeekMidStream() const
+    // Every path can seek. The CPU sync path (prefetch=False) used to be
+    // excluded on the theory that avcodec_flush_buffers on a frame-threaded
+    // codec context trips FFmpeg's `fctx->async_lock` assertion — but the flush
+    // was never the problem. Decoder::seek/seekToNearestKeyframe stop the
+    // producer, flush on a quiesced context, and then unconditionally called
+    // startDecodingThread() again, putting the async producer back onto the
+    // same AVFormatContext/AVCodecContext that the sync consumer drives on the
+    // caller thread. Two threads on one context is what tripped the assertion.
+    // Those restarts are now guarded by !syncMode_ (matching initialize() and
+    // reconfigure()), so seeking is safe here and set_range no longer has to
+    // decode and discard every frame from zero.
+    // Evaluated UNDER the lock, because the answer is read out of the decoder's
+    // AVFormatContext (hasZeroBasedTimeline inspects the video stream's
+    // start_time) and close() frees that context. A pinned shared_ptr keeps the
+    // Decoder object alive but not its contexts, so asking this question off a
+    // pin would race a concurrent close()/reconfigure().
+    bool canSeekMidStream()
     {
-        return !(decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch);
+        return underReaderLock([](nelux::Decoder& d)
+                               { return canSeekMidStream(d); });
     }
-    // Rewind the sync CPU path to the true first frame before a fresh
-    // iteration. Since it cannot seek, a full decoder reconfigure is the only
-    // safe rewind -- the same trick iter() already uses to force NVDEC back to
-    // frame 0. No-op when nothing has been decoded yet.
+
+    static bool canSeekMidStream(nelux::Decoder& dec)
+    {
+        // Seeking needs frame indices and frame timestamps to share an origin;
+        // on a container that starts at a non-zero timestamp they do not, and a
+        // seek lands somewhere other than the requested frame. Those fall back
+        // to decoding forward, exactly as this path always did.
+        return dec.hasZeroBasedTimeline();
+    }
+
+    // Copy a decoder out from under the lifecycle lock. Anything that
+    // dereferences a decoder across a point where the GIL is released — its own
+    // release, or a nested decodeFrame() — must hold the result for the whole
+    // span, otherwise close() can swap the member concurrently, which is a data
+    // race on the shared_ptr itself and can free the decoder mid-call.
+    std::shared_ptr<nelux::Decoder> pinDecoder() const
+    {
+        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+        return decoder;
+    }
+
+    // Run one FFmpeg-context-mutating call (a seek, a flush, a reconfigure)
+    // under the reader lock with the GIL dropped.
+    //
+    // Holding the GIL is NOT enough on its own. A thread sitting between two of
+    // its own decodeFrame() calls holds the GIL, but the decode it just
+    // finished released it — so another thread can already be inside a decode,
+    // with the lock, driving these very contexts. Anything that mutates them
+    // has to take the lock too.
+    //
+    // Wrap ONLY the FFmpeg call. The lock is not recursive, so a region that
+    // also runs decodeFrame() (every discard loop does) would deadlock.
+    // Read-only counterpart of underReaderLock. Takes a SHARED lock — concurrent
+    // readers do not disturb each other, and the exclusive holders (the decode
+    // entry points, close(), and every underReaderLock mutation) are excluded,
+    // which is the whole point: queries like getBitDepth()/get_frame_count()/
+    // isPrefetching() read the decoder's AVFormatContext or its producer thread,
+    // and a pinned shared_ptr does not protect either from a concurrent close()
+    // or a prefetch restart.
+    //
+    // The callback gets a possibly-null Decoder* so each caller decides what a
+    // closed reader means — the plain getters return a default, the rest throw.
+    template <class Fn>
+    auto underReaderLockRead(Fn&& fn) const
+        -> decltype(fn(std::declval<nelux::Decoder*>()))
+    {
+        auto run = [&]() -> decltype(fn(std::declval<nelux::Decoder*>()))
+        {
+            std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+            return fn(decoder.get());
+        };
+        if (PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            return run();
+        }
+        return run();
+    }
+
+    // The callback receives the LIVE decoder, read from the member under the
+    // lock — never a pointer the caller pinned beforehand. A pre-lock pin keeps
+    // the object alive but says nothing about whether it is still open: close()
+    // could have swapped it out and torn it down in the gap, and seeking a
+    // closed Decoder dereferences a null AVFormatContext.
+    template <class Fn>
+    auto underReaderLock(Fn&& fn) -> decltype(fn(std::declval<nelux::Decoder&>()))
+    {
+        auto run = [&]() -> decltype(fn(std::declval<nelux::Decoder&>()))
+        {
+            std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+            if (!decoder)
+                throw std::runtime_error("VideoReader is closed");
+            return fn(*decoder);
+        };
+
+        // GIL before lock, released after it, for the same deadlock reason as
+        // the decode paths — `release` outlives the lock taken inside run().
+        // Guarded because close()/destructor paths can reach helpers like this
+        // without the GIL.
+        if (PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            return run();
+        }
+        return run();
+    }
+    // Rewind to the true first frame before a fresh iteration. Seeks to zero
+    // when the stream's timeline allows it (see canSeekMidStream) and falls
+    // back to a full decoder reconfigure otherwise -- the same rebuild iter()
+    // uses to force NVDEC back to frame 0. No-op when nothing has been decoded
+    // yet.
     void rewindForFreshIteration();
 
     // ML output dtype. Currently always FP32 (FP16 path disabled due to artifacts).
@@ -503,6 +606,47 @@ class VideoReader
         return (properties.fps > 0.0) ? 1.0 / properties.fps : 0.0;
     }
     std::shared_ptr<nelux::Decoder> rand_decoder;
+
+    // Serialises everything a reader does to its FFmpeg contexts, and the
+    // decoder ownership handoff along with it.
+    //
+    // All of this used to be serialised for free by the GIL: a second Python
+    // thread calling close() (or read_frame, or decode_batch) simply could not
+    // run until the first finished. Now that those paths drop the GIL, the
+    // exclusion has to be explicit. Without it, two threads both saw a non-null
+    // `decoder`, both called Decoder::close() and both joined the same
+    // std::thread ("no such process", every time), and two concurrent decodes
+    // on one reader aborted the process on FFmpeg's internal
+    // "Assertion fctx->async_lock failed".
+    //
+    // So the decode entry points (decodeFrame, decodeBatch, decodeFrameAt) take
+    // it EXCLUSIVELY for their whole run, and close() takes it to swap the
+    // owners out before tearing anything down. A second closer then finds
+    // nullptr and returns; a decode either completes before teardown starts or
+    // observes nullptr and raises rather than touching freed contexts.
+    //
+    // It stays a shared_mutex because the cheap accessors (pinDecoder, used by
+    // the prefetch getters and by callers that only need to hold the decoder
+    // alive across a nested decodeFrame) genuinely are read-only and should not
+    // serialise against each other. Note it is NOT recursive: nothing that
+    // holds it may call a decode entry point.
+    //
+    // Concurrent decoding of one reader was never meaningful — separate readers
+    // still run fully in parallel, which is what dropping the GIL buys.
+    mutable std::shared_mutex lifecycleMu_;
+
+    // Timestamp of the last frame decodeFrameAt() returned from rand_decoder,
+    // or -1 when its position is unknown. Lets a forward request that is only a
+    // few frames ahead decode straight on instead of seeking back to the
+    // keyframe and re-decoding the whole GOP prefix. Reset whenever
+    // rand_decoder is destroyed or the file changes.
+    //
+    // Atomic because decodeFrameAt() reads and writes it around a window where
+    // the GIL is released, while close()/reconfigure() reset it under
+    // lifecycleMu_. It is only a hint -- a stale value costs a redundant seek,
+    // never a wrong frame -- so relaxed access is enough; what matters is that
+    // the read and the write are not torn.
+    std::atomic<double> randLastTs_{-1.0};
 
     torch::Tensor makeLikeOutputTensor() const;
     /**

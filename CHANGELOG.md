@@ -30,17 +30,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reader(("0:00:05", "0:00:10"))` now parse `"H:MM:SS[.ms]"`, `"MM:SS[.ms]"` and
   `"SS[.ms]"` into seconds.
 
+### Performance
+
+- **The default CPU path can seek again, so `set_range` no longer decodes the
+  whole file to reach its start.** `prefetch=False` — the default — treated
+  itself as unseekable and reached a range start by decoding and discarding every
+  frame from zero, which made the cost of a range proportional to its *start
+  index* rather than its length. The root cause was not the flush it was blamed
+  on: `Decoder::seek` and `Decoder::seekToNearestKeyframe` stop the producer,
+  flush a quiesced context, and then unconditionally called
+  `startDecodingThread()` again — putting the async producer back onto the same
+  `AVFormatContext`/`AVCodecContext` that the sync consumer drives on the caller
+  thread. Two threads on one context is what tripped
+  `Assertion fctx->async_lock failed`. Those restarts are now guarded by
+  `!syncMode_`, matching what `initialize()` and `reconfigure()` always did, and
+  the path seeks like every other. Measured on a 720p clip: `set_range(9000,
+  9030)` **56x** faster, `set_range(1000, 1030)` **8.3x**.
+
+  Seeking is only used when the stream's timestamps and its frame indices share
+  an origin, i.e. the first timestamp is zero. On a container that starts
+  elsewhere — MPEG-TS is the usual case, and its `start_time` comes from the
+  first DTS, which is not even the first frame's PTS — an index-derived seek
+  target and a decoded frame's timestamp are in different frames of reference,
+  so those inputs keep decoding forward exactly as before.
+- **`frame_at()` / `reader[i]` no longer keyframe-seek on every call.** A forward
+  request that lands within a second of the previous one now decodes on from
+  where the decoder already sits instead of seeking back to the enclosing
+  keyframe and re-decoding the GOP prefix. A repeat request for the same
+  timestamp, a backward request, or a jump further than that still seeks.
+  Measured: **48x** on a monotonic walk (`reader[i]` for consecutive `i`),
+  **12.5x** on a stride-5 walk.
+- **Re-iterating a reader rewinds by seeking instead of reopening the file.**
+  The rewind rebuilt the whole decoder — `avformat_open_input` plus
+  `avformat_find_stream_info` plus `avcodec_open2` plus a fresh thread pool — on
+  every pass; it now seeks to zero and falls back to the rebuild only if that
+  fails. Measured **2.0x** on repeated short passes over one reader.
+- **`decode_batch()` remembers where it left the stream.** Consecutive calls over
+  adjacent index ranges — the ordinary dataloader pattern — re-seeked to a
+  keyframe and re-decoded the GOP prefix every call. The position now carries
+  across calls, and is dropped whenever anything else moves the shared demuxer
+  (streaming reads, seeks, reconfigure) or the batch fails. Measured **2.43x**
+  over 16 adjacent 32-frame batches.
+- **`decode_batch()` scales straight into the output tensor.** libswscale wrote a
+  scratch buffer that was then memcpy'd into each output slice; it now writes the
+  first requested slice directly, and only duplicate indices are copied.
+  Measured **+30%** on a dense 128-frame batch.
+- **`backend="numpy"` no longer copies every frame.** Frames were cloned on the
+  way out on the theory that the decode path reuses one internal buffer. Only the
+  hardware path does that, and `.cpu()` already gives it a private copy; every CPU
+  path returns a per-frame buffer nothing else can touch. The clone was a full
+  frame-sized `at::parallel_for` copy per frame. Measured **+21%** at 720p,
+  **+65%** at 1080p, **+76%** at 4K, and larger still when the caller retains
+  frames or runs several readers at once.
+- **The GIL is released across reader open, `probe()`, reader teardown and
+  encoder close.** All four are milliseconds of FFmpeg work with no Python state
+  involved — opening a 1080p reader is ~4.7 ms, tearing one down ~6.8 ms (joining
+  up to 17 threads), and an x264 close drains the entire lookahead. Holding the
+  GIL through them serialised every other Python thread. Single-threaded cost is
+  unchanged; measured on concurrent short-clip workloads: reader open+decode+close
+  **+37%** at 4 threads and **+63%** at 8, encode **+45%** at 4 threads and
+  **+44%** at 8.
+- **NVDEC decoders no longer allocate a dead NV12 staging buffer.** Every
+  hardware decoder `cudaMalloc`'d 1.5·W·H bytes that were never read or written.
+  Removing it cuts **12 MiB per 4K reader** and 4 MiB per 1080p reader, plus one
+  synchronising `cudaMalloc` per open.
+- **CUDA `decode_batch()` opens the file once instead of twice.** It constructed
+  an isolated decoder and then immediately reconfigured it to the same path,
+  doubling container open, stream analysis and codec setup for identical state.
+  Measured **+11%**.
+- **The encoder stops pre-creating its output file.** A `stat` plus an
+  `ofstream` create-and-close ran before `avio_open`, which creates the file
+  itself. Matters most for network output paths.
+- **Plain CPU streaming decode also measured faster** — +3% at 720p, +13% at
+  1080p, +18% at 4K (5/5 paired wins, against an A/A noise band of about
+  +-5%). No change in this release targets that path, so this is most likely
+  an incidental effect of the decoder's field layout shifting; it is recorded
+  because it reproduces, not claimed as an engineered win.
+
 ### Fixed
 
+- **`start_prefetch()` on a synchronous reader aborted the process.** A reader
+  built with `prefetch=False` (the default) drives the codec context on the
+  calling thread; `start_prefetch()` started the background producer against the
+  same `AVFormatContext`, and the next read tripped
+  `Assertion fctx->async_lock failed at pthread_frame.c`, killing the
+  interpreter. It now raises a `RuntimeError` explaining that the reader must be
+  constructed with `prefetch=True`, and the reader stays usable.
+- **Iterating after `decode_batch()` started mid-stream.** `decode_batch` seeks
+  and demuxes on the same format context the streaming path uses, but did not
+  mark the stream as touched, so `iter()` skipped its rewind and a following
+  `for frame in reader` yielded frames from wherever the batch had left the file
+  while reporting index 0. `reset()` did not fix it either.
+- **`set_range()` with frame indices returned frames 0..3 on `prefetch=True`**
+  for containers whose first timestamp is not zero (MPEG-TS, and mp4 with a
+  non-zero start). The seek target was computed as a span from zero and compared
+  against raw stream timestamps, so it landed at the head of the file. Those
+  containers now decode forward instead of seeking.
+- **A time range started one frame late.** `set_range(start_time, end_time)` on
+  the seeking paths (`prefetch=True` and NVDEC) dropped the first frame of the
+  range, because it seeked with `seek()`, which decodes *past* the target and
+  discards the frame it lands on. It now uses `seekToNearestKeyframe()` and lets
+  the existing discard loop stop on the first frame at or after `start_time` —
+  the same approach `repositionToActiveSegment()` already documented. Verified
+  against a sequential ground-truth decode.
 - **Re-iterating a reader on the default CPU path silently returned the wrong
   frames.** With `prefetch=False` (the default) a second `for frame in reader`
   carried on from wherever the previous pass had stopped while reporting frame
   index 0 — or yielded nothing at all once a full pass had drained the stream —
-  because that path deliberately never seeks (`avcodec_flush_buffers` on its
-  frame-threaded codec context trips an internal FFmpeg assertion) and `iter()`
-  only zeroed the counters. It now rewinds by rebuilding the decoder, the same
-  mechanism `iter()` already used to force NVDEC back to the true first frame.
-  `reset()` took the unsafe flush-seek on that path and now rewinds the same way.
+  because that path deliberately never seeks and `iter()` only zeroed the
+  counters. It now rewinds properly (by seeking, see above). `reset()` took the
+  unsafe flush-seek on that path and now rewinds the same way.
 - **`VideoReader.reconfigure()` left the old file's ranges half-cleared,** zeroing
   the frame/time bounds without resetting the rest of the range state.
 

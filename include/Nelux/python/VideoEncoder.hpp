@@ -169,6 +169,15 @@ class VideoEncoder
     size_t maxFramesInFlight = 8;    // bounded == backpressure
     std::exception_ptr workerError;  // first error from any worker, re-raised
     bool workersStarted = false;     // submit thread up
+
+    // Serialises teardown. close() is directly Python-callable and also fires
+    // from __exit__ and the destructor; it used to be serialised for free by
+    // the GIL, which it now releases for the codec drain and trailer write.
+    // Without this two threads both saw a non-null `encoder`, both ran the full
+    // drain/mux/av_write_trailer on one AVFormatContext, and the process died
+    // with an access violation. The winner swaps `encoder` out under the lock,
+    // so the loser finds nullptr and returns.
+    std::mutex closeMu;
     bool convertStarted = false;     // convert pool up (CPU path only)
     bool stopping = false;
 

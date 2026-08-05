@@ -233,22 +233,19 @@ void Encoder::openOutputFile()
         }
     }
 
-    // If the file doesn't exist, create it
-    if (!std::filesystem::exists(filename))
-    {
-        std::ofstream file(filename, std::ios::binary);
-        if (!file)
-        {
-            throw std::runtime_error("Failed to create output file: " + filename);
-        }
-        file.close();
-    }
-
+    // avio_open with AVIO_FLAG_WRITE creates the file itself, so the stat plus
+    // create-and-close-an-ofstream that used to run first was one extra syscall
+    // and one extra file-handle round trip per encoder — cheap locally, not
+    // cheap against a UNC/network output path. Its only other value was a
+    // friendlier message for permission/path failures, so report avio_open's
+    // own reason instead of dropping that.
     if (!(formatCtx->oformat->flags & AVFMT_NOFILE))
     {
-        if (avio_open(&formatCtx->pb, filename.c_str(), AVIO_FLAG_WRITE) < 0)
+        if (int ret = avio_open(&formatCtx->pb, filename.c_str(), AVIO_FLAG_WRITE);
+            ret < 0)
         {
-            throw std::runtime_error("Could not open output file: " + filename);
+            throw std::runtime_error("Could not open output file: " + filename +
+                                     " (" + errorToString(ret) + ")");
         }
     }
 

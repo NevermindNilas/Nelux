@@ -127,6 +127,57 @@ def test_numpy_backend_frames_do_not_alias_memory():
     print("✓ NumPy backend frames use independent memory")
 
 
+def test_numpy_backend_retained_frame_survives_later_decodes():
+    """A retained frame must keep its contents while decoding continues.
+
+    Two live frames are trivially distinct as long as the decoder hands out a
+    fresh buffer each time, so the pairwise check above cannot see the real
+    hazard: a buffer being RECYCLED and rewritten while an old array still
+    points at it. Hold frame 0, decode well past the decoder's in-flight window
+    so its buffers must be reused, and assert the held frame is untouched.
+    """
+    vr = VideoReader(VIDEO_PATH, backend="numpy")
+
+    first = vr.read_frame()
+    expected = first.copy()
+
+    decoded = 0
+    for _ in range(50):
+        f = vr.read_frame()
+        if f is None or f.size == 0:
+            break
+        decoded += 1
+        del f
+
+    assert decoded > 0, "needed at least one further decode to exercise recycling"
+    assert np.array_equal(first, expected), (
+        f"Retained NumPy frame was mutated after {decoded} further decodes; "
+        "its buffer was recycled while still referenced."
+    )
+
+    print(f"✓ Retained NumPy frame intact after {decoded} further decodes")
+
+
+def test_numpy_backend_all_frames_retained_stay_distinct():
+    """Holding every frame at once must not collapse them onto shared storage."""
+    vr = VideoReader(VIDEO_PATH, backend="numpy")
+
+    frames = []
+    for _ in range(24):
+        f = vr.read_frame()
+        if f is None or f.size == 0:
+            break
+        frames.append(f)
+
+    assert len(frames) >= 2
+    ptrs = {f.__array_interface__["data"][0] for f in frames}
+    assert len(ptrs) == len(frames), (
+        f"{len(frames)} retained frames share only {len(ptrs)} distinct buffers"
+    )
+
+    print(f"✓ {len(frames)} simultaneously retained NumPy frames are distinct")
+
+
 def test_numpy_backend_frame_at():
     """Test that frame_at with numpy backend returns numpy.ndarray."""
     vr = VideoReader(VIDEO_PATH, backend="numpy")
