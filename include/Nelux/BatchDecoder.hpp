@@ -95,10 +95,11 @@ private:
     // position_valid, since the demuxer is shared with the streaming path.
     int64_t retainedFrame_ = -1;
 
-    // Cached RGB24 scaling context + scratch buffer for copyFrameToOutput.
-    // Building an SwsContext (scaling tables, SIMD init) and allocating the RGB
-    // buffer once per decoded frame dominated batch decode; both are reused and
-    // only rebuilt when the source frame geometry/format changes. Freed in dtor.
+    // Cached RGB24 scaling context for copyFrameToOutput. Building an SwsContext
+    // per decoded frame (scaling tables, SIMD init) dominated batch decode, so
+    // it is reused and only rebuilt when the source frame geometry/format
+    // changes. Freed in the destructor. There is no scratch buffer any more —
+    // copyFrameToOutput scales straight into the output tensor.
     SwsContext* copySws_ = nullptr;
     int copySwsSrcW_ = -1;
     int copySwsSrcH_ = -1;

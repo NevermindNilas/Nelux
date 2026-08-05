@@ -532,21 +532,32 @@ class VideoReader
     }
     std::shared_ptr<nelux::Decoder> rand_decoder;
 
-    // Guards the decoder OWNERSHIP handoff, not decoding itself.
+    // Serialises everything a reader does to its FFmpeg contexts, and the
+    // decoder ownership handoff along with it.
     //
-    // close() used to be serialised for free: it ran entirely under the GIL, so
-    // a second Python thread calling close() (or __exit__, or read_frame)
-    // simply could not run until the first finished. Now that teardown releases
-    // the GIL, that exclusion has to be explicit — without it two threads both
-    // saw a non-null `decoder`, both called Decoder::close(), and both joined
-    // the same std::thread (reproducible: "no such process" every time).
+    // All of this used to be serialised for free by the GIL: a second Python
+    // thread calling close() (or read_frame, or decode_batch) simply could not
+    // run until the first finished. Now that those paths drop the GIL, the
+    // exclusion has to be explicit. Without it, two threads both saw a non-null
+    // `decoder`, both called Decoder::close() and both joined the same
+    // std::thread ("no such process", every time), and two concurrent decodes
+    // on one reader aborted the process on FFmpeg's internal
+    // "Assertion fctx->async_lock failed".
     //
-    // Readers take a shared lock and copy the shared_ptr before doing any long
-    // work with the GIL released; close() takes the unique lock, swaps the
-    // owners out, and only then does the actual teardown. So a second closer
-    // finds nullptr and returns, and a decode either runs to completion before
-    // teardown starts or observes nullptr and raises instead of dereferencing a
-    // freed decoder.
+    // So the decode entry points (decodeFrame, decodeBatch, decodeFrameAt) take
+    // it EXCLUSIVELY for their whole run, and close() takes it to swap the
+    // owners out before tearing anything down. A second closer then finds
+    // nullptr and returns; a decode either completes before teardown starts or
+    // observes nullptr and raises rather than touching freed contexts.
+    //
+    // It stays a shared_mutex because the cheap accessors (pinDecoder, used by
+    // the prefetch getters and by callers that only need to hold the decoder
+    // alive across a nested decodeFrame) genuinely are read-only and should not
+    // serialise against each other. Note it is NOT recursive: nothing that
+    // holds it may call a decode entry point.
+    //
+    // Concurrent decoding of one reader was never meaningful — separate readers
+    // still run fully in parallel, which is what dropping the GIL buys.
     mutable std::shared_mutex lifecycleMu_;
 
     // Timestamp of the last frame decodeFrameAt() returned from rand_decoder,

@@ -738,22 +738,30 @@ torch::Tensor VideoReader::decodeFrame()
 {
     NELUX_TRACE("decodeFrame() called");
 
-    // Release the GIL, THEN take the shared lock, and keep it for the whole
-    // decode. Holding it only long enough to copy the shared_ptr would keep the
-    // Decoder object alive but would not stop close() from calling
-    // Decoder::close() concurrently, which frees the very AVCodecContext /
-    // AVFormatContext this decode is using. close() takes the unique lock, so
-    // it now waits for an in-flight decode instead of pulling the contexts out
-    // from under it.
+    // Release the GIL, THEN take the lock, and keep it for the whole decode.
+    //
+    // EXCLUSIVE: one AVCodecContext and one AVFormatContext per reader, so two
+    // threads decoding the same reader at once is not merely interleaved
+    // frames, it aborts the process on FFmpeg's internal
+    // "Assertion fctx->async_lock failed". The GIL used to make that
+    // impossible; now that the decode drops it, the lock has to. Concurrent
+    // decoding of ONE reader was never meaningful — separate readers still run
+    // fully in parallel, which is what the GIL release buys.
+    //
+    // Holding it only long enough to copy the shared_ptr would also be too
+    // weak for teardown: that keeps the Decoder object alive but does not stop
+    // close() from calling Decoder::close() concurrently, freeing the very
+    // contexts this decode is using. close() takes the same lock, so it now
+    // waits for an in-flight decode instead.
     //
     // The ORDER of these two is load-bearing and must not be swapped. Locals
     // are destroyed in reverse, so the lock is released while the GIL is still
     // dropped, and only then is the GIL re-acquired. The other way round, this
-    // thread would want the GIL back while still holding the shared lock, and
-    // close() -- which reaches its unique lock holding the GIL -- would
-    // deadlock against it.
+    // thread would want the GIL back while still holding the lock, and close()
+    // -- which reaches its own lock holding the GIL -- would deadlock against
+    // it.
     py::gil_scoped_release release;
-    std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+    std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
 
     std::shared_ptr<nelux::Decoder> dec = decoder;
     if (!dec)
@@ -1222,8 +1230,9 @@ void VideoReader::reset()
     NELUX_TRACE("reset() called: Resetting VideoReader state");
     if (std::shared_ptr<nelux::Decoder> dec = pinDecoder())
     {
-        // The sync CPU path cannot be flush-seeked (frame-threaded context);
-        // rebuild the decoder instead, as iter() does.
+        // Route the sync CPU path through the shared rewind helper, which
+        // seeks to zero when the stream allows it and rebuilds the decoder
+        // otherwise — the same choice iter() makes.
         if (decodeAccelerator == nelux::DecodeAccelerator::CPU && !prefetch)
             rewindForFreshIteration();
         else
@@ -1270,13 +1279,20 @@ void VideoReader::ensureRandDecoder()
         // outChannels_). Passed into the ctor for the same reason as the main
         // decoder — no post-construction channel switch.
         // Constructed OUTSIDE the lock (opening a file is slow and would block
-        // close()), then published under it. The re-check covers two threads
-        // racing to create it; the loser's decoder is simply dropped.
-        std::shared_ptr<nelux::Decoder> fresh = nelux::createDecoder(
-            filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
-            resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_, resizeFilter_,
-            motionVectorsEnabled_);
-        fresh->setForce8Bit(force_8bit);
+        // close()) and with the GIL dropped — this is a full container open,
+        // find_stream_info and codec open, the same FFmpeg-only work the reader
+        // constructor releases the GIL for. Published under the lock; the
+        // re-check covers two threads racing to create it, and the loser's
+        // decoder is simply dropped.
+        std::shared_ptr<nelux::Decoder> fresh;
+        {
+            py::gil_scoped_release release;
+            fresh = nelux::createDecoder(
+                filePath, numThreads, decodeAccelerator, cudaDeviceIndex,
+                resizeWidth_, resizeHeight_, /*syncMode=*/true, grayscale_,
+                resizeFilter_, motionVectorsEnabled_);
+            fresh->setForce8Bit(force_8bit);
+        }
 
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
         // Re-check that the reader is still open: close() may have run while
@@ -1295,12 +1311,14 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     // a newly built decoder, and a shared_mutex is not recursive.
     ensureRandDecoder();
 
-    // One GIL release and one shared lock covering the whole call — the seek
-    // and every decode. Same ordering rule as decodeFrame(): GIL first so the
-    // lock is dropped before the GIL is taken back, otherwise close() (which
-    // holds the GIL while it waits for the unique lock) deadlocks against this.
+    // EXCLUSIVE for the whole call. Random access seeks and flushes one shared
+    // rand_decoder, so two concurrent frame_at() calls on the same reader would
+    // interleave seeks on one FFmpeg context. Same ordering rule as
+    // decodeFrame(): GIL first so the lock is dropped before the GIL is taken
+    // back, otherwise close() (which holds the GIL while it waits for its own
+    // unique lock) deadlocks against this.
     py::gil_scoped_release release;
-    std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+    std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
 
     std::shared_ptr<nelux::Decoder> rdec = rand_decoder;
     if (!rdec)
@@ -1887,11 +1905,15 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 
     torch::Tensor batch;
     {
-        // GIL first, then the shared lock, held for the whole batch — see
-        // decodeFrame() for why the order matters and why the lock has to
-        // outlive the call rather than just the pointer copy.
+        // EXCLUSIVE, not shared. decode_batch drives the shared AVFormatContext
+        // directly — it stops the producer, seeks and demuxes on it — so two
+        // concurrent batches, or a batch racing a streaming decode, corrupt the
+        // demuxer state (two threads also double-join the producer thread). The
+        // GIL used to serialise this for free; now that it is dropped, the lock
+        // has to. Ordering as in decodeFrame(): GIL first, so the lock is
+        // released before the GIL is taken back.
         py::gil_scoped_release release;
-        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
 
         std::shared_ptr<nelux::Decoder> dec = decoder;
         if (!dec)
