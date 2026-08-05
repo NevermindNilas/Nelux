@@ -17,6 +17,7 @@ exactly those hashes at exactly those ordinals.
 import hashlib
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -42,9 +43,16 @@ def _sequential_hashes(path):
 
 def _generate(path, container_args, offset=None):
     """A short synthetic clip; testsrc2 makes every frame visually distinct."""
+    return _generate_source(path, container_args, offset=offset)
+
+
+def _generate_source(path, container_args, offset=None, duration=3, filters=()):
     cmd = ["ffmpeg", "-y", "-v", "error",
-           "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=3",
-           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "12", *container_args]
+           "-f", "lavfi",
+           "-i", f"testsrc2=size=320x240:rate=30:duration={duration}"]
+    if filters:
+        cmd += ["-vf", *filters, "-fps_mode", "passthrough"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "12", *container_args]
     if offset is not None:
         cmd += ["-output_ts_offset", str(offset), "-muxdelay", "0", "-muxpreload", "0"]
     cmd.append(path)
@@ -71,6 +79,33 @@ def clips(tmp_path_factory):
                                offset=7.5),
         "offset_mkv": _generate(str(d / "offset.mkv"), ["-bf", "2", "-f", "matroska"],
                                 offset=5.25),
+    }
+
+
+@pytest.fixture(scope="module")
+def gappy_clips(tmp_path_factory):
+    """MPEG-TS clips whose PTS spacing does not map 1:1 onto avg_frame_rate.
+
+    These are the streams where derived ordinals are genuinely absent rather
+    than merely hidden behind a bad seek, which is what the seek-overshoot
+    recovery must not over-generalise from. Longer than the fixtures above so
+    that a recovery which rescans from frame 0 per target is visibly costly.
+    """
+    if not _have_ffmpeg():
+        pytest.skip("ffmpeg not on PATH")
+    d = tmp_path_factory.mktemp("gappy")
+    return {
+        # Exactly one missing frame, so exactly one absent ordinal (42) in an
+        # otherwise perfect mapping. The archetypal capture-with-a-dropout.
+        "dropped_frame": _generate_source(
+            str(d / "dropped.ts"), ["-f", "mpegts"], duration=40,
+            filters=("select='not(eq(n,42))'",)),
+        # Every third frame kept, so most ordinals are absent and the ones that
+        # remain are irregularly spaced. Long enough (900 kept frames) that a
+        # per-target rescan from frame 0 is measurably more than one pass.
+        "vfr": _generate_source(
+            str(d / "vfr.ts"), ["-f", "mpegts"], duration=90,
+            filters=("select='not(mod(n,3))'",)),
     }
 
 
@@ -145,6 +180,90 @@ class TestNonZeroStartTimeline:
                 assert got == [expected[i] for i in chunk], f"chunk {chunk}"
 
 
+class TestAbsentOrdinalsDoNotPoisonTheBatch:
+    """Requesting an index that does not exist must not change any other index.
+
+    The seek-overshoot recovery cannot reach every target: on a stream with
+    missing ordinals, some requests have no exactly-matching frame and the
+    recovery necessarily returns the next one. The danger is generalising that
+    per-target fact into per-file state. A first cut latched the recovery off
+    for the rest of the file the moment one target failed to land exactly,
+    after which later targets silently got whatever their overshooting seek
+    happened to produce -- a worse frame than the same index returned when
+    requested on its own.
+
+    The oracle needs no timestamp arithmetic: a batch's answer for one index
+    must not depend on what else was in the batch.
+    """
+
+    def _one(self, path, index):
+        with VideoReader(path) as r:
+            return _hash(r.decode_batch([index])[0])
+
+    def _after(self, path, absent, index):
+        with VideoReader(path) as r:
+            return _hash(r.decode_batch([absent, index])[1])
+
+    @pytest.mark.parametrize("index", [43, 200, 600, 900])
+    def test_absent_ordinal_first_does_not_change_a_later_index(
+            self, gappy_clips, index):
+        path = gappy_clips["dropped_frame"]
+        with VideoReader(path) as r:
+            if index >= len(r):
+                pytest.skip("clip shorter than expected")
+        assert self._after(path, 42, index) == self._one(path, index), (
+            f"index {index} changed because absent ordinal 42 was requested "
+            f"alongside it"
+        )
+
+    def test_many_absent_ordinals_do_not_change_later_indices(self, gappy_clips):
+        """The same property when most ordinals are missing, not just one."""
+        path = gappy_clips["vfr"]
+        with VideoReader(path) as r:
+            n = len(r)
+        probes = [i for i in (100, 300, 600) if i < n]
+        alone = [self._one(path, i) for i in probes]
+        with VideoReader(path) as r:
+            batch = r.decode_batch([1] + probes)
+        together = [_hash(batch[k + 1]) for k in range(len(probes))]
+        assert together == alone
+
+    def test_batch_cost_does_not_scale_with_index_count(self, gappy_clips):
+        """Bound the recovery's cost, which is the reason it is conditional.
+
+        Recovering by rescanning from frame 0 for every target is O(K*N) in the
+        index count. Comparing two batches with the same spread over the same
+        clip and only the index count differing makes machine speed cancel out,
+        which an absolute time budget cannot do on a shared box:
+
+          - rescan per target: work scales with K, measured 4.46x for 4 -> 32
+          - single forward pass: both batches cost about one pass, measured 1.16x
+
+        The threshold sits between the two with room on both sides.
+        """
+        path = gappy_clips["vfr"]
+        with VideoReader(path) as r:
+            n = len(r)
+
+        def cost(k):
+            indices = [i * (n // k) for i in range(k)]
+            best = float("inf")
+            for _ in range(3):  # best-of-3, so a scheduling hiccup cannot fail it
+                t0 = time.perf_counter()
+                with VideoReader(path) as r:
+                    r.decode_batch(indices)
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        few, many = cost(4), cost(32)
+        assert many < few * 2.5, (
+            f"32 indices cost {many:.4f}s against {few:.4f}s for 4 "
+            f"({many / few:.2f}x) -- cost is scaling with the index count, so "
+            f"the overshoot recovery is rescanning from the stream start once "
+            f"per index"
+        )
+
+
 class TestZeroBasedControl:
 
     def test_zero_based_clip_unaffected(self):
@@ -191,6 +310,15 @@ class TestReconfigureAcrossTimelines:
         a, b = clips["offset_ts"], clips["offset_mkv"]
         a_expected = _sequential_hashes(a)
         b_expected = _sequential_hashes(b)
+
+        # All the fixtures come from one testsrc2 source and differ only in
+        # container and x264's B-frame decisions. If those ever stop producing
+        # different pixels, every assertion below would hold no matter which
+        # file was decoded, and the test would pass while checking nothing.
+        assert a_expected != b_expected, (
+            "fixtures decode identically; this test can no longer detect a "
+            "stale origin"
+        )
 
         with VideoReader(a) as r:
             indices = [0, 7, 30]

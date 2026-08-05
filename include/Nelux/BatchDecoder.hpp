@@ -131,13 +131,15 @@ private:
     int64_t ptsOrigin_ = 0;
     bool ptsOriginResolved_ = false;
 
-    // Set once a rewind-and-scan has failed to improve on what a seek produced,
-    // which means the requested ordinal is absent from the stream rather than
-    // merely hidden behind an inaccurate seek. That is a property of the stream
-    // (VFR, dropped capture timestamps, an avg_frame_rate that does not map 1:1
-    // onto PTS spacing), so once it is observed the recovery is abandoned for
-    // this file instead of being re-attempted, and paid for, on every target.
-    bool rescanIneffective_ = false;
+    // Set once a rewind-and-scan has been needed, i.e. this stream's seeks land
+    // somewhere a forward scan improves on. From then on the optional
+    // gap-based seek is skipped and later targets are reached by decoding
+    // forward. Purely a cost decision: ordinals are monotonic in output order
+    // and both routes stop at the first ordinal >= target, so scanning forward
+    // returns exactly the frame a seek-then-rescan would, starting closer.
+    // Mandatory seeks (backwards, drained decoder, unknown position) are
+    // unaffected.
+    bool forwardScanPreferred_ = false;
 
     // Upper bound on packets resolvePtsOrigin() will demux looking for the first
     // timestamped frame. The answer normally arrives in the first packet or two;
