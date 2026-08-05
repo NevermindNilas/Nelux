@@ -6,6 +6,7 @@
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <atomic>
 #include <shared_mutex>
 
 
@@ -558,7 +559,13 @@ class VideoReader
     // few frames ahead decode straight on instead of seeking back to the
     // keyframe and re-decoding the whole GOP prefix. Reset whenever
     // rand_decoder is destroyed or the file changes.
-    double randLastTs_ = -1.0;
+    //
+    // Atomic because decodeFrameAt() reads and writes it around a window where
+    // the GIL is released, while close()/reconfigure() reset it under
+    // lifecycleMu_. It is only a hint -- a stale value costs a redundant seek,
+    // never a wrong frame -- so relaxed access is enough; what matters is that
+    // the read and the write are not torn.
+    std::atomic<double> randLastTs_{-1.0};
 
     torch::Tensor makeLikeOutputTensor() const;
     /**

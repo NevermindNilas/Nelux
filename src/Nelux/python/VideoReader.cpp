@@ -244,17 +244,18 @@ void VideoReader::close()
     // involved, so the GIL is dead weight that stalls every other thread.
     // Guarded because this also runs from ~VideoReader, which can fire from a
     // non-Python thread or during interpreter finalisation.
-    // Take ownership of the decoders under the lifecycle lock FIRST. The unique
-    // lock waits for any in-flight decode to finish, and after the swap a
-    // concurrent close() sees nullptr and does nothing while a concurrent
-    // decode sees nullptr and raises. Only then is it safe to drop the GIL for
-    // the actual teardown.
+    // Take ownership of the decoders under the lifecycle lock FIRST. The lock
+    // serialises the OWNERSHIP SWAP, not decoding: a decode holds the lock only
+    // long enough to copy the shared_ptr, and is then kept safe by that
+    // reference for the rest of its run. After the swap a concurrent close()
+    // sees nullptr and does nothing, and a decode that starts later sees
+    // nullptr and raises. Only then is it safe to drop the GIL for teardown.
     std::shared_ptr<nelux::Decoder> dec, randDec;
     {
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
         dec.swap(decoder);
         randDec.swap(rand_decoder);
-        randLastTs_ = -1.0;
+        randLastTs_.store(-1.0, std::memory_order_relaxed);
     }
     if (!dec && !randDec)
     {
@@ -1214,7 +1215,7 @@ py::object VideoReader::operator[](py::object key)
 void VideoReader::reset()
 {
     NELUX_TRACE("reset() called: Resetting VideoReader state");
-    if (decoder)
+    if (std::shared_ptr<nelux::Decoder> dec = pinDecoder())
     {
         // The sync CPU path cannot be flush-seeked (frame-threaded context);
         // rebuild the decoder instead, as iter() does.
@@ -1222,7 +1223,7 @@ void VideoReader::reset()
             rewindForFreshIteration();
         else
         {
-            decoder->seek(0.0);
+            dec->seek(0.0);
             streamTouched_ = false;
         }
     }
@@ -1273,6 +1274,11 @@ void VideoReader::ensureRandDecoder()
         fresh->setForce8Bit(force_8bit);
 
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        // Re-check that the reader is still open: close() may have run while
+        // the decoder above was being built, and publishing now would resurrect
+        // random access on a closed reader.
+        if (!decoder)
+            throw std::runtime_error("VideoReader is closed");
         if (!rand_decoder)
             rand_decoder = std::move(fresh);
     }
@@ -1304,13 +1310,14 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     //        on a container that starts at a non-zero timestamp the seeking
     //        path and this one disagree about which frame a request names, and
     //        frame_at() must stay a pure function of its argument.
-    const bool decodeForward = randLastTs_ >= 0.0 &&
-                               timestamp_seconds > randLastTs_ + half &&
-                               (timestamp_seconds - randLastTs_) <= 1.0 &&
+    const double lastTs = randLastTs_.load(std::memory_order_relaxed);
+    const bool decodeForward = lastTs >= 0.0 &&
+                               timestamp_seconds > lastTs + half &&
+                               (timestamp_seconds - lastTs) <= 1.0 &&
                                rdec->hasZeroBasedTimeline();
     // Position is unknown until this call re-establishes it: any throw or
     // partial decode below must leave the next call re-seeking.
-    randLastTs_ = -1.0;
+    randLastTs_.store(-1.0, std::memory_order_relaxed);
 
     if (!decodeForward)
     {
@@ -1366,7 +1373,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         throw std::runtime_error("Failed to decode frame at requested timestamp");
 
     // Position is known again: the decoder has just emitted the frame at hit_ts.
-    randLastTs_ = hit_ts;
+    randLastTs_.store(hit_ts, std::memory_order_relaxed);
 
     NELUX_DEBUG("decodeFrameAt(): hit ts={}", hit_ts);
     return out_frame;
@@ -1836,7 +1843,10 @@ std::string VideoReader::getPixelFormat() const
 
 int64_t VideoReader::getFrameCount() const
 {
-    return decoder->get_frame_count();
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+    return dec->get_frame_count();
 }
 
 torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
@@ -1870,18 +1880,19 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
 
+    // Set BEFORE the call, not after: decode_batch seeks and demuxes on the
+    // SHARED format context, so the reader stops being parked at frame 0 as
+    // soon as it starts — including on the paths that throw part way through.
+    // Without this, iter() saw streamTouched_ == false, skipped the rewind, and
+    // a following `for frame in reader` started from wherever the batch left
+    // the stream while reporting index 0.
+    streamTouched_ = true;
+
     torch::Tensor batch;
     {
         py::gil_scoped_release release;
         batch = dec->decode_batch(indices);
     }
-
-    // decode_batch seeks and demuxes on the SHARED format context, so the
-    // reader is no longer parked at frame 0 even if nothing has been iterated.
-    // Without this, iter() saw streamTouched_ == false, skipped the rewind, and
-    // a following `for frame in reader` started from wherever the batch left
-    // the stream while reporting index 0.
-    streamTouched_ = true;
 
     return batch;
 }
@@ -1910,36 +1921,49 @@ void VideoReader::startPrefetch(size_t buffer_size, bool start_immediately)
             "Construct the reader as VideoReader(path, prefetch=True) instead.");
     }
 
+    // Pinned like every other decoder use: close() swaps the member out, so an
+    // unpinned dereference here is both a shared_ptr race and a null deref on a
+    // closed reader.
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+
     if (buffer_size > 0)
     {
-        decoder->setPrefetchSize(buffer_size);
+        dec->setPrefetchSize(buffer_size);
     }
     
     if (start_immediately)
     {
-        decoder->startPrefetch();
+        dec->startPrefetch();
     }
 }
 
 void VideoReader::stopPrefetch()
 {
     NELUX_INFO("Stopping prefetch");
-    decoder->stopPrefetch();
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+    dec->stopPrefetch();
 }
 
 size_t VideoReader::getPrefetchBufferedCount() const
 {
-    return decoder->getPrefetchBufferedCount();
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    return dec ? dec->getPrefetchBufferedCount() : 0;
 }
 
 bool VideoReader::isPrefetching() const
 {
-    return decoder->isPrefetching();
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    return dec ? dec->isPrefetching() : false;
 }
 
 size_t VideoReader::getPrefetchSize() const
 {
-    return decoder->getPrefetchSize();
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    return dec ? dec->getPrefetchSize() : 0;
 }
 
 // ----------------------------------
@@ -1961,7 +1985,7 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     {
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
         oldRand.swap(rand_decoder);
-        randLastTs_ = -1.0;
+        randLastTs_.store(-1.0, std::memory_order_relaxed);
     }
 
     // Reconfigure the main decoder
