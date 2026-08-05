@@ -1,4 +1,5 @@
 ﻿#include "python/VideoEncoder.hpp"
+#include <cassert>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -132,26 +133,38 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     return props;
 }
 
+bool VideoEncoder::isHardwareEncoder() const
+{
+    // Reads the `encoder` member, which close() swaps out and then destroys, so
+    // it needs the lock rather than a bare pointer test. Shared: two threads
+    // asking this question do not disturb each other.
+    return underEncoderLockRead(
+        [this] { return encoder && encoder->isHardwareEncoder(); });
+}
+
 void VideoEncoder::addPassthrough(const std::string& source, bool audio,
                                   bool subtitles, double start, double end,
                                   bool allowTranscode)
 {
-    if (!encoder)
-        throw std::runtime_error("Encoder is not initialized");
-    // The container header is written on the first encodeFrame; copied streams
-    // must be registered before that. workersStarted flips on the first frame.
-    if (workersStarted)
-        throw std::runtime_error(
-            "add_passthrough must be called before the first encode_frame");
-    encoder->addInputStreams(source, audio, subtitles, start, end,
-                             allowTranscode);
+    underEncoderLock(
+        [&]
+        {
+            if (!encoder)
+                throw std::runtime_error("Encoder is not initialized");
+            // The container header is written on the first encodeFrame; copied
+            // streams must be registered before that. workersStarted flips on
+            // the first frame — and it is only a meaningful gate because the
+            // lock makes this check and that flip mutually exclusive.
+            if (workersStarted)
+                throw std::runtime_error(
+                    "add_passthrough must be called before the first encode_frame");
+            encoder->addInputStreams(source, audio, subtitles, start, end,
+                                     allowTranscode);
+        });
 }
 
 void VideoEncoder::encodeFrame(torch::Tensor frame)
 {
-    if (!encoder)
-        throw std::runtime_error("Encoder is not initialized");
-
     // Validate input size up front, while the GIL is still held so this raises
     // as a clean Python exception. The convert pipeline consumes exactly
     // width*height*3 RGB bytes; accept either a 3-channel HWC RGB frame or a
@@ -200,22 +213,15 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         }
     }
 
-    // Verbatim grayscale data path: when the output pixel format is a plain
-    // single-plane gray format the codec actually accepts, fill it directly
-    // (full-range, up to 16-bit) instead of funnelling through the 8-bit RGB24
-    // convert pipeline. Runs synchronously — grayscale/data output is not the
-    // throughput-critical path — so it never mixes with the async submit thread.
-    if (isGrayVerbatimPixfmt(outputPixelFormat))
-    {
-        encodeGrayVerbatim(frame);
-        return;
-    }
-
 #ifdef NELUX_ENABLE_CUDA
     // Free GPU tensors retired by the submit thread, here while pybind still
     // holds the GIL (torch CUDA dealloc can need it). Moving this off the submit
     // thread avoids a per-frame GIL acquire that otherwise stalls it behind the
     // GIL-heavy host pipeline (TensorRT) and tanks NVENC throughput.
+    //
+    // Deliberately before the lifecycle lock: it only needs `mu`, which is the
+    // inner lock, and doing it here keeps the "free under the GIL" property
+    // without holding the GIL for the whole encode.
     {
         std::deque<torch::Tensor> toFree;
         {
@@ -226,7 +232,33 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     }
 #endif
 
-    py::gil_scoped_release release;
+    // Everything from here on drives the codec, the worker pipeline and the
+    // buffer pools, so it runs serialised against every other operation on this
+    // encoder — with the GIL dropped, so other encoders still run in parallel.
+    underEncoderLock([&] { encodeFrameLocked(frame); });
+}
+
+void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
+{
+    // Re-checked (not merely checked) under the lock: a concurrent close() can
+    // have swapped `encoder` out and destroyed it at any point before we got
+    // here, and the pipeline below dereferences it.
+    if (!encoder)
+        throw std::runtime_error("Encoder is not initialized");
+
+    const int64_t grayElems = static_cast<int64_t>(width) * height;
+    const bool grayInput = (frame.numel() == grayElems);
+
+    // Verbatim grayscale data path: when the output pixel format is a plain
+    // single-plane gray format the codec actually accepts, fill it directly
+    // (full-range, up to 16-bit) instead of funnelling through the 8-bit RGB24
+    // convert pipeline. Runs synchronously — grayscale/data output is not the
+    // throughput-critical path — so it never mixes with the async submit thread.
+    if (isGrayVerbatimPixfmt(outputPixelFormat))
+    {
+        encodeGrayVerbatim(frame);
+        return;
+    }
 
     // Grayscale input: replicate the single luma channel into a fresh 3-channel
     // RGB tensor so the rest of the pipeline is unchanged (R==G==B). Uses only
@@ -458,12 +490,11 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
     const int64_t grayElems = static_cast<int64_t>(width) * height;
     const bool grayInput = (frame.numel() == grayElems);
 
-    py::gil_scoped_release release;
-
-    // Serialize the whole verbatim path: it lazily inits grayRgbConverter_ (a
-    // non-thread-safe SwsContext) and drives the single stateful encoder, so two
-    // Python threads calling encode_frame concurrently must not overlap here.
-    std::lock_guard<std::mutex> lk(mu);
+    // Precondition: called only from encodeFrameLocked, i.e. with lifecycleMu_
+    // held exclusively and the GIL already dropped. That is what serialises the
+    // whole verbatim path — it lazily inits grayRgbConverter_ (a non-thread-safe
+    // SwsContext) and drives the single stateful encoder, so two Python threads
+    // calling encode_frame concurrently must not overlap here.
 
     // Mark that encoding has begun, mirroring the async path's workersStarted
     // flag, so add_passthrough() (which must precede the first frame) is
@@ -868,62 +899,107 @@ void VideoEncoder::stopEncodeWorkers()
     cvReady.notify_all();
     cvFree.notify_all();
 
-    auto joinAll = [&] {
-        // Join convert workers FIRST so they drain convertQueue and populate
-        // readyMap for every admitted frame; then the submit thread can finish
-        // sending all of them and exit.
-        for (auto& t : convertWorkers)
-            if (t.joinable())
-                t.join();
-        if (encodeThread.joinable())
-            encodeThread.join();
-    };
+    // The GIL is not held here, and must not be: joining is a blocking wait, and
+    // stalling every other Python thread for its duration would be rude. Note
+    // this is politeness, NOT deadlock avoidance — the workers never take the
+    // GIL (that is the whole point of retiredTensors: the submit thread MOVES
+    // tensors out and the caller frees them), so a join under the GIL would
+    // merely be slow.
+    //
+    // Do NOT "restore" a release-if-we-hold-it branch here. Releasing the GIL
+    // inside the lock and re-acquiring it before the unlock is precisely the
+    // ordering inversion underEncoderLock exists to prevent: the thread would
+    // hold lifecycleMu_ while waiting for the GIL, deadlocking any close() that
+    // reached its own lock still holding it.
+    //
+    // The assert documents a LOCAL precondition (this function's callers have
+    // dropped the GIL); it is not what makes the acquire in closeLocked() safe —
+    // that rests on the global property documented on underEncoderLock. And it
+    // is documentation only: CMakeLists.txt FORCEs Release, so NDEBUG is always
+    // defined and this never executes in a buildable configuration.
+    assert(!PyGILState_Check() &&
+           "stopEncodeWorkers() must run under lifecycleMu_ with the GIL dropped");
 
-    // Release the GIL while joining: the submit thread may need it to free torch
-    // tensors (GPU path); holding it here would deadlock the join.
-    if (PyGILState_Check())
-    {
-        py::gil_scoped_release rel;
-        joinAll();
-    }
-    else
-    {
-        joinAll();
-    }
+    // Join convert workers FIRST so they drain convertQueue and populate
+    // readyMap for every admitted frame; then the submit thread can finish
+    // sending all of them and exit.
+    for (auto& t : convertWorkers)
+        if (t.joinable())
+            t.join();
+    if (encodeThread.joinable())
+        encodeThread.join();
 
     convertWorkers.clear();
     workersStarted = false;
+    // NOTE: this leaves convertStarted true with convertWorkers empty, so the
+    // object is deliberately NOT restartable. Encoding again from here would
+    // respawn the submit thread (workersStarted is false), early-return from
+    // ensureConvertPipeline() (convertStarted is true) and then block on cvFree
+    // forever with zero convert workers to fill it — while holding lifecycleMu_,
+    // so it hangs every operation on the encoder, not just the one caller.
+    //
+    // It is unreachable because both callers guarantee no later encode:
+    // closeLocked() swaps `encoder` out immediately after this returns and
+    // before anything that can throw, so a later encodeFrameLocked() raises on
+    // the null check; and ~VideoEncoder's fallback runs while the object is
+    // already being destroyed.
+    //
+    // If a resume path is ever added, resetting convertStarted, the converters
+    // and both buffer pools is NOT sufficient. Also required:
+    //   - resync nextSubmitSeq/enqueueSeq. encodeSubmitLoop's early break
+    //     clears readyMap and zeroes inFlight but leaves nextSubmitSeq behind
+    //     enqueueSeq, so a respawned submit thread waits on a sequence number
+    //     that was discarded and never arrives.
+    //   - clear workerError. ~VideoEncoder's fallback path does not run
+    //     closeLocked()'s rethrow-and-clear, so a stale error would be raised
+    //     immediately by the next encode_frame instead of the new one.
+    // convertQueue and readyMap do NOT need clearing: the workers drain
+    // convertQueue before exiting and the submit loop empties readyMap on its
+    // way out.
 }
 
 void VideoEncoder::close()
 {
-    // Whole-teardown lock. close() is Python-callable, runs from __exit__ and
-    // from the destructor, and now releases the GIL for the codec drain — so
-    // the GIL no longer serialises it and a second caller could otherwise run
-    // stopEncodeWorkers() and the drain concurrently with the first. A second
-    // caller blocks here, then finds `encoder` already swapped out and does
-    // nothing.
+    // Whole-teardown under the same lock every other operation takes. close()
+    // is Python-callable, runs from __exit__ and from the destructor, and
+    // releases the GIL for the codec drain — so the GIL no longer serialises it
+    // against a second closer OR against an in-flight encode_frame. A second
+    // caller blocks on the lock, then finds `encoder` already swapped out and
+    // does nothing.
     //
-    // The GIL MUST be dropped while waiting for it. The first caller holds this
-    // lock while joining the encode workers, and those workers can need the GIL
-    // to free torch tensors (see stopEncodeWorkers). A second caller that waited
-    // here still holding the GIL would therefore deadlock the first — which is
-    // exactly what happened before this release was added.
-    std::unique_lock<std::mutex> closeLock(closeMu, std::defer_lock);
-    if (PyGILState_Check())
-    {
-        py::gil_scoped_release rel;
-        closeLock.lock();
-    }
-    else
-    {
-        closeLock.lock();
-    }
+    // underEncoderLock drops the GIL BEFORE taking the lock. That is what lets
+    // the holder re-acquire the GIL mid-teardown (it does, to free retired CUDA
+    // tensors) without deadlocking a waiter: no thread is ever parked on
+    // lifecycleMu_ while holding the GIL.
+    underEncoderLock([this] { closeLocked(); });
+}
 
+void VideoEncoder::closeLocked()
+{
     // Drain + join the encode workers FIRST so every queued frame is sent to the
     // codec before we flush. Flushing (encoder->close sends a null frame) must
     // happen only after the last real frame.
     stopEncodeWorkers();
+
+    // Claim ownership NOW — before anything else in this function can throw.
+    // (stopEncodeWorkers() above can, in principle: std::thread::join() raises
+    // std::system_error. That one is harmless here, because it leaves
+    // workersStarted true and convertWorkers uncleared — not the wedged
+    // combination described below.) A later close() then has nothing to drain,
+    // but the ordering matters for a second reason:
+    // gpuConverter->synchronize() below raises on a sticky CUDA error, and if
+    // `encoder` were still set when it did, the exception would propagate out of
+    // close() leaving a live Python object in the one state stopEncodeWorkers()
+    // cannot recover from — workersStarted false, convertStarted true, zero
+    // convert workers. The next encode_frame would pass the null check, respawn
+    // the submit thread, early-return from ensureConvertPipeline() and then block
+    // on cvFree forever WHILE HOLDING lifecycleMu_, hanging every other operation
+    // on the encoder including close() itself. Swapping here makes that state
+    // unreachable: a later encode_frame sees a null `encoder` and throws.
+    //
+    // Unwinding from here still finalises the file — ~Encoder() calls close().
+    std::unique_ptr<nelux::Encoder> enc;
+    enc.swap(encoder);
 
 #ifdef NELUX_ENABLE_CUDA
     if (gpuConverter)
@@ -939,57 +1015,99 @@ void VideoEncoder::close()
     }
 #endif
 
-    // Claim ownership so a later close() has nothing to drain.
-    std::unique_ptr<nelux::Encoder> enc;
-    enc.swap(encoder);
-
     if (enc)
     {
         // enc->close() drains the codec (an x264/x265 close flushes the entire
         // lookahead — tens of frames of real encode work), muxes those packets
         // and writes the trailer, which for mp4 rewrites the moov box. None of
-        // it touches Python, so holding the GIL through it stalls every other
-        // thread for the whole flush. Guarded like stopEncodeWorkers() above,
-        // because this also runs from ~VideoEncoder, which can fire from a
-        // non-Python thread or during interpreter finalisation.
-        if (PyGILState_Check())
-        {
-            py::gil_scoped_release release;
-            enc->close();
-        }
-        else
-        {
-            enc->close();
-        }
+        // it touches Python, so it must not run under the GIL — it would stall
+        // every other thread for the whole flush.
+        //
+        // Same local precondition as stopEncodeWorkers(), same reasons not to
+        // reintroduce a conditional release here, and the same caveat: NDEBUG is
+        // always defined for this project, so the assert is documentation rather
+        // than an active check.
+        assert(!PyGILState_Check() &&
+               "closeLocked() must run under lifecycleMu_ with the GIL dropped");
+        enc->close();
         enc.reset();
     }
 
 #ifdef NELUX_ENABLE_CUDA
     // Drain any GPU tensors the submit thread retired but the caller didn't get
-    // to free. close() is normally called from Python (GIL held); guard for the
-    // destructor-at-shutdown path.
-    if (!retiredTensors.empty())
+    // to free.
+    //
+    // This needs `mu`, not just lifecycleMu_. stopEncodeWorkers() above excluded
+    // the WORKER threads, but not a concurrent encode_frame: its prologue swaps
+    // this same deque holding `mu` alone, deliberately outside lifecycleMu_ (it
+    // has to free under the GIL). `mu` is therefore the only lock the two have
+    // in common, and touching the deque without it is a data race.
+    //
+    // `mu` here is load-bearing, not belt-and-braces. It would be tempting to
+    // think the GIL covers this: the prologue holds the GIL continuously from
+    // the pybind entry through its swap, so anything else that also held the GIL
+    // would be excluded for free. That is exactly why the old shape survived —
+    // its clear() ran under gil_scoped_acquire and so could never overlap the
+    // swap. What was NOT covered was the `if (!retiredTensors.empty())` probe
+    // that guarded it: closeLocked() reaches this point with the GIL already
+    // dropped by underEncoderLock and without `mu`, so that read raced the
+    // prologue's write. The guard is gone and the swap below runs GIL-dropped,
+    // which means the GIL no longer serialises anything here and `mu` is the
+    // only thing that does.
+    //
+    // Swap out under `mu`, drop `mu`, and only THEN free. `mu` must never be
+    // held across the GIL acquisition below — see the invariant on `mu` in the
+    // header: encode_frame's prologue blocks on `mu` while holding the GIL, so a
+    // "hold `mu`, want GIL" edge here would close that into a real deadlock.
     {
-        if (PyGILState_Check())
+        std::deque<torch::Tensor> toFree;
         {
-            retiredTensors.clear();
+            std::lock_guard<std::mutex> lk(mu);
+            toFree.swap(retiredTensors);
         }
-        else
+        if (!toFree.empty())
         {
+            // Freeing a CUDA tensor can re-enter Python — a tensor imported via
+            // DLPack carries a capsule deleter that does — so this needs the
+            // GIL. We got here through underEncoderLock, which already dropped
+            // it, so re-acquire.
+            //
+            // gil_scoped_acquire also covers the destructor-on-a-non-Python-
+            // thread case, but NOT teardown after Py_Finalize: PyGILState_Ensure
+            // is fatal there. Nothing in this class can prevent that — an
+            // encoder still holding retired tensors when the interpreter is
+            // finalising is already past the point where its memory can be
+            // released safely — so the contract is simply that encoders are
+            // closed (or dropped) before interpreter shutdown, which __exit__,
+            // an explicit close() and ordinary refcounting all satisfy.
             pybind11::gil_scoped_acquire gil;
-            retiredTensors.clear();
+            toFree.clear();
         }
     }
 #endif
 
     // Surface any error the worker hit mid-stream (it kept draining to avoid a
     // producer deadlock; this is the first place we can throw cleanly).
-    if (workerError)
+    //
+    // Under `mu`, which is where the workers publish it. They are joined by now
+    // so this is uncontended, but workerError is listed as `mu`-protected in the
+    // header and reading it through lifecycleMu_ alone would be the same shape
+    // of violation just fixed for retiredTensors above — benign by coincidence
+    // rather than by rule, and the next reader cannot tell those apart.
+    //
+    // Keep the copy-then-null shape and the rethrow OUTSIDE the lock. Collapsing
+    // this to a rethrow of std::exchange(workerError, nullptr) under `mu` looks
+    // tidier but destroys the exception object while holding `mu` — and for a
+    // pybind11::error_already_set that destructor takes the GIL, which is the
+    // one thing `mu` may never be held across (see the invariant in the header).
+    std::exception_ptr err;
     {
-        std::exception_ptr e = workerError;
+        std::lock_guard<std::mutex> lk(mu);
+        err = workerError;
         workerError = nullptr;
-        std::rethrow_exception(e);
     }
+    if (err)
+        std::rethrow_exception(err);
 }
 
 VideoEncoder::~VideoEncoder()
@@ -1002,8 +1120,16 @@ VideoEncoder::~VideoEncoder()
     }
     catch (...)
     {
-        // Best-effort: ensure the workers are joined even if flush threw.
-        try { stopEncodeWorkers(); } catch (...) {}
+        // Best-effort: ensure the workers are joined even if flush threw. Still
+        // under the lock — close() released it when it unwound, and
+        // stopEncodeWorkers() touches the thread objects and workersStarted.
+        try
+        {
+            underEncoderLock([this] { stopEncodeWorkers(); });
+        }
+        catch (...)
+        {
+        }
     }
 }
 
