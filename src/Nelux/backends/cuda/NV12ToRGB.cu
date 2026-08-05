@@ -75,6 +75,18 @@ struct RGB24x2 {
     uchar3 y;
 };
 
+// RGB48: packed 3x16-bit pixel, the destination layout for >8-bit sources
+// (matches libswscale's AV_PIX_FMT_RGB48LE, which is what the CPU decode path
+// writes into a uint16 tensor). Deliberately a plain struct, not ushort3, for
+// the same alignment reason as RGB24.
+struct RGB48 {
+    uint16_t r, g, b;
+
+    __device__ __host__ RGB48() : r(0), g(0), b(0) {}
+    __device__ __host__ RGB48(uint16_t r_, uint16_t g_, uint16_t b_)
+        : r(r_), g(g_), b(b_) {}
+};
+
 // 32-bit RGBA with alpha
 union RGBA32 {
     uint32_t d;
@@ -351,6 +363,48 @@ __device__ __forceinline__ RGB24 YuvToRgbForPixel(YuvUnit y, YuvUnit u, YuvUnit 
 }
 
 /**
+ * @brief Convert YUV to a 16-bit-per-channel RGB48 pixel.
+ *
+ * Identical math to YuvToRgbForPixel: the source sample is normalised to the
+ * 8-bit-equivalent float scale the matYuv2Rgb coefficients are calibrated for,
+ * and the matrix is applied in float, so the full source precision survives.
+ * Only the final quantisation differs — the result is scaled onto the 16-bit
+ * range (65535/255) instead of being rounded to a byte. That matches what
+ * libswscale produces for RGB48LE, so the NVDEC and CPU decode paths put the
+ * same value range into a uint16 tensor.
+ *
+ * @tparam YuvUnit Type of YUV component (uint16_t for 10/12/16-bit sources)
+ */
+template<class YuvUnit>
+__device__ __forceinline__ RGB48 YuvToRgb48ForPixel(YuvUnit y, YuvUnit u, YuvUnit v, bool fullRange = false) {
+    const int bitDepth = sizeof(YuvUnit) * 8;
+
+    const int low = fullRange ? 0 : (1 << (bitDepth - 4));   // Y offset
+    const int mid = 1 << (bitDepth - 1);                     // UV offset
+
+    float normScale = (bitDepth > 8) ? (255.0f / static_cast<float>((1 << bitDepth) - 1)) : 1.0f;
+    float lowNorm = static_cast<float>(low) * normScale;
+    float midNorm = static_cast<float>(mid) * normScale;
+
+    float fy = static_cast<float>(y) * normScale - lowNorm;
+    float fu = static_cast<float>(u) * normScale - midNorm;
+    float fv = static_cast<float>(v) * normScale - midNorm;
+
+    float rf = matYuv2Rgb[0][0] * fy + matYuv2Rgb[0][1] * fu + matYuv2Rgb[0][2] * fv;
+    float gf = matYuv2Rgb[1][0] * fy + matYuv2Rgb[1][1] * fu + matYuv2Rgb[1][2] * fv;
+    float bf = matYuv2Rgb[2][0] * fy + matYuv2Rgb[2][1] * fu + matYuv2Rgb[2][2] * fv;
+
+    // 65535/255 — widen the 0..255 float result onto the full 16-bit range.
+    const float kTo16Bit = 257.0f;
+
+    RGB48 rgb;
+    rgb.r = static_cast<uint16_t>(Clamp(rf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    rgb.g = static_cast<uint16_t>(Clamp(gf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    rgb.b = static_cast<uint16_t>(Clamp(bf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    return rgb;
+}
+
+/**
  * @brief Convert YUV to RGBA32 with alpha channel
  */
 template<class YuvUnit>
@@ -620,6 +674,52 @@ __global__ void P016ToRgb24Kernel(
     pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
     
     // Row 1: pixels (x, y+1) and (x+1, y+1)
+    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
+    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
+}
+
+/**
+ * @brief P016 (10/12/16-bit NV12) to RGB48 kernel
+ *
+ * Same traversal as P016ToRgb24Kernel; the destination is 6 bytes per pixel.
+ * nRgbPitch is in BYTES, like every other pitch in this file.
+ */
+__global__ void P016ToRgb48Kernel(
+    const uint8_t* __restrict__ pP016,
+    int nP016Pitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nSurfaceHeight,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        return;
+    }
+
+    const uint16_t* pSrcY0 = reinterpret_cast<const uint16_t*>(pP016 + y * nP016Pitch) + x;
+    const uint16_t* pSrcY1 = reinterpret_cast<const uint16_t*>(pP016 + (y + 1) * nP016Pitch) + x;
+    ushort2 y0 = *reinterpret_cast<const ushort2*>(pSrcY0);
+    ushort2 y1 = *reinterpret_cast<const ushort2*>(pSrcY1);
+
+    const uint16_t* pSrcUV = reinterpret_cast<const uint16_t*>(pP016 + nSurfaceHeight * nP016Pitch + (y / 2) * nP016Pitch) + x;
+    ushort2 uv = *reinterpret_cast<const ushort2*>(pSrcUV);
+
+    RGB48 rgb00 = YuvToRgb48ForPixel<uint16_t>(y0.x, uv.x, uv.y, fullRange);
+    RGB48 rgb01 = YuvToRgb48ForPixel<uint16_t>(y0.y, uv.x, uv.y, fullRange);
+    RGB48 rgb10 = YuvToRgb48ForPixel<uint16_t>(y1.x, uv.x, uv.y, fullRange);
+    RGB48 rgb11 = YuvToRgb48ForPixel<uint16_t>(y1.y, uv.x, uv.y, fullRange);
+
+    uint16_t* pDst0 = reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+    uint16_t* pDst1 = reinterpret_cast<uint16_t*>(pRgb + (y + 1) * nRgbPitch) + x * 3;
+
+    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
+    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
+
     pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
     pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
 }
@@ -924,6 +1024,46 @@ __global__ void Yuv444P16ToRgb24Kernel(
     pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
 }
 
+/**
+ * @brief YUV444 10/12/16-bit planar to RGB48 kernel
+ *
+ * Same traversal as Yuv444P16ToRgb24Kernel; the destination is 6 bytes per
+ * pixel. nRgbPitch is in BYTES.
+ */
+__global__ void Yuv444P16ToRgb48Kernel(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pU,
+    const uint8_t* __restrict__ pV,
+    int nYuvPitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (x + 1 >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    const uint16_t* pSrcY = reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch) + x;
+    const uint16_t* pSrcU = reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch) + x;
+    const uint16_t* pSrcV = reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch) + x;
+
+    ushort2 yy = *reinterpret_cast<const ushort2*>(pSrcY);
+    ushort2 uu = *reinterpret_cast<const ushort2*>(pSrcU);
+    ushort2 vv = *reinterpret_cast<const ushort2*>(pSrcV);
+
+    RGB48 rgb0 = YuvToRgb48ForPixel<uint16_t>(yy.x, uu.x, vv.x, fullRange);
+    RGB48 rgb1 = YuvToRgb48ForPixel<uint16_t>(yy.y, uu.y, vv.y, fullRange);
+
+    uint16_t* pDst = reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
+}
+
 //==============================================================================
 // PUBLIC API FUNCTIONS
 //==============================================================================
@@ -1074,6 +1214,34 @@ void launchP016ToRgb24(
     );
     
     P016ToRgb24Kernel<<<gridDim, blockDim, 0, stream>>>(
+        pP016, nP016Pitch, pRgb, nRgbPitch, nWidth, nHeight, nHeight,
+        colorRange == ColorRange_Full
+    );
+}
+
+/**
+ * @brief Convert P016 (10/12/16-bit NV12) to RGB48 (16 bits per channel)
+ */
+void launchP016ToRgb48(
+    const uint8_t* pP016,
+    int nP016Pitch,
+    uint8_t* pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatYuv2Rgb(colorSpace, colorRange, stream);
+
+    dim3 blockDim(32, 2);
+    dim3 gridDim(
+        (nWidth + 63) / 64,
+        (nHeight + 3) / 4
+    );
+
+    P016ToRgb48Kernel<<<gridDim, blockDim, 0, stream>>>(
         pP016, nP016Pitch, pRgb, nRgbPitch, nWidth, nHeight, nHeight,
         colorRange == ColorRange_Full
     );
@@ -1290,6 +1458,36 @@ void launchYuv444P16ToRgb24(
     );
     
     Yuv444P16ToRgb24Kernel<<<gridDim, blockDim, 0, stream>>>(
+        pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight,
+        colorRange == ColorRange_Full
+    );
+}
+
+/**
+ * @brief Convert YUV444 10/12/16-bit planar to RGB48 (16 bits per channel)
+ */
+void launchYuv444P16ToRgb48(
+    const uint8_t* pY,
+    const uint8_t* pU,
+    const uint8_t* pV,
+    int nYuvPitch,
+    uint8_t* pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream)
+{
+    SetMatYuv2Rgb(colorSpace, colorRange, stream);
+
+    dim3 blockDim(32, 4);
+    dim3 gridDim(
+        (nWidth + 63) / 64,
+        (nHeight + 3) / 4
+    );
+
+    Yuv444P16ToRgb48Kernel<<<gridDim, blockDim, 0, stream>>>(
         pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight,
         colorRange == ColorRange_Full
     );

@@ -74,6 +74,11 @@ extern void invalidateColorSpaceMatrixCache(cudaStream_t stream);
 extern void launchP016ToRgb24(const uint8_t* pP016, int nP016Pitch, uint8_t* pRgb,
                               int nRgbPitch, int nWidth, int nHeight, int colorSpace,
                               int colorRange, cudaStream_t stream);
+// ... and the 16-bit-per-channel destination variant (RGB48LE layout), used
+// when the output tensor is uint16.
+extern void launchP016ToRgb48(const uint8_t* pP016, int nP016Pitch, uint8_t* pRgb,
+                              int nRgbPitch, int nWidth, int nHeight, int colorSpace,
+                              int colorRange, cudaStream_t stream);
 
 // YUV444 (4:4:4, 8-bit planar) - for HEVC 4:4:4 on Ampere+
 extern void launchYuv444ToRgb24(const uint8_t* pY, const uint8_t* pU, const uint8_t* pV,
@@ -83,6 +88,10 @@ extern void launchYuv444ToRgb24(const uint8_t* pY, const uint8_t* pU, const uint
 
 // YUV444P16 (4:4:4, 16-bit planar) - for HEVC 4:4:4 10/12-bit on Ampere+
 extern void launchYuv444P16ToRgb24(const uint8_t* pY, const uint8_t* pU,
+                                   const uint8_t* pV, int nYuvPitch, uint8_t* pRgb,
+                                   int nRgbPitch, int nWidth, int nHeight,
+                                   int colorSpace, int colorRange, cudaStream_t stream);
+extern void launchYuv444P16ToRgb48(const uint8_t* pY, const uint8_t* pU,
                                    const uint8_t* pV, int nYuvPitch, uint8_t* pRgb,
                                    int nRgbPitch, int nWidth, int nHeight,
                                    int colorSpace, int colorRange, cudaStream_t stream);
@@ -662,8 +671,25 @@ void Decoder::initRawPassthrough()
     // do not support RGB software formats).
 }
 
+int Decoder::outputElemSize() const
+{
+    if (force_8bit || properties.bitDepth <= 8)
+        return 1;
+    // Mirror VideoReader::findTypeFromBitDepth()'s switch over the depths that
+    // map to uint16. Anything else it accepts (depth 32 -> kUInt32) or rejects
+    // has no matching kernel here, and guessing 2 would size the copy against a
+    // destination whose rows are a different width.
+    if (properties.bitDepth == 10 || properties.bitDepth == 12 ||
+        properties.bitDepth == 16)
+        return 2;
+    throw CxException("CUDA DECODER: no supported RGB output size for a " +
+                      std::to_string(properties.bitDepth) +
+                      "-bit source; decode this file with "
+                      "decode_accelerator='cpu' or force_8bit=True");
+}
+
 void Decoder::transferAndConvertRawFrame(AVFrame* frame, void* outputBuffer,
-                                         int outputPitch)
+                                         int outputPitch, int elemSize)
 {
     if (!rawPassthroughMode_ || !frame || !outputBuffer)
         throw CxException("CUDA DECODER: Invalid rawvideo conversion request");
@@ -673,25 +699,29 @@ void Decoder::transferAndConvertRawFrame(AVFrame* frame, void* outputBuffer,
     const int srcHeight = frame->height;
     const int width = properties.width;
     const int height = properties.height;
+    // 16-bit destinations take RGB48LE, the same packed layout the CPU decode
+    // path produces for a uint16 tensor.
+    const AVPixelFormat dstFmt = (elemSize == 2) ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+    const int rowBytes = width * 3 * elemSize;
     AVFrame* rgbFrame = frame;
 
-    if (srcFmt != AV_PIX_FMT_RGB24 || srcWidth != width || srcHeight != height)
+    if (srcFmt != dstFmt || srcWidth != width || srcHeight != height)
     {
         SwsContext* sws = sws_getCachedContext(
-            rawSwsCtx_, srcWidth, srcHeight, srcFmt, width, height, AV_PIX_FMT_RGB24,
+            rawSwsCtx_, srcWidth, srcHeight, srcFmt, width, height, dstFmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws)
             throw CxException("CUDA DECODER: sws_getCachedContext failed for rawvideo");
         rawSwsCtx_ = sws;
 
         if (!rawSwsFrame_ || rawSwsFrame_->width != width ||
-            rawSwsFrame_->height != height)
+            rawSwsFrame_->height != height || rawSwsFrame_->format != dstFmt)
         {
             av_frame_free(&rawSwsFrame_);
             rawSwsFrame_ = av_frame_alloc();
             if (!rawSwsFrame_)
                 throw CxException("CUDA DECODER: av_frame_alloc failed for rawvideo");
-            rawSwsFrame_->format = AV_PIX_FMT_RGB24;
+            rawSwsFrame_->format = dstFmt;
             rawSwsFrame_->width = width;
             rawSwsFrame_->height = height;
             if (av_frame_get_buffer(rawSwsFrame_, 0) < 0)
@@ -707,17 +737,17 @@ void Decoder::transferAndConvertRawFrame(AVFrame* frame, void* outputBuffer,
         rgbFrame = rawSwsFrame_;
     }
 
-    const int rgbPitch = outputPitch > 0 ? outputPitch : width * 3;
+    const int rgbPitch = outputPitch > 0 ? outputPitch : rowBytes;
     cudaError_t err = cudaMemcpy2DAsync(
         outputBuffer, rgbPitch, rgbFrame->data[0], rgbFrame->linesize[0],
-        width * 3, height, cudaMemcpyHostToDevice, cudaStream_);
+        rowBytes, height, cudaMemcpyHostToDevice, cudaStream_);
     if (err != cudaSuccess)
         throw CxException(std::string("CUDA DECODER: Rawvideo upload failed: ") +
                           cudaGetErrorString(err));
 }
 
 void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
-                                      int outputPitch)
+                                      int outputPitch, int elemSize)
 {
     // Input validation
     if (!hwFrame)
@@ -728,6 +758,11 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     {
         throw CxException("CUDA DECODER: Null output buffer provided");
     }
+    if (elemSize != 1 && elemSize != 2)
+    {
+        throw CxException("CUDA DECODER: Unsupported output element size " +
+                          std::to_string(elemSize));
+    }
 
     // hwFrame contains CUDA device pointers in data[0], data[1], etc.
     // For NV12: data[0] = Y plane, data[1] = UV plane (interleaved)
@@ -737,7 +772,7 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     {
         if (rawPassthroughMode_)
         {
-            transferAndConvertRawFrame(hwFrame, outputBuffer, outputPitch);
+            transferAndConvertRawFrame(hwFrame, outputBuffer, outputPitch, elemSize);
             return;
         }
         throw CxException(
@@ -753,8 +788,9 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     int width = hwFrame->width;
     int height = hwFrame->height;
 
-    // Output RGB buffer pitch (3 channels, contiguous or aligned)
-    int rgbPitch = (outputPitch > 0) ? outputPitch : (width * 3);
+    // Output RGB buffer pitch in BYTES (3 channels of elemSize bytes each,
+    // contiguous or aligned).
+    int rgbPitch = (outputPitch > 0) ? outputPitch : (width * 3 * elemSize);
 
     // Determine color space and range from frame metadata
     int colorSpace = mapColorSpace(hwFrame->colorspace, width, height);
@@ -768,7 +804,32 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
                 av_get_pix_fmt_name(swFormat), colorSpace,
                 colorRange == ColorRange_Full ? "full" : "limited");
 
-    // Select appropriate kernel based on software format
+    // A wider-than-8-bit destination is legal only for the formats that have an
+    // RGB48 kernel in the switch below. Stated as an allowlist so that the
+    // default for every format NOT named here is to throw — including formats
+    // not yet wired into the switch at all, such as NV16 and P216, whose 8-bit
+    // launchers already exist and are one case label away from being added.
+    // Whoever adds such a case gets a loud error on the first 16-bit decode
+    // instead of an 8-bit kernel writing half of a 16-bit frame, and does not
+    // have to know this check exists. Adding a format that does have a wide
+    // kernel means naming it here; forgetting is likewise loud, not silent.
+    const bool hasWideKernel =
+        (swFormat == AV_PIX_FMT_P010LE || swFormat == AV_PIX_FMT_P016LE ||
+         swFormat == AV_PIX_FMT_YUV444P10LE || swFormat == AV_PIX_FMT_YUV444P12LE ||
+         swFormat == AV_PIX_FMT_YUV444P16LE);
+    if (elemSize != 1 && !hasWideKernel)
+    {
+        throw CxException(std::string("CUDA DECODER: ") +
+                          std::to_string(elemSize * 8) +
+                          "-bit output requested for surface format '" +
+                          av_get_pix_fmt_name(swFormat) +
+                          "', which has no wider conversion kernel");
+    }
+
+    // Select appropriate kernel based on software format. The RGB48
+    // (elemSize == 2) variants exist only for the >8-bit source formats,
+    // because elemSize is 2 exactly when the source is >8-bit — see
+    // outputElemSize().
     switch (swFormat)
     {
     // 4:2:0 formats (most common - NVDEC native output)
@@ -793,8 +854,18 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         const uint8_t* yPlane = hwFrame->data[0];
         int yPitch = hwFrame->linesize[0];
 
-        launchP016ToRgb24(yPlane, yPitch, static_cast<uint8_t*>(outputBuffer), rgbPitch,
-                          width, height, colorSpace, colorRange, cudaStream_);
+        if (elemSize == 2)
+        {
+            launchP016ToRgb48(yPlane, yPitch, static_cast<uint8_t*>(outputBuffer),
+                              rgbPitch, width, height, colorSpace, colorRange,
+                              cudaStream_);
+        }
+        else
+        {
+            launchP016ToRgb24(yPlane, yPitch, static_cast<uint8_t*>(outputBuffer),
+                              rgbPitch, width, height, colorSpace, colorRange,
+                              cudaStream_);
+        }
         break;
     }
 
@@ -824,10 +895,20 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         const uint8_t* vPlane = hwFrame->data[2];
         int yuvPitch = hwFrame->linesize[0];
 
-        NELUX_DEBUG("CUDA DECODER: Using YUV444P16 kernel (10/12/16-bit)");
-        launchYuv444P16ToRgb24(yPlane, uPlane, vPlane, yuvPitch,
-                               static_cast<uint8_t*>(outputBuffer), rgbPitch, width,
-                               height, colorSpace, colorRange, cudaStream_);
+        NELUX_DEBUG("CUDA DECODER: Using YUV444P16 kernel (10/12/16-bit), elemSize={}",
+                    elemSize);
+        if (elemSize == 2)
+        {
+            launchYuv444P16ToRgb48(yPlane, uPlane, vPlane, yuvPitch,
+                                   static_cast<uint8_t*>(outputBuffer), rgbPitch, width,
+                                   height, colorSpace, colorRange, cudaStream_);
+        }
+        else
+        {
+            launchYuv444P16ToRgb24(yPlane, uPlane, vPlane, yuvPitch,
+                                   static_cast<uint8_t*>(outputBuffer), rgbPitch, width,
+                                   height, colorSpace, colorRange, cudaStream_);
+        }
         break;
     }
 
@@ -936,8 +1017,15 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         // and to support writing to unaligned host memory (CPU tensor)
         int width = rawPassthroughMode_ ? properties.width : frame.get()->width;
         int height = rawPassthroughMode_ ? properties.height : frame.get()->height;
-        int alignedPitch = (width * 3 + 255) & ~255;
-        size_t alignedSize = alignedPitch * height;
+        // Row size follows the destination element size: a >8-bit source (unless
+        // force_8bit) is delivered as RGB48LE into a uint16 tensor, so every
+        // pitch and copy extent below is 3 * elemSize bytes per pixel. Sizing
+        // these as if the output were always RGB24 wrote only the first half of
+        // a 16-bit tensor and left the rest of it uninitialised.
+        const int elemSize = outputElemSize();
+        const int rowBytes = width * 3 * elemSize;
+        int alignedPitch = (rowBytes + 255) & ~255;
+        size_t alignedSize = static_cast<size_t>(alignedPitch) * height;
 
         if (!rgb24Buffer_ || rgb24BufferSize_ < alignedSize)
         {
@@ -955,12 +1043,12 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         waitForFrameProducerStream(frame.get());
 
         // 1. Convert to aligned GPU buffer
-        transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch);
+        transferAndConvertFrame(frame.get(), rgb24Buffer_, alignedPitch, elemSize);
 
         if (outputOnDevice)
         {
             cudaError_t copy_err = cudaMemcpy2DAsync(
-                buffer, width * 3, rgb24Buffer_, alignedPitch, width * 3, height,
+                buffer, rowBytes, rgb24Buffer_, alignedPitch, rowBytes, height,
                 cudaMemcpyDeviceToDevice, cudaStream_);
             if (copy_err != cudaSuccess)
             {
@@ -978,8 +1066,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                                   cudaGetErrorString(sync_err));
             }
 
-            cudaError_t copy_err = cudaMemcpy2D(buffer, width * 3, rgb24Buffer_,
-                                                alignedPitch, width * 3, height,
+            cudaError_t copy_err = cudaMemcpy2D(buffer, rowBytes, rgb24Buffer_,
+                                                alignedPitch, rowBytes, height,
                                                 cudaMemcpyDeviceToHost);
             if (copy_err != cudaSuccess)
             {
@@ -1369,7 +1457,10 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
                 rgb24BufferSize_ = rgb24Size;
             }
 
-            transferAndConvertFrame(frame.get(), rgb24Buffer_, rgbPitch);
+            // ML output is always float32/float16 BCHW, produced from an 8-bit
+            // RGB24 intermediate whatever the source depth, so this stays at
+            // elemSize 1 even for a 10/12/16-bit source.
+            transferAndConvertFrame(frame.get(), rgb24Buffer_, rgbPitch, /*elemSize=*/1);
 
             if (mlUseFP16_)
             {
@@ -1492,11 +1583,17 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("CUDA DECODER: decode_batch called with {} indices", indices.size());
 
+    // Determine output properties. The empty-index early return uses the same
+    // rule, so a zero-length batch has the dtype the caller would have got had
+    // the batch been populated.
+    const int elemSize = outputElemSize();
+    const torch::ScalarType dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+
     if (indices.empty())
     {
         return torch::empty({0, properties.height, properties.width, 3},
                             torch::TensorOptions()
-                                .dtype(torch::kUInt8)
+                                .dtype(dtype)
                                 .device(torch::kCUDA, cudaDeviceIndex_));
     }
 
@@ -1514,15 +1611,6 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
     for (const auto& pair : position_map)
     {
         sorted_frames.push_back(pair.first);
-    }
-
-    // Determine output properties
-    torch::ScalarType dtype = torch::kUInt8;
-    int elemSize = 1;
-    if (!force_8bit && properties.bitDepth > 8)
-    {
-        dtype = torch::kUInt16;
-        elemSize = 2;
     }
 
     // Allocate output tensor on GPU

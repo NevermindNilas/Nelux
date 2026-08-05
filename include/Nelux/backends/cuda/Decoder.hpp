@@ -185,13 +185,40 @@ protected:
     void initRawPassthrough();
 
     /**
+     * @brief Bytes per output colour component for this decoder's frames.
+     *
+     * 1 (RGB24) when force_8bit is set or the source is 8-bit; 2 (RGB48LE) for
+     * a 10-, 12- or 16-bit source. Every pitch, allocation and copy on the NVDEC
+     * path is sized from this, so it must match the element size of the tensor
+     * VideoReader::findTypeFromBitDepth() allocated, or the copy under-fills the
+     * destination — which is exactly the bug this function was introduced to fix.
+     *
+     * It agrees with findTypeFromBitDepth() over the depths this decoder can
+     * actually produce, and NOT over its whole domain: that function also maps
+     * depth 32 to kUInt32, four bytes, which no colour-conversion kernel here
+     * can write. Rather than silently returning a mismatched 2 for such a
+     * source, this throws. (The hwaccel kernel switch would reject a 32-bit
+     * surface anyway, but rawvideo passthrough does not go through that switch,
+     * so the throw is the only thing standing between a gbrpf32le rawvideo
+     * source and a half-written kUInt32 tensor.)
+     *
+     * @throws CxException if the source bit depth has no supported output size.
+     */
+    int outputElemSize() const;
+
+    /**
      * @brief Transfer and convert frame from NV12 to RGB on GPU
      * @param hwFrame Hardware frame from NVDEC
      * @param outputBuffer Output RGB buffer (device pointer)
+     * @param outputPitch Destination row stride in BYTES (0 = tightly packed)
+     * @param elemSize Bytes per colour component to emit: 1 for RGB24, 2 for
+     *        RGB48LE. Callers that consume the result as 8-bit (the ML path)
+     *        must leave this at 1 regardless of the source bit depth.
      */
-    void transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch = 0);
+    void transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer, int outputPitch = 0,
+                                 int elemSize = 1);
     void transferAndConvertRawFrame(AVFrame* swFrame, void* outputBuffer,
-                                    int outputPitch = 0);
+                                    int outputPitch = 0, int elemSize = 1);
 
     // Static callback for FFmpeg hardware pixel format selection
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);
