@@ -529,25 +529,38 @@ class VideoReader
     //
     // Wrap ONLY the FFmpeg call. The lock is not recursive, so a region that
     // also runs decodeFrame() (every discard loop does) would deadlock.
+    // The callback receives the LIVE decoder, read from the member under the
+    // lock — never a pointer the caller pinned beforehand. A pre-lock pin keeps
+    // the object alive but says nothing about whether it is still open: close()
+    // could have swapped it out and torn it down in the gap, and seeking a
+    // closed Decoder dereferences a null AVFormatContext.
     template <class Fn>
-    auto underReaderLock(Fn&& fn) -> decltype(fn())
+    auto underReaderLock(Fn&& fn) -> decltype(fn(std::declval<nelux::Decoder&>()))
     {
+        auto run = [&]() -> decltype(fn(std::declval<nelux::Decoder&>()))
+        {
+            std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+            if (!decoder)
+                throw std::runtime_error("VideoReader is closed");
+            return fn(*decoder);
+        };
+
         // GIL before lock, released after it, for the same deadlock reason as
-        // the decode paths. Guarded because close()/destructor paths can reach
-        // helpers like this without the GIL.
+        // the decode paths — `release` outlives the lock taken inside run().
+        // Guarded because close()/destructor paths can reach helpers like this
+        // without the GIL.
         if (PyGILState_Check())
         {
             py::gil_scoped_release release;
-            std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-            return fn();
+            return run();
         }
-        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-        return fn();
+        return run();
     }
-    // Rewind the sync CPU path to the true first frame before a fresh
-    // iteration. Since it cannot seek, a full decoder reconfigure is the only
-    // safe rewind -- the same trick iter() already uses to force NVDEC back to
-    // frame 0. No-op when nothing has been decoded yet.
+    // Rewind to the true first frame before a fresh iteration. Seeks to zero
+    // when the stream's timeline allows it (see canSeekMidStream) and falls
+    // back to a full decoder reconfigure otherwise -- the same rebuild iter()
+    // uses to force NVDEC back to frame 0. No-op when nothing has been decoded
+    // yet.
     void rewindForFreshIteration();
 
     // ML output dtype. Currently always FP32 (FP16 path disabled due to artifacts).

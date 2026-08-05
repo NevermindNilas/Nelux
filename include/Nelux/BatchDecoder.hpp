@@ -40,10 +40,9 @@ public:
 
     ~BatchDecoder();
 
-    // Owns raw SwsContext/av_image_alloc resources freed in the destructor, so
-    // the implicitly generated copy operations would double-free them (and two
-    // live copies would share one scratch buffer). Not needed -- the only
-    // instance lives in a unique_ptr.
+    // Owns a raw SwsContext freed in the destructor, so the implicitly generated
+    // copy operations would double-free it. Not needed -- the only instance
+    // lives in a unique_ptr.
     BatchDecoder(const BatchDecoder&) = delete;
     BatchDecoder& operator=(const BatchDecoder&) = delete;
     BatchDecoder(BatchDecoder&&) = delete;
@@ -110,13 +109,10 @@ private:
     // H.264 encoders re-tag at an IDR) must not keep the stale matrix.
     int copySwsSrcCs_ = -1;    // AVColorSpace
     int copySwsSrcRange_ = -1; // AVColorRange (after UNSPECIFIED->MPEG folding)
-    // Destination geometry the cached context and the cached buffer were each
-    // built for. config_ is immutable for the life of a BatchDecoder today, but
-    // keying on it keeps the cache self-correcting if the output size ever
-    // changes under instance reuse. The two are tracked separately on purpose:
-    // an explicitly supplied sws_ctx skips the context rebuild but not the
-    // buffer realloc, so a single shared "dst" field could let a stale context
-    // scale into a differently sized buffer.
+    // Destination geometry the cached context was built for. config_ is
+    // immutable for the life of a BatchDecoder today, but keying on it keeps
+    // the cache self-correcting if the output size ever changes under instance
+    // reuse.
     int copySwsDstW_ = -1;
     int copySwsDstH_ = -1;
     // Trailing bytes reserved past the visible output so libswscale writing the
