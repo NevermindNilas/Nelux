@@ -180,6 +180,24 @@ void launchP016ToRgb24(
     cudaStream_t stream);
 
 /**
+ * @brief Convert P016 (10/12/16-bit NV12) to RGB48 (16 bits per channel).
+ *
+ * Destination layout matches AV_PIX_FMT_RGB48LE, i.e. what the CPU decode path
+ * writes into a uint16 tensor. nRgbPitch is in BYTES and must be at least
+ * nWidth * 3 * sizeof(uint16_t).
+ */
+void launchP016ToRgb48(
+    const uint8_t* pP016,
+    int nP016Pitch,
+    uint8_t* pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream);
+
+/**
  * @brief Convert P016 to planar RGB
  */
 void launchP016ToRgbPlanar(
@@ -284,6 +302,25 @@ void launchYuv444ToRgbPlanar(
  * @brief Convert YUV444 16-bit planar to RGB24
  */
 void launchYuv444P16ToRgb24(
+    const uint8_t* pY,
+    const uint8_t* pU,
+    const uint8_t* pV,
+    int nYuvPitch,
+    uint8_t* pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    int colorSpace,
+    int colorRange,
+    cudaStream_t stream);
+
+/**
+ * @brief Convert YUV444 10/12/16-bit planar to RGB48 (16 bits per channel).
+ *
+ * Destination layout matches AV_PIX_FMT_RGB48LE. nRgbPitch is in BYTES and
+ * must be at least nWidth * 3 * sizeof(uint16_t).
+ */
+void launchYuv444P16ToRgb48(
     const uint8_t* pY,
     const uint8_t* pU,
     const uint8_t* pV,
