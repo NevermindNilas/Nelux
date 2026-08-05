@@ -638,14 +638,16 @@ void VideoReader::rewindForFreshIteration()
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
 
-    if (canSeekMidStream(dec) && dec->seek(0.0))
+    const bool rewound =
+        canSeekMidStream(dec) && underReaderLock([&] { return dec->seek(0.0); });
+    if (rewound)
     {
         NELUX_DEBUG("Rewinding via seek to 0");
     }
     else
     {
         NELUX_DEBUG("Rewinding via decoder reconfigure");
-        dec->reconfigure(filePath);
+        underReaderLock([&] { dec->reconfigure(filePath); return 0; });
     }
     currentIndex = 0;
     current_timestamp = 0.0;
@@ -676,7 +678,7 @@ void VideoReader::repositionToActiveSegment()
             // seekToNearestKeyframe directly rather than seek(): seek() decodes
             // *past* the target and drops the frame it lands on, which would
             // lose the segment's first frame.
-            if (!dec->seekToNearestKeyframe(start_time))
+            if (!underReaderLock([&] { return dec->seekToNearestKeyframe(start_time); }))
             {
                 NELUX_ERROR("Failed to seek to segment start_time {}", start_time);
                 throw std::runtime_error("Failed to seek to segment start_time.");
@@ -985,7 +987,10 @@ bool VideoReader::seek(double timestamp)
         return false;
     }
 
-    bool success = decoder->seekToNearestKeyframe(timestamp);
+    std::shared_ptr<nelux::Decoder> dec = pinDecoder();
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+    bool success = underReaderLock([&] { return dec->seekToNearestKeyframe(timestamp); });
     if (!success)
     {
         NELUX_WARN("Seek to keyframe failed at timestamp {}", timestamp);
@@ -1237,7 +1242,7 @@ void VideoReader::reset()
             rewindForFreshIteration();
         else
         {
-            dec->seek(0.0);
+            underReaderLock([&] { return dec->seek(0.0); });
             streamTouched_ = false;
         }
     }
@@ -1449,7 +1454,11 @@ bool VideoReader::seekToFrame(int frame_number)
     double seek_timestamp = frame_number / properties.fps;
 
     // Seek to the closest keyframe first
-    bool success = decoder->seekToNearestKeyframe(seek_timestamp);
+    std::shared_ptr<nelux::Decoder> seekDec = pinDecoder();
+    if (!seekDec)
+        throw std::runtime_error("VideoReader is closed");
+    bool success =
+        underReaderLock([&] { return seekDec->seekToNearestKeyframe(seek_timestamp); });
     if (!success)
     {
         NELUX_WARN("Seek to keyframe for frame {} failed", frame_number);
@@ -1555,7 +1564,7 @@ VideoReader& VideoReader::iter()
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_time <= 0.0)
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
-            dec->reconfigure(filePath);
+            underReaderLock([&] { dec->reconfigure(filePath); return 0; });
             streamTouched_ = false;
         }
         else if (!canSeekMidStream(dec))
@@ -1575,7 +1584,8 @@ VideoReader& VideoReader::iter()
             // against a sequential ground-truth decode.) The discard loop below
             // then advances from the keyframe to the first frame at or after
             // start_time and holds it.
-            if (!dec->seekToNearestKeyframe(start_time))
+            if (!underReaderLock(
+                    [&] { return dec->seekToNearestKeyframe(start_time); }))
             {
                 NELUX_ERROR("Failed to seek to start_time: {}", start_time);
                 throw std::runtime_error("Failed to seek to start_time.");
@@ -1625,7 +1635,7 @@ VideoReader& VideoReader::iter()
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_frame <= 0)
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
-            dec->reconfigure(filePath);
+            underReaderLock([&] { dec->reconfigure(filePath); return 0; });
             currentIndex = 0;
             current_timestamp = 0.0;
             streamTouched_ = false;
@@ -2017,7 +2027,7 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     }
 
     // Reconfigure the main decoder
-    dec->reconfigure(newFilePath);
+    underReaderLock([&] { dec->reconfigure(newFilePath); return 0; });
 
     if (oldRand)
         oldRand->close();

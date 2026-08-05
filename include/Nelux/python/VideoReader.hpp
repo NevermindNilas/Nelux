@@ -517,6 +517,33 @@ class VideoReader
         std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
         return decoder;
     }
+
+    // Run one FFmpeg-context-mutating call (a seek, a flush, a reconfigure)
+    // under the reader lock with the GIL dropped.
+    //
+    // Holding the GIL is NOT enough on its own. A thread sitting between two of
+    // its own decodeFrame() calls holds the GIL, but the decode it just
+    // finished released it — so another thread can already be inside a decode,
+    // with the lock, driving these very contexts. Anything that mutates them
+    // has to take the lock too.
+    //
+    // Wrap ONLY the FFmpeg call. The lock is not recursive, so a region that
+    // also runs decodeFrame() (every discard loop does) would deadlock.
+    template <class Fn>
+    auto underReaderLock(Fn&& fn) -> decltype(fn())
+    {
+        // GIL before lock, released after it, for the same deadlock reason as
+        // the decode paths. Guarded because close()/destructor paths can reach
+        // helpers like this without the GIL.
+        if (PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+            return fn();
+        }
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        return fn();
+    }
     // Rewind the sync CPU path to the true first frame before a fresh
     // iteration. Since it cannot seek, a full decoder reconfigure is the only
     // safe rewind -- the same trick iter() already uses to force NVDEC back to
