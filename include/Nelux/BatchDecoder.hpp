@@ -120,6 +120,49 @@ private:
     // register is 64 bytes; double it and round up.
     static constexpr int64_t SWS_DST_SLACK = 128;
 
+    // PTS of the stream's first presented frame, i.e. the timestamp that frame
+    // ordinal 0 sits at. Every ordinal in this class is (pts - ptsOrigin_)
+    // converted to seconds and multiplied by fps, and every seek target is
+    // ptsOrigin_ plus the same conversion run backwards. Containers whose
+    // timeline starts at zero -- the overwhelming majority -- keep an origin of
+    // 0, which makes the arithmetic bit-for-bit what it was before the origin
+    // existed. Resolved once per file (Decoder::reconfigure drops the whole
+    // BatchDecoder) by resolvePtsOrigin().
+    int64_t ptsOrigin_ = 0;
+    bool ptsOriginResolved_ = false;
+
+    /**
+     * @brief Establish ptsOrigin_ for this stream, once.
+     *
+     * Cheap and behaviour-preserving for zero-based containers; for everything
+     * else it decodes the stream's first frame to read the origin off it rather
+     * than trusting the container's advertised start_time.
+     *
+     * @return true if it actually probed, i.e. left the demuxer and codec
+     *         context moved, so the caller must not reuse a retained position.
+     */
+    bool resolvePtsOrigin(
+        AVFormatContext* fmt_ctx,
+        AVCodecContext* codec_ctx,
+        int stream_idx);
+
+    /**
+     * @brief Put the demuxer and codec context back at the stream's first frame.
+     * @return false if every seek attempt failed.
+     */
+    bool rewindToStreamStart(
+        AVFormatContext* fmt_ctx,
+        AVCodecContext* codec_ctx,
+        int stream_idx);
+
+    /**
+     * @brief Frame ordinal for a decoded frame's PTS, relative to ptsOrigin_.
+     */
+    int64_t frameOrdinalFromPts(
+        int64_t pts,
+        const AVStream* stream,
+        double fps) const;
+
     /**
      * @brief Seek to a specific frame index
      * @param fmt_ctx Format context

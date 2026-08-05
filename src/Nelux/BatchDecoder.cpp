@@ -38,6 +38,129 @@ BatchDecoder::~BatchDecoder()
         sws_freeContext(copySws_);
 }
 
+int64_t BatchDecoder::frameOrdinalFromPts(
+    int64_t pts,
+    const AVStream* stream,
+    double fps) const
+{
+    const double timestamp =
+        static_cast<double>(pts - ptsOrigin_) * av_q2d(stream->time_base);
+    return static_cast<int64_t>(timestamp * fps + 0.5);
+}
+
+bool BatchDecoder::rewindToStreamStart(
+    AVFormatContext* fmt_ctx,
+    AVCodecContext* codec_ctx,
+    int stream_idx)
+{
+    // Aim strictly BELOW where the stream begins. Asking for start_time exactly
+    // is not equivalent: MPEG-TS seeks by binary-searching byte positions, and a
+    // search for start_time can land just past the opening keyframe, in which
+    // case the decoder emits nothing until the next one and the "rewind" is a
+    // whole GOP late. Undershooting costs nothing — AVSEEK_FLAG_BACKWARD lands
+    // on the nearest keyframe at or before the target, and every demuxer clamps
+    // that to the first one.
+    //
+    // INT64_MIN would be the obvious way to say "as early as possible" and is
+    // wrong: it overflows the rescale inside the MP4 seek and leaves the
+    // demuxer at EOF, so the probe reads no frames at all.
+    AVStream* stream = fmt_ctx->streams[stream_idx];
+    const int64_t floor_ts = (stream->start_time != AV_NOPTS_VALUE)
+                                 ? std::min<int64_t>(stream->start_time, 0)
+                                 : 0;
+
+    int ret = av_seek_frame(fmt_ctx, stream_idx, floor_ts, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0 && stream->start_time != AV_NOPTS_VALUE)
+        ret = av_seek_frame(fmt_ctx, stream_idx, stream->start_time,
+                            AVSEEK_FLAG_BACKWARD);
+
+    avcodec_flush_buffers(codec_ctx);
+    decoderDrained_ = false;
+    return ret >= 0;
+}
+
+bool BatchDecoder::resolvePtsOrigin(
+    AVFormatContext* fmt_ctx,
+    AVCodecContext* codec_ctx,
+    int stream_idx)
+{
+    if (ptsOriginResolved_)
+        return false;
+
+    // Resolved from here on however this turns out: a probe that cannot find a
+    // usable timestamp must not be retried on every subsequent call.
+    ptsOriginResolved_ = true;
+    ptsOrigin_ = 0;
+
+    AVStream* stream = fmt_ctx->streams[stream_idx];
+
+    // Zero-based or entirely untimestamped stream: origin 0 is already right,
+    // so return without touching the demuxer. This is the path essentially
+    // every file takes, and it leaves their ordinal arithmetic and their seek
+    // targets byte-for-byte identical to what they were before origins existed.
+    // The predicate deliberately matches Decoder::hasZeroBasedTimeline().
+    if (stream->start_time == AV_NOPTS_VALUE || stream->start_time == 0)
+        return false;
+
+    // The stream starts somewhere other than zero. Subtracting the advertised
+    // start_time is the obvious move and is not trustworthy: MPEG-TS start_time
+    // can come from the first DTS rather than the first frame's presentation
+    // timestamp, and the two differ by the reorder delay, which would leave
+    // every ordinal a frame or two off -- the same reason seeking elsewhere in
+    // this codebase is gated on hasZeroBasedTimeline() instead of just
+    // subtracting start_time. Read the origin off the stream instead: rewind
+    // and decode until the first frame comes out. avcodec_receive_frame emits
+    // in presentation order, so that frame is ordinal 0 by definition, whatever
+    // the container claims.
+    if (!rewindToStreamStart(fmt_ctx, codec_ctx, stream_idx)) {
+        NELUX_WARN("PTS origin probe: rewind failed, assuming a zero origin");
+        return true; // the demuxer may still have moved
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    if (!pkt || !frame) {
+        if (pkt) av_packet_free(&pkt);
+        if (frame) av_frame_free(&frame);
+        throw std::runtime_error("Failed to allocate probe packet/frame");
+    }
+
+    bool found = false;
+    while (!found && av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == stream_idx) {
+            int ret = avcodec_send_packet(codec_ctx, pkt);
+            if (ret >= 0 || ret == AVERROR(EAGAIN)) {
+                while (avcodec_receive_frame(codec_ctx, frame) >= 0) {
+                    if (frame->pts != AV_NOPTS_VALUE) {
+                        ptsOrigin_ = frame->pts;
+                        found = true;
+                    }
+                    av_frame_unref(frame);
+                    if (found)
+                        break;
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    if (!found) {
+        // No frame carried a PTS. The ordinal path falls back to counting
+        // frames in that case anyway, so a zero origin costs nothing.
+        NELUX_WARN("PTS origin probe found no timestamped frame; using origin 0");
+    } else {
+        NELUX_DEBUG("PTS origin resolved to {} (container start_time {})",
+                    ptsOrigin_, stream->start_time);
+    }
+
+    // The probe consumed packets and left frames in flight; the caller has to
+    // re-seek before the first target.
+    return true;
+}
+
 void BatchDecoder::seekToFrame(
     AVFormatContext* fmt_ctx,
     AVCodecContext* codec_ctx,
@@ -46,18 +169,22 @@ void BatchDecoder::seekToFrame(
     double fps)
 {
     NELUX_TRACE("Seeking to frame {}", target_frame);
-    
-    // Calculate timestamp for target frame
+
+    // Calculate timestamp for target frame. Frame ordinals are relative to the
+    // stream's first frame, so the seek target has to be rebased onto the
+    // stream's own timeline (a no-op for the usual zero origin).
     AVStream* stream = fmt_ctx->streams[stream_idx];
     double target_time = static_cast<double>(target_frame) / fps;
-    int64_t target_pts = static_cast<int64_t>(target_time / av_q2d(stream->time_base));
-    
+    int64_t target_pts =
+        ptsOrigin_ + static_cast<int64_t>(target_time / av_q2d(stream->time_base));
+
     // Seek to nearest keyframe before target
     int ret = av_seek_frame(fmt_ctx, stream_idx, target_pts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         NELUX_WARN("Seek failed for frame {}, error code: {}", target_frame, ret);
-        // Try seeking to beginning if backward seek fails
-        av_seek_frame(fmt_ctx, stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+        // Try seeking to beginning if backward seek fails. ptsOrigin_ is where
+        // this stream's timeline actually begins (0 for the usual case).
+        av_seek_frame(fmt_ctx, stream_idx, ptsOrigin_, AVSEEK_FLAG_BACKWARD);
     }
     
     // Flush codec buffers
@@ -105,8 +232,7 @@ bool BatchDecoder::decodeUntilFrame(
                 // Calculate frame number from PTS
                 int64_t frame_pts = frame->pts;
                 if (frame_pts != AV_NOPTS_VALUE) {
-                    double timestamp = frame_pts * av_q2d(stream->time_base);
-                    current_frame = static_cast<int64_t>(timestamp * fps + 0.5);
+                    current_frame = frameOrdinalFromPts(frame_pts, stream, fps);
                 } else {
                     // If no PTS, just increment
                     current_frame++;
@@ -135,8 +261,7 @@ bool BatchDecoder::decodeUntilFrame(
     while ((flush_ret = avcodec_receive_frame(codec_ctx, frame)) >= 0) {
         int64_t frame_pts = frame->pts;
         if (frame_pts != AV_NOPTS_VALUE) {
-            double timestamp = frame_pts * av_q2d(stream->time_base);
-            current_frame = static_cast<int64_t>(timestamp * fps + 0.5);
+            current_frame = frameOrdinalFromPts(frame_pts, stream, fps);
         } else {
             current_frame++;
         }
@@ -336,13 +461,22 @@ torch::Tensor BatchDecoder::decode_batch(
 
     AVStream* stream = fmt_ctx->streams[stream_idx];
     double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
-    
+
+    // Pin the stream's frame-0 timestamp before any ordinal is computed or any
+    // seek target is built. Containers muxed with a non-zero start (MPEG-TS,
+    // anything written with -output_ts_offset) otherwise map every ordinal onto
+    // a timestamp that is start_time*fps frames too late, which made
+    // decodeUntilFrame's `current_frame >= target_frame` true on the very first
+    // decoded frame and handed back frame 0 for every index in the batch.
+    // A probe moves the demuxer, so it invalidates any retained position.
+    const bool probed = resolvePtsOrigin(fmt_ctx, codec_ctx, stream_idx);
+
     // Resume from wherever the previous call left the stream when the caller
     // vouches that nothing else has read from fmt_ctx since. The seek decision
     // below is unchanged — a backward target or a gap wider than
     // SEQUENTIAL_THRESHOLD still seeks — so this only removes seeks that were
     // provably redundant.
-    int64_t current_frame = position_valid ? retainedFrame_ : -1;
+    int64_t current_frame = (position_valid && !probed) ? retainedFrame_ : -1;
     bool need_seek = (current_frame < 0);
     retainedFrame_ = -1; // no valid position until this call completes
 
@@ -370,7 +504,32 @@ torch::Tensor BatchDecoder::decode_batch(
             }
 
             // Decode until we reach target frame
-            if (!decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx, target_frame, current_frame, frame)) {
+            bool reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
+                                            target_frame, current_frame, frame);
+
+            // Backstop for containers whose seek granularity does not match
+            // their timeline. On MPEG-TS the demuxer seeks by binary-searching
+            // byte positions, so a request for a given timestamp can land after
+            // the keyframe that owns it; the decoder then emits nothing until
+            // the *next* keyframe and the frame handed back is a whole GOP too
+            // late (or the file ends first). Ordinals are trustworthy here —
+            // only the seek was — so recover by rewinding to the stream start
+            // and scanning forward, which needs no seek accuracy at all. Bounded
+            // to one retry per target, and deliberately confined to streams with
+            // a non-zero origin: a zero-based container has ptsOrigin_ == 0 by
+            // construction, so it cannot reach this branch and its behaviour is
+            // unchanged, overshoot detection included.
+            if (ptsOrigin_ != 0 && (!reached || current_frame > target_frame)) {
+                NELUX_DEBUG("Seek landed on frame {} for target {}; rescanning "
+                            "from the stream start",
+                            current_frame, target_frame);
+                rewindToStreamStart(fmt_ctx, codec_ctx, stream_idx);
+                current_frame = -1;
+                reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
+                                           target_frame, current_frame, frame);
+            }
+
+            if (!reached) {
                 av_frame_free(&frame);
                 throw std::runtime_error("Failed to decode frame " + std::to_string(target_frame));
             }
