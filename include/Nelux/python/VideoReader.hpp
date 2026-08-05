@@ -495,16 +495,24 @@ class VideoReader
     // Those restarts are now guarded by !syncMode_ (matching initialize() and
     // reconfigure()), so seeking is safe here and set_range no longer has to
     // decode and discard every frame from zero.
-    // Takes the decoder the caller has already pinned, rather than reading the
-    // member: callers hold a pinned shared_ptr across a window in which the GIL
-    // is dropped and close() may swap the member out.
-    static bool canSeekMidStream(const std::shared_ptr<nelux::Decoder>& dec)
+    // Evaluated UNDER the lock, because the answer is read out of the decoder's
+    // AVFormatContext (hasZeroBasedTimeline inspects the video stream's
+    // start_time) and close() frees that context. A pinned shared_ptr keeps the
+    // Decoder object alive but not its contexts, so asking this question off a
+    // pin would race a concurrent close()/reconfigure().
+    bool canSeekMidStream()
+    {
+        return underReaderLock([](nelux::Decoder& d)
+                               { return canSeekMidStream(d); });
+    }
+
+    static bool canSeekMidStream(nelux::Decoder& dec)
     {
         // Seeking needs frame indices and frame timestamps to share an origin;
         // on a container that starts at a non-zero timestamp they do not, and a
         // seek lands somewhere other than the requested frame. Those fall back
         // to decoding forward, exactly as this path always did.
-        return dec && dec->hasZeroBasedTimeline();
+        return dec.hasZeroBasedTimeline();
     }
 
     // Copy a decoder out from under the lifecycle lock. Anything that

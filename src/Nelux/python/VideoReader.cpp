@@ -639,7 +639,7 @@ void VideoReader::rewindForFreshIteration()
         throw std::runtime_error("VideoReader is closed");
 
     const bool rewound =
-        canSeekMidStream(dec) && underReaderLock([](nelux::Decoder& d) { return d.seek(0.0); });
+        canSeekMidStream() && underReaderLock([](nelux::Decoder& d) { return d.seek(0.0); });
     if (rewound)
     {
         NELUX_DEBUG("Rewinding via seek to 0");
@@ -666,7 +666,7 @@ void VideoReader::repositionToActiveSegment()
     std::shared_ptr<nelux::Decoder> dec = pinDecoder();
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
-    const bool seekable = canSeekMidStream(dec);
+    const bool seekable = canSeekMidStream();
 
     if (start_time >= 0.0 && end_time > 0.0)
     {
@@ -1579,7 +1579,7 @@ VideoReader& VideoReader::iter()
             underReaderLock([&](nelux::Decoder& d) { d.reconfigure(filePath); return 0; });
             streamTouched_ = false;
         }
-        else if (!canSeekMidStream(dec))
+        else if (!canSeekMidStream())
         {
             // Non-seekable path: restart at frame 0 if a previous pass has
             // already moved the stream, then let the discard loop below advance
@@ -1654,7 +1654,7 @@ VideoReader& VideoReader::iter()
             current_timestamp = 0.0;
             streamTouched_ = false;
         }
-        else if (!canSeekMidStream(dec) || start_frame == 0)
+        else if (!canSeekMidStream() || start_frame == 0)
         {
             // Either the stream's timeline rules seeking out (see
             // canSeekMidStream), or there is nothing to seek to: a
