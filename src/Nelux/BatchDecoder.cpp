@@ -251,6 +251,9 @@ void BatchDecoder::copyFrameToOutput(
     // at the very end of the allocation. Note it does NOT cover the last row of
     // a non-final slice, which would spill into the neighbouring slice — that
     // only matters if the no-overshoot property above ever stops holding.
+    // RGB24, three bytes per pixel — the constructor rejects any other channel
+    // count precisely because this row stride and the AV_PIX_FMT_RGB24
+    // destination above are hard-coded, so the two cannot drift apart.
     const int rowBytes = config_.width * 3;
     const size_t frameBytes = static_cast<size_t>(config_.height) * rowBytes;
     uint8_t* out_base = output.data_ptr<uint8_t>();

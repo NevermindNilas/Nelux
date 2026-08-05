@@ -765,45 +765,51 @@ torch::Tensor VideoReader::decodeFrame()
     // thread would want the GIL back while still holding the lock, and close()
     // -- which reaches its own lock holding the GIL -- would deadlock against
     // it.
-    py::gil_scoped_release release;
-    std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-
-    std::shared_ptr<nelux::Decoder> dec = decoder;
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-
     double frame_timestamp = 0.0;
     bool success = false;
     torch::Tensor outTensor;  // populated by zero-copy CPU path
 
-    // No silent NVDEC->CPU fallback: if hardware decode fails mid-stream we
-    // surface the error to the caller. Silent fallback was removed because it
-    // masked configuration errors and silently switched output devices/tensor
-    // layouts under the caller's feet. Use decode_accelerator='cpu' to opt in
-    // to software decode explicitly.
-    try
     {
-        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        py::gil_scoped_release release;
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+
+        std::shared_ptr<nelux::Decoder> dec = decoder;
+        if (!dec)
+            throw std::runtime_error("VideoReader is closed");
+
+        // No silent NVDEC->CPU fallback: if hardware decode fails mid-stream we
+        // surface the error to the caller. Silent fallback was removed because
+        // it masked configuration errors and silently switched output
+        // devices/tensor layouts under the caller's feet. Use
+        // decode_accelerator='cpu' to opt in to software decode explicitly.
+        try
         {
-            outTensor = prefetch
-                            ? dec->decodeNextFrameTensor(&frame_timestamp)
-                            : dec->decodeNextFrameTensorSync(&frame_timestamp);
-            success = outTensor.defined();
+            if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+            {
+                outTensor = prefetch
+                                ? dec->decodeNextFrameTensor(&frame_timestamp)
+                                : dec->decodeNextFrameTensorSync(&frame_timestamp);
+                success = outTensor.defined();
+            }
+            else
+            {
+                // NVDEC / hardware path: in-place write into shared CUDA tensor.
+                success = dec->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+            }
         }
-        else
+        catch (const std::exception& ex)
         {
-            // NVDEC / hardware path: in-place write into shared CUDA tensor.
-            success = dec->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
+            NELUX_ERROR("decodeFrame(): decoder failed: {}. "
+                        "Set decode_accelerator='cpu' to use software decode.",
+                        ex.what());
+            throw;
         }
     }
-    catch (const std::exception& ex)
-    {
-        NELUX_ERROR("decodeFrame(): decoder failed: {}. "
-                    "Set decode_accelerator='cpu' to use software decode.",
-                    ex.what());
-        throw;
-    }
-    
+    // Scope ends here deliberately: the reader-level counters below are updated
+    // with the GIL HELD and the lock released, which is where iter(), next() and
+    // reset() also read and write them. Updating them inside the GIL-free region
+    // would race those callers on plain int/double fields.
+
     if (!success)
     {
         NELUX_WARN("Decoding failed or no more frames available");
