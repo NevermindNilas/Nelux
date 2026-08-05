@@ -738,21 +738,26 @@ torch::Tensor VideoReader::decodeFrame()
 {
     NELUX_TRACE("decodeFrame() called");
 
-    // Hold the decoder alive for the whole decode and pin it against a
-    // concurrent close(). The shared lock is uncontended in the normal case
-    // (one reader thread, no teardown in flight) and costs far less than a
-    // frame; what it buys is that close() cannot swap the decoder out from
-    // under a decode that has already started, and a decode that starts after
-    // teardown raises instead of dereferencing null.
-    std::shared_ptr<nelux::Decoder> dec;
-    {
-        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
-        dec = decoder;
-    }
+    // Release the GIL, THEN take the shared lock, and keep it for the whole
+    // decode. Holding it only long enough to copy the shared_ptr would keep the
+    // Decoder object alive but would not stop close() from calling
+    // Decoder::close() concurrently, which frees the very AVCodecContext /
+    // AVFormatContext this decode is using. close() takes the unique lock, so
+    // it now waits for an in-flight decode instead of pulling the contexts out
+    // from under it.
+    //
+    // The ORDER of these two is load-bearing and must not be swapped. Locals
+    // are destroyed in reverse, so the lock is released while the GIL is still
+    // dropped, and only then is the GIL re-acquired. The other way round, this
+    // thread would want the GIL back while still holding the shared lock, and
+    // close() -- which reaches its unique lock holding the GIL -- would
+    // deadlock against it.
+    py::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+
+    std::shared_ptr<nelux::Decoder> dec = decoder;
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
-
-    py::gil_scoped_release release; // Release GIL before calling decoder
 
     double frame_timestamp = 0.0;
     bool success = false;
@@ -1286,10 +1291,18 @@ void VideoReader::ensureRandDecoder()
 
 torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 {
+    // Must run BEFORE the shared lock below: it takes the unique lock to publish
+    // a newly built decoder, and a shared_mutex is not recursive.
     ensureRandDecoder();
-    // Pin it: this function releases the GIL around the seek and every decode,
-    // and close() can swap the member out during those windows.
-    std::shared_ptr<nelux::Decoder> rdec = pinRandDecoder();
+
+    // One GIL release and one shared lock covering the whole call — the seek
+    // and every decode. Same ordering rule as decodeFrame(): GIL first so the
+    // lock is dropped before the GIL is taken back, otherwise close() (which
+    // holds the GIL while it waits for the unique lock) deadlocks against this.
+    py::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+
+    std::shared_ptr<nelux::Decoder> rdec = rand_decoder;
     if (!rdec)
         throw std::runtime_error("Random-access decoder not initialized");
 
@@ -1321,7 +1334,6 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 
     if (!decodeForward)
     {
-        py::gil_scoped_release release;
         if (!rdec->seekToNearestKeyframe(timestamp_seconds))
         {
             double backoff = std::max(0.0, timestamp_seconds - 2.0);
@@ -1347,11 +1359,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         double ts = 0.0;
         // torch::Tensor buf = makeLikeOutputTensor(); // Moved outside
 
-        bool ok;
-        {
-            py::gil_scoped_release release;
-            ok = rdec->decodeNextFrame(buf.data_ptr(), &ts);
-        }
+        bool ok = rdec->decodeNextFrame(buf.data_ptr(), &ts);
         if (!ok)
             break;
 
@@ -1869,17 +1877,6 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
             "with the default color_format='rgb' for batch decoding.");
     }
 
-    // Use the main decoder for batch operations. Pin it for the duration for
-    // the same reason decodeFrame() does: this runs with the GIL released and
-    // another thread may close the reader underneath it.
-    std::shared_ptr<nelux::Decoder> dec;
-    {
-        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
-        dec = decoder;
-    }
-    if (!dec)
-        throw std::runtime_error("VideoReader is closed");
-
     // Set BEFORE the call, not after: decode_batch seeks and demuxes on the
     // SHARED format context, so the reader stops being parked at frame 0 as
     // soon as it starts — including on the paths that throw part way through.
@@ -1890,7 +1887,16 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 
     torch::Tensor batch;
     {
+        // GIL first, then the shared lock, held for the whole batch — see
+        // decodeFrame() for why the order matters and why the lock has to
+        // outlive the call rather than just the pointer copy.
         py::gil_scoped_release release;
+        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
+
+        std::shared_ptr<nelux::Decoder> dec = decoder;
+        if (!dec)
+            throw std::runtime_error("VideoReader is closed");
+
         batch = dec->decode_batch(indices);
     }
 

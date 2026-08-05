@@ -517,11 +517,6 @@ class VideoReader
         std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
         return decoder;
     }
-    std::shared_ptr<nelux::Decoder> pinRandDecoder() const
-    {
-        std::shared_lock<std::shared_mutex> lk(lifecycleMu_);
-        return rand_decoder;
-    }
     // Rewind the sync CPU path to the true first frame before a fresh
     // iteration. Since it cannot seek, a full decoder reconfigure is the only
     // safe rewind -- the same trick iter() already uses to force NVDEC back to
