@@ -31,9 +31,12 @@ if not FFMPEG.exists():                     # linux/mac checkouts name it plainl
     FFMPEG = FFMPEG.with_suffix("")
     FFPROBE = FFPROBE.with_suffix("")
 
+# Both binaries matter: probe() drives ffprobe, so checking only ffmpeg would
+# turn a missing ffprobe into a pile of errors instead of a clean skip.
 pytestmark = pytest.mark.skipif(
-    not (CORPUS / "manifest.json").exists() or not FFMPEG.exists(),
-    reason="ProRes corpus not generated; run tests/prores/gen_corpus.py",
+    not (CORPUS / "manifest.json").exists()
+    or not FFMPEG.exists() or not FFPROBE.exists(),
+    reason="ProRes corpus or bundled FFmpeg missing; run tests/prores/gen_corpus.py",
 )
 
 _PIXFMT = {"rgb24": (3, np.uint8), "rgb48le": (3, np.uint16),
@@ -345,9 +348,9 @@ def test_float64_input_is_not_black(tmp_path):
         for _ in range(3):
             enc.encode_frame(torch.from_numpy(src))
         enc.close()
-        back = nelux_frames(out, 1)[0].astype(float)
-        peak = 255.0 if back.max() <= 255 and str(back.dtype) == "float64" else 65535.0
-        peak = 255.0 if nelux_frames(out, 1).dtype == np.uint8 else 65535.0
+        decoded = nelux_frames(out, 1)[0]
+        peak = 255.0 if decoded.dtype == np.uint8 else 65535.0
+        back = decoded.astype(float)
         assert back.mean() > 0.35 * peak, (
             f"{pix}: float64 encoded as ~black (mean {back.mean():.1f} of {peak})")
 

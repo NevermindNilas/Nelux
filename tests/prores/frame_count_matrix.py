@@ -35,7 +35,7 @@ CASES = [
 ]
 
 
-def probe_counts(path: Path) -> tuple[int, int]:
+def probe_counts(path: Path) -> tuple[int, str]:
     out = subprocess.run(
         [str(FFPROBE), "-v", "error", "-count_packets", "-select_streams", "v:0",
          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],

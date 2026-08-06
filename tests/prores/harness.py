@@ -21,9 +21,12 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
-FFMPEG = REPO / "external" / "ffmpeg" / "bin" / "ffmpeg.exe"
-FFPROBE = REPO / "external" / "ffmpeg" / "bin" / "ffprobe.exe"
 FFBIN = REPO / "external" / "ffmpeg" / "bin"
+FFMPEG = FFBIN / "ffmpeg.exe"
+FFPROBE = FFBIN / "ffprobe.exe"
+if not FFMPEG.exists():                     # linux/mac checkouts name it plainly
+    FFMPEG = FFMPEG.with_suffix("")
+    FFPROBE = FFPROBE.with_suffix("")
 CORPUS = REPO / "tests" / "data" / "prores"
 NULLDEV = "NUL" if os.name == "nt" else "/dev/null"
 

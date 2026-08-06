@@ -60,8 +60,11 @@ class AutoToRGBConverter
     // plane when the source has none, exactly as `ffmpeg -pix_fmt rgba` does.
     void setOutputChannels(int channels)
     {
-        if (channels == 1 || channels == 3 || channels == 4)
-            channels_ = channels;
+        if (channels != 1 && channels != 3 && channels != 4)
+            throw std::runtime_error(
+                "AutoToRGBConverter: expected 1 (gray), 3 (RGB) or 4 (RGBA) output "
+                "channels, got " + std::to_string(channels));
+        channels_ = channels;
     }
 
     // Set decoder-side output dimensions. Pass (0, 0) to disable (use source dims).

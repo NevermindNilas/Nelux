@@ -18,6 +18,7 @@ import _repo_path  # noqa: F401  (repo root before site-packages)
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -83,8 +84,8 @@ def main() -> None:
     ap.add_argument("--profiles", nargs="*", type=int, default=[0, 1, 2, 3])
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--ffmpeg-extra", default="",
-                    help="extra ffmpeg args as ONE space-separated string, e.g. "
-                         "--ffmpeg-extra=\"-vf setparams=colorspace=bt709\"")
+                    help="extra ffmpeg args as ONE shell-quoted string, e.g. "
+                         "--ffmpeg-extra=\"-vf 'setparams=colorspace=bt709'\"")
     ap.add_argument("--out", default=str(WORK / "encode_parity.json"))
     args = ap.parse_args()
 
@@ -117,7 +118,7 @@ def main() -> None:
             nx.peak_rss_mb = max(r.peak_rss_mb for r in runs)
 
             ffcmd = ffmpeg_encode(raw, ff_out, args.width, args.height, src_pix,
-                                  codec, pix, prof, args.ffmpeg_extra.split())
+                                  codec, pix, prof, shlex.split(args.ffmpeg_extra))
             franks = [run_measured(ffcmd, f"ffmpeg {tag}", frames=args.frames)
                       for _ in range(args.repeat)]
             ff = min(franks, key=lambda r: r.wall_s)
