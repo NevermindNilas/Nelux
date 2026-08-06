@@ -51,14 +51,9 @@ static void ffmpegLogCallback(void* ptr, int level, const char* fmt, va_list vl)
         buf[len - 1] = '\0';
     }
 
-    if (level <= AV_LOG_FATAL)
-    {
-        NELUX_ERROR("FFmpeg: {}", buf);
-    }
-    else if (level <= AV_LOG_ERROR)
-    {
-        NELUX_ERROR("FFmpeg: {}", buf);
-    }
+    // Only AV_LOG_ERROR and below get this far (see the early return above), and
+    // fatal and error were being logged identically, so one call covers both.
+    NELUX_ERROR("FFmpeg: {}", buf);
 }
 
 // Forward declarations of CUDA kernels (defined in NV12ToRGB.cu)
@@ -191,6 +186,33 @@ static int mapColorSpace(AVColorSpace cs, int width, int height)
 static int mapColorRange(AVColorRange cr)
 {
     return (cr == AVCOL_RANGE_JPEG) ? ColorRange_Full : ColorRange_Limited;
+}
+
+// Kernel launches are asynchronous and report configuration/binary errors
+// (notably cudaErrorNoKernelImageForDevice when the build's -gencode list omits
+// this GPU's architecture) only via the sticky per-thread error.
+// cudaStreamSynchronize does NOT surface them, so without this check the launch
+// silently no-ops and every decoded frame comes back as a fully black image.
+//
+// Call it after every launch site; `what` names the group of launches the call
+// follows. cudaGetLastError() returns the last error from ANY runtime call on
+// this thread, so `what` is where the error was noticed, not a proof of which
+// call produced it -- the error string is the authority.
+static void throwOnKernelLaunchError(const char* what)
+{
+    cudaError_t launchErr = cudaGetLastError();
+    if (launchErr == cudaSuccess)
+    {
+        return;
+    }
+
+    throw CxException(
+        std::string("CUDA DECODER: ") + what +
+        " kernel launch failed: " + cudaGetErrorString(launchErr) +
+        (launchErr == cudaErrorNoKernelImageForDevice
+             ? ". This build contains no CUDA binary for the current GPU "
+               "architecture; rebuild with CMAKE_CUDA_ARCHITECTURES covering it."
+             : ""));
 }
 
 // Wait for the CUDA stream that CUVID used to produce this frame's surface.
@@ -550,22 +572,14 @@ void Decoder::initCodecContextWithHwAccel()
                           avcodec_get_name(codec_id));
     }
 
-    // Try hardware decoder first
-    if (hw_decoder_name)
-    {
-        codec = avcodec_find_decoder_by_name(hw_decoder_name);
-        if (codec)
-        {
-            NELUX_INFO("CUDA DECODER: Using hardware decoder: {}", hw_decoder_name);
-        }
-    }
-
     // If the hardware decoder wasn't found, fail fast so the caller can fall back.
+    codec = avcodec_find_decoder_by_name(hw_decoder_name);
     if (!codec)
     {
         throw CxException(std::string("NVDEC hardware decoder not found for codec: ") +
                           avcodec_get_name(codec_id));
     }
+    NELUX_INFO("CUDA DECODER: Using hardware decoder: {}", hw_decoder_name);
 
     // Allocate codec context
     AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
@@ -925,35 +939,15 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     }
     }
 
-    // Kernel launches are asynchronous and report configuration//binary errors
-    // (notably cudaErrorNoKernelImageForDevice when the build's -gencode list
-    // omits this GPU's architecture) only via the sticky per-thread error.
-    // Without this check the launch silently no-ops and every decoded frame
-    // comes back as a fully black image.
-    cudaError_t launchErr = cudaGetLastError();
-    if (launchErr != cudaSuccess)
-    {
-        throw CxException(
-            std::string("CUDA DECODER: color-conversion kernel launch failed: ") +
-            cudaGetErrorString(launchErr) +
-            (launchErr == cudaErrorNoKernelImageForDevice
-                 ? ". This build contains no CUDA binary for the current GPU "
-                   "architecture; rebuild with CMAKE_CUDA_ARCHITECTURES covering it."
-                 : ""));
-    }
+    throwOnKernelLaunchError("color-conversion");
 
     // Note: We don't synchronize here - the stream ordering ensures
     // the conversion completes before the buffer is used
 }
 
-bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
+std::optional<Frame> Decoder::acquireDecodedFrame(double* frame_timestamp,
+                                                  const char* logTag)
 {
-    if (!hwInitialized_)
-    {
-        NELUX_WARN("CUDA DECODER: Hardware not initialized");
-        return false;
-    }
-
     // Ensure this thread uses the correct CUDA device.
     cudaError_t device_err = cudaSetDevice(cudaDeviceIndex_);
     if (device_err != cudaSuccess)
@@ -974,7 +968,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
     if (frameQueue.empty())
     {
-        return false;
+        return std::nullopt;
     }
 
     Frame frame = std::move(frameQueue.front());
@@ -997,7 +991,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         cudaError_t sync_err = cudaDeviceSynchronize();
         if (sync_err != cudaSuccess)
         {
-            throw CxException(std::string("CUDA DECODER: Device sync failed: ") +
+            throw CxException(std::string(logTag) + ": Device sync failed: " +
                               cudaGetErrorString(sync_err));
         }
     }
@@ -1006,6 +1000,58 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     {
         *frame_timestamp = getFrameTimestamp(frame.get());
     }
+
+    return std::optional<Frame>(std::move(frame));
+}
+
+void Decoder::releaseDecodedFrame(Frame& frame)
+{
+    // Record the completion event (stream already synchronized by the caller) so
+    // waitForDecodeComplete() remains functional for external consumers.
+    if (decodeCompleteEvent_)
+    {
+        cudaEventRecord(decodeCompleteEvent_, cudaStream_);
+    }
+
+    // Conversion is complete and no longer reads the NVDEC surface.  The
+    // producer may now receive/decode the next frame and reuse that surface.
+    // Drop the AVFrame reference before releasing the producer; otherwise a
+    // small CUVID surface pool can advance/duplicate display output while the
+    // just-consumed surface is still retained until the caller returns.
+    av_frame_unref(frame.get());
+    producerBlocked_.store(false, std::memory_order_release);
+    producerCond.notify_one();
+}
+
+void Decoder::ensureRgbBuffer(size_t bytes, const char* allocFailMessage)
+{
+    if (rgb24Buffer_ && rgb24BufferSize_ >= bytes)
+    {
+        return;
+    }
+
+    if (rgb24Buffer_)
+        cudaFree(rgb24Buffer_);
+    cudaError_t err = cudaMalloc(&rgb24Buffer_, bytes);
+    if (err != cudaSuccess)
+        throw CxException(allocFailMessage);
+    rgb24BufferSize_ = bytes;
+}
+
+bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
+{
+    if (!hwInitialized_)
+    {
+        NELUX_WARN("CUDA DECODER: Hardware not initialized");
+        return false;
+    }
+
+    std::optional<Frame> frameOpt = acquireDecodedFrame(frame_timestamp, "CUDA DECODER");
+    if (!frameOpt)
+    {
+        return false;
+    }
+    Frame& frame = *frameOpt;
 
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
@@ -1027,15 +1073,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         int alignedPitch = (rowBytes + 255) & ~255;
         size_t alignedSize = static_cast<size_t>(alignedPitch) * height;
 
-        if (!rgb24Buffer_ || rgb24BufferSize_ < alignedSize)
-        {
-            if (rgb24Buffer_)
-                cudaFree(rgb24Buffer_);
-            cudaError_t err = cudaMalloc(&rgb24Buffer_, alignedSize);
-            if (err != cudaSuccess)
-                throw CxException("CUDA DECODER: Alloc failed");
-            rgb24BufferSize_ = alignedSize;
-        }
+        ensureRgbBuffer(alignedSize, "CUDA DECODER: Alloc failed");
 
         const bool outputOnDevice = isDeviceAccessiblePointer(buffer);
 
@@ -1103,21 +1141,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                           "for this stream.");
     }
 
-    // Record the completion event (stream already synchronized above) so
-    // waitForDecodeComplete() remains functional for external consumers.
-    if (decodeCompleteEvent_)
-    {
-        cudaEventRecord(decodeCompleteEvent_, cudaStream_);
-    }
-
-    // Conversion is complete and no longer reads the NVDEC surface.  The
-    // producer may now receive/decode the next frame and reuse that surface.
-    // Drop the AVFrame reference before releasing the producer; otherwise a
-    // small CUVID surface pool can advance/duplicate display output while the
-    // just-consumed surface is still retained until this function returns.
-    av_frame_unref(frame.get());
-    producerBlocked_.store(false, std::memory_order_release);
-    producerCond.notify_one();
+    releaseDecodedFrame(frame);
 
     return true;
 }
@@ -1329,49 +1353,13 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         return false;
     }
 
-    // Ensure this thread uses the correct CUDA device.
-    cudaError_t device_err = cudaSetDevice(cudaDeviceIndex_);
-    if (device_err != cudaSuccess)
-    {
-        throw CxException(std::string("CUDA DECODER: Failed to set CUDA device: ") +
-                          cudaGetErrorString(device_err));
-    }
-
-    // Use the base class decoding thread infrastructure
-    if (!decodingThread.joinable())
-    {
-        startDecodingThread();
-    }
-
-    std::unique_lock<std::mutex> lock(queueMutex);
-    queueCond.wait(lock, [this]
-                   { return !frameQueue.empty() || isFinished || stopDecoding; });
-
-    if (frameQueue.empty())
+    std::optional<Frame> frameOpt =
+        acquireDecodedFrame(frame_timestamp, "CUDA DECODER ML");
+    if (!frameOpt)
     {
         return false;
     }
-
-    Frame frame = std::move(frameQueue.front());
-    frameQueue.pop();
-    producerBlocked_.store(true, std::memory_order_release);
-    lock.unlock();
-
-    if (const char* env = std::getenv("NELUX_NVDEC_SKIP_ENTRY_SYNC");
-        !env || std::atoi(env) == 0)
-    {
-        cudaError_t sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess)
-        {
-            throw CxException(std::string("CUDA DECODER ML: Device sync failed: ") +
-                              cudaGetErrorString(sync_err));
-        }
-    }
-
-    if (frame_timestamp)
-    {
-        *frame_timestamp = getFrameTimestamp(frame.get());
-    }
+    Frame& frame = *frameOpt;
 
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
@@ -1407,15 +1395,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             int rgbaPitch = width * 4; // Always 256-byte aligned for 1920 (7680)
             size_t rgbaSize = rgbaPitch * height;
 
-            if (!rgb24Buffer_ || rgb24BufferSize_ < rgbaSize)
-            {
-                if (rgb24Buffer_)
-                    cudaFree(rgb24Buffer_);
-                cudaError_t err = cudaMalloc(&rgb24Buffer_, rgbaSize);
-                if (err != cudaSuccess)
-                    throw CxException("CUDA DECODER: RGBA Alloc failed");
-                rgb24BufferSize_ = rgbaSize;
-            }
+            ensureRgbBuffer(rgbaSize, "CUDA DECODER: RGBA Alloc failed");
 
             // NV12 -> RGBA32
             const uint8_t* yPlane = frame.get()->data[0];
@@ -1447,15 +1427,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             int rgbPitch = (width * 3 + 255) & ~255;
             size_t rgb24Size = rgbPitch * height;
 
-            if (!rgb24Buffer_ || rgb24BufferSize_ < rgb24Size)
-            {
-                if (rgb24Buffer_)
-                    cudaFree(rgb24Buffer_);
-                cudaError_t err = cudaMalloc(&rgb24Buffer_, rgb24Size);
-                if (err != cudaSuccess)
-                    throw CxException("CUDA DECODER: RGB Alloc failed");
-                rgb24BufferSize_ = rgb24Size;
-            }
+            ensureRgbBuffer(rgb24Size, "CUDA DECODER: RGB Alloc failed");
 
             // ML output is always float32/float16 BCHW, produced from an 8-bit
             // RGB24 intermediate whatever the source depth, so this stays at
@@ -1476,6 +1448,21 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
             }
         }
 
+        // Both ML branches end in an unchecked BCHW launch (the NV12 branch also
+        // launches the RGBA32 conversion; the fallback branch's RGB24 step is
+        // checked inside transferAndConvertFrame). One check here covers every
+        // launch above it — cudaStreamSynchronize below would not report any of
+        // them, so an arch-mismatched build would otherwise hand back black
+        // frames with no error at all.
+        //
+        // Note for whoever revives this path: decodeNextFrameML currently has no
+        // caller anywhere in the repo (ML mode is not bound to Python either), so
+        // this whole function is dead-stripped out of the shipped module and this
+        // check has never executed. It is here so the path is not resurrected
+        // without it, not because it is protecting anything today. The live NVDEC
+        // path is decodeNextFrame -> transferAndConvertFrame, checked above.
+        throwOnKernelLaunchError("ML color-conversion");
+
         // Ensure our decode stream finishes writing before the tensor is
         // consumed on any torch stream. CPU-blocks on our own stream only.
         cudaError_t sync_err = cudaStreamSynchronize(cudaStream_);
@@ -1490,14 +1477,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         throw CxException("CUDA DECODER ML mode: Received non-CUDA frame.");
     }
 
-    if (decodeCompleteEvent_)
-    {
-        cudaEventRecord(decodeCompleteEvent_, cudaStream_);
-    }
-
-    av_frame_unref(frame.get());
-    producerBlocked_.store(false, std::memory_order_release);
-    producerCond.notify_one();
+    releaseDecodedFrame(frame);
 
     return true;
 }

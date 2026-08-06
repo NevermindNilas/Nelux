@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`color_format="rgba"` and 4-channel encode input — ProRes 4444 alpha is
+  reachable.** `VideoReader(color_format="rgba")` returns a 4-channel HWC frame
+  carrying the source alpha plane (`RGBA` for 8-bit sources, `RGBA64LE` for
+  10/12/16-bit), and `encode_frame` accepts an `[H, W, 4]` tensor. ProRes alpha
+  is straight, not premultiplied, and is passed through unchanged; a source
+  without an alpha plane yields a fully opaque one, matching
+  `ffmpeg -pix_fmt rgba`. Alpha reaches the file only when the output
+  `pixel_format` has an alpha plane (`yuva444p10le` with ProRes 4444 / 4444 XQ);
+  otherwise it is dropped, again as ffmpeg does. Like `"gray"`, `"rgba"` is
+  CPU-decode only and `decode_batch()` rejects it.
+
+  Verified byte-exact against `ffmpeg -pix_fmt rgba` / `rgba64le` on ProRes 4444
+  and 4444 XQ, ffv1 `gbrap`/`gbrap16le`, qtrle `argb`, png `rgba`, utvideo and a
+  palette GIF with real transparency — on clips where R, G, B and A all differ,
+  so a channel or byte swap would be visible. A 16-bit alpha ramp survives an
+  encode at 65.4 dB.
+- **More than 8 bits of encode input.** ProRes is a 10/12-bit format, but every
+  frame handed to it was staged as 8-bit `RGB24` first: a `uint16` tensor was
+  divided by 257 down to `uint8` before libswscale ever saw it. When the output
+  `pixel_format` stores more than 8 bits per component (`yuv422p10le`,
+  `yuva444p10le`, `yuv420p10le`, `p010`, ...) a `uint16` tensor is now carried
+  through at full 16-bit precision, and a float tensor in `[0, 1]` scales to the
+  full 16-bit range instead of to 0–255. A 16-bit ramp into ProRes HQ goes from
+  54.78 dB to **69.67 dB**, which is what the ffmpeg CLI scores from the same
+  raw input (69.63 dB).
+
+  `uint8` input keeps the exact `RGB24` path it always took and is bit-for-bit
+  unchanged; `int16`/`int32`/`int64` keep their documented 0–255 meaning. A CUDA
+  tensor that is deep or 4-channel now takes the CPU staging path rather than
+  the zero-copy GPU convert, whose fused kernel is 8-bit RGB-only — otherwise
+  the same data came out 10-bit from a CPU tensor and 8-bit-quantised from the
+  byte-identical `.cuda()` one.
+- **A ProRes parity suite.** `tests/test_prores_parity.py` (49 assertions)
+  compares decoded pixels against an `rgb48le`/`rgba64le` ffmpeg reference
+  across the profile matrix and guards the encode-side colour, precision, alpha
+  and frame-count behaviour. Every pre-existing ffmpeg reference in `tests/`
+  compared at `rgb24`, which cannot express ProRes at all. The corpus is built
+  by `tests/prores/gen_corpus.py`, the measurement harness lives in
+  `tests/prores/`, and `tests/output/prores_parity/REPORT.md` records the
+  numbers with the commands that produce them.
+- **`tests/conftest.py`** puts the repo root ahead of site-packages and the
+  bundled FFmpeg on the DLL search path. Without it, `pytest` from the repo root
+  either tested whatever wheel happened to be installed or aborted the
+  interpreter with 0xC06D007E on the first `VideoReader`.
 - **`set_ranges([(in, out), ...])` — several in/out segments in one pass.** Takes a
   list of `(start, end)` pairs (exclusive end, matching `set_range`) as frame
   indices, seconds, or `"H:MM:SS[.ms]"` timecode strings, and iterates every
@@ -30,7 +74,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reader(("0:00:05", "0:00:10"))` now parse `"H:MM:SS[.ms]"`, `"MM:SS[.ms]"` and
   `"SS[.ms]"` into seconds.
 
+### Fixed
+
+- **ProRes files were converted with one colour matrix and decoded with
+  another.** The ProRes encoders write their colour description from the
+  **AVFrame**, not the `AVCodecContext` — the opposite of every other codec
+  Nelux drives. Tagging only the codec context reached the MOV `colr` atom while
+  the ProRes frame header stayed at "unspecified" (`icpf` header bytes 22/23/24
+  = `02 02 02`), so every decoder — including Nelux's own reader — applied
+  BT.601 to pixels the convert pool had produced with BT.709. An 8-bit 720p RGB
+  round trip scored **28.70 dB**; it now scores **42.21 dB**, against 42.44 dB
+  for the same content through the ffmpeg CLI. The encoder's pooled input frames
+  now carry `colorspace`/`color_primaries`/`color_trc`/`color_range`.
+
+  With that fixed, Nelux's ProRes **video elementary stream is byte-identical to
+  the ffmpeg CLI's** at matched parameters — verified across `prores`,
+  `prores_aw` and `prores_ks`, profiles proxy/standard/HQ/4444/4444 XQ, from
+  both 8-bit and 16-bit sources — while encoding 1.17x–1.49x faster. (The
+  reference invocation needs `-vf setparams=color_primaries=…:color_trc=…:colorspace=…`;
+  `-colorspace` alone only moves the codec context.)
+
+  Colour keys passed through `options=` now move the conversion matrix too.
+  They are applied at `avcodec_open2` and override the codec context, but `props`
+  — which the converters and the frame tag are built from — was the *pre-open*
+  copy, so the file declared one matrix and its pixels used another. `props` is
+  refreshed from the opened codec context, the same way `pixelFormat` already was.
+- **MOV silently dropped a frame.** The muxer sizes the final sample from
+  `pkt->duration`, and most encoders leave it at 0 — so the last sample was
+  written with zero duration. `stts` came out `[[n-1, 3750], [1, 0]]` where the
+  CLI writes `[[n, 512]]`; the declared track duration was short by exactly one
+  frame at every length, and at some lengths the last frame was not demuxable at
+  all: 4 frames in came back as 3, 7 → 6, 10 → 9, 13 → 12, and a 1-frame file
+  was unreadable by Nelux's own reader. It affected `prores`, `prores_aw`,
+  `prores_ks`, `mjpeg`, `dnxhd` and `libx264` in MOV; Matroska was unaffected
+  because it derives durations differently. Packets now carry a one-frame
+  duration when the encoder leaves it unset — the codec time base is `{1, fps}`
+  and the pts is always the frame counter, so one tick is exactly one frame.
+  Interior samples, audio/subtitle passthrough and the transcode paths are
+  untouched. Guarded by `tests/prores/frame_count_matrix.py` (9 codec/container
+  combinations x n = 1..13).
+- **A 4-channel tensor handed to a grayscale-output encoder** hit a hardcoded
+  3-channel reshape and raised an internal error naming a shape the caller never
+  supplied — after the container header had been written, leaving the encoder
+  unusable. It now drops the alpha and converts to luma, as documented.
+- **`float64` and `bfloat16` frames encoded as solid black.** The 8-bit path
+  matched on `kFloat16 || kFloat32` and let every other float dtype fall through
+  to a truncating cast, which turns a `[0, 1]` tensor into zeros. Both the deep
+  and the narrow path now key on `is_floating_point()`.
+
 ### Performance
+
+- **`NELUX_PRORES_SLICE_THREADS=1` trades throughput for memory on ProRes
+  decode:** about 30% lower peak RSS (4K, 312 frames: 3.36 GB → 2.32 GB) for
+  about 7% less throughput. It is **off by default**, and the reason is worth
+  recording. Measured on the 24-frame corpus clips, slice threading looks 1.22x
+  *faster* — but frame threading needs `thread_count` pictures in flight before
+  it reaches speed, and its throughput climbs from 137 to 285 fps as the same 4K
+  clip lengthens, so a short clip measures only its startup. Across 16 rounds on
+  clips of 192–312 frames at two resolutions, slice threading won zero. Pixels
+  are identical either way (30/30 corpus clips byte-exact in both arms). Do not
+  flip the default without re-running `tests/prores/ab_thread_type.py --concat`
+  at >= 300 frames.
+
+  The same sweep disproves the tempting generalisation that intra-only codecs
+  prefer slice threads: huffyuv 0.30x, utvideo 0.39x, magicyuv 0.45x, mjpeg 0.98x.
 
 - **The default CPU path can seek again, so `set_range` no longer decodes the
   whole file to reach its start.** `prefetch=False` — the default — treated

@@ -8,6 +8,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <mutex>
+#include <optional>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -219,6 +220,41 @@ protected:
                                  int elemSize = 1);
     void transferAndConvertRawFrame(AVFrame* swFrame, void* outputBuffer,
                                     int outputPitch = 0, int elemSize = 1);
+
+    /**
+     * @brief Take the next decoded frame off the producer queue, ready to convert.
+     *
+     * The shared front half of decodeNextFrame() and decodeNextFrameML(): select
+     * the device, make sure the producer is running, wait for a frame, claim the
+     * surface (producerBlocked_) and pay the entry synchronization before anything
+     * reads it. Returns nullopt when the producer finished or stopped with an
+     * empty queue, i.e. exactly where both callers report "no frame".
+     *
+     * @param frame_timestamp Written with the frame's timestamp when non-null.
+     * @param logTag Prefix for the entry-sync failure message ("CUDA DECODER" or
+     *        "CUDA DECODER ML"), so the message still names the path that failed.
+     */
+    std::optional<Frame> acquireDecodedFrame(double* frame_timestamp,
+                                             const char* logTag);
+
+    /**
+     * @brief Hand the NVDEC surface back to the producer once conversion is done.
+     *
+     * The shared back half of both decode paths: record the completion event, drop
+     * this frame's reference and release the producer.
+     */
+    void releaseDecodedFrame(Frame& frame);
+
+    /**
+     * @brief (Re)allocate the intermediate device buffer to at least `bytes`.
+     *
+     * Grow-only and shared by every conversion path, which each need a different
+     * layout in it (RGB24/RGB48 aligned rows, or RGBA32).
+     *
+     * @param allocFailMessage Thrown verbatim if cudaMalloc fails, so each caller
+     *        keeps naming its own layout.
+     */
+    void ensureRgbBuffer(size_t bytes, const char* allocFailMessage);
 
     // Static callback for FFmpeg hardware pixel format selection
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);
