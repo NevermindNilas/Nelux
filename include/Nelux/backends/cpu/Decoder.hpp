@@ -9,13 +9,16 @@ class Decoder : public nelux::Decoder
 {
   public:
     Decoder(const std::string& filePath, int numThreads, bool syncMode = false,
-            bool grayscale = false, bool motionVectors = false)
+            int outChannels = 3, bool motionVectors = false)
         : nelux::Decoder( numThreads)
     {
         // Set the output channel count BEFORE initialize() so the converter and
         // convertedFrameBytes are sized correctly and the producer thread (which
-        // initialize() may start) never observes a mid-flight change.
-        if (grayscale) { grayscale_ = true; outChannels_ = 1; }
+        // initialize() may start) never observes a mid-flight change. Rejecting
+        // an unsupported count here matches Decoder::setOutputChannels rather
+        // than silently decoding to a different shape than the caller asked for.
+        requireOutputChannels(outChannels);
+        outChannels_ = outChannels;
         // Motion-vector export must likewise be decided before initialize()
         // opens the codec (the flag is consumed at avcodec_open2 time).
         motionVectorsEnabled_ = motionVectors;
@@ -25,11 +28,12 @@ class Decoder : public nelux::Decoder
     }
 
     Decoder(const std::string& filePath, int numThreads, int resizeWidth,
-            int resizeHeight, bool syncMode = false, bool grayscale = false,
+            int resizeHeight, bool syncMode = false, int outChannels = 3,
             int resizeFilter = SWS_BILINEAR, bool motionVectors = false)
         : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
     {
-        if (grayscale) { grayscale_ = true; outChannels_ = 1; }
+        requireOutputChannels(outChannels);
+        outChannels_ = outChannels;
         // Set the scaling kernel BEFORE initialize() so the converter and the
         // convert-worker pool bake it into their sws contexts on first build.
         if (resizeFilter > 0) resizeFlags_ = resizeFilter;
@@ -40,5 +44,14 @@ class Decoder : public nelux::Decoder
     }
 
     // No need to override methods unless specific behavior is needed
+
+  private:
+    static void requireOutputChannels(int channels)
+    {
+        if (channels != 1 && channels != 3 && channels != 4)
+            throw nelux::error::CxException(
+                "cpu::Decoder: expected 1 (gray), 3 (RGB) or 4 (RGBA) output "
+                "channels, got " + std::to_string(channels));
+    }
 };
 } // namespace nelux::backends::cpu

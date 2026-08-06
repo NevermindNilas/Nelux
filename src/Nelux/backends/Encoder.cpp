@@ -1283,6 +1283,19 @@ void Encoder::initVideoStream()
     }
 
     avcodec_parameters_from_context(videoStream->codecpar, videoCodecCtx.get());
+
+    // Publish the colour description the codec context ACTUALLY opened with.
+    // properties.* is the pre-open request; extraOptions are applied last into
+    // the avcodec_open2 dictionary (see above) and can override colorspace /
+    // color_primaries / color_trc / color_range there. Everything downstream --
+    // the swscale conversion matrix and the per-frame colour tag ProRes writes
+    // in-band -- reads Properties(), so without this write-back a caller
+    // passing options={"colorspace": ...} got a file whose container said one
+    // thing and whose bitstream and pixels said another.
+    properties.colorspace = videoCodecCtx->colorspace;
+    properties.colorPrimaries = videoCodecCtx->color_primaries;
+    properties.colorTrc = videoCodecCtx->color_trc;
+    properties.colorRange = videoCodecCtx->color_range;
 }
 
 bool Encoder::encodeFrame(const Frame& frame)
@@ -1382,6 +1395,26 @@ bool Encoder::encodeFrame(const Frame& frame)
 }
 
 
+void Encoder::stampPacketDuration()
+{
+    // Most encoders leave pkt->duration at 0 -- including libx264 in this
+    // build, so this was never a prores/mjpeg/dnxhd-only problem, only most
+    // visible there. The MOV muxer derives every sample's duration from the
+    // NEXT sample's dts and can only fall back to pkt->duration for the last
+    // one, so a zero there wrote a final sample of length 0. That truncated
+    // the declared track duration by exactly one frame at every length, and at
+    // some lengths the last sample became unreadable outright: 4 frames in ->
+    // 3 demuxed, 7 -> 6, 10 -> 9, 13 -> 12 (mkv was unaffected; it derives
+    // durations differently). Silent frame loss in the container ProRes
+    // actually ships in.
+    //
+    // The codec time base is 1/fps, so one frame is exactly 1 tick. Only fill
+    // it in when the encoder left it unset, so encoders that report a real
+    // duration keep it.
+    if (pkt && pkt->duration <= 0)
+        pkt->duration = 1;
+}
+
 void Encoder::writePacket()
 {
     // ONLY video packets should ever reach this helper;
@@ -1398,6 +1431,7 @@ void Encoder::writePacket()
         pumpPassthrough(vt);
     }
 
+    stampPacketDuration();
     av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base, videoStream->time_base);
     if (int ret = av_interleaved_write_frame(formatCtx.get(), pkt.get()); ret < 0)
     {
@@ -1433,6 +1467,7 @@ void Encoder::close()
                 break;
             }
             pkt->stream_index = videoStream->index;
+            stampPacketDuration();
             av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base,
                                  videoStream->time_base);
             if (int wret = av_interleaved_write_frame(formatCtx.get(), pkt.get());

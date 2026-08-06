@@ -39,9 +39,15 @@ VideoEncoder::VideoEncoder(const std::string& filename,
     this->outputPixelFormat = properties.pixelFormat;
 
     encoder = std::make_unique<nelux::Encoder>(filename, properties);
-    
-    // After encoder init, check if NVENC changed the pixel format (e.g., to NV12)
-    this->outputPixelFormat = encoder->Properties().pixelFormat;
+
+    // Re-read what the encoder actually opened with. NVENC may have changed the
+    // pixel format (e.g. to NV12), a codec may have fallen back to a format it
+    // supports, and colour keys passed through `options` are applied at
+    // avcodec_open2 and can override the inferred colour description. props is
+    // what the convert pool and the per-frame colour tag are built from, so it
+    // has to be the post-open truth rather than the pre-open request.
+    this->props = encoder->Properties();
+    this->outputPixelFormat = props.pixelFormat;
 }
 
 nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
@@ -172,14 +178,18 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     // frame is replicated to RGB below so the rest of the pipeline is unchanged
     // (R==G==B => the encoder sees neutral chroma / exact luma).
     const int64_t rgbElems = static_cast<int64_t>(width) * height * 3;
+    const int64_t rgbaElems = static_cast<int64_t>(width) * height * 4;
     const int64_t grayElems = static_cast<int64_t>(width) * height;
     const bool grayInput = (frame.numel() == grayElems);
-    if (frame.numel() != rgbElems && !grayInput)
+    const bool rgbaInput = (frame.numel() == rgbaElems);
+    if (frame.numel() != rgbElems && !grayInput && !rgbaInput)
         throw std::invalid_argument(
             "encode_frame: tensor has " + std::to_string(frame.numel()) +
             " elements, expected " + std::to_string(rgbElems) + " (" +
             std::to_string(height) + "x" + std::to_string(width) +
-            "x3 HWC RGB) or " + std::to_string(grayElems) + " (" +
+            "x3 HWC RGB), " + std::to_string(rgbaElems) + " (" +
+            std::to_string(height) + "x" + std::to_string(width) +
+            "x4 HWC RGBA) or " + std::to_string(grayElems) + " (" +
             std::to_string(height) + "x" + std::to_string(width) +
             " grayscale)");
 
@@ -198,7 +208,8 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
             shapeOk = (frame.size(0) == height && frame.size(1) == width);
         else if (d == 3)
             shapeOk = (frame.size(0) == height && frame.size(1) == width &&
-                       (frame.size(2) == 3 || frame.size(2) == 1));
+                       (frame.size(2) == 3 || frame.size(2) == 4 ||
+                        frame.size(2) == 1));
         if (!shapeOk)
         {
             std::string got;
@@ -207,7 +218,8 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
             throw std::invalid_argument(
                 "encode_frame: expected HWC layout [" + std::to_string(height) +
                 "x" + std::to_string(width) + "x3], [" + std::to_string(height) +
-                "x" + std::to_string(width) + "x1], or [" +
+                "x" + std::to_string(width) + "x4] (RGBA), [" +
+                std::to_string(height) + "x" + std::to_string(width) + "x1], or [" +
                 std::to_string(height) + "x" + std::to_string(width) +
                 "] (grayscale); got shape [" + got + "]");
         }
@@ -272,7 +284,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         torch::Tensor g = frame;
         if (g.device().is_cuda())
             g = g.to(torch::kCPU);
-        if (g.dtype() == torch::kFloat16 || g.dtype() == torch::kFloat32)
+        // is_floating_point(), for the same reason as the colour path below:
+        // a kFloat16/kFloat32 list sends float64 and bfloat16 to the truncating
+        // .to(kUInt8) catch-all, which turns a [0,1] tensor into an all-black
+        // frame.
+        if (g.is_floating_point())
             g = (g.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
         else if (g.scalar_type() == torch::ScalarType::UInt16)
             g = (g.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
@@ -297,6 +313,31 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         frame = rgb;
     }
 
+    // How much precision the destination can hold, and whether the caller
+    // actually supplied it. Decided here, ABOVE the NVENC zero-copy branch,
+    // because that branch narrows unconditionally: leaving the decision below
+    // it made a .cuda() tensor come out 8-bit-quantised while the byte-
+    // identical CPU tensor came out full 10-bit on the same p010 encoder.
+    //
+    // Restricted to uint16 and float on purpose. int16/int32/int64 remain
+    // documented 0-255 integer levels (same convention as encodeGrayVerbatim),
+    // so reading them as 0-65535 would silently reinterpret existing data.
+    const AVPixFmtDescriptor* outDesc = av_pix_fmt_desc_get(outputPixelFormat);
+    const bool deepDest = outDesc && outDesc->comp[0].depth > 8;
+    const bool deepSource = frame.is_floating_point() ||
+                            frame.scalar_type() == torch::ScalarType::UInt16;
+    const bool deep = deepDest && deepSource;
+
+    // A 4-channel [H,W,4] input carries alpha. It is what makes ProRes 4444 /
+    // 4444 XQ (yuva444p10le) reachable: swscale copies the alpha plane straight
+    // through, and for a destination without alpha it simply drops it, exactly
+    // as `ffmpeg -pix_fmt rgba -c:v ...` does.
+    const int srcChannels =
+        (frame.numel() == static_cast<int64_t>(width) * height * 4) ? 4 : 3;
+    const AVPixelFormat srcFmt =
+        (srcChannels == 4) ? (deep ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGBA)
+                           : (deep ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24);
+
 #ifdef NELUX_ENABLE_CUDA
     // GPU path: tensor already on CUDA and the encoder is NVENC -> keep the
     // whole pipeline on the GPU (zero-copy). The caller only does the GPU dtype
@@ -304,7 +345,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // data is ready, then hands the tensor to the encode worker and returns.
     // The RGB->NV12 convert, device copy, stream sync and avcodec_send_frame all
     // run on the worker, overlapped with the caller's next decode/inference.
-    if (frame.device().is_cuda() && encoder->isHardwareEncoder())
+    // Alpha and deep-colour input fall through to the CPU staging path: the
+    // fused GPU convert kernel is 8-bit RGB-only, and the CPU path handles a
+    // CUDA tensor natively (one stream-ordered D2H straight into staging).
+    if (frame.device().is_cuda() && encoder->isHardwareEncoder() && !deep &&
+        srcChannels == 3)
     {
         int deviceIndex = frame.device().index();
         if (deviceIndex < 0)
@@ -374,12 +419,36 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
 
     // CPU path (fallback for non-CUDA tensors or software encoders)
 
-    // Normalize dtype to uint8 FIRST, on whatever device the tensor is on.
-    // Doing this before any download means a CUDA float tensor is reduced to
-    // uint8 on the GPU and we transfer 1 byte/channel instead of 2/4 — at 4K
-    // that's a 24.8 MB D2H instead of ~99 MB for float32.
-    if (frame.dtype() == torch::kFloat16 || frame.dtype() == torch::kFloat32)
+    // uint8 in keeps the exact RGB24 path it has always taken, so every
+    // existing 8-bit caller stays bit-for-bit unchanged; a deep source into a
+    // deep destination stages as RGB48LE/RGBA64LE instead of being narrowed to
+    // 8 bits first (a uint16 tensor used to be divided by 257 down to uint8
+    // before swscale ever saw it, which defeats a 10/12-bit codec entirely).
+    //
+    // Normalize dtype FIRST, on whatever device the tensor is on. Doing this
+    // before any download means a CUDA float tensor is reduced on the GPU and
+    // we transfer 1-2 bytes/channel instead of 4 — at 4K that's a 24.8 MB D2H
+    // instead of ~99 MB for float32.
+    if (deep)
     {
+        // Float is normalized [0,1] and scales to the FULL 16-bit range (the
+        // same convention encodeGrayVerbatim uses for 16-bit gray output);
+        // uint16 is already the target representation and passes through.
+        if (frame.is_floating_point())
+        {
+            frame = (frame.to(torch::kFloat32) * 65535.0f)
+                        .round()
+                        .clamp(0, 65535)
+                        .to(torch::kUInt16);
+        }
+    }
+    else if (frame.is_floating_point())
+    {
+        // is_floating_point(), not a kFloat16/kFloat32 list: float64 and
+        // bfloat16 used to fall through to the bare .to(kUInt8) catch-all
+        // below, which truncates a [0,1] tensor to an all-black frame. The deep
+        // branch above uses the same predicate, so changing only pixel_format
+        // can no longer flip a caller between correct and black.
         frame = (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
     }
     else if (frame.scalar_type() == torch::ScalarType::UInt16)
@@ -412,7 +481,8 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     startEncodeWorkersIfNeeded();
     ensureConvertPipeline();   // CPU path needs the swscale convert pool
 
-    const size_t rgbBytes = static_cast<size_t>(width) * height * 3;
+    const size_t rgbBytes = static_cast<size_t>(width) * height * srcChannels *
+                            (deep ? 2 : 1);
 
     std::vector<uint8_t>* staging = nullptr;
     nelux::Frame* yuv = nullptr;
@@ -455,7 +525,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         int dev = frame.device().index();
         if (dev < 0) dev = 0;
         cudaStream_t s = nelux::currentCudaStream(dev);
-        cudaError_t cerr = cudaMemcpyAsync(staging->data(), frame.data_ptr<uint8_t>(),
+        cudaError_t cerr = cudaMemcpyAsync(staging->data(), frame.data_ptr(),
                                            rgbBytes, cudaMemcpyDeviceToHost, s);
         if (cerr == cudaSuccess)
             cerr = cudaStreamSynchronize(s);
@@ -467,17 +537,17 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         }
 #else
         frame = frame.to(torch::kCPU);
-        std::memcpy(staging->data(), frame.data_ptr<uint8_t>(), rgbBytes);
+        std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
 #endif
     }
     else
     {
-        std::memcpy(staging->data(), frame.data_ptr<uint8_t>(), rgbBytes);
+        std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
     }
 
     {
         std::lock_guard<std::mutex> lk(mu);
-        convertQueue.push_back(ConvertJob{staging, yuv, seq});
+        convertQueue.push_back(ConvertJob{staging, yuv, seq, srcFmt});
     }
     cvConvert.notify_one();
 }
@@ -565,20 +635,28 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
     }
     else
     {
-        // RGB [H,W,3] input to a gray-output encoder: convert to luma (full
-        // range) with swscale. This path is 8-bit (RGB24 source); grayscale
-        // *data* callers should feed a single-channel frame for full precision.
+        // RGB [H,W,3] or RGBA [H,W,4] input to a gray-output encoder: convert
+        // to luma (full range) with swscale, dropping any alpha. This path is
+        // 8-bit; grayscale *data* callers should feed a single-channel frame
+        // for full precision. The channel count has to be honoured here -- a
+        // hardcoded 3 turned a documented "alpha is dropped" case into an
+        // internal reshape error that also left the encoder half-started.
         torch::Tensor rgb = frame;
         if (rgb.is_floating_point())
             rgb = (rgb.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
         else if (rgb.dtype() != torch::kUInt8)
             rgb = rgb.clamp(0, 255).to(torch::kUInt8);
-        rgb = rgb.reshape({height, width, 3}).contiguous();
+        const int64_t ch =
+            (rgb.numel() == static_cast<int64_t>(width) * height * 4) ? 4 : 3;
+        rgb = rgb.reshape({height, width, ch}).contiguous();
         if (!grayRgbConverter_)
             grayRgbConverter_ =
                 std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
                     width, height, pf, AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_JPEG);
-        grayRgbConverter_->convert(f, rgb.data_ptr<uint8_t>());
+        // convert() rebuilds its cached context when the source format changes,
+        // so a session mixing 3- and 4-channel frames stays correct.
+        grayRgbConverter_->convert(f, rgb.data_ptr<uint8_t>(),
+                                   ch == 4 ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24);
     }
 
     encoder->encodeFrame(f);
@@ -608,8 +686,12 @@ void VideoEncoder::startEncodeWorkersIfNeeded()
         numConvertWorkers = std::clamp(k, 2, 4);
     }
     // workers + 2 keeps every convert worker fed (one filling, one draining)
-    // without over-buffering. At 4K each in-flight slot costs ~24.8 MB RGB +
-    // 12.4 MB YUV, so the depth directly sets the pool RAM footprint.
+    // without over-buffering. The depth directly sets the pool RAM footprint,
+    // and a slot is no longer a fixed size: at 4K the staging buffer is 24.8 MB
+    // for RGB24, 33.2 MB for RGBA, 49.8 MB for RGB48LE and 66.4 MB for
+    // RGBA64LE, on top of the YUV frame (12.4 MB yuv420p, 33.2 MB yuv422p10le).
+    // Measured 4K pool footprint: ~400-470 MB for uint8 RGB, 582 MB for uint16
+    // RGB, 1596 MB for uint16 RGBA into yuva444p10le.
     maxFramesInFlight = static_cast<size_t>(numConvertWorkers) + 2;
 
     workersStarted = true;
@@ -644,6 +726,21 @@ void VideoEncoder::ensureConvertPipeline()
         f->get()->format = outputPixelFormat;
         f->get()->width = width;
         f->get()->height = height;
+        // Tag the SOURCE FRAME, not just the codec context. Several encoders --
+        // ProRes above all -- write the colour description straight out of the
+        // AVFrame into the bitstream and ignore AVCodecContext entirely, so a
+        // context-only tag (Encoder.cpp initVideoStream) reaches the container's
+        // colr atom but leaves the ProRes frame header at "unspecified". A
+        // decoder trusts the in-band value first, so the file came back as
+        // BT.601 while these workers had converted it with the BT.709 matrix:
+        // an 8-bit 720p RGB round trip scored 28.70 dB instead of 42.44 dB.
+        // props is refreshed from the OPENED codec context in the constructor,
+        // so the frame tag, the converters' matrix and the container's colr
+        // atom carry the same values even when `options` overrode them.
+        f->get()->colorspace = props.colorspace;
+        f->get()->color_primaries = props.colorPrimaries;
+        f->get()->color_trc = props.colorTrc;
+        f->get()->color_range = props.colorRange;
         f->allocateBuffer(32);
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -693,7 +790,7 @@ void VideoEncoder::convertWorkerLoop(int workerId)
             if (av_frame_make_writable(job.yuv->get()) < 0)
                 throw std::runtime_error("Failed to make encoder frame writable");
 
-            conv->convert(*job.yuv, job.staging->data());
+            conv->convert(*job.yuv, job.staging->data(), job.srcFmt);
         }
         catch (...)
         {

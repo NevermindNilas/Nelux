@@ -78,6 +78,10 @@ class Encoder
     void initialize();
     bool encodeFrame(const Frame& frame);
     void writePacket();
+    // Give `pkt` a one-frame duration when the encoder left it unset, so the
+    // MOV muxer can size the final sample. See the definition for the frame
+    // loss this prevents.
+    void stampPacketDuration();
     void close();
 
     // Copy (remux) audio and/or subtitle streams from `source` into the output

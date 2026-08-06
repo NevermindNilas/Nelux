@@ -258,8 +258,12 @@ Args:
         3-channel HWC RGB frame; "gray" (aliases: "grayscale", "l") returns a
         single-channel HWC luma frame (shape H×W×1), derived from the source
         colorspace/range by libswscale (BT.601/709-correct, not a naive channel
-        average). Grayscale is CPU-decode only (decode_accelerator="cpu") and is
-        not supported by decode_batch().
+        average); "rgba" returns a 4-channel HWC frame carrying the source alpha
+        plane (ProRes 4444 / 4444 XQ, VP9 or PNG with alpha). ProRes alpha is
+        straight, not premultiplied, and is passed through unchanged; a source
+        without an alpha plane yields a fully opaque one, matching
+        ``ffmpeg -pix_fmt rgba``. Both "gray" and "rgba" are CPU-decode only
+        (decode_accelerator="cpu") and are not supported by decode_batch().
     resize_filter (str, optional): libswscale scaling kernel used for the
         decoder-side resize. Only takes effect when resize is set. Accepts the
         same scaler names as ffmpeg's -sws_flags: "fast_bilinear", "bilinear"
@@ -570,7 +574,25 @@ Args:
         ``options={"tune": "film", "x264-params": "ref=3", "cpu-used": "8"}``.
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
-             "Encode one video frame (H×W×3 torch.uint8 tensor).")
+             R"doc(Encode one video frame.
+
+Accepts H×W×3 (RGB), H×W×4 (RGBA) or H×W / H×W×1 (grayscale), HWC.
+
+dtype decides precision. uint8 takes the 8-bit path unchanged. When the output
+``pixel_format`` stores more than 8 bits per component (ProRes' yuv422p10le /
+yuva444p10le, yuv420p10le, p010, ...) a uint16 tensor is carried through at full
+16-bit precision instead of being narrowed to 8 bits first, and a float tensor
+in [0, 1] is scaled to the full 16-bit range rather than to 0-255. int16/int32/
+int64 keep their documented 0-255 meaning.
+
+A 4-channel frame's alpha reaches the file only if the output ``pixel_format``
+has an alpha plane (``yuva444p10le`` with ProRes 4444/4444 XQ); otherwise it is
+dropped, exactly as ``ffmpeg -pix_fmt rgba`` does.
+
+A CUDA tensor that is deep or 4-channel takes the CPU staging path rather than
+the zero-copy GPU convert, whose fused kernel is 8-bit RGB-only -- correctness
+over throughput, so a p010 NVENC encode keeps its extra bits whichever device
+the tensor came from.)doc")
         .def(
             "add_passthrough",
             [](nelux::VideoEncoder& e, const std::string& source, bool audio,

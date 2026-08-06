@@ -453,7 +453,7 @@ void Decoder::initialize(const std::string& filePath)
 
     converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     converter->setForce8Bit(force_8bit);
-    converter->setGrayscale(grayscale_);
+    converter->setOutputChannels(outChannels_);
     converter->setResizeFilter(resizeFlags_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
     {
@@ -588,6 +588,40 @@ void Decoder::initCodecContext()
         supported_types = FF_THREAD_FRAME;
     else if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS)
         supported_types = FF_THREAD_SLICE;
+
+    // ProRes can be slice-threaded instead, but that is NOT the default: it
+    // trades throughput for memory, and which way the trade goes depends on
+    // clip length. RDD 36 cuts every picture into many independent slices, so
+    // slice threading saturates the machine on a SINGLE frame, while frame
+    // threading needs thread_count pictures in flight before it reaches full
+    // speed. On short clips slice therefore looks like a large win; on real
+    // ones it is a small loss. Paired, order-alternating A/B on this reader
+    // (tests/prores/ab_thread_type.py, frame -> slice, 24 cores):
+    //     4K     24 frames   1.23x faster   <- the misleading regime
+    //     4K    312 frames   0.93x  (0/5)   peak RSS 3.36 -> 2.32 GB
+    //     4K    192 frames   0.93x  (0/5)   peak RSS 3.20 -> 2.00 GB
+    //     4K    300 frames   0.97x  (0/3)   peak RSS 3.57 -> 2.86 GB
+    //     1080p 192 frames   0.94x  (0/3)   peak RSS 1.12 -> 0.80 GB
+    // The frame arm climbs from 137 to 285 fps as the clip lengthens; the slice
+    // arm's ceiling is simply lower. Zero wins in 16 long-clip rounds across
+    // three clips and two resolutions, so frame-first stays the default and
+    // NELUX_PRORES_SLICE_THREADS=1 opts in to roughly 20-35% lower peak RSS for
+    // 3-7% less throughput -- worth it when many readers share one machine.
+    // Do not flip the default without re-running that A/B on >= 300 frames.
+    // The "intra-only codecs prefer slice threads" generalisation is false
+    // regardless: the same sweep has huffyuv at 0.30x, utvideo 0.39x, magicyuv
+    // 0.45x and mjpeg 0.98x, because those formats carry few slices per frame.
+    // Either way the thread type changes scheduling only, never the pixels
+    // (verified byte-exact vs the ffmpeg CLI on all 30 corpus clips).
+    {
+        const char* sliceEnv = std::getenv("NELUX_PRORES_SLICE_THREADS");
+        const bool wantSlice = sliceEnv && std::atoi(sliceEnv) != 0;
+        if (wantSlice && codecCtx->codec_id == AV_CODEC_ID_PRORES &&
+            (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS))
+        {
+            supported_types = FF_THREAD_SLICE;
+        }
+    }
     codecCtx->thread_type = supported_types;
     NELUX_DEBUG("BASE DECODER: Codec context threading configured: thread_count={}, "
                 "thread_type={}",
@@ -933,7 +967,7 @@ void Decoder::syncConvertWorkerLoop()
 {
     auto local_converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
     local_converter->setForce8Bit(force_8bit);
-    local_converter->setGrayscale(grayscale_);
+    local_converter->setOutputChannels(outChannels_);
     local_converter->setResizeFilter(resizeFlags_);
     if (resizeWidth_ > 0 && resizeHeight_ > 0)
         local_converter->setOutputSize(resizeWidth_, resizeHeight_);
@@ -1643,13 +1677,14 @@ void Decoder::setForce8Bit(bool enabled)
     }
 }
 
-void Decoder::setColorFormat(bool grayscale)
+void Decoder::setOutputChannels(int channels)
 {
-    grayscale_ = grayscale;
-    outChannels_ = grayscale ? 1 : 3;
+    if (channels != 1 && channels != 3 && channels != 4)
+        throw CxException("setOutputChannels: expected 1 (gray), 3 (RGB) or 4 (RGBA)");
+    outChannels_ = channels;
     if (converter)
     {
-        converter->setGrayscale(grayscale);
+        converter->setOutputChannels(outChannels_);
     }
     // Resize the pooled convert buffers for the new channel count. Any
     // previously sized pool buffers are dropped by acquireOutputBuffer when the
@@ -1781,7 +1816,7 @@ void Decoder::reconfigure(const std::string& filePath)
     // Update converter if needed
     if (converter)
     {
-        converter->setGrayscale(grayscale_);
+        converter->setOutputChannels(outChannels_);
         converter->setResizeFilter(resizeFlags_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {
@@ -1792,7 +1827,7 @@ void Decoder::reconfigure(const std::string& filePath)
     {
         converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
         converter->setForce8Bit(force_8bit);
-        converter->setGrayscale(grayscale_);
+        converter->setOutputChannels(outChannels_);
         converter->setResizeFilter(resizeFlags_);
         if (resizeWidth_ > 0 && resizeHeight_ > 0)
         {

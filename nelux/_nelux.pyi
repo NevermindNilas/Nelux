@@ -51,7 +51,7 @@ class VideoReader:
         resize: Optional[Tuple[int, int]] = None,
         prefetch: bool = False,
         convert_workers: Optional[int] = None,
-        color_format: Literal["rgb", "gray"] = "rgb",
+        color_format: Literal["rgb", "gray", "rgba"] = "rgb",
         resize_filter: Literal[
             "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
             "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
@@ -89,8 +89,12 @@ class VideoReader:
             color_format (str, optional): Output color format. "rgb" (default) returns a
                 3-channel HWC RGB frame; "gray" (aliases: "grayscale", "l") returns a
                 single-channel HWC luma frame (shape H×W×1), derived from the source
-                colorspace/range by libswscale. Grayscale is CPU-decode only
-                (decode_accelerator="cpu") and is not supported by decode_batch().
+                colorspace/range by libswscale; "rgba" returns a 4-channel HWC frame
+                carrying the source alpha plane (ProRes 4444 / 4444 XQ, VP9 or PNG
+                with alpha). ProRes alpha is straight, not premultiplied; a source
+                without alpha yields a fully opaque plane, matching
+                ``ffmpeg -pix_fmt rgba``. Both "gray" and "rgba" are CPU-decode only
+                (decode_accelerator="cpu") and are not supported by decode_batch().
             resize_filter (str, optional): libswscale scaling kernel for the decoder-side
                 resize. Only takes effect when ``resize`` is set. Same scaler names as
                 ffmpeg's ``-sws_flags``: "fast_bilinear", "bilinear" (default), "bicubic",
@@ -390,8 +394,25 @@ class VideoEncoder:
         """
         Encode one video frame.
 
-        Accepts a 3-channel RGB frame (H×W×3) or a single-channel frame
-        (H×W or H×W×1).
+        Accepts a 3-channel RGB frame (H×W×3), a 4-channel RGBA frame
+        (H×W×4) or a single-channel frame (H×W or H×W×1).
+
+        dtype decides precision. uint8 takes the 8-bit path unchanged. When the
+        output ``pixel_format`` stores more than 8 bits per component (ProRes'
+        ``yuv422p10le``/``yuva444p10le``, ``yuv420p10le``, ``p010``, ...) a
+        uint16 tensor is carried through at full 16-bit precision instead of
+        being narrowed to 8 bits first, and a float tensor in ``[0, 1]`` scales
+        to the full 16-bit range rather than to 0-255. int16/int32/int64 keep
+        their documented 0-255 meaning.
+
+        A 4-channel frame's alpha reaches the file only if the output
+        ``pixel_format`` has an alpha plane (``yuva444p10le`` with ProRes
+        4444/4444 XQ); otherwise it is dropped, as ``ffmpeg -pix_fmt rgba`` does.
+
+        A CUDA tensor that is deep or 4-channel takes the CPU staging path
+        rather than the zero-copy GPU convert, whose fused kernel is 8-bit
+        RGB-only -- correctness over throughput, so a p010 NVENC encode keeps
+        its extra bits whichever device the tensor came from.
 
         With a grayscale output ``pixel_format`` (``"gray"``/``"gray16le"``/
         ``"gray16be"``) single-channel input is stored **verbatim and
