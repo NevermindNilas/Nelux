@@ -284,7 +284,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         torch::Tensor g = frame;
         if (g.device().is_cuda())
             g = g.to(torch::kCPU);
-        if (g.dtype() == torch::kFloat16 || g.dtype() == torch::kFloat32)
+        // is_floating_point(), for the same reason as the colour path below:
+        // a kFloat16/kFloat32 list sends float64 and bfloat16 to the truncating
+        // .to(kUInt8) catch-all, which turns a [0,1] tensor into an all-black
+        // frame.
+        if (g.is_floating_point())
             g = (g.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
         else if (g.scalar_type() == torch::ScalarType::UInt16)
             g = (g.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);

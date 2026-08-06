@@ -355,6 +355,36 @@ def test_float64_input_is_not_black(tmp_path):
             f"{pix}: float64 encoded as ~black (mean {back.mean():.1f} of {peak})")
 
 
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_float_grayscale_input_is_not_black(tmp_path, dtype):
+    """The grayscale replication path had the same float-predicate bug."""
+    h, w = 64, 96
+    src = np.full((h, w), 0.5, dtype)
+    out = tmp_path / f"gray_{np.dtype(dtype).name}.mkv"
+    enc = nelux.VideoEncoder(str(out), codec="ffv1", width=w, height=h, fps=24,
+                             pixel_format="yuv420p")
+    for _ in range(3):
+        enc.encode_frame(torch.from_numpy(src))
+    enc.close()
+    back = nelux_frames(out, 1)[0].astype(float)
+    assert back.mean() > 90, f"float grayscale encoded as ~black (mean {back.mean():.1f})"
+
+
+@pytest.mark.parametrize("alias,channels", [
+    ("grey", 1), ("grayscale", 1), ("l", 1),
+    ("rgb24", 3), ("rgb32", 4), ("rgba64", 4),
+])
+def test_color_format_aliases(alias, channels):
+    """Every spelling the parser accepts must also be named in its error text."""
+    clip = CORPUS / "p1080_prores_ks_hq.mov"
+    if not clip.exists():
+        pytest.skip("missing fixture")
+    assert nelux_frames(clip, 1, color_format=alias).shape[-1] == channels
+    with pytest.raises(ValueError) as excinfo:
+        nelux.VideoReader(str(clip), color_format="definitely-not-a-format")
+    assert alias in str(excinfo.value)
+
+
 def test_colour_options_reach_the_conversion_and_the_bitstream(tmp_path):
     """options={'colorspace': ...} must move BOTH the tag and the matrix."""
     h, w = 128, 192

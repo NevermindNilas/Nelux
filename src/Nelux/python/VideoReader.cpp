@@ -162,7 +162,9 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         else
             throw std::invalid_argument(
                 "Unknown color_format: '" + color_format +
-                "'. Valid options: 'rgb', 'gray', 'rgba'.");
+                "'. Valid options: 'rgb' (aliases: 'rgb24'), 'gray' (aliases: "
+                "'grey', 'grayscale', 'greyscale', 'gray8', 'l') and 'rgba' "
+                "(aliases: 'rgb32', 'rgba64').");
     }
     if (outChannels_ != 3 && decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
         throw std::invalid_argument(
