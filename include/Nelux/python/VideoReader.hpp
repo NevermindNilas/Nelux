@@ -716,9 +716,8 @@ class VideoReader
     std::string filePath;
     int numThreads;
     bool force_8bit = false;
-    // Output color format. grayscale_ selects single-channel GRAY output;
-    // outChannels_ (1 or 3) drives every tensor/array shape the reader builds.
-    bool grayscale_ = false;
+    // Output color format as a channel count: 1 = GRAY, 3 = RGB (default),
+    // 4 = RGBA. It drives every tensor/array shape the reader builds.
     int outChannels_ = 3;
     Backend backend = Backend::PyTorch; // Output backend selection
     nelux::DecodeAccelerator decodeAccelerator = nelux::DecodeAccelerator::CPU;

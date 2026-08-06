@@ -145,9 +145,12 @@ class VideoEncoder
     // RGB frame awaiting conversion (CPU path), assigned a target YUV frame.
     struct ConvertJob
     {
-        std::vector<uint8_t>* staging = nullptr;  // recycled RGB24 buffer
+        std::vector<uint8_t>* staging = nullptr;  // recycled packed-RGB buffer
         nelux::Frame* yuv = nullptr;              // recycled YUV frame to fill
         int64_t seq = 0;
+        // Layout of `staging`: RGB24 for 8-bit input, RGB48LE when the caller
+        // supplied deep-colour data and the destination can store it.
+        AVPixelFormat srcFmt = AV_PIX_FMT_RGB24;
     };
 
     // A frame ready for the submit thread, in `readyMap` keyed by seq.

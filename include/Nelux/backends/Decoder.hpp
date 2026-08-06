@@ -164,14 +164,16 @@ class Decoder
     void setForce8Bit(bool enabled);
     int getBitDepth() const;
 
-    // Select the decoded output color format. false (default) = 3-channel RGB;
-    // true = single-channel grayscale (GRAY8 / GRAY16LE). Must be called before
-    // the first decode call (after construction, like setForce8Bit): it
-    // reconfigures the converter and the pooled buffer geometry. CPU path only —
-    // the NVDEC decoder does not override this.
-    void setColorFormat(bool grayscale);
+    // Select the decoded output color format by channel count: 1 = grayscale
+    // (GRAY8 / GRAY16LE), 3 = RGB (default), 4 = RGBA (RGBA / RGBA64LE, the
+    // only way an alpha-bearing source such as ProRes 4444 reaches the caller).
+    // Must be called before the first decode call (after construction, like
+    // setForce8Bit): it reconfigures the converter and the pooled buffer
+    // geometry. CPU path only — the NVDEC decoder does not override this.
+    void setOutputChannels(int channels);
+    void setColorFormat(bool grayscale) { setOutputChannels(grayscale ? 1 : 3); }
 
-    // Number of output channels (1 grayscale / 3 RGB) currently configured.
+    // Number of output channels (1 gray / 3 RGB / 4 RGBA) currently configured.
     int getOutputChannels() const { return outChannels_; }
 
     // Prefetch control API
@@ -280,10 +282,9 @@ class Decoder
     VideoProperties properties;
     Frame frame;
     bool force_8bit = false;
-    // Output color format. 3-channel RGB by default; grayscale_ selects a
-    // single-channel GRAY plane. outChannels_ mirrors it for buffer/tensor
-    // geometry so every convert path stays channel-count agnostic.
-    bool grayscale_ = false;
+    // Output color format as a channel count: 1 = single GRAY plane, 3 = RGB
+    // (default), 4 = RGBA. Every convert path and buffer/tensor geometry is
+    // driven from this one number.
     int outChannels_ = 3;
     // Motion-vector export is opt-in (VideoReader motion_vectors=True). When
     // false, AV_CODEC_FLAG2_EXPORT_MVS is NOT set at codec-open, which avoids

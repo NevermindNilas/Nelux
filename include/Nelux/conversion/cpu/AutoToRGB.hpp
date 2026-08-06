@@ -50,7 +50,19 @@ class AutoToRGBConverter
     // default 3-channel RGB24 / RGB48LE. libswscale derives luma from the
     // source colorspace/range exactly as it does for the RGB path, so the
     // grayscale plane is BT.601/709-correct rather than a naive channel average.
-    void setGrayscale(bool enabled) { grayscale_ = enabled; }
+    void setGrayscale(bool enabled) { channels_ = enabled ? 1 : 3; }
+
+    // Output channel count: 1 = GRAY8/GRAY16LE, 3 = RGB24/RGB48LE (default),
+    // 4 = RGBA/RGBA64LE. The 4-channel form is what makes an alpha-bearing
+    // source (ProRes 4444 yuva444p10le/yuva444p12le, VP9/PNG with alpha)
+    // reachable at all; libswscale carries the alpha plane straight through
+    // (ProRes alpha is straight, not premultiplied) and synthesises an opaque
+    // plane when the source has none, exactly as `ffmpeg -pix_fmt rgba` does.
+    void setOutputChannels(int channels)
+    {
+        if (channels == 1 || channels == 3 || channels == 4)
+            channels_ = channels;
+    }
 
     // Set decoder-side output dimensions. Pass (0, 0) to disable (use source dims).
     // When both are > 0, sws_scale will resize the frame to these dimensions and
@@ -120,7 +132,8 @@ class AutoToRGBConverter
         // 1.8) Fast-path for RGB24 input. Direct memcpy per row — no swscale
         // overhead, no libyuv dep. Skip when resizing or when grayscale output
         // is requested (RGB24 -> GRAY8 still needs a luma conversion).
-        if (!resize_active && !grayscale_ && bit_depth <= 8 && src_fmt == AV_PIX_FMT_RGB24)
+        if (!resize_active && channels_ == 3 && bit_depth <= 8 &&
+            src_fmt == AV_PIX_FMT_RGB24)
         {
             uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
             int dst_stride = width * 3;
@@ -138,7 +151,7 @@ class AutoToRGBConverter
         // maps round-trips losslessly) and much cheaper than the swscale
         // gray->gray path. A limited-range source still needs swscale to expand
         // to full range, so it is excluded here.
-        if (grayscale_ && !resize_active && src_color_range == AVCOL_RANGE_JPEG)
+        if (channels_ == 1 && !resize_active && src_color_range == AVCOL_RANGE_JPEG)
         {
             const bool srcEightBit = (bit_depth <= 8 || force_8bit);
             const AVPixelFormat wantSrc =
@@ -159,13 +172,14 @@ class AutoToRGBConverter
         // 2) Choose destination format/stride accordingly
         // If force_8bit is true, we want 8-bit output regardless of input bit
         // depth. Otherwise, preserve >8-bit sources with a 16-bit output.
-        // grayscale_ picks the single-channel GRAY variant of each.
+        // channels_ picks the GRAY / RGB / RGBA variant of each.
         const bool eightBit = (bit_depth <= 8 || force_8bit);
         const AVPixelFormat dst_fmt =
-            grayscale_ ? (eightBit ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_GRAY16LE)
-                       : (eightBit ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_RGB48LE);
+            (channels_ == 1) ? (eightBit ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_GRAY16LE)
+          : (channels_ == 4) ? (eightBit ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGBA64LE)
+                             : (eightBit ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_RGB48LE);
         const int elem_size = eightBit ? 1 : 2; // bytes per channel
-        const int channels = grayscale_ ? 1 : 3;
+        const int channels = channels_;
 
 
         // 3) (Re)build sws context if anything changed
@@ -268,7 +282,8 @@ class AutoToRGBConverter
     int last_out_width, last_out_height;
     bool force_8bit;
     int out_width, out_height;
-    bool grayscale_ = false;
+    // 1 = gray, 3 = RGB (default), 4 = RGBA.
+    int channels_ = 3;
     // libswscale scaling kernel used when a resize is active. Default matches
     // the historical hardcoded behavior.
     int resize_flags_ = SWS_BILINEAR;

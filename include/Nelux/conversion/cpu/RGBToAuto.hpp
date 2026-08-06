@@ -50,12 +50,17 @@ class RGBToAutoConverter
     }
 
     /**
-     * @brief Converts RGB24 buffer (HWC uint8) to Frame (any format).
+     * @brief Converts a packed RGB buffer (HWC) to Frame (any format).
      *
-     * @param frame  Output nelux::Frame (must be pre-allocated, correct format/size).
-     * @param buffer Input buffer (raw RGB24, typically from tensor).
+     * @param frame   Output nelux::Frame (must be pre-allocated, correct format/size).
+     * @param buffer  Input buffer (packed RGB in @p srcPixFmt, typically from a tensor).
+     * @param srcPixFmt Source layout: AV_PIX_FMT_RGB24 (8-bit, the default) or
+     *        AV_PIX_FMT_RGB48LE (16-bit per component). A 16-bit source is what
+     *        lets a >8-bit destination (yuv422p10le for ProRes, yuv444p12le,
+     *        p010, ...) actually carry more than 8 bits of the caller's data.
      */
-    void convert(nelux::Frame& frame, void* buffer)
+    void convert(nelux::Frame& frame, void* buffer,
+                 AVPixelFormat srcPixFmt = AV_PIX_FMT_RGB24)
     {
         // Check destination frame format
         if (frame.getWidth() != width || frame.getHeight() != height ||
@@ -65,16 +70,25 @@ class RGBToAutoConverter
             throw std::runtime_error("Frame size or format mismatch");
         }
 
-        // Init SWS if needed
+        // Init SWS if needed. The source format is per-call (a caller may hand
+        // 8-bit and 16-bit frames to the same encoder), so a change tears the
+        // cached context down and rebuilds it — including the colorspace
+        // details below, which sws_getContext resets.
+        if (swsContext && srcPixFmt != src_fmt)
+        {
+            sws_freeContext(swsContext);
+            swsContext = nullptr;
+        }
         if (!swsContext)
         {
+            src_fmt = srcPixFmt;
 
             // Plain SWS_BILINEAR matches ffmpeg's default flag set; the
             // previous SWS_ACCURATE_RND combo was slower without quality
             // benefit. See v0.11.0 decode-side change for the same reasoning
             // (tests/output/pixfmt_matrix/REPORT.md).
             swsContext =
-                sws_getContext(width, height, AV_PIX_FMT_RGB24, width, height, dst_fmt,
+                sws_getContext(width, height, src_fmt, width, height, dst_fmt,
                                SWS_BILINEAR, nullptr, nullptr, nullptr);
 
             if (!swsContext)
@@ -124,10 +138,14 @@ class RGBToAutoConverter
                                      dstRange, 0, 1 << 16, 1 << 16);
         }
 
-        // Prepare source data/stride
+        // Prepare source data/stride. Packed, so one plane; the row stride comes
+        // from the format (RGB24 = 3 bytes/pixel, RGB48LE = 6).
         const uint8_t* srcData[4] = {static_cast<const uint8_t*>(buffer), nullptr,
                                      nullptr, nullptr};
-        int srcLineSize[4] = {width * 3, 0, 0, 0}; // RGB24 = 3 bytes/pixel
+        const int srcStride = av_image_get_linesize(src_fmt, width, 0);
+        if (srcStride <= 0)
+            throw std::runtime_error("RGBToAutoConverter: unsupported source format");
+        int srcLineSize[4] = {srcStride, 0, 0, 0};
 
         // Prepare destination data/stride (planes)
         uint8_t* dstData[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -167,6 +185,7 @@ class RGBToAutoConverter
     SwsContext* swsContext = nullptr;
     int width;
     int height;
+    AVPixelFormat src_fmt = AV_PIX_FMT_RGB24;  // layout the cached context was built for
     AVPixelFormat dst_fmt;
     AVColorSpace dst_colorspace;
     AVColorRange dst_color_range;
