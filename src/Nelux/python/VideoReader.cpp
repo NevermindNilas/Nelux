@@ -214,7 +214,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // Apply user-supplied convert_workers override before any decode
         // call spawns the worker pool (lazy-start in startSyncConvertWorkers).
         // -1 sentinel = keep the ctor-time default (defaultConvertWorkers()).
-        if (convertWorkers >= 0 && decoder)
+        if (convertWorkers >= 0)
             decoder->setSyncConvertWorkers(convertWorkers);
 
         // Random-access decoder is now lazy-loaded in ensureRandDecoder()
@@ -1462,8 +1462,6 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     while (true)
     {
         double ts = 0.0;
-        // torch::Tensor buf = makeLikeOutputTensor(); // Moved outside
-
         bool ok = rdec->decodeNextFrame(buf.data_ptr(), &ts);
         if (!ok)
             break;
@@ -1625,23 +1623,12 @@ VideoReader& VideoReader::iter()
         NELUX_INFO("Using timestamp range for iteration: start_time={}, end_time={}",
                    start_time, end_time);
 
-        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && properties.fps > 0.0)
-        {
-            double span = std::max(0.0, end_time - start_time);
-            // +2, not +1: a span of S seconds at F fps covers ceil(S*F) frame
-            // intervals, i.e. ceil(S*F)+1 frame instants including both ends,
-            // and the range starts on the first frame AT OR AFTER start_time.
-            // The old +1 only produced the right count while the seek was
-            // dropping the range's first frame; with that fixed the cap was one
-            // short and truncated the tail.
-            rangeFrameLimit_ = static_cast<int>(std::ceil(span * properties.fps)) + 2;
-            rangeFramesEmitted_ = 0;
-        }
-        else
-        {
-            rangeFrameLimit_ = -1;
-            rangeFramesEmitted_ = 0;
-        }
+        // rangeFrameLimit_/rangeFramesEmitted_ are already correct for this
+        // range: a live start_time can only have been written by applySegment()
+        // -- which ran above, since every path that sets start_time also stores
+        // the matching segment list -- and it derives the NVDEC frame cap from
+        // exactly these start_time/end_time values. Recomputing it here was a
+        // second copy of that rule to keep in step by hand.
 
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_time <= 0.0)
         {
@@ -1714,8 +1701,9 @@ VideoReader& VideoReader::iter()
         // Using frame range
         NELUX_INFO("Using frame range for iteration: start_frame={}, end_frame={}",
                    start_frame, end_frame);
-        rangeFrameLimit_ = -1;
-        rangeFramesEmitted_ = 0;
+        // applySegment() above already cleared the frame cap for a frame range
+        // (it only applies to NVDEC time ranges); same reasoning as the
+        // timestamp branch.
         if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC && start_frame <= 0)
         {
             // NVDEC seek-to-zero can skip early frames; reopen decoder to ensure start.
@@ -1894,6 +1882,32 @@ int VideoReader::length() const
     return properties.totalFrames;
 }
 
+// The bit-depth -> dtype rule on its own, with no locking and no reader state,
+// so it can also be applied from inside a critical section that already holds
+// the lifecycle lock (reconfigure()). Throws on a depth the reader cannot
+// represent, which is what keeps an unsupported depth out of every entry point
+// rather than only out of the constructor.
+static torch::ScalarType scalarTypeFromBitDepth(int bit_depth)
+{
+    switch (bit_depth)
+    {
+    case 8:
+        NELUX_DEBUG("Setting tensor data type to torch::kUInt8");
+        return torch::kUInt8;
+    case 10:
+    case 12:
+    case 16:
+        NELUX_DEBUG("Setting tensor data type to torch::kUInt16");
+        return torch::kUInt16;
+    case 32:
+        NELUX_DEBUG("Setting tensor data type to torch::kUInt32");
+        return torch::kUInt32;
+    default:
+        NELUX_WARN("Unsupported bit depth: {}", bit_depth);
+        throw std::runtime_error("Unsupported bit depth: " + std::to_string(bit_depth));
+    }
+}
+
 torch::ScalarType VideoReader::findTypeFromBitDepth()
 {
     if (force_8bit)
@@ -1912,40 +1926,7 @@ torch::ScalarType VideoReader::findTypeFromBitDepth()
             return d->getBitDepth();
         });
     NELUX_INFO("Bit depth of video: {}", bit_depth);
-    torch::ScalarType torchDataType;
-    switch (bit_depth)
-    {
-    case 8:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt8");
-        torchDataType = torch::kUInt8;
-        break;
-    case 10:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt16");
-        torchDataType = torch::kUInt16;
-        break;
-    case 12:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt16");
-        torchDataType = torch::kUInt16;
-        break;
-    case 16:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt16");
-        torchDataType = torch::kUInt16;
-        break;
-    case 32:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt32");
-        torchDataType = torch::kUInt32;
-        break;
-    default:
-        NELUX_WARN("Unsupported bit depth: {}", bit_depth);
-        throw std::runtime_error("Unsupported bit depth: " + std::to_string(bit_depth));
-    }
-    return torchDataType;
-}
-
-torch::ScalarType VideoReader::findMLTypeFromBitDepth()
-{
-    // FP16 path disabled due to artifacts; ML output is always FP32.
-    return torch::kFloat32;
+    return scalarTypeFromBitDepth(bit_depth);
 }
 
 std::shared_ptr<nelux::VideoEncoder>
@@ -2163,21 +2144,76 @@ void VideoReader::reconfigure(const std::string& newFilePath)
             properties = d.getVideoProperties();
             filePath = newFilePath;
 
-            // Reallocate the output tensor if the geometry or dtype changed.
-            // findMLTypeFromBitDepth() is inlined here rather than called: it
-            // is safe to call only OUTSIDE the lock now that the reader's
-            // queries take it, and lifecycleMu_ is not recursive.
-            const torch::Device torchDevice = tensor.device();
-            const torch::Dtype torchDataType = torch::kFloat32; // FP16 disabled
-            if (tensor.dim() != 4 || tensor.size(2) != properties.height ||
-                tensor.size(3) != properties.width ||
-                tensor.dtype() != torchDataType)
+            // Reallocate the output tensor if the geometry, layout or dtype
+            // changed. The layout has to follow the reader's mode, not be
+            // assumed: only an ML reader emits {1, 3, H, W} float32, everyone
+            // else emits native-depth HWC, which is what decodeFrame() fills.
+            // Hardcoding BCHW float32 here handed ordinary readers a tensor of
+            // the wrong shape and dtype with RGB24/RGB48 rows written into it.
+            //
+            // The dtype is re-derived from the NEW file rather than carried
+            // over: reconfiguring from an 8-bit file to a 10-bit one has to move
+            // uint8 -> uint16. scalarTypeFromBitDepth() is used instead of
+            // findTypeFromBitDepth() because the latter takes the lifecycle
+            // lock, which this critical section already holds and which is not
+            // recursive. It also re-applies the constructor's depth validation,
+            // closing reconfigure() as a second way in for depths the
+            // constructor would have rejected.
+            //
+            // ML mode stays float32 whatever mlUseFP16_ says. The NV12 ML kernel
+            // (launchRgba32ToBchw) writes float32 unconditionally and documents
+            // that it ignores the flag, so honouring it here would hand a
+            // 4-byte-per-element kernel a 2-byte-per-element tensor.
+            try
             {
-                tensor = torch::empty(
-                    {1, 3, properties.height, properties.width},
-                    torch::TensorOptions().dtype(torchDataType).device(torchDevice));
-                NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} (BCHW)",
-                            properties.width, properties.height);
+                const torch::Device torchDevice = tensor.device();
+                const torch::Dtype torchDataType =
+                    mlOutputMode_ ? torch::kFloat32 // FP16 disabled
+                                  : scalarTypeFromBitDepth(force_8bit ? 8
+                                                                      : d.getBitDepth());
+                const std::vector<int64_t> wantShape =
+                    mlOutputMode_
+                        ? std::vector<int64_t>{1, 3, properties.height, properties.width}
+                        : std::vector<int64_t>{properties.height, properties.width,
+                                               outChannels_};
+                if (tensor.sizes() != c10::IntArrayRef(wantShape) ||
+                    tensor.dtype() != torchDataType)
+                {
+                    tensor = torch::empty(
+                        wantShape,
+                        torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+                    NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} ({})",
+                                properties.width, properties.height,
+                                mlOutputMode_ ? "BCHW" : "HWC");
+                }
+            }
+            catch (...)
+            {
+                // Fail closed. By this point the decoder is already on the new
+                // file and `properties`/`filePath` describe it, but `tensor`
+                // still describes the old one -- and that pair is not merely
+                // wrong, it is unsafe: makeLikeOutputTensor() (frame_at) sizes
+                // its buffer from the NEW geometry and the STALE dtype, so an
+                // 8-bit -> unsupported-depth switch would have the decoder write
+                // 2 bytes per element into a 1-byte-per-element buffer.
+                //
+                // Leaving the reader open is not an option either: the caller
+                // that writes `try: r.reconfigure(p) except: continue` would go
+                // on reading frames from the very file this just rejected, out
+                // of a reader the constructor would have refused to build.
+                //
+                // So tear the reader down and let every later call raise
+                // "VideoReader is closed". Same teardown close() performs, done
+                // inline because this already holds the lifecycle lock, which is
+                // not recursive.
+                NELUX_ERROR("Reconfigure to '{}' failed after the decoder had "
+                            "switched; closing the reader",
+                            newFilePath);
+                std::shared_ptr<nelux::Decoder> dead;
+                dead.swap(decoder);
+                if (dead)
+                    dead->close();
+                throw;
             }
             return 0;
         });

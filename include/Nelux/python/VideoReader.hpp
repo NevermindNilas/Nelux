@@ -598,9 +598,6 @@ class VideoReader
     // yet.
     void rewindForFreshIteration();
 
-    // ML output dtype. Currently always FP32 (FP16 path disabled due to artifacts).
-    torch::ScalarType findMLTypeFromBitDepth();
-    
     double frameDuration() const
     {
         return (properties.fps > 0.0) ? 1.0 / properties.fps : 0.0;

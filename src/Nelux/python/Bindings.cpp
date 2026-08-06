@@ -467,6 +467,8 @@ which is significantly faster than creating a new VideoReader (10-50x speedup).
 
 After reconfiguration:
 - All video properties are updated to reflect the new file
+- The output dtype follows the new file's bit depth (8-bit -> uint8,
+  10/12/16-bit -> uint16, 32-bit -> uint32), unless force_8bit was set
 - Frame iterator is reset to the beginning
 - Prefetch buffer is cleared and restarted
 - Any set ranges are cleared
@@ -478,7 +480,11 @@ Args:
     file_path (str): Path to the new video file.
 
 Raises:
-    RuntimeError: If the new file cannot be opened or decoded.
+    RuntimeError: If the new file cannot be opened or decoded, or if its bit
+        depth is not one the reader supports (the same depths the constructor
+        accepts). The reader is CLOSED when reconfigure raises: the decoder has
+        already switched by then, so the reader cannot be left describing one
+        file while buffered for another. Build a new VideoReader to recover.
 
 Example:
     >>> reader = VideoReader("video1.mp4")
