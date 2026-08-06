@@ -2,8 +2,8 @@
 
 Running ``python tests/prores/foo.py`` puts the SCRIPT's directory on sys.path,
 not the repo root, so a plain ``import nelux`` silently resolves to whatever
-build is installed in site-packages instead of the one just compiled into
-``D:/Nelux/nelux/_nelux.pyd``. Every measurement then describes the wrong
+build is installed in site-packages instead of the one just compiled into the
+in-tree ``nelux/_nelux.*`` extension. Every measurement then describes the wrong
 binary. Prepending the repo root fixes that for scripts and child processes
 alike.
 """

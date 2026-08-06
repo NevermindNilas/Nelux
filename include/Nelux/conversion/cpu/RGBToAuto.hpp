@@ -54,10 +54,14 @@ class RGBToAutoConverter
      *
      * @param frame   Output nelux::Frame (must be pre-allocated, correct format/size).
      * @param buffer  Input buffer (packed RGB in @p srcPixFmt, typically from a tensor).
-     * @param srcPixFmt Source layout: AV_PIX_FMT_RGB24 (8-bit, the default) or
-     *        AV_PIX_FMT_RGB48LE (16-bit per component). A 16-bit source is what
-     *        lets a >8-bit destination (yuv422p10le for ProRes, yuv444p12le,
-     *        p010, ...) actually carry more than 8 bits of the caller's data.
+     * @param srcPixFmt Source layout, one of AV_PIX_FMT_RGB24 (8-bit, the
+     *        default), RGB48LE (16-bit per component), RGBA or RGBA64LE. A
+     *        16-bit source is what lets a >8-bit destination (yuv422p10le for
+     *        ProRes, yuv444p12le, p010, ...) actually carry more than 8 bits of
+     *        the caller's data. An RGBA source's alpha reaches the destination
+     *        only if that format has an alpha plane (yuva444p10le); against a
+     *        destination without one libswscale drops it, matching
+     *        `ffmpeg -pix_fmt rgba`.
      */
     void convert(nelux::Frame& frame, void* buffer,
                  AVPixelFormat srcPixFmt = AV_PIX_FMT_RGB24)

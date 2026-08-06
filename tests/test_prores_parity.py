@@ -74,6 +74,12 @@ def probe(path: Path) -> dict:
     return json.loads(proc.stdout)["streams"][0]
 
 
+def psnr16(got: np.ndarray, want: np.ndarray) -> float:
+    """PSNR against a 16-bit reference. An exact match is inf, not a crash."""
+    mse = float(np.mean((got.astype(np.int64) - want.astype(np.int64)) ** 2))
+    return float("inf") if mse == 0 else 10 * np.log10(65535.0 ** 2 / mse)
+
+
 def nelux_frames(path: Path, frames: int, **kw) -> np.ndarray:
     reader = nelux.VideoReader(str(path), backend="numpy", **kw)
     out = []
@@ -230,10 +236,7 @@ def test_encode_round_trip_colour_is_accurate(tmp_path):
         enc.encode_frame(torch.from_numpy(src))
     enc.close()
 
-    back = nelux_frames(out, 1)[0].astype(np.int64)
-    want = src.astype(np.int64) * 257
-    mse = float(np.mean((back - want) ** 2))
-    psnr = 10 * np.log10(65535.0 ** 2 / mse)
+    psnr = psnr16(nelux_frames(out, 1)[0], src.astype(np.int64) * 257)
     # A matrix mismatch scores ~29 dB; a correct round trip scores ~42 dB.
     assert psnr > 38, f"round-trip PSNR {psnr:.2f} dB suggests a colour-matrix mismatch"
 
@@ -404,8 +407,5 @@ def test_colour_options_reach_the_conversion_and_the_bitstream(tmp_path):
 
     # And the pixels must have been converted with that same matrix: decoding
     # (which trusts the in-band value) has to return the original colour.
-    back = nelux_frames(out, 1)[0].astype(np.int64)
-    want = src.astype(np.int64) * 257
-    mse = float(np.mean((back - want) ** 2))
-    psnr = 10 * np.log10(65535.0 ** 2 / mse)
+    psnr = psnr16(nelux_frames(out, 1)[0], src.astype(np.int64) * 257)
     assert psnr > 40, f"colour round trip {psnr:.2f} dB - tag and matrix disagree"

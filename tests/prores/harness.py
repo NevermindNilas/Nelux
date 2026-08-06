@@ -169,7 +169,13 @@ class RunStats:
 def run_measured(cmd: list[str], label: str, *, frames: int = 0,
                  env: dict | None = None, poll: float = 0.004) -> RunStats:
     """Run ``cmd``, sampling peak RSS (process tree) until it exits."""
-    import psutil
+    try:
+        import psutil
+    except ImportError as exc:      # harness-only dep, not needed by the suite
+        raise RuntimeError(
+            "the ProRes perf harness needs psutil for its RSS/CPU sampling: "
+            "pip install psutil. tests/test_prores_parity.py does not need it."
+        ) from exc
 
     t0 = time.perf_counter()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
