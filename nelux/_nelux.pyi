@@ -9,6 +9,9 @@ from enum import Enum
 __version__: str
 __torch_abi__: str
 __cuda_support__: bool
+# av_version_info() of the FFmpeg loaded at runtime, e.g. "8.1.2-tas" for the
+# TAS-FFMPEG build bundled in the wheel.
+__ffmpeg_version__: str
 
 class LogLevel(Enum):
     trace = 0
@@ -387,6 +390,15 @@ class VideoEncoder:
         preset accepts an int (mapped per codec) or a str forwarded straight to
         ffmpeg (e.g. "veryfast", "p4", "medium"). options is a dict of extra
         AVOption key/value pairs applied after the built-in options.
+
+        fps is tagged as an exact rational, never rounded to an integer. NTSC
+        abbreviations snap to their true fraction (23.976 -> 24000/1001, 29.97
+        -> 30000/1001, 47.952 -> 48000/1001); any other value becomes the exact
+        fraction it denotes (47.96 -> 1199/25). The codec time base is the
+        inverse, so this sets the real timeline, not just the tag. The one
+        exception is the legacy "mpeg4" encoder, whose time base denominator
+        cannot exceed 65535; a finer rate is approximated there to within ~1e-8
+        while the stream is still tagged with the exact rate.
         """
         ...
 

@@ -982,18 +982,61 @@ void Encoder::initVideoStream()
     videoCodecCtx->bit_rate = properties.bitRate;
     videoCodecCtx->width = properties.width;
     videoCodecCtx->height = properties.height;
-    videoCodecCtx->time_base = {1, properties.fps};
-    videoCodecCtx->framerate = {properties.fps, 1};
+    videoCodecCtx->framerate = properties.frameRate;
+    // The exact rate carries a numerator of up to 1e6 (av_d2q's cap), and that
+    // numerator becomes the time base denominator. MPEG-4 hard-rejects a
+    // denominator above 65535 ("the maximum admitted value for the timebase
+    // denominator"), so every NTSC rate from ~65.9 fps up -- 120000/1001,
+    // 240000/1001, ... -- would fail avcodec_open2 outright on that encoder.
+    // Bound the base for MPEG-4 alone: the best fraction under the cap is within
+    // ~1e-8 of the real rate (1001/120000 becomes 342/40999, which is what the
+    // ffmpeg CLI writes too), so the stream tags below can still state the exact
+    // rate the caller asked for. No other codec is clamped -- the point of
+    // carrying an exact rational is that it reaches the encoder intact.
+    AVRational encoderTimeBase = av_inv_q(properties.frameRate);
+    if (videoCodecCtx->codec_id == AV_CODEC_ID_MPEG4 && encoderTimeBase.den > 65535)
+        av_reduce(&encoderTimeBase.num, &encoderTimeBase.den, encoderTimeBase.num,
+                  encoderTimeBase.den, 65535);
+    videoCodecCtx->time_base = encoderTimeBase;
     videoCodecCtx->gop_size = properties.gopSize;
     // B-frames are meaningless for intra-only codecs (mjpeg, prores, ffv1, dnxhd,
     // image codecs, ...). Some (notably mjpeg) HARD-REJECT a non-zero
     // max_b_frames at avcodec_open2 ("B-frames not supported by codec"), so a
     // forced default of 2 made those encoders un-openable. Zero it for intra-only.
+    //
+    // Intra-only is not the whole story, though: the inter-frame encoders built
+    // on FFmpeg's mpegvideo core reject B-frames too. ff_mpv_encode_init()
+    // allows them for exactly three codec IDs -- MPEG-1, MPEG-2 and MPEG-4 --
+    // and returns EINVAL ("B-frames not supported by codec") for the rest, so
+    // the forced default of 2 left msmpeg4, msmpeg4v2, wmv1, wmv2, h263p, rv10,
+    // rv20 and flv1 unopenable at any setting. There is no capability flag to
+    // test, and retrying a failed avcodec_open2 is not an option because the
+    // failure path unrefs hw_frames_ctx, so the codec IDs are named here.
     {
         int maxB = properties.maxBFrames;
         const AVCodecDescriptor* desc = avcodec_descriptor_get(videoCodecCtx->codec_id);
         if (desc && (desc->props & AV_CODEC_PROP_INTRA_ONLY))
             maxB = 0;
+
+        switch (videoCodecCtx->codec_id)
+        {
+        case AV_CODEC_ID_MSMPEG4V2:
+        case AV_CODEC_ID_MSMPEG4V3:
+        case AV_CODEC_ID_WMV1:
+        case AV_CODEC_ID_WMV2:
+        case AV_CODEC_ID_H261:
+        case AV_CODEC_ID_H263:
+        case AV_CODEC_ID_H263P:
+        case AV_CODEC_ID_RV10:
+        case AV_CODEC_ID_RV20:
+        case AV_CODEC_ID_FLV1:
+        case AV_CODEC_ID_AMV:
+            maxB = 0;
+            break;
+        default:
+            break;
+        }
+
         videoCodecCtx->max_b_frames = maxB;
     }
 
@@ -1283,6 +1326,20 @@ void Encoder::initVideoStream()
     }
 
     avcodec_parameters_from_context(videoStream->codecpar, videoCodecCtx.get());
+
+    // Hand the muxer the codec's own time base and frame rate. Left unset, the
+    // stream keeps whatever default the container picked -- 1/600 for AVI,
+    // 1/90000 for MOV/MP4, 1/1000 for Matroska -- and writePacket() rescales
+    // every packet into it, so a rate the default cannot express is quantized
+    // on the way out. 23.976 came back as 2160000/90091 from mp4 and as 293/12
+    // from mkv, and AVI, which is CFR and derives its single dwRate/dwScale
+    // pair from this value, turned 24 frames at 23.976 fps into 601 frames at
+    // 600 fps. avformat_write_header may still substitute a base the container
+    // prefers; what matters is that it starts from the encoder's rate instead
+    // of from a default that predates it.
+    videoStream->time_base = videoCodecCtx->time_base;
+    videoStream->avg_frame_rate = properties.frameRate;
+    videoStream->r_frame_rate = properties.frameRate;
 
     // Publish the colour description the codec context ACTUALLY opened with.
     // properties.* is the pre-open request; extraOptions are applied last into

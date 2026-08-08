@@ -74,8 +74,12 @@ jobs:
           "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt \
             --triplet ${VCPKG_TARGET_TRIPLET} --recurse
 
-      - name: Install FFmpeg (Homebrew + mirror into external/ffmpeg)
+      - name: Download pinned TAS-FFMPEG build (headers + dylibs, shipped in the wheel)
         run: |
+          # No longer Homebrew. Homebrew is a rolling package manager with no
+          # pinnable hash, which made macOS the one platform that could not be
+          # held to an exact build; the TAS-FFMPEG tarballs fix that, and these
+          # dylibs end up INSIDE the wheel via delocate below.
           chmod +x tools/download_ffmpeg.sh
           ./tools/download_ffmpeg.sh
           ls -l external/ffmpeg/lib | head -30
@@ -85,7 +89,7 @@ jobs:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "OFF"
-          NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
+          NELUX_BUNDLE_FFMPEG_DLLS: "ON"
           CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
@@ -97,7 +101,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} \
             -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} \
             -DNELUX_ENABLE_CUDA=OFF \
-            -DNELUX_BUNDLE_FFMPEG_DLLS=OFF \
+            -DNELUX_BUNDLE_FFMPEG_DLLS=ON \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
@@ -111,7 +115,7 @@ jobs:
           echo "=== dist/ ==="
           ls -la dist/
 
-      - name: Repair wheel with delocate (bundle sibling dylibs, exclude torch/ffmpeg)
+      - name: Repair wheel with delocate (bundle sibling dylibs + FFmpeg, exclude torch)
         run: |
           WHEEL=$(ls dist/*.whl | head -n1)
           echo "Repairing: ${WHEEL}"
@@ -124,12 +128,14 @@ jobs:
           export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_LIBRARY_PATH}"
 
           mkdir -p dist_repaired
-          # Exclude torch and FFmpeg dylibs — they are provided by the user's env.
+          # Exclude torch only — it is already a runtime dependency of nelux.
+          # FFmpeg is deliberately NOT excluded any more: the TAS-FFMPEG dylibs
+          # carry install_name @rpath/lib<x>.<major>.dylib and CMake gives the
+          # extension an rpath into external/ffmpeg/lib, so delocate can follow
+          # them, copy them into nelux/.dylibs and rewrite the references to
+          # @loader_path. That is what makes the wheel self-contained.
           delocate-wheel -v \
             -e libtorch -e libc10 -e libshm \
-            -e libavcodec -e libavformat -e libavutil \
-            -e libavfilter -e libavdevice \
-            -e libswscale \
             -w dist_repaired \
             "${WHEEL}"
 
@@ -145,13 +151,21 @@ jobs:
           echo "=== Wheel contents ==="
           unzip -l dist/*.whl | grep -E 'nelux/' || true
 
+      - name: Verify the wheel ships FFmpeg and its licences
+        run: |
+          # The whole point of the retarget: a wheel that needs nothing on
+          # DYLD_LIBRARY_PATH. Assert the dylibs and the GPL paper trail are
+          # actually inside it, with the soname majors tools/ffmpeg.lock pins.
+          python tools/verify_wheel_ffmpeg.py dist/*.whl
+
       - name: Test wheel (import + real decode smoke test)
         run: |
           pip install dist/*.whl --force-reinstall
 
-          export DYLD_LIBRARY_PATH="${GITHUB_WORKSPACE}/external/ffmpeg/lib:${DYLD_LIBRARY_PATH:-}"
-          export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_LIBRARY_PATH}"
-          export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
+          # external/ffmpeg is deliberately NOT on DYLD_*_PATH: the wheel has to
+          # stand on its own vendored dylibs, and pointing the loader at the
+          # build tree would hide exactly the failure this step catches.
+          # FFMPEG_BIN stays so tests that shell out to ffmpeg still find one.
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
 
           python tests/wheel_smoke_test.py

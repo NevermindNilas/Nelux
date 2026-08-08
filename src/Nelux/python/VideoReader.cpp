@@ -1929,6 +1929,22 @@ torch::ScalarType VideoReader::findTypeFromBitDepth()
     return scalarTypeFromBitDepth(bit_depth);
 }
 
+namespace
+{
+    // The source's frame rate as a double that av_d2q can turn back into the
+    // container's exact fraction. avg_frame_rate first (it is what a CFR
+    // transcode should carry), r_frame_rate as the fallback for containers
+    // that leave the average unset.
+    double frameRateOf(const nelux::Decoder::VideoProperties& p)
+    {
+        if (p.avgFrameRateNum > 0 && p.avgFrameRateDen > 0)
+            return av_q2d(AVRational{p.avgFrameRateNum, p.avgFrameRateDen});
+        if (p.rFrameRateNum > 0 && p.rFrameRateDen > 0)
+            return av_q2d(AVRational{p.rFrameRateNum, p.rFrameRateDen});
+        return p.fps;
+    }
+} // namespace
+
 std::shared_ptr<nelux::VideoEncoder>
 VideoReader::createEncoder(const std::string& outputPath) const
 {
@@ -1938,7 +1954,12 @@ VideoReader::createEncoder(const std::string& outputPath) const
         /* width          */ properties.width,
         /* height         */ properties.height,
         /* bitRate        */ std::nullopt,
-        /* fps            */ static_cast<float>(properties.fps),
+        // Hand over the source's own rational rather than properties.fps.
+        // properties.fps is av_q2d(avg_frame_rate) and a double round-trip of
+        // 24000/1001 is recoverable, but going through the container's exact
+        // num/den keeps a transcode's tagged rate identical to the input's by
+        // construction instead of by floating-point luck.
+        /* fps            */ frameRateOf(properties),
         /* preset         */ std::nullopt,
         /* cq             */ std::nullopt,
         /* pixelFormat    */ std::nullopt);

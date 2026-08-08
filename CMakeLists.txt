@@ -26,7 +26,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   endif()
 endif()
 
-project(Nelux VERSION 0.10.1 LANGUAGES CXX)
+project(Nelux VERSION 0.17.0 LANGUAGES CXX)
 
 # ─── Compiler options ─── 
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.
@@ -58,7 +58,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(NELUX_ENABLE_CUDA   "Enable CUDA support in Nelux" OFF)
 option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)
-option(NELUX_BUNDLE_FFMPEG_DLLS "Bundle FFmpeg runtime DLLs into Windows wheels" ON)
+# Ship the FFmpeg runtime libraries inside the wheel so `pip install nelux` is
+# self-contained and nothing has to be on PATH. On Windows that means CMake
+# installs bin/av*.dll + sw*.dll next to _nelux.pyd; on Linux/macOS the
+# equivalent copy is made by auditwheel/delocate at repair time, and this option
+# only controls whether the licence paper trail is installed. Turn it OFF only
+# for a build that deliberately links a system FFmpeg.
+option(NELUX_BUNDLE_FFMPEG_DLLS "Ship the FFmpeg runtime libraries inside the wheel" ON)
 
 # Host-side performance options
 # - AVX2: baked-in AVX2/FMA for Nelux's own host code. DEFAULT OFF, because it
@@ -287,17 +293,69 @@ else()
 endif()
 
 # --- FFmpeg ---
-# Uses pre-built FFmpeg from external/ffmpeg directory
-# Run: .\tools\download_ffmpeg.ps1 to download FFmpeg before building
+# Uses the TAS-FFMPEG build unpacked into external/ffmpeg by
+#   tools/download_ffmpeg.ps1   (Windows)
+#   tools/download_ffmpeg.sh    (Linux / macOS)
+# Both read tools/ffmpeg.lock, which is the single source of truth for the
+# version, the URLs and the hashes.
 set(NELUX_FFMPEG_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg")
+set(NELUX_FFMPEG_LOCK "${CMAKE_SOURCE_DIR}/tools/ffmpeg.lock")
 
 if(NOT EXISTS "${NELUX_FFMPEG_DIR}/include/libavcodec/avcodec.h")
-  message(FATAL_ERROR 
+  if(WIN32)
+    set(_nelux_ffmpeg_hint ".\\tools\\download_ffmpeg.ps1")
+  else()
+    set(_nelux_ffmpeg_hint "./tools/download_ffmpeg.sh")
+  endif()
+  message(FATAL_ERROR
     "FFmpeg not found at ${NELUX_FFMPEG_DIR}\n"
-    "Run: .\\tools\\download_ffmpeg.ps1 to download pre-built FFmpeg")
+    "Run: ${_nelux_ffmpeg_hint} to fetch the pinned TAS-FFMPEG build")
 endif()
 
-message(STATUS "Using external FFmpeg from: ${NELUX_FFMPEG_DIR}")
+# Read the pin so the rest of this file can talk about the build by name, and
+# so a tree left behind by an older lock is caught HERE rather than surfacing as
+# a mangled runtime failure. The delay-load contract below bakes the exact DLL
+# file names found on disk at configure time, so a stale tree is not a cosmetic
+# problem — it produces a wheel that names the wrong soname generation.
+function(_nelux_read_lock key out_var)
+  file(STRINGS "${NELUX_FFMPEG_LOCK}" _lines REGEX "^${key}=")
+  if(_lines)
+    list(GET _lines 0 _line)
+    string(REGEX REPLACE "^${key}=" "" _value "${_line}")
+    string(STRIP "${_value}" _value)
+    set(${out_var} "${_value}" PARENT_SCOPE)
+  else()
+    set(${out_var} "" PARENT_SCOPE)
+  endif()
+endfunction()
+
+set(NELUX_FFMPEG_AV_VERSION_INFO "")
+set(NELUX_FFMPEG_SOURCE_URL "")
+set(NELUX_FFMPEG_LICENSE_SPDX "")
+if(EXISTS "${NELUX_FFMPEG_LOCK}")
+  _nelux_read_lock("AV_VERSION_INFO" NELUX_FFMPEG_AV_VERSION_INFO)
+  _nelux_read_lock("CORRESPONDING_SOURCE_URL" NELUX_FFMPEG_SOURCE_URL)
+  _nelux_read_lock("LICENSE_SPDX" NELUX_FFMPEG_LICENSE_SPDX)
+  _nelux_read_lock("PIN_STAMP_FILE" _nelux_stamp_name)
+
+  if(_nelux_stamp_name AND EXISTS "${NELUX_FFMPEG_DIR}/${_nelux_stamp_name}")
+    file(READ "${NELUX_FFMPEG_DIR}/${_nelux_stamp_name}" _nelux_stamp)
+    string(STRIP "${_nelux_stamp}" _nelux_stamp)
+    if(NOT _nelux_stamp MATCHES "^${NELUX_FFMPEG_AV_VERSION_INFO} ")
+      message(FATAL_ERROR
+        "external/ffmpeg holds '${_nelux_stamp}' but tools/ffmpeg.lock pins "
+        "'${NELUX_FFMPEG_AV_VERSION_INFO}'.\n"
+        "Re-run the download script with -Force (Windows) or FORCE=1 (Unix).")
+    endif()
+  else()
+    message(WARNING
+      "external/ffmpeg has no pin stamp — it was not installed by "
+      "tools/download_ffmpeg.{ps1,sh}. Its version is unverified and it may not "
+      "be the TAS-FFMPEG build the wheel is meant to ship.")
+  endif()
+endif()
+
+message(STATUS "Using external FFmpeg from: ${NELUX_FFMPEG_DIR} (${NELUX_FFMPEG_AV_VERSION_INFO})")
 
 # Set include directories
 set(NELUX_FFMPEG_INCS "${NELUX_FFMPEG_DIR}/include")
@@ -678,15 +736,21 @@ if(NELUX_BUILD_PYTHON)
   endif()
 
   # RPATH so nelux/_nelux.so|.dylib finds sibling deps at runtime.
+  # The TAS-FFMPEG dylibs carry install_name @rpath/lib<x>.<major>.dylib, so the
+  # extension needs an rpath that reaches external/ffmpeg/lib or it cannot be
+  # loaded — and, more to the point, delocate cannot follow the @rpath entries
+  # to vendor them into the wheel. The absolute build path is stripped by
+  # auditwheel (patchelf --set-rpath) and left inert by delocate, which rewrites
+  # the dependencies themselves to @loader_path/.dylibs.
   if(APPLE)
     set_target_properties(nelux PROPERTIES
-      INSTALL_RPATH "@loader_path"
+      INSTALL_RPATH "@loader_path;${_ffmpeg_lib_dir}"
       BUILD_WITH_INSTALL_RPATH TRUE
       MACOSX_RPATH TRUE
     )
   elseif(UNIX)
     set_target_properties(nelux PROPERTIES
-      INSTALL_RPATH "$ORIGIN"
+      INSTALL_RPATH "$ORIGIN;${_ffmpeg_lib_dir}"
       BUILD_WITH_INSTALL_RPATH TRUE
     )
   endif()
@@ -753,9 +817,16 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   # bundling our own copies would add ~100 MB of dead weight that duplicates
   # what the user's PyTorch install already provides.
 
+  # FFmpeg runtime DLLs are kept in their OWN list, deliberately not merged into
+  # NELUX_DLLS. NELUX_DLLS is the vcpkg set, which CI hands to delvewheel and
+  # therefore skips installing (NELUX_SKIP_DLL_INSTALL). FFmpeg must go the
+  # other way: delvewheel mangles the names it vendors (avcodec-62-<hash>.dll)
+  # and the /DELAYLOAD thunk resolves the literal baked name next to the module,
+  # so a mangled copy would never be found. These are installed unmangled into
+  # nelux/ and excluded from delvewheel in the workflows.
+  set(NELUX_FFMPEG_RUNTIME_DLLS)
   if(NELUX_BUNDLE_FFMPEG_DLLS)
-    # Bundle FFmpeg runtime DLLs from external/ffmpeg/bin when explicitly enabled.
-    file(GLOB NELUX_FFMPEG_DLLS
+    file(GLOB NELUX_FFMPEG_RUNTIME_DLLS
       "${NELUX_FFMPEG_DIR}/bin/avcodec-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avformat-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avutil-*.dll"
@@ -764,13 +835,13 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
       "${NELUX_FFMPEG_DIR}/bin/avfilter-*.dll"
       "${NELUX_FFMPEG_DIR}/bin/avdevice-*.dll"
     )
-    if(NELUX_FFMPEG_DLLS)
-      list(APPEND NELUX_DLLS ${NELUX_FFMPEG_DLLS})
-    else()
-      message(WARNING "FFmpeg runtime DLLs not found under ${NELUX_FFMPEG_DIR}/bin")
+    if(NOT NELUX_FFMPEG_RUNTIME_DLLS)
+      message(FATAL_ERROR
+        "NELUX_BUNDLE_FFMPEG_DLLS=ON but no FFmpeg runtime DLLs were found under "
+        "${NELUX_FFMPEG_DIR}/bin. Run tools/download_ffmpeg.ps1.")
     endif()
   else()
-    message(STATUS "NELUX_BUNDLE_FFMPEG_DLLS=OFF, skipping FFmpeg runtime DLL bundling")
+    message(STATUS "NELUX_BUNDLE_FFMPEG_DLLS=OFF — the wheel will require FFmpeg on PATH")
   endif()
 
   # Deduplicate in case multiple glob sources overlap
@@ -782,7 +853,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
 
   # Keep local dev copy option for in-tree testing.
   if(DEFINED ENV{NELUX_COPY_DLLS_FOR_DEV})
-    foreach(dll ${NELUX_DLLS})
+    foreach(dll ${NELUX_DLLS} ${NELUX_FFMPEG_RUNTIME_DLLS})
       add_custom_command(TARGET nelux POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${NELUX_DLL_DIR}"
         COMMENT "Copying dependency DLL for dev: ${dll} → ${NELUX_DLL_DIR}"
@@ -872,6 +943,55 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     message(STATUS "Bundling ${CMAKE_CURRENT_LIST_DIR} runtime DLLs into wheel: ${NELUX_DLLS}")
   else()
     message(WARNING "No runtime DLLs found to bundle into wheel on Windows")
+  endif()
+
+  # FFmpeg is installed regardless of NELUX_SKIP_DLL_INSTALL: that flag exists
+  # to hand the vcpkg DLLs to delvewheel, and delvewheel must NOT be the one to
+  # place these (see the NELUX_FFMPEG_RUNTIME_DLLS comment above).
+  if(NELUX_FFMPEG_RUNTIME_DLLS)
+    install(FILES ${NELUX_FFMPEG_RUNTIME_DLLS} DESTINATION nelux)
+    message(STATUS "Bundling FFmpeg runtime DLLs into wheel: ${NELUX_FFMPEG_RUNTIME_DLLS}")
+  endif()
+endif()
+
+# --- GPL paper trail --------------------------------------------------------
+# The FFmpeg binaries we ship are GPL-2.0-or-later (libx264 and libx265 are
+# linked in), so the wheel is a combined work and the corresponding source has
+# to stay offer-able. Ship the licence texts the archive came with plus a NOTICE
+# naming where the source lives. This is not optional decoration — dropping it
+# is a licence violation, which is why it installs on every platform and not
+# only where CMake also copies the binaries.
+if(NELUX_BUILD_PYTHON AND NELUX_BUNDLE_FFMPEG_DLLS)
+  set(_nelux_notice "${CMAKE_BINARY_DIR}/FFMPEG-NOTICE.txt")
+  file(WRITE "${_nelux_notice}"
+"This wheel bundles FFmpeg shared libraries built by TAS-FFMPEG\n"
+"(https://github.com/NevermindNilas/TAS-FFMPEG).\n"
+"\n"
+"  FFmpeg build : ${NELUX_FFMPEG_AV_VERSION_INFO}\n"
+"  Licence      : ${NELUX_FFMPEG_LICENSE_SPDX}\n"
+"\n"
+"The build is GPL because libx264 and libx265 are linked into it. The complete\n"
+"corresponding source for these binaries, including the exact build scripts and\n"
+"configure flags used, is published as a release asset:\n"
+"\n"
+"  ${NELUX_FFMPEG_SOURCE_URL}\n"
+"\n"
+"Per-component licence texts are in the licenses/ directory next to this file.\n"
+"Nelux itself is AGPL-3.0; see the project LICENSE.\n")
+  install(FILES "${_nelux_notice}" DESTINATION nelux/ffmpeg-licenses)
+
+  if(EXISTS "${NELUX_FFMPEG_DIR}/licenses")
+    install(DIRECTORY "${NELUX_FFMPEG_DIR}/licenses"
+            DESTINATION nelux/ffmpeg-licenses)
+  else()
+    message(FATAL_ERROR
+      "${NELUX_FFMPEG_DIR}/licenses is missing. The FFmpeg binaries are "
+      "${NELUX_FFMPEG_LICENSE_SPDX} and cannot ship without their licence texts. "
+      "Re-run the download script — it copies licenses/ out of the archive.")
+  endif()
+  if(EXISTS "${NELUX_FFMPEG_DIR}/manifest.json")
+    install(FILES "${NELUX_FFMPEG_DIR}/manifest.json"
+            DESTINATION nelux/ffmpeg-licenses)
   endif()
 endif()
 

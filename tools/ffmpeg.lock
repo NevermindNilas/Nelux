@@ -1,0 +1,191 @@
+# tools/ffmpeg.lock — SINGLE SOURCE OF TRUTH for every FFmpeg binary Nelux
+# fetches, builds against, and SHIPS INSIDE ITS WHEELS.
+#
+# Format: KEY=value, one per line, no quotes, no spaces around `=`, `#` starts a
+# comment. Deliberately parseable by bash (`sed -n 's/^KEY=//p'`), PowerShell (a
+# `-match '^([A-Z0-9_]+)=(.*)$'` loop), Python and GitHub Actions alike.
+#
+# Every consumer MUST verify the SHA256 below before using a download and must
+# fail loudly on a mismatch. Consumers:
+#
+#   tools/download_ffmpeg.ps1                   -> WIN64_*
+#   tools/download_ffmpeg.sh                    -> LINUX64_*, LINUXARM64_*, MACOS_ARM64_*, MACOS_X64_*
+#   .github/workflows/build_wheel.yml           -> via download_ffmpeg.ps1
+#   .github/workflows/build_wheel_linux.yml     -> via download_ffmpeg.sh
+#   .github/workflows/build_wheel_macos.yml     -> via download_ffmpeg.sh
+#   .github/workflows/createRelease.yaml        -> via both scripts
+#   examples/comfyui_nelux_nodes/__init__.py    -> WIN64_* (DUPLICATED, see below)
+#
+# The ComfyUI node pack ships standalone (NevermindNilas/ComfyUI-Nelux) and has
+# no access to this file at runtime, so it hard-codes the same values with a
+# comment naming this file as canonical. TheAnimeScripter's src/infra/getFFMPEG.py
+# is a separate repo and does the same. Change a value here and you MUST mirror
+# it in both.
+#
+# ===========================================================================
+# SUPPLIER: TAS-FFMPEG — our own build, no longer BtbN / gyan / Homebrew
+# ===========================================================================
+# Every platform now resolves to a release of NevermindNilas/TAS-FFMPEG, which
+# builds FFmpeg from source as one union build serving both Nelux (links the
+# shared libraries in-process and bundles them in the wheel) and
+# TheAnimeScripter (spawns ffmpeg.exe / ffprobe).
+#
+# What that buys over the third-party builds it replaces:
+#   * One supplier, five platforms, ONE ABI — including macOS, which previously
+#     came from Homebrew and could not be pinned to a hash at all.
+#   * A hash for every archive, including macOS.
+#   * `--extra-version=tas`, so av_version_info() is exactly "8.1.2-tas". No
+#     distro, gyan or BtbN build can produce that string, which turns the
+#     runtime assertion into a "wrong build" detector, not just a "wrong
+#     version" detector. nelux exposes it as `nelux.__ffmpeg_version__`.
+#   * Immutable release assets. BtbN prunes its dated autobuild-* tags after a
+#     few months, so every pinned BtbN URL eventually 404s. These do not.
+#   * The Linux archives are built inside manylinux_2_28 (AlmaLinux 8, glibc
+#     2.28) precisely so `auditwheel repair` accepts them into a
+#     manylinux_2_28 wheel. An ubuntu-built FFmpeg references GLIBC_2.34 and
+#     fails the repair for the WHOLE wheel.
+#
+# Shared-library ABI, identical across all five platforms:
+#   avcodec 62 | avutil 60 | avformat 62 | avdevice 62
+#   avfilter 11 | swscale 9 | swresample 6
+#
+# NOT FFmpeg 9.x, deliberately. 9.0 expired FF_API_NVDEC_OLD_PIX_FMTS, and
+# src/Nelux/backends/cuda/Decoder.cpp still switches on the old NVDEC pixel
+# formats and hard-throws on the new YUV444P10MSB/YUV444P12MSB/P212/P012, so
+# HEVC 4:4:4 high-bit-depth NVDEC decode would raise. Do not bump to 9.x until
+# that is fixed.
+#
+# ---------------------------------------------------------------------------
+# THESE BINARIES SHIP INSIDE THE WHEELS
+# ---------------------------------------------------------------------------
+# Wheels are self-contained: users no longer need FFmpeg on PATH.
+#   Windows   CMake installs bin/av*.dll + sw*.dll next to _nelux.pyd. They are
+#             EXCLUDED from delvewheel on purpose — delvewheel mangles file
+#             names (avcodec-62-<hash>.dll) and the /DELAYLOAD thunk resolves
+#             the literal baked name, so a mangled copy would never be found.
+#   Linux     auditwheel vendors lib/libav*.so.* + libsw*.so.* into nelux.libs
+#             and patches the RPATH.
+#   macOS     delocate vendors lib/libav*.dylib + libsw*.dylib into
+#             nelux/.dylibs and rewrites the @rpath references.
+#
+# LICENCE CONSEQUENCE: these binaries are GPL-2.0-or-later (libx264 and libx265
+# are linked in). Shipping them inside the wheel means the wheel is a combined
+# work, so the corresponding source MUST remain offer-able. Both download
+# scripts copy the archive's licenses/ tree and manifest.json into
+# external/ffmpeg/, and CMake installs them into nelux/ffmpeg-licenses/ in the
+# wheel alongside a NOTICE naming CORRESPONDING_SOURCE_URL below. Do not drop
+# that step. Nelux itself is AGPL-3.0, which GPLv3 §13 ¶2 explicitly permits
+# combining with GPL code.
+#
+# ---------------------------------------------------------------------------
+# HOW TO RETARGET A NEW TAS-FFMPEG RELEASE
+# ---------------------------------------------------------------------------
+#   1. curl -fL -o /tmp/pin.lock \
+#        https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/<TAG>/ffmpeg-pin.lock
+#   2. Copy its FFMPEG_*/AV_VERSION_INFO/SONAME_*/<PLATFORM>_* values over the
+#      corresponding blocks below. The key names are identical by design.
+#   3. A MISSING platform block in the upstream pin is a HARD ERROR, never a
+#      "fall back to the previous release" — mixing two builds of
+#      identically-named libraries in one process is undefined.
+#   4. Bump TAS_FFMPEG_RELEASE and re-run both download scripts with -Force /
+#      FORCE=1 locally to confirm the hashes.
+#
+# Vendored 2026-08-08 from TAS-FFMPEG v8.1.2's published ffmpeg-pin.lock.
+# ===========================================================================
+
+TAS_FFMPEG_REPO=NevermindNilas/TAS-FFMPEG
+TAS_FFMPEG_RELEASE=v8.1.2
+TAS_FFMPEG_PIN_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/ffmpeg-pin.lock
+
+# --- Identity — assert these at runtime --------------------------------------
+FFMPEG_VERSION=8.1.2
+FFMPEG_TAG=n8.1.2
+FFMPEG_COMMIT=38b88335f99e76ed89ff3c93f877fdefce736c13
+# av_version_info() returns exactly this string.
+AV_VERSION_INFO=8.1.2-tas
+
+# --- Shared-library ABI ------------------------------------------------------
+SONAME_AVCODEC=62
+SONAME_AVDEVICE=62
+SONAME_AVFILTER=11
+SONAME_AVFORMAT=62
+SONAME_AVUTIL=60
+SONAME_SWRESAMPLE=6
+SONAME_SWSCALE=9
+
+# --- Licensing of the shipped binaries ---------------------------------------
+LICENSE_SPDX=GPL-2.0-or-later
+CORRESPONDING_SOURCE_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-corresponding-source.tar.xz
+
+# Files to preserve out of every archive. The GPL terms travel with the
+# binaries; extraction copies anything matching these globs into the FFmpeg
+# output directory instead of deleting it with the rest of the unpacked tree.
+LICENSE_GLOBS=licenses;manifest.json;LICENSE*;COPYING*;GPL*
+
+# ===========================================================================
+# Per-platform archives
+# ===========================================================================
+
+# --- Windows x86_64 ----------------------------------------------------------
+# Ships bin/*.dll + bin/*.lib (MSVC import libs), lib/*.def, lib/*.dll.a.
+WIN64_VERSION=8.1.2
+WIN64_FILE=tas-ffmpeg-8.1.2-win64.zip
+WIN64_ROOT=tas-ffmpeg-8.1.2-win64
+WIN64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-win64.zip
+WIN64_SHA256=1d570273dc8be2b3f386467657591a22045d058a830b1eb1eaa881dafb689bfb
+
+# --- Linux x86_64 (built in manylinux_2_28 / glibc 2.28) ---------------------
+LINUX64_VERSION=8.1.2
+LINUX64_FILE=tas-ffmpeg-8.1.2-linux64.tar.xz
+LINUX64_ROOT=tas-ffmpeg-8.1.2-linux64
+LINUX64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-linux64.tar.xz
+LINUX64_SHA256=6205ef68cd9fdf2d1bd6478766c9c2b0c0363d901caea09aa91634a92a21ed28
+
+# --- Linux aarch64 (built in manylinux_2_28 / glibc 2.28) --------------------
+LINUXARM64_VERSION=8.1.2
+LINUXARM64_FILE=tas-ffmpeg-8.1.2-linuxarm64.tar.xz
+LINUXARM64_ROOT=tas-ffmpeg-8.1.2-linuxarm64
+LINUXARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-linuxarm64.tar.xz
+LINUXARM64_SHA256=6a0759046f0a0537743e6fc366eb19f5fcb91ba757a84b036e1b04bcf380a3b9
+
+# --- macOS arm64 -------------------------------------------------------------
+# install_name is @rpath/lib<x>.<major>.dylib with LC_RPATH @loader_path/../lib,
+# so the dylibs resolve each other inside a flat lib/ directory and delocate can
+# follow them from _nelux.so.
+MACOS_ARM64_VERSION=8.1.2
+MACOS_ARM64_FILE=tas-ffmpeg-8.1.2-macos-arm64.tar.xz
+MACOS_ARM64_ROOT=tas-ffmpeg-8.1.2-macos-arm64
+MACOS_ARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-macos-arm64.tar.xz
+MACOS_ARM64_SHA256=c57c509ffc3c5456fb9a37101ec25468f4bfe20d2f68394b9f307066422642d0
+
+# --- macOS x86_64 ------------------------------------------------------------
+# KNOWN END DATE: AUGUST 2027. GitHub-hosted Intel macOS runners are the last
+# x86_64 images on Actions and GitHub has stated x86_64 will not be supported
+# after that (actions/runner-images#13045). When TAS-FFMPEG stops emitting these
+# keys, this block disappears — treat that as a decision to make, not a default.
+MACOS_X64_VERSION=8.1.2
+MACOS_X64_FILE=tas-ffmpeg-8.1.2-macos-x86_64.tar.xz
+MACOS_X64_ROOT=tas-ffmpeg-8.1.2-macos-x86_64
+MACOS_X64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-macos-x86_64.tar.xz
+MACOS_X64_SHA256=dcae9a250043be3ab898b59222c4a98c9da87b22ab4b181c69941714cc52ec6f
+
+# ===========================================================================
+# PER-PLATFORM FEATURE DIFFERENCES (TAS-FFMPEG README.md#encoders-per-platform)
+#   NVENC/NVDEC/CUVID   everywhere except macOS
+#   QSV (libvpl)        Windows + Linux x86_64 only
+#   AMF                 Windows + Linux x86_64 only
+#   MediaFoundation     Windows only  (h264_mf, hevc_mf)
+#   VideoToolbox        macOS only    (h264/hevc/prores_videotoolbox)
+#   libx264/libx265/libsvtav1/libaom/libvpx/libopenh264/libopus/libzimg/libvmaf
+#   and a TLS backend for https:// exist on ALL five.
+# ===========================================================================
+
+# --- Stale-tree guard --------------------------------------------------------
+# download_ffmpeg.{sh,ps1} stamp what they installed into this file inside the
+# output directory and refuse to skip a re-download unless the stamp matches
+# what this lock asks for. Without it their "FFmpeg already present" short
+# circuit silently keeps an older tree — which matters a lot here, because
+# CMakeLists.txt globs external/ffmpeg/bin/av*.dll at configure time to bake
+# /DELAYLOAD:<filename>, so a stale tree produces a wheel whose delay-load
+# contract names the wrong soname generation.
+PIN_STAMP_FILE=.nelux-ffmpeg-pin

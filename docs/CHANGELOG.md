@@ -1,5 +1,110 @@
 
-### **Unreleased**
+### **Version 0.17.0 (2026-08-09)**
+
+#### **FFmpeg is bundled in every wheel, and it is now our own build**
+
+- **Changed: the supplier.** Wheels are built against, and now ship,
+  [TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 8.1.2.
+  `tools/ffmpeg.lock` pins five archives (Windows x64, Linux x86_64/aarch64,
+  macOS arm64/x86_64); wheels are published for the three CI targets — Windows
+  x64, Linux x86_64 (`manylinux_2_28`) and macOS arm64. It replaces three
+  different third-party suppliers: BtbN on Windows and Linux, Homebrew on
+  macOS. Homebrew is a rolling package manager with no pinnable hash, so macOS
+  was the one platform that could not be held to an exact build at all; the
+  Windows CI job was worse, downloading BtbN's mutable `master-latest` URL,
+  which had already drifted onto FFmpeg 9.0 by accident once — a version whose
+  expiry of `FF_API_NVDEC_OLD_PIX_FMTS` makes HEVC 4:4:4 high-bit-depth NVDEC
+  decode raise in `backends/cuda/Decoder.cpp`.
+- **Changed: wheels are self-contained.** Nothing needs to be on `PATH`,
+  `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`; `pip install nelux` is enough. Three
+  mechanisms, one per platform, because they are not interchangeable:
+  - **Windows** — CMake installs `av*.dll` / `sw*.dll` next to `_nelux.pyd`, and
+    every FFmpeg DLL is *excluded* from delvewheel. delvewheel mangles the names
+    it vendors (`avcodec-62-<hash>.dll`) while the `/DELAYLOAD` thunk asks the
+    loader for the literal name baked at link time, so a delvewheel-vendored
+    copy would be invisible to it.
+  - **Linux** — `auditwheel` vendors `libav*`/`libsw*` into `nelux.libs/` and
+    patches the RPATH. That is only viable because the TAS-FFMPEG Linux
+    archives are built inside `manylinux_2_28`; an Ubuntu-built FFmpeg
+    references `GLIBC_2.34` and auditwheel would reject the entire wheel.
+  - **macOS** — `delocate` follows the `@rpath/lib<x>.<major>.dylib` install
+    names into `nelux/.dylibs`. CMake gives the extension an rpath into
+    `external/ffmpeg/lib` so those references are resolvable at repair time.
+- **Added: `nelux.__ffmpeg_version__`** — `av_version_info()` of the FFmpeg
+  actually loaded, not the one we compiled against. The build carries
+  `--extra-version=tas`, so the expected value is `8.1.2-tas`, which no distro,
+  gyan or BtbN build can produce. That distinction earns its keep on Windows,
+  where the first DLL of a given name into a process serves every consumer in
+  it — TheAnimeScripter deliberately ships identically-named libraries, and this
+  is how you tell whose copy won.
+- **Changed: `tools/ffmpeg.lock` is the single source of truth**, vendored from
+  the pin file TAS-FFMPEG publishes with each release. Both download scripts
+  read it, verify the archive's SHA256 before extracting, assert the seven
+  soname majors and `av_version_info`, and write a pin stamp into
+  `external/ffmpeg/`. CMake refuses to configure against a tree whose stamp
+  disagrees with the lock — which matters because it globs
+  `external/ffmpeg/bin/av*.dll` at configure time to bake
+  `/DELAYLOAD:<filename>`, so a stale tree silently produces a wheel whose
+  delay-load contract names the wrong soname generation.
+- **Added: `tools/verify_wheel_ffmpeg.py`**, run in CI on all three platforms
+  after the repair step. Every bundling mechanism above can silently no-op, and
+  the resulting wheel imports perfectly on the build machine — which has FFmpeg
+  everywhere — and fails on a user's. The CI smoke tests no longer put
+  `external/ffmpeg` on the loader path for the same reason.
+- **Licensing.** The bundled binaries are GPL-2.0-or-later (libx264 and libx265
+  are linked in), so the wheel is a combined work and the corresponding source
+  must stay offer-able. The download scripts preserve the archive's `licenses/`
+  tree and `manifest.json`, and CMake installs them to
+  `nelux/ffmpeg-licenses/` together with a NOTICE naming the
+  corresponding-source URL. Nelux remains AGPL-3.0; GPLv3 §13 ¶2 explicitly
+  authorises the combination.
+- **Encoder availability**, now guaranteed rather than dependent on whatever
+  build the user had: NVENC/NVDEC/CUVID everywhere except macOS; QSV (libvpl)
+  and AMF on Windows and Linux x86_64; MediaFoundation on Windows;
+  VideoToolbox on macOS; libx264, libx265, libsvtav1, libaom, libvpx,
+  libopenh264, libopus, libzimg, libvmaf and an HTTPS-capable TLS backend on all
+  five.
+- **Tests:** `tests/test_ffmpeg_bundle.py` — the loaded build matches the lock,
+  every pinned soname is present inside the installed package, the GPL paper
+  trail is installed, and (Windows) no name-mangled FFmpeg copy sneaked into
+  `nelux.libs/`.
+
+#### **Encoder: frame rates are exact rationals, not rounded integers**
+
+- **Fixed: every rate was collapsed to an integer.**
+  `EncodingProperties::fps` was an `int` and the codec time base was
+  `{1, fps}`, so the NTSC rates — `1000/1001` fractions — encoded as 24/30/60.
+  The time base *is* the timeline (every pts is a tick count in it), so 23.976
+  fps ran 0.1% fast: ~3.6s of drift per hour, and progressive desync against
+  passthrough audio, which is rescaled from the source's own time base and
+  therefore does not move with it. The rate is now an `AVRational` from the
+  Python argument through to the muxer, and the stream's `time_base`,
+  `avg_frame_rate` and `r_frame_rate` are written from it instead of being left
+  at a container default (1/600 AVI, 1/90000 MP4, 1/1000 Matroska), which used
+  to quantize it on the way out.
+- **Changed: `fps` is a `double`.** float32 cannot hold `24000/1001` closely
+  enough for `av_d2q` to recover the fraction it came from.
+- **Changed: a decimal abbreviation of an NTSC rate snaps to that rate.**
+  23.976 → 24000/1001, 29.97 → 30000/1001, 47.952 → 48000/1001. Anything else
+  becomes the exact fraction it denotes (47.96 → 1199/25, and it stays there).
+  The snap tolerance is absolute, not proportional to fps: a relative one
+  eventually exceeds the ~0.999 spacing between `n * 1000/1001` candidates and
+  starts rewriting unrelated high rates. Exact integers skip the test entirely.
+- **Changed: `VideoReader.create_encoder` carries the source's own rational**
+  (`avg_frame_rate`, falling back to `r_frame_rate`) rather than
+  `av_q2d(fps)`, so a transcode's tagged rate matches its input by construction.
+- **Known limitation: the legacy `mpeg4` encoder.** It rejects a time base
+  denominator above 65535, which every NTSC rate from ~65.9 fps up would need,
+  so the base is bounded for that one encoder — within ~1e-8 of the requested
+  rate, the same approximation the ffmpeg CLI writes — while the stream tags
+  stay exact. No other codec is clamped.
+- **Changed: a zero, negative or NaN rate falls back to 30 fps** (it was
+  clamped to 1 fps).
+- **Tests:** `tests/test_frame_rate_tagging.py` — every video encoder in the
+  bundled build × every container it is normally muxed into × ten rates, plus
+  the container duration, the rational read back through `nelux.probe`, the
+  transcode path, and the two edges of the NTSC snap (a neighbouring integer
+  must not be pulled in; a high rate must not be pulled onto the grid).
 
 #### **ProRes: colour, precision, alpha and frame-count parity with the FFmpeg CLI**
 
@@ -59,8 +164,6 @@ Harness: `tests/prores/`. Assertions: `tests/test_prores_parity.py` (49).
 - **Fixed:** with `prefetch=False` — the default — a second `for frame in reader` continued from wherever the previous pass had stopped while reporting frame index 0, and yielded nothing at all once a full pass had drained the stream. That path deliberately never seeks, because `avcodec_flush_buffers` on its frame-threaded codec context trips `Assertion fctx->async_lock failed` (#60), and `iter()` only zeroed `currentIndex` / `current_timestamp` — so the reader claimed to be at frame 0 while the decoder sat mid-stream. It now rewinds properly. (The rewind originally rebuilt the decoder via `Decoder::reconfigure`, on the belief that this path could not flush safely; it now seeks to zero and keeps the rebuild only as a fallback -- see the performance section above for why the flush was never the problem.) The rewind is skipped when nothing has been decoded yet, so the common single-pass case is unaffected.
 - **Fixed:** `reset()` issued the unsafe flush-seek on that same path; it now takes the rebuild route too.
 - **Fixed:** `reconfigure()` cleared the frame/time bounds of the previous file but not the rest of the range state.
-
-### **Version 0.17.0 (2026-07-25)**
 
 #### **Critical: CUDA wheels shipped device code for one architecture**
 - **Fixed:** the `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)` guard sat *after* `enable_language(CUDA)`, which under CMP0104 has already defined the variable from nvcc's single default architecture (75 on CUDA 13.2). The guard was therefore **dead code**, and every build shipped exactly one architecture: that arch's SASS plus its PTX. PTX only JITs *forward*, so **every GPU older than the build architecture failed every kernel launch** with `cudaErrorNoKernelImageForDevice` — which surfaced to users as fully black decoded frames. Architecture selection now runs *before* `enable_language(CUDA)` and derives the list from the nvcc version: `75;80;86;89;90`, plus `60;70` on CUDA < 13 (Pascal/Volta were removed in 13) and `100;120` on CUDA >= 12.8 (Blackwell). Because the guard now runs before `enable_language`, it also honours the `CUDAARCHS` environment variable itself, which would otherwise have been silently discarded.

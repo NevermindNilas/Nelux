@@ -23,9 +23,31 @@ Supported platforms:
 
 | Platform | Backends | Notes |
 |----------|----------|-------|
-| Windows x64 | CPU + CUDA (NVDEC/NVENC) | Requires FFmpeg DLLs on `PATH` (or pass to `os.add_dll_directory`). |
-| Linux x86_64 (manylinux_2_28+) | CPU + CUDA (NVDEC/NVENC) | Install FFmpeg via `apt install ffmpeg libavcodec62 libavformat62 libavutil60 libswscale9 libavfilter11 libavdevice62`. |
-| macOS arm64 (Apple Silicon, ≥ 12.0) | CPU / MPS (via PyTorch) | Install FFmpeg via `brew install ffmpeg`. No CUDA on macOS. |
+| Windows x64 | CPU + CUDA (NVDEC/NVENC) | FFmpeg bundled. NVENC/NVDEC, QSV, AMF and MediaFoundation encoders available. |
+| Linux x86_64 (manylinux_2_28+) | CPU + CUDA (NVDEC/NVENC) | FFmpeg bundled. NVENC/NVDEC, QSV and AMF available. |
+| macOS arm64 (Apple Silicon, ≥ 14.0) | CPU / MPS (via PyTorch) | FFmpeg bundled, with VideoToolbox. No CUDA on macOS. |
+
+**FFmpeg ships inside the wheel** — nothing needs to be installed or put on
+`PATH`. Every wheel carries the same build,
+[TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 8.1.2, pinned by
+hash in [`tools/ffmpeg.lock`](tools/ffmpeg.lock) and tagged so it is
+identifiable at runtime:
+
+```python
+>>> nelux.__ffmpeg_version__
+'8.1.2-tas'
+```
+
+If that reports anything else, a different FFmpeg of the same soname won the
+load — on Windows the first DLL of a given name into the process serves
+everyone, so another library shipping `avcodec-62.dll` can take over.
+(`'unknown'` is the exception, and it has two causes: the extension predates
+this attribute — rebuild it — or, on Windows, no FFmpeg could be loaded at all,
+which the extension reports instead of aborting the import.)
+
+Those bundled binaries are **GPL-2.0-or-later** (libx264 and libx265 are linked
+in). The licence texts and a pointer to the complete corresponding source are
+installed at `nelux/ffmpeg-licenses/` inside the package.
 
 PyTorch must be importable **before** `nelux` — the package uses torch's C++ runtime. For CUDA builds, install the matching CUDA torch wheel:
 
@@ -380,7 +402,11 @@ NELUX_ENABLE_CUDA=ON pip install -e .
 NELUX_ENABLE_CUDA=ON pip wheel . -w dist/
 ```
 
-On Windows the build needs MSVC 18 (or compatible), and FFmpeg headers/libs under `external/ffmpeg/` (see `tools/download_ffmpeg.ps1`).
+FFmpeg comes from `external/ffmpeg/`, populated by `tools/download_ffmpeg.ps1`
+(Windows) or `tools/download_ffmpeg.sh` (Linux/macOS). Both read
+`tools/ffmpeg.lock`, verify the archive's SHA256 and stamp the tree, so a build
+either has the exact pinned TAS-FFMPEG or fails loudly. On Windows the build
+also needs MSVC 18 (or compatible).
 
 See [BUILD.md](docs/BUILD.md) for detailed build instructions.
 

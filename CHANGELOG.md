@@ -5,10 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-08-09
+
+### Changed
+
+- **FFmpeg now ships inside the wheel, and it is our own build.** Every
+  published wheel — Windows x64, Linux x86_64, macOS arm64 — carries
+  [TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 8.1.2. Nothing has
+  to be on `PATH`, in `LD_LIBRARY_PATH`, or installed by the user any more.
+
+  The supplier change matters as much as the bundling. Wheels previously built
+  against BtbN (Windows/Linux) and Homebrew (macOS), which meant three
+  suppliers, a macOS build that could not be pinned to a hash at all, and, on
+  Windows, a rolling `master-latest` URL that had silently drifted onto FFmpeg
+  9.0 once already. Now `tools/ffmpeg.lock` pins one release, one ABI and a
+  SHA256 per platform, and both download scripts verify the hash and refuse to
+  reuse a tree whose pin stamp does not match.
+
+  The build is tagged `--extra-version=tas`, so **`nelux.__ffmpeg_version__`
+  reports `8.1.2-tas`** — a string no distro, gyan or BtbN build can produce.
+  That turns "which FFmpeg am I actually running?" into a one-line check, which
+  is worth having on Windows, where the first DLL of a given name into the
+  process serves every consumer in it.
+
+  Bundled binaries are **GPL-2.0-or-later** (libx264 and libx265 are linked in).
+  The licence texts and a pointer to the complete corresponding source are
+  installed at `nelux/ffmpeg-licenses/`. Nelux itself remains AGPL-3.0, which
+  GPLv3 §13 explicitly permits combining with GPL code.
+
+  Encoders now guaranteed present, per platform: NVENC/NVDEC everywhere except
+  macOS; QSV and AMF on Windows and Linux x86_64; MediaFoundation on Windows;
+  VideoToolbox on macOS; libx264/libx265/libsvtav1/libaom/libvpx/libopenh264/
+  libopus/libzimg/libvmaf and HTTPS on all five.
 
 ### Added
 
+- **`nelux.__ffmpeg_version__`** — `av_version_info()` of the FFmpeg actually
+  loaded into the process, not the one the extension was compiled against.
+- **`tools/verify_wheel_ffmpeg.py`** — asserts a built wheel really contains the
+  seven FFmpeg libraries (with the soname majors `tools/ffmpeg.lock` pins) and
+  the GPL licence texts. Run in CI on all three platforms, because every
+  bundling mechanism involved — CMake install, auditwheel, delocate — can
+  silently no-op and leave a wheel that only works on the build machine.
 - **`color_format="rgba"` and 4-channel encode input — ProRes 4444 alpha is
   reachable.** `VideoReader(color_format="rgba")` returns a 4-channel HWC frame
   carrying the source alpha plane (`RGBA` for 8-bit sources, `RGBA64LE` for
@@ -75,6 +113,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"SS[.ms]"` into seconds.
 
 ### Fixed
+
+- **Encoder: every frame rate was rounded to an integer, writing a timeline of
+  the wrong length.** `EncodingProperties::fps` was an `int` and the codec time
+  base was `{1, fps}`, so the NTSC rates — which are `1000/1001` fractions —
+  became 24/30/60. That is not a mislabelled stream: the time base *is* the
+  timeline, and every frame's pts is a tick count in it, so a 23.976 fps encode
+  ran 0.1% fast (~3.6s of drift per hour) and desynced progressively against
+  passthrough audio, which is rescaled from the source's own time base. The rate
+  is now carried end to end as an `AVRational`, and `VideoReader.create_encoder`
+  hands the source's exact `num/den` to the encoder rather than a double.
+
+  `fps` is also `double` rather than `float` now (float32 cannot hold
+  `24000/1001` closely enough to recover the fraction), and a decimal
+  abbreviation of an NTSC rate is snapped to the fraction it stands for
+  (23.976 → 24000/1001, 29.97 → 30000/1001, 47.952 → 48000/1001); anything else
+  becomes the exact fraction it denotes (47.96 → 1199/25). Two consequences
+  worth knowing: the legacy `mpeg4` encoder rejects a time base denominator
+  above 65535, so a finer rate is approximated there to within ~1e-8 while the
+  stream is still tagged exactly; and a zero, negative or NaN rate now falls
+  back to 30 fps rather than 1 fps. Covered by `tests/test_frame_rate_tagging.py`
+  across every encoder in the bundled build, in every container each is normally
+  muxed into.
 
 - **ProRes files were converted with one colour matrix and decoded with
   another.** The ProRes encoders write their colour description from the
@@ -255,8 +315,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `__next__` on a reader with an unknown frame rate (`fps <= 0`) and a *time* range
   keeps stopping only at EOF, as before; the upper-bound slack is now written as an
   explicit infinity rather than falling out of a `1 / 0.0` division.
-
-## [0.17.0] - 2026-07-25
 
 ### Fixed
 
