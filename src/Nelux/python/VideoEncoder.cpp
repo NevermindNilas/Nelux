@@ -1,6 +1,7 @@
 ﻿#include "python/VideoEncoder.hpp"
 #include <cassert>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -13,17 +14,62 @@
 extern "C"
 {
 #include <libavutil/pixdesc.h>
+#include <libavutil/rational.h>
 }
 
 namespace fs = std::filesystem;
 
 namespace nelux
 {
+
+namespace
+{
+    // Turn a frame rate given as a double into the exact rational the muxer
+    // should tag, without ever collapsing it to an integer.
+    //
+    // av_d2q recovers a small exact ratio from a double, so a rate that came
+    // from a source stream (av_q2d of 24000/1001, 1199/25, ...) round-trips
+    // back to the very same fraction. What it cannot do is guess intent: a
+    // caller typing 23.976 means NTSC 24000/1001 (23.976023...), but taken
+    // literally that decimal is 2997/125, which drifts by 1 frame per ~11.6
+    // hours. So first test the NTSC family — is this rate 1000/1001 of a whole
+    // number? — and snap to the exact fraction when it is. An exact integer is
+    // never such an abbreviation (n*1000/1001 is itself whole only when n is a
+    // multiple of 1001, and av_d2q recovers that value exactly anyway), so
+    // integers skip the test entirely and stay exact. For everything else the
+    // 5e-3 tolerance is wide enough for a 3-decimal abbreviation (23.976 sits
+    // 2.4e-5 away from 24000/1001) and narrower than half the ~0.999 spacing of
+    // the candidate grid, so a rate that merely sits near a candidate is left
+    // alone (47.96 stays 1199/25). It has to be an absolute tolerance: one
+    // proportional to fps outgrows that fixed spacing past ~910 fps and would
+    // rewrite whole bands of unrelated rates.
+    AVRational frameRateFromDouble(double fps)
+    {
+        // A zero/negative rate would produce a degenerate time base
+        // {0,x} / a negative one: division by zero downstream, muxer rejection.
+        if (!(fps > 0.0) || !std::isfinite(fps))
+            return AVRational{30, 1};
+
+        const int64_t ntscBase = static_cast<int64_t>(std::llround(fps * 1001.0 / 1000.0));
+        if (fps != std::trunc(fps) && ntscBase > 0 && ntscBase <= 1000000)
+        {
+            const AVRational ntsc{static_cast<int>(ntscBase * 1000), 1001};
+            if (std::abs(av_q2d(ntsc) - fps) <= 5e-3)
+                return ntsc;
+        }
+
+        AVRational q = av_d2q(fps, 1000000);
+        if (q.num <= 0 || q.den <= 0)
+            return AVRational{30, 1};
+        return q;
+    }
+} // namespace
+
     //NOTE --- USED HWC
 VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> codec, std::optional<int> width,
                            std::optional<int> height, std::optional<int> bitRate,
-                           std::optional<float> fps,
+                           std::optional<double> fps,
                            std::optional<int> preset,
                            std::optional<int> cq,
                            std::optional<std::string> pixelFormat,
@@ -53,7 +99,7 @@ VideoEncoder::VideoEncoder(const std::string& filename,
 nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     const std::string& filename, std::optional<std::string> codec,
     std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
-    std::optional<float> fps,
+    std::optional<double> fps,
     std::optional<int> preset, std::optional<int> cq,
     std::optional<std::string> pixelFormat,
     std::optional<std::string> presetStr,
@@ -65,13 +111,7 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     props.width = width.value_or(1920);
     props.height = height.value_or(1080);
     props.bitRate = bitRate.value_or(4000000); // 4 Mbps default
-    // Round to an integer fps and clamp to >= 1. A zero/negative value would
-    // produce an invalid time_base {1,0} (division by zero downstream / muxer
-    // rejection).
-    {
-        int roundedFps = static_cast<int>(std::round(fps.value_or(30.0f)));
-        props.fps = roundedFps < 1 ? 1 : roundedFps;
-    }
+    props.frameRate = frameRateFromDouble(fps.value_or(30.0));
     props.gopSize = 60;
     props.maxBFrames = 2;
 

@@ -238,17 +238,31 @@ except ImportError as e:
         raise ImportError(
             f"Failed to load Nelux C extension.\n\n"
             f"On Windows this is usually a missing runtime DLL dependency.\n"
-            f"Common missing DLLs: FFmpeg (avcodec/avformat/...) or fmt/spdlog.\n\n"
+            f"Released wheels bundle FFmpeg (avcodec-62.dll and friends) next to\n"
+            f"_nelux.pyd, so a missing FFmpeg DLL here means either a self-built\n"
+            f"wheel built with NELUX_BUNDLE_FFMPEG_DLLS=OFF, or a damaged install.\n\n"
             f"{missing_block}\n"
-            f"If FFmpeg is external, add this before importing nelux:\n"
+            f"To point at an external FFmpeg instead, add this before importing nelux:\n"
             f"  import os\n"
-            f"  os.add_dll_directory(r'C:\\\\path\\\\to\\\\ffmpeg\\\\bin')\n\n"
+            f"  os.add_dll_directory(r'C:\\\\path\\\\to\\\\ffmpeg\\\\bin')\n"
+            f"It must be FFmpeg 8.x — avcodec 62 / avutil 60 / avformat 62 /\n"
+            f"avfilter 11 / swscale 9 / swresample 6.\n\n"
             f"Make sure to also import torch first:\n"
             f"  import torch\n\n"
-            f"If using a self-built wheel, ensure it bundles Windows DLLs.\n"
             f"Original error: {e}"
         ) from e
     raise
+
+# Which FFmpeg actually got loaded. Wheels bundle the TAS-FFMPEG build
+# (tools/ffmpeg.lock is canonical) and it is tagged --extra-version=tas, so this
+# reads e.g. "8.1.2-tas"; anything else means a different FFmpeg won the load.
+# Fetched with getattr rather than in the import list above so an extension
+# built before this attribute existed degrades to "unknown" instead of tripping
+# the missing-DLL diagnostic, which would point at entirely the wrong problem.
+from . import _nelux as _nelux_ext
+
+__ffmpeg_version__ = getattr(_nelux_ext, "__ffmpeg_version__", "unknown")
+del _nelux_ext
 
 _torch_version = sys.modules["torch"].__version__.split("+", 1)[0].split(".")[:2]
 _torch_abi = ".".join(_torch_version)
@@ -310,6 +324,7 @@ __all__ = [
     "__version__",
     "__torch_abi__",
     "__cuda_support__",
+    "__ffmpeg_version__",
     "VideoReader",
     "VideoEncoder",
     "set_log_level",

@@ -88,8 +88,11 @@ jobs:
           "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt \
             --triplet x64-linux-dynamic --recurse
 
-      - name: Download FFmpeg (headers + shared libs for build/test)
+      - name: Download pinned TAS-FFMPEG build (headers + shared libs, shipped in the wheel)
         run: |
+          # tools/ffmpeg.lock is the single source of truth for the URL, the hash
+          # and the expected av_version_info. These .so files end up INSIDE the
+          # wheel via auditwheel below, so this is not a build-only dependency.
           chmod +x tools/download_ffmpeg.sh
           ./tools/download_ffmpeg.sh
           ls -l external/ffmpeg/lib | head -30
@@ -99,7 +102,7 @@ jobs:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
-          NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
+          NELUX_BUNDLE_FFMPEG_DLLS: "ON"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
           export VCPKG_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -111,7 +114,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} \
             -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} \
             -DNELUX_ENABLE_CUDA=ON \
-            -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
+            -DNELUX_BUNDLE_FFMPEG_DLLS=ON"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
           python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
@@ -124,7 +127,7 @@ jobs:
           echo "=== dist/ ==="
           ls -la dist/
 
-      - name: Repair wheel with auditwheel (bundle sibling libs, exclude torch/ffmpeg/cuda)
+      - name: Repair wheel with auditwheel (bundle sibling libs + FFmpeg, exclude torch/cuda)
         run: |
           WHEEL=$(ls dist/*.whl | head -n1)
           echo "Repairing: ${WHEEL}"
@@ -136,13 +139,17 @@ jobs:
           export LD_LIBRARY_PATH="${VCPKG_LIB}:${FFMPEG_LIB}:${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
           # Libraries we exclude from bundling — users bring their own torch
-          # (already a runtime dep), their own FFmpeg, and CUDA comes from PyTorch.
+          # (already a runtime dep) and CUDA comes from PyTorch.
+          #
+          # FFmpeg is deliberately NOT excluded any more: auditwheel vendors
+          # libav*/libsw* into nelux.libs/ and patches the RPATH, so the wheel
+          # is self-contained. That is safe here only because the TAS-FFMPEG
+          # Linux archives are built inside manylinux_2_28 (glibc 2.28) — an
+          # ubuntu-built FFmpeg references GLIBC_2.34 and auditwheel would
+          # reject the WHOLE wheel, not just those libraries.
           EXCLUDES=(
             libtorch.so libtorch_cpu.so libtorch_python.so libtorch_cuda.so
             libc10.so libc10_cuda.so libshm.so
-            libavcodec.so.* libavformat.so.* libavutil.so.*
-            libavfilter.so.* libavdevice.so.*
-            libswscale.so.*
             libcudart.so.* libnvrtc.so.* libnvrtc-builtins.so.*
             libcufft.so.* libcurand.so.* libcusolver.so.*
             libcusparse.so.* libcublas.so.* libcublasLt.so.*
@@ -169,12 +176,21 @@ jobs:
           echo "=== Wheel contents ==="
           unzip -l dist/*.whl | grep -E 'nelux/|\.libs' || true
 
+      - name: Verify the wheel ships FFmpeg and its licences
+        run: |
+          # The whole point of the retarget: a wheel that needs nothing on
+          # LD_LIBRARY_PATH. Assert the .so files and the GPL paper trail are
+          # actually inside it, with the soname majors tools/ffmpeg.lock pins.
+          python tools/verify_wheel_ffmpeg.py dist/*.whl
+
       - name: Test wheel (import + real decode smoke test)
         run: |
           pip install dist/*.whl --force-reinstall
 
-          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/external/ffmpeg/lib:${LD_LIBRARY_PATH:-}"
-          export PATH="${GITHUB_WORKSPACE}/external/ffmpeg/bin:${PATH}"
+          # external/ffmpeg is deliberately NOT on LD_LIBRARY_PATH: the wheel
+          # has to stand on its own vendored libraries, and pointing the loader
+          # at the build tree would hide exactly the failure this step catches.
+          # FFMPEG_BIN stays so tests that shell out to ffmpeg still find one.
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
 
           python tests/wheel_smoke_test.py

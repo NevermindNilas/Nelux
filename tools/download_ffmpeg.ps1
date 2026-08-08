@@ -1,154 +1,186 @@
 # download_ffmpeg.ps1
-# Downloads and extracts pre-built FFmpeg shared libraries for NeLux
+#
+# Populate external/ffmpeg/{bin,lib,include,licenses} with the FFmpeg build that
+# Nelux links against AND ships inside its Windows wheels.
+#
+# The binaries come from NevermindNilas/TAS-FFMPEG - our own source build - and
+# every URL, hash and version string lives in tools/ffmpeg.lock. Nothing is
+# hard-coded here; retarget by editing that file, not this one.
+#
+# The archive is verified against its SHA256 before a single file is extracted,
+# and the installed tree is stamped with what the lock asked for so the
+# "already present" short circuit cannot silently keep a stale generation. That
+# matters because CMakeLists.txt globs external/ffmpeg/bin/av*.dll at CONFIGURE
+# time to bake /DELAYLOAD:<filename> - a stale tree yields a wheel whose
+# delay-load contract names the wrong soname.
 
 param(
     [string]$OutputDir = "$PSScriptRoot\..\external\ffmpeg",
-    [string]$FFmpegVersion = "latest",
+    [string]$LockFile = "$PSScriptRoot\ffmpeg.lock",
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
 
-# Latest FFmpeg shared build from gyan.dev (GPL, includes x264/x265)
-$FFmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"
-$ArchiveName = "ffmpeg-release-full-shared.7z"
+function Say  { param($m) Write-Host "[ffmpeg] $m" -ForegroundColor Cyan }
+function Ok   { param($m) Write-Host "  [OK] $m" -ForegroundColor Green }
+function Warn { param($m) Write-Host "  [WARN] $m" -ForegroundColor Yellow }
 
-Write-Host "=== FFmpeg Download Script ===" -ForegroundColor Cyan
-Write-Host "Output directory: $OutputDir" -ForegroundColor Gray
-
-# Check if already exists
-if ((Test-Path "$OutputDir\bin\avcodec-*.dll") -and -not $Force) {
-    Write-Host "FFmpeg already exists at $OutputDir. Use -Force to re-download." -ForegroundColor Yellow
-    exit 0
+# --- Parse the lock ---------------------------------------------------------
+if (-not (Test-Path $LockFile)) {
+    throw "FFmpeg lock file not found: $LockFile"
 }
 
-# Create output directory
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+$Lock = @{}
+foreach ($line in Get-Content $LockFile) {
+    if ($line -match '^\s*#') { continue }
+    if ($line -match '^([A-Z0-9_]+)=(.*)$') { $Lock[$Matches[1]] = $Matches[2].Trim() }
 }
 
-$TempDir = Join-Path $env:TEMP "ffmpeg_download"
+function LockValue {
+    param([string]$Key)
+    if (-not $Lock.ContainsKey($Key) -or [string]::IsNullOrWhiteSpace($Lock[$Key])) {
+        throw "tools/ffmpeg.lock is missing required key '$Key'. A missing platform block is a hard error, never a fall back to the previous release."
+    }
+    return $Lock[$Key]
+}
+
+$Url        = LockValue "WIN64_URL"
+$ArchiveName= LockValue "WIN64_FILE"
+$Root       = LockValue "WIN64_ROOT"
+$Sha256     = (LockValue "WIN64_SHA256").ToLowerInvariant()
+$Version    = LockValue "WIN64_VERSION"
+$VersionInfo= LockValue "AV_VERSION_INFO"
+$StampName  = LockValue "PIN_STAMP_FILE"
+$SourceUrl  = LockValue "CORRESPONDING_SOURCE_URL"
+$LicenseSpdx= LockValue "LICENSE_SPDX"
+
+# Identity the installed tree must carry to be considered current.
+$StampWanted = "$VersionInfo $Sha256 $ArchiveName"
+$StampPath   = Join-Path $OutputDir $StampName
+
+Say "TAS-FFMPEG $Version ($VersionInfo) -> $OutputDir"
+
+# --- Stale-tree guard -------------------------------------------------------
+if (-not $Force) {
+    # A truncated stamp (interrupted Set-Content below) reads back as $null, so
+    # test the value before calling Trim() on it - an empty stamp means stale,
+    # not a crash.
+    $StampFound = if (Test-Path $StampPath) { Get-Content $StampPath -Raw } else { $null }
+    if ($StampFound -and $StampFound.Trim() -eq $StampWanted) {
+        Ok "FFmpeg $VersionInfo already installed (pin stamp matches). Use -Force to re-download."
+        exit 0
+    }
+    if (Test-Path (Join-Path $OutputDir "bin")) {
+        Warn "Existing FFmpeg tree does not match the pin in tools/ffmpeg.lock - replacing it."
+    }
+}
+
+$TempDir = Join-Path $env:TEMP "nelux_ffmpeg_download"
+if (Test-Path $TempDir) { Remove-Item -Recurse -Force $TempDir }
+New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 $ArchivePath = Join-Path $TempDir $ArchiveName
 
-# Create temp directory
-if (-not (Test-Path $TempDir)) {
-    New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
-}
+# --- Download ---------------------------------------------------------------
+Say "[1/4] Downloading $Url"
+& curl.exe -L --fail --retry 3 --retry-delay 2 -o $ArchivePath $Url
+if ($LASTEXITCODE -ne 0) { throw "Download failed ($LASTEXITCODE): $Url" }
 
-# Download FFmpeg archive
-Write-Host "`n[1/3] Downloading FFmpeg shared build..." -ForegroundColor Green
-if (-not (Test-Path $ArchivePath) -or $Force) {
-    try {
-        Start-BitsTransfer -Source $FFmpegUrl -Destination $ArchivePath
-        Write-Host "  Downloaded: $ArchivePath"
-    }
-    catch {
-        Write-Host "  Failed to download from gyan.dev, trying GitHub mirror..." -ForegroundColor Yellow
-        $GithubUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
-        Start-BitsTransfer -Source $GithubUrl -Destination "$TempDir\ffmpeg.zip"
-        $ArchivePath = "$TempDir\ffmpeg.zip"
-    }
+# --- Verify -----------------------------------------------------------------
+Say "[2/4] Verifying SHA256"
+$Actual = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Sha256) {
+    throw @"
+SHA256 MISMATCH for $ArchiveName
+  expected: $Sha256
+  actual:   $Actual
+Refusing to install. Either tools/ffmpeg.lock is stale or the download was
+tampered with. Do NOT 'fix' this by pasting the new hash without checking the
+TAS-FFMPEG release it came from.
+"@
 }
-else {
-    Write-Host "  Using cached: $ArchivePath"
-}
+Ok "SHA256 $Actual"
 
-# Extract archive
-Write-Host "`n[2/3] Extracting FFmpeg..." -ForegroundColor Green
+# --- Extract ----------------------------------------------------------------
+Say "[3/4] Extracting"
 $ExtractDir = Join-Path $TempDir "extracted"
-if (Test-Path $ExtractDir) {
-    Remove-Item -Recurse -Force $ExtractDir
-}
-New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
 
-if ($ArchivePath -like "*.7z") {
-    # Use 7z if available, otherwise try tar (Windows 10+)
-    $7zPath = Get-Command "7z" -ErrorAction SilentlyContinue
-    if ($7zPath) {
-        & 7z x $ArchivePath -o"$ExtractDir" -y | Out-Null
-    }
-    else {
-        # Try with tar (Windows 10 1803+)
-        Write-Host "  7z not found, trying PowerShell extraction..." -ForegroundColor Yellow
-        # For .7z, we need 7-zip. Download portable version if not found.
-        $7zUrl = "https://www.7-zip.org/a/7zr.exe"
-        $7zExe = Join-Path $TempDir "7zr.exe"
-        if (-not (Test-Path $7zExe)) {
-            Start-BitsTransfer -Source $7zUrl -Destination $7zExe
-        }
-        & $7zExe x $ArchivePath -o"$ExtractDir" -y | Out-Null
-    }
-}
-else {
-    Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
+$SrcRoot = Join-Path $ExtractDir $Root
+if (-not (Test-Path $SrcRoot)) {
+    throw "Archive did not unpack into the expected root '$Root'. Check WIN64_ROOT in tools/ffmpeg.lock."
 }
 
-# Find the extracted FFmpeg folder
-$FFmpegDir = Get-ChildItem -Path $ExtractDir -Directory | Select-Object -First 1
-if (-not $FFmpegDir) {
-    throw "Failed to find extracted FFmpeg directory"
-}
-Write-Host "  Extracted to: $($FFmpegDir.FullName)"
-
-# Copy to output directory
-Write-Host "`n[3/3] Installing FFmpeg to $OutputDir..." -ForegroundColor Green
-
-# Clean output directory
-if (Test-Path $OutputDir) {
-    Remove-Item -Recurse -Force $OutputDir
-}
+if (Test-Path $OutputDir) { Remove-Item -Recurse -Force $OutputDir }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-# Copy bin, lib, include directories
-$Subdirs = @("bin", "lib", "include")
-foreach ($subdir in $Subdirs) {
-    $SourcePath = Join-Path $FFmpegDir.FullName $subdir
-    if (Test-Path $SourcePath) {
-        Copy-Item -Path $SourcePath -Destination $OutputDir -Recurse -Force
-        $count = (Get-ChildItem -Path (Join-Path $OutputDir $subdir) -File).Count
-        Write-Host "  Copied $subdir/ ($count files)"
+# bin/ carries the DLLs AND the MSVC import libs; lib/ carries the .def files
+# CMake turns into import libs plus the MinGW .dll.a; licenses/ and
+# manifest.json are the GPL paper trail that has to travel with the binaries
+# into the wheel.
+foreach ($sub in @("bin", "lib", "include", "licenses")) {
+    $src = Join-Path $SrcRoot $sub
+    if (Test-Path $src) {
+        Copy-Item -Path $src -Destination $OutputDir -Recurse -Force
+        $count = (Get-ChildItem -Path (Join-Path $OutputDir $sub) -Recurse -File).Count
+        Ok "$sub/ ($count files)"
+    }
+    elseif ($sub -ne "licenses") {
+        throw "Archive is missing required directory '$sub'"
     }
 }
+foreach ($glob in @("manifest.json", "LICENSE*", "COPYING*", "GPL*")) {
+    Get-ChildItem -Path $SrcRoot -Filter $glob -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item $_.FullName -Destination $OutputDir -Force }
+}
 
-# Verify installation (version-agnostic patterns)
+# --- Verify the installed tree ----------------------------------------------
+Say "[4/4] Verifying installation"
+
 $RequiredDlls = @(
-    "avcodec-*.dll",
-    "avformat-*.dll",
-    "avutil-*.dll",
-    "swscale-*.dll",
-    "avfilter-*.dll",
-    "avdevice-*.dll"
+    "avcodec-$(LockValue 'SONAME_AVCODEC').dll",
+    "avformat-$(LockValue 'SONAME_AVFORMAT').dll",
+    "avutil-$(LockValue 'SONAME_AVUTIL').dll",
+    "avfilter-$(LockValue 'SONAME_AVFILTER').dll",
+    "avdevice-$(LockValue 'SONAME_AVDEVICE').dll",
+    "swscale-$(LockValue 'SONAME_SWSCALE').dll",
+    "swresample-$(LockValue 'SONAME_SWRESAMPLE').dll"
 )
-
-Write-Host "`n=== Verifying Installation ===" -ForegroundColor Cyan
-$AllFound = $true
-foreach ($pattern in $RequiredDlls) {
-    $DllMatches = Get-ChildItem -Path "$OutputDir\bin" -Filter $pattern -ErrorAction SilentlyContinue
-    if ($DllMatches) {
-        Write-Host "  [OK] $($DllMatches.Name)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [MISSING] $pattern" -ForegroundColor Red
-        $AllFound = $false
+foreach ($dll in $RequiredDlls) {
+    if (-not (Test-Path (Join-Path $OutputDir "bin\$dll"))) {
+        throw "Missing $dll - the archive's soname majors disagree with tools/ffmpeg.lock"
     }
 }
+Ok "All seven runtime DLLs present with the expected soname majors"
 
-if ($AllFound) {
-    Write-Host "`nFFmpeg installation complete!" -ForegroundColor Green
-    
-    # Show version info
-    $FFmpegExe = Join-Path $OutputDir "bin\ffmpeg.exe"
-    if (Test-Path $FFmpegExe) {
-        Write-Host "`nInstalled version:"
-        & $FFmpegExe -version | Select-Object -First 1
+if (-not (Test-Path (Join-Path $OutputDir "include\libavcodec\avcodec.h"))) {
+    throw "Missing headers under $OutputDir\include"
+}
+
+# The build identity assertion. --extra-version=tas means no distro, gyan or
+# BtbN build can produce this string, so this catches "wrong build" as well as
+# "wrong version".
+$FFmpegExe = Join-Path $OutputDir "bin\ffmpeg.exe"
+if (Test-Path $FFmpegExe) {
+    # Capture the whole banner before slicing it. Piping a native command
+    # straight into Select-Object -First 1 stops the pipeline early, and
+    # Windows PowerShell 5.1 then leaves $LASTEXITCODE = -1 behind - which the
+    # GitHub Actions powershell wrapper turns into a failed step even though
+    # the install succeeded.
+    $VersionOut  = & $FFmpegExe -version 2>&1
+    $VersionLine = $VersionOut | Select-Object -First 1
+    if ($VersionLine -notmatch [regex]::Escape($VersionInfo)) {
+        throw "ffmpeg.exe reports '$VersionLine' but tools/ffmpeg.lock expects av_version_info '$VersionInfo'"
     }
+    Ok $VersionLine
 }
 else {
-    throw "FFmpeg installation incomplete - some DLLs are missing"
+    Warn "ffmpeg.exe absent - skipped the av_version_info assertion"
 }
 
-# Cleanup temp files
-Write-Host "`nCleaning up temporary files..." -ForegroundColor Gray
+Set-Content -Path $StampPath -Value $StampWanted -NoNewline
 Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
 
-Write-Host "`nDone! FFmpeg is ready at: $OutputDir" -ForegroundColor Cyan
+Say "Done. FFmpeg $VersionInfo ready at $OutputDir"
+Say "These binaries are $LicenseSpdx and are shipped inside the wheel."
+Say "Corresponding source: $SourceUrl"

@@ -6,6 +6,15 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+extern "C"
+{
+#include <libavutil/avutil.h>
+}
+
+#ifdef _WIN32
+#include <excpt.h>  // EXCEPTION_EXECUTE_HANDLER, for loadedFFmpegVersion() below
+#endif
+
 namespace py = pybind11;
 #define PYBIND11_DETAILED_ERROR_MESSAGES
 #ifndef NELUX_TORCH_ABI
@@ -135,6 +144,33 @@ bool looksLikeSegmentList(py::handle seq)
     py::object first = py::reinterpret_borrow<py::sequence>(seq)[0];
     return py::isinstance<py::list>(first) || py::isinstance<py::tuple>(first);
 }
+
+// The version string is read at module init, and every FFmpeg import here is
+// delay-loaded, so this one call is what decides whether `import nelux` needs
+// avutil present at all. When the loader cannot resolve it (an FFmpeg-less
+// install, or a wheel built with NELUX_BUNDLE_FFMPEG_DLLS=OFF and no FFmpeg on
+// the search path) the MSVC delay-load helper raises a Win32 SEH exception
+// instead of returning, and CPython does not translate that into an ImportError:
+// the interpreter dies inside PyInit__nelux with no traceback, so none of the
+// Python-level diagnostics in nelux/__init__.py can run and the module cannot
+// even be imported to be inspected. Catch it and degrade to "unknown", which
+// __init__.py already tolerates. Kept in its own function with nothing to
+// unwind, which is what __try requires.
+const char* loadedFFmpegVersion()
+{
+#ifdef _WIN32
+    __try
+    {
+        return av_version_info();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return "unknown";
+    }
+#else
+    return av_version_info();
+#endif
+}
 } // namespace
 
 PYBIND11_MODULE(_nelux, m)
@@ -142,6 +178,15 @@ PYBIND11_MODULE(_nelux, m)
     m.doc() = "nelux – lightspeed video decoding into tensors";
     m.attr("__version__") = "0.17.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
+
+    // Identity of the FFmpeg actually loaded into this process, not the one we
+    // compiled against. Wheels bundle the TAS-FFMPEG build, which is tagged
+    // --extra-version=tas, so this reads "8.1.2-tas" and no distro, gyan or
+    // BtbN build can forge it. A different string means some other FFmpeg won
+    // the load — on Windows that is a real possibility, since a DLL of the same
+    // name already in the process serves everyone. Reads "unknown" when no
+    // FFmpeg can be loaded at all (see loadedFFmpegVersion).
+    m.attr("__ffmpeg_version__") = loadedFFmpegVersion();
 
     // Expose CUDA build status
 #ifdef NELUX_ENABLE_CUDA
@@ -152,7 +197,8 @@ PYBIND11_MODULE(_nelux, m)
 
     m.attr("__all__") =
         py::make_tuple("__version__", "__torch_abi__", "__cuda_support__",
-                       "VideoReader", "VideoEncoder", "set_log_level", "LogLevel");
+                       "__ffmpeg_version__", "VideoReader", "VideoEncoder",
+                       "set_log_level", "LogLevel");
     py::enum_<spdlog::level::level_enum>(m, "LogLevel")
         .value("trace", spdlog::level::trace)
         .value("debug", spdlog::level::debug)
@@ -502,7 +548,7 @@ Example:
                  [](const std::string& output_path,
                     std::optional<std::string> codec,
                     std::optional<int> width, std::optional<int> height,
-                    std::optional<int> bit_rate, std::optional<float> fps,
+                    std::optional<int> bit_rate, std::optional<double> fps,
                     py::object preset, std::optional<int> cq,
                     std::optional<std::string> pixel_format,
                     std::optional<std::map<std::string, std::string>> options)
@@ -556,7 +602,15 @@ Args:
     width (int, optional): Frame width. Defaults to 1920.
     height (int, optional): Frame height. Defaults to 1080.
     bit_rate (int, optional): Video bitrate in bps. Defaults to 4000000 (4 Mbps).
-    fps (float, optional): Frames per second. Defaults to 30.
+    fps (float, optional): Frames per second. Defaults to 30. Tagged as an
+        exact rational, never rounded to an integer: NTSC abbreviations snap to
+        their true fraction (23.976 -> 24000/1001, 29.97 -> 30000/1001, 47.952
+        -> 48000/1001) and any other value becomes the exact fraction it
+        denotes (47.96 -> 1199/25). The codec time base is the inverse of this,
+        so it sets the timeline itself, not just the container tag. The one
+        exception is the legacy "mpeg4" encoder, whose time base denominator
+        cannot exceed 65535; a finer rate is approximated there to within
+        ~1e-8 while the stream is still tagged with the exact rate.
     preset (int | str, optional): Encoding preset.
         - int: 1..N mapped through a per-codec table:
             * libx264/libx265: 1=ultrafast..9=veryslow

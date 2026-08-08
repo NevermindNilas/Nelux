@@ -42,7 +42,16 @@ class Encoder
         AVPixelFormat pixelFormat;
         int gopSize;
         int maxBFrames;
-        int fps;
+
+        // Frame rate as an exact rational. It must not be collapsed to an
+        // integer: the NTSC rates are 1000/1001 fractions (24000/1001,
+        // 30000/1001, 60000/1001, ...) and rounding them to 24/30/60 does not
+        // just mistag the stream. The codec time base is the inverse of this
+        // value and every frame's pts is a tick count in it, so a rounded rate
+        // writes a timeline that runs 0.1% fast — a ~3.6s error per hour, and
+        // progressive desync against passthrough audio, which is rescaled from
+        // the source's own time base.
+        AVRational frameRate{30, 1};
 
         // NVENC/Hardware encoding options
         bool useHardwareEncoder = false;  // Auto-detected from codec name

@@ -204,3 +204,30 @@ build_test/
 tests/output/**/*.raw
 HANDOFF.md
 build_iter2.bat
+
+# Generated test and bench output. What lands here is reproducible by re-running
+# the test that wrote it, and it reaches tens of gigabytes. This rule only stops
+# *new* output from being offered; the committed baselines and reports already
+# under tests/output/ stay tracked, as does the prores parity report the
+# changelog cites.
+tests/output/
+!tests/output/prores_parity/
+!tests/output/prores_parity/REPORT.md
+
+# Downloaded FFmpeg (both the current pin and the previous tree the download
+# script keeps for rollback). Fetched by tools/download_ffmpeg.{ps1,sh}.
+external/
+
+# Large test fixtures, fetched or generated locally rather than committed.
+tests/data/metadata_corpus/
+tests/data/prores/
+
+# Local scratch: archived experiments, past-project work trees, agent notes.
+_archive/
+ffapi/
+stable-abi-prototype/
+examples/comfyui_nelux_nodes/
+docs/agents/
+CLAUDE.md
+plan.md
+HANDOFF-*.md

@@ -40,7 +40,9 @@ class VideoEncoder
                  std::optional<int> width = std::nullopt,
                  std::optional<int> height = std::nullopt,
                  std::optional<int> bitRate = std::nullopt,
-                 std::optional<float> fps = std::nullopt,
+                 // double, not float: float32 cannot hold 24000/1001 closely
+                 // enough for av_d2q to recover the fraction it came from.
+                 std::optional<double> fps = std::nullopt,
                  std::optional<int> preset = std::nullopt,
                  std::optional<int> cq = std::nullopt,
                  std::optional<std::string> pixelFormat = std::nullopt,
@@ -291,7 +293,7 @@ class VideoEncoder
     nelux::Encoder::EncodingProperties inferEncodingProperties(
         const std::string& filename, std::optional<std::string> codec,
         std::optional<int> width, std::optional<int> height, std::optional<int> bitRate,
-        std::optional<float> fps,
+        std::optional<double> fps,
         std::optional<int> preset, std::optional<int> cq,
         std::optional<std::string> pixelFormat,
         std::optional<std::string> presetStr,

@@ -37,7 +37,9 @@ pip install ./nelux-*.whl
 **Requirements:**
 - Python 3.10+
 - PyTorch 2.0+
-- FFmpeg shared libraries in PATH (Windows: ensure `ffmpeg.exe` is accessible)
+
+FFmpeg is **bundled in the wheel** — nothing to install, nothing to put on
+`PATH`. `nelux.__ffmpeg_version__` reports which build is actually loaded.
 
 ---
 
@@ -793,7 +795,28 @@ def batch_process(video_paths: list, model):
 ## Troubleshooting
 
 ### FFmpeg Not Found
-Ensure FFmpeg shared libraries are in your system PATH.
+Released wheels bundle FFmpeg next to the extension module, so this should not
+happen on a `pip install nelux`. When it does:
+
+- Check `nelux.__ffmpeg_version__`. The expected value is the one pinned in
+  `tools/ffmpeg.lock` (`8.1.2-tas`). `'unknown'` means one of two things: the
+  built extension predates the attribute (rebuild it), or — on Windows — no
+  FFmpeg could be loaded at all, which the extension reports as `'unknown'`
+  rather than killing the interpreter mid-import. Any *other* string means
+  another FFmpeg of the same soname was loaded into the process first — common
+  on Windows, where one DLL of a given name serves every consumer in the
+  process.
+- On a self-built wheel, confirm it was built with
+  `NELUX_BUNDLE_FFMPEG_DLLS=ON`; `python tools/verify_wheel_ffmpeg.py <wheel>`
+  answers that directly.
+- To force an external FFmpeg instead, call `os.add_dll_directory(...)`
+  (Windows) or set `DYLD_LIBRARY_PATH` (macOS) before importing nelux. It must
+  be FFmpeg 8.x — avcodec 62 / avutil 60 / avformat 62 / avfilter 11 /
+  swscale 9 / swresample 6. The released Linux wheel cannot be overridden this
+  way: `auditwheel` renames the vendored libraries to `libavcodec-<hash>.so.62`
+  and rewrites the extension's `DT_NEEDED` to match, so `LD_LIBRARY_PATH` is
+  never consulted for the plain soname. Use a wheel built with
+  `NELUX_BUNDLE_FFMPEG_DLLS=OFF` if you need to supply your own.
 
 ### CUDA Not Available
 - Check `nelux.__cuda_support__` is `True`

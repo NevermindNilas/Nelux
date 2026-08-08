@@ -78,39 +78,14 @@ jobs:
         run: |
           "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
 
-      - name: Download FFmpeg master for build (headers/libs only)
+      - name: Download pinned TAS-FFMPEG build (headers, import libs, DLLs)
         shell: powershell
         run: |
-          # Match TheAnimeScripter's packaged ffmpeg_shared DLL ABI. Build needs headers + import libs
-          # only; DLLs are NOT bundled — users must have FFmpeg in their PATH.
-          $FFmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
-          $OutputDir = "${{ github.workspace }}/external/ffmpeg"
-          $TempDir = "${{ runner.temp }}/ffmpeg_download"
-
-          New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
-          New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-
-          Write-Host "Downloading FFmpeg master (for build-time headers/libs only)..."
-          curl.exe -L --retry 3 --retry-delay 2 -o "$TempDir/ffmpeg.zip" $FFmpegUrl
-
-          Write-Host "Extracting FFmpeg..."
-          Expand-Archive -Path "$TempDir/ffmpeg.zip" -DestinationPath "$TempDir/extracted" -Force
-
-          $FFmpegDir = Get-ChildItem -Path "$TempDir/extracted" -Directory | Select-Object -First 1
-          # Copy all directories including bin (needed for running tests, but NOT bundled by CMake)
-          Copy-Item -Path "$($FFmpegDir.FullName)/bin" -Destination $OutputDir -Recurse -Force
-          Copy-Item -Path "$($FFmpegDir.FullName)/lib" -Destination $OutputDir -Recurse -Force
-          Copy-Item -Path "$($FFmpegDir.FullName)/include" -Destination $OutputDir -Recurse -Force
-
-          # Verify FFmpeg DLLs
-          Write-Host "=== Verifying FFmpeg DLLs ==="
-          $DllPattern = "$OutputDir/bin/avcodec-*.dll"
-          $DllFiles = Get-ChildItem -Path $DllPattern
-          if ($DllFiles) {
-              Write-Host "Found: $($DllFiles.Name)"
-          }
-
-          Write-Host "=== FFmpeg installed (headers/libs for build, bin for testing) ==="
+          # tools/ffmpeg.lock is the single source of truth for the URL, the
+          # hash and the expected av_version_info. The script verifies all three
+          # and these DLLs are SHIPPED IN THE WHEEL, so this is not a build-only
+          # dependency any more.
+          ./tools/download_ffmpeg.ps1 -Force
 
       - name: Setup CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.30
@@ -153,9 +128,14 @@ jobs:
           CMAKE_GENERATOR: Ninja
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
-          NELUX_BUNDLE_FFMPEG_DLLS: "OFF"
-          # Skip CMake-side DLL install — delvewheel will pick up vcpkg DLLs
-          # via --add-path and bundle them into nelux.libs/ (avoids duplicates).
+          # Ship FFmpeg inside the wheel. CMake installs the DLLs unmangled next
+          # to _nelux.pyd; delvewheel is told to leave them alone, because it
+          # renames what it vendors and the /DELAYLOAD thunk resolves the
+          # literal baked file name.
+          NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # Skip CMake-side DLL install for the VCPKG DLLs only — delvewheel
+          # picks those up via --add-path and bundles them into nelux.libs/
+          # (avoids duplicates). FFmpeg is installed regardless of this flag.
           NELUX_SKIP_DLL_INSTALL: "ON"
         run: |
           # Convert backslashes to forward slashes to avoid CMake escaping issues on Windows
@@ -171,7 +151,7 @@ jobs:
           export CMAKE_PREFIX_PATH="${VCPKG_ROOT}/installed/x64-windows-release"
 
           # Construct CMAKE_ARGS with sanitized paths and explicit wheel-bundling policy.
-          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON -DNELUX_BUNDLE_FFMPEG_DLLS=OFF"
+          export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE} -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH} -DNELUX_ENABLE_CUDA=ON -DNELUX_BUNDLE_FFMPEG_DLLS=ON"
 
           echo "CMAKE_ARGS: $CMAKE_ARGS"
           python -c "import torch; print('Building Nelux against torch', torch.__version__, 'cuda', torch.version.cuda)"
@@ -203,7 +183,12 @@ jobs:
           $TorchSite = python -c "import torch, os; print(os.path.dirname(torch.__file__))"
           $TorchLib = Join-Path $TorchSite "lib"
 
-          # FFmpeg DLLs (for build/test, but NOT bundled)
+          # FFmpeg is bundled by CMake, NOT by delvewheel, and every FFmpeg DLL
+          # is excluded here on purpose. delvewheel mangles the names it vendors
+          # (avcodec-62-<hash>.dll) while the /DELAYLOAD thunk resolves the
+          # literal baked name next to the module - a mangled copy is invisible
+          # to it, and letting delvewheel act would ALSO produce a second copy
+          # of ~100 MB of FFmpeg in nelux.libs/.
           $FFmpegBin = "${{ github.workspace }}/external/ffmpeg/bin"
 
           # Dynamically get list of ALL FFmpeg DLLs to exclude them
@@ -212,7 +197,7 @@ jobs:
 
           # Dynamically enumerate CUDA + Torch DLLs so we exclude the EXACT
           # versioned filenames (e.g. nvrtc64_130_0.dll, nvrtc-builtins64_131.dll).
-          # delvewheel --exclude matches literal filenames only — globs like
+          # delvewheel --exclude matches literal filenames only - globs like
           # "nvrtc64*.dll" do NOT match and would cause those DLLs to be bundled,
           # inflating the wheel ~100 MB. We scan BOTH torch/lib and the CUDA
           # toolkit bin because the dep walker may pick up either copy depending
@@ -252,8 +237,8 @@ jobs:
           New-Item -ItemType Directory -Path dist_repaired -Force | Out-Null
 
           # Run delvewheel repair
-          # CUDA / Torch DLLs come from the user's PyTorch install at runtime —
-          # we never bundle them. FFmpeg DLLs likewise must be user-provided.
+          # CUDA / Torch DLLs come from the user's PyTorch install at runtime -
+          # we never bundle them. FFmpeg is bundled, but by CMake (see above).
           delvewheel repair $WheelFile.FullName `
             --add-path "$VcpkgBin" `
             --add-path "$TorchLib" `
@@ -271,8 +256,16 @@ jobs:
 
       - name: List wheel contents
         run: |
-          echo "=== Wheel contents (CUDA DLLs bundled via delvewheel, FFmpeg NOT bundled) ==="
+          echo "=== Wheel contents (vcpkg DLLs via delvewheel, FFmpeg via CMake) ==="
           unzip -l dist/*.whl | grep nelux/
+
+      - name: Verify the wheel ships FFmpeg and its licences
+        shell: bash
+        run: |
+          # The whole point of the retarget: a wheel that needs nothing on PATH.
+          # Assert the DLLs and the GPL paper trail are actually inside it, with
+          # the soname majors tools/ffmpeg.lock pins.
+          python tools/verify_wheel_ffmpeg.py dist/*.whl
 
       - name: Test wheel (import + real decode smoke test)
         shell: powershell
@@ -280,9 +273,11 @@ jobs:
           Write-Host "=== Installing wheel ==="
           pip install (Get-ChildItem dist/*.whl) --force-reinstall
 
-          $FFmpegBin = Join-Path $pwd "external\ffmpeg\bin"
-          $env:PATH = "$FFmpegBin;$env:PATH"
-          $env:FFMPEG_BIN = $FFmpegBin
+          # external/ffmpeg is deliberately NOT put on PATH: the wheel has to
+          # stand on its own bundled DLLs, and prepending the build tree would
+          # hide exactly the failure this step exists to catch. FFMPEG_BIN stays
+          # so tests that shell out to ffmpeg.exe still find one.
+          $env:FFMPEG_BIN = Join-Path $pwd "external\ffmpeg\bin"
 
           # GitHub's powershell shell runs with $ErrorActionPreference='Stop',
           # which turns ANY native stderr line (e.g. torch's harmless
