@@ -340,6 +340,10 @@ Args:
         .def_property_readonly("properties", &VideoReader::getProperties)
         .def_property_readonly("width", &VideoReader::getWidth)
         .def_property_readonly("height", &VideoReader::getHeight)
+        .def_property_readonly(
+            "channels", &VideoReader::getChannels,
+            "Channels in a decoded frame, following color_format: 3 for 'rgb', "
+            "4 for 'rgba', 1 for 'gray'.")
         .def_property_readonly("fps", &VideoReader::getFps)
         .def_property_readonly("min_fps", &VideoReader::getMinFps)
         .def_property_readonly("max_fps", &VideoReader::getMaxFps)
@@ -367,7 +371,9 @@ Uses the secondary decoder; does not disturb iteration.)doc")
              R"doc(Return the frame at or after the given frame index.
 Uses the secondary decoder; does not disturb iteration.)doc")
         .def("get_frame_count", &VideoReader::getFrameCount,
-             "Get total frame count from metadata (no pre-scanning)")
+             "Total frame count, cached after the first call. Read from container "
+             "metadata (nb_frames) when present; containers that omit it (MKV/WebM, "
+             "most VFR) pay one demux-only pass over the file on the first call.")
         .def(
             "decode_batch", &VideoReader::decodeBatch, py::arg("indices"),
             "Decode a batch of frames at specified indices, returning [B,H,W,C] tensor")

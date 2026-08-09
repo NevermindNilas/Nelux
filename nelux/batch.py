@@ -1,5 +1,7 @@
 """Batch frame reading support for VideoReader."""
 
+import operator
+
 import numpy as np
 import torch
 from typing import Union, List
@@ -14,6 +16,55 @@ class BatchMixin:
     - Sorting frames in sequential order
     - Only seeking when necessary (backward jumps or large gaps)
     """
+
+    def _slice_to_index_list(self, s: slice) -> List[int]:
+        """Resolve a slice against ``frame_count`` into absolute indices.
+
+        None and negative bounds follow CPython's container rules, so
+        ``vr[:0]`` is empty, ``vr[:-1]`` is every frame but the last,
+        ``vr[-10:]`` is the last ten, ``vr[::-1]`` is the video reversed and
+        ``vr[-10**6:]`` is the whole clip rather than an error.
+
+        ``slice.indices()`` is the obvious tool and is deliberately not used:
+        it clamps in *both* directions, which would silently turn
+        ``vr[n:n+10]`` into an empty batch. Nelux raises ``IndexError`` for a
+        frame past the end, so only the underflow side is clamped here and an
+        out-of-range positive bound is left for :meth:`get_batch` to reject.
+
+        Bounds are taken through ``operator.index`` — ints, bools and numpy
+        integer scalars resolve, floats and strings raise ``TypeError`` as
+        they do for a list. A bare float subscript means *seconds* elsewhere
+        in this API (``vr[2.5]``), so silently reading ``vr[2.5:5.0]`` as
+        frame indices would be the wrong kind of helpful.
+
+        The returned indices are absolute: callers must not normalise them a
+        second time.
+        """
+        n = self.frame_count
+        step = 1 if s.step is None else operator.index(s.step)
+        if step == 0:
+            raise ValueError("slice step cannot be zero")
+
+        # Underflow floor. For a forward step the first reachable index is 0;
+        # for a reverse step, -1 is the "walked off the front" sentinel that
+        # makes range() stop after index 0.
+        floor = 0 if step > 0 else -1
+
+        if s.start is None:
+            start = 0 if step > 0 else n - 1
+        else:
+            start = operator.index(s.start)
+            if start < 0:
+                start = max(start + n, floor)
+
+        if s.stop is None:
+            stop = n if step > 0 else -1
+        else:
+            stop = operator.index(s.stop)
+            if stop < 0:
+                stop = max(stop + n, floor)
+
+        return list(range(start, stop, step))
 
     def _to_index_list(self, indices) -> List[int]:
         """
@@ -32,10 +83,7 @@ class BatchMixin:
         """
         # Handle slice notation
         if isinstance(indices, slice):
-            start = indices.start or 0
-            stop = indices.stop or self.frame_count
-            step = indices.step or 1
-            return list(range(start, stop, step))
+            return self._slice_to_index_list(indices)
 
         # Handle range objects
         if isinstance(indices, range):
@@ -81,22 +129,31 @@ class BatchMixin:
             >>> batch = vr.get_batch([0, 10, 20])  # [3, H, W, C]
             >>> batch = vr.get_batch(range(0, 100, 10))  # [10, H, W, C]
         """
-        # Convert to list
-        indices_list = self._to_index_list(indices)
+        if isinstance(indices, slice):
+            # Already absolute — _slice_to_index_list resolved the negatives
+            # against frame_count, and adding it again would move them twice.
+            normalized = self._slice_to_index_list(indices)
+        else:
+            normalized = self._to_index_list(indices)
+            if normalized:
+                # Only pay for frame_count when a negative index needs it: on
+                # a container without nb_frames the first call demuxes the
+                # whole file.
+                if any(idx < 0 for idx in normalized):
+                    n = self.frame_count
+                    normalized = [idx + n if idx < 0 else idx for idx in normalized]
 
-        if not indices_list:
-            # Return empty tensor with correct shape
-            return torch.empty(0, self.height, self.width, 3, dtype=torch.uint8)
-
-        # Normalize negative indices
-        frame_count = self.frame_count
-        normalized = []
-        for idx in indices_list:
-            if idx < 0:
-                idx = frame_count + idx
-            normalized.append(idx)
+        if not normalized:
+            # Let the C++ path build the empty batch: it matches the shape,
+            # dtype and device a populated batch would have had (channel
+            # count, uint8 vs uint16, CPU vs CUDA), which a hardcoded
+            # torch.empty here cannot. decodeBatch skips its capability gates
+            # for an empty request, so this works on gray/rgba/resize readers
+            # too.
+            return self.decode_batch([])
 
         # Validate bounds
+        frame_count = self.frame_count
         for idx in normalized:
             if not (0 <= idx < frame_count):
                 raise IndexError(f"Frame index {idx} out of bounds [0, {frame_count})")
@@ -122,9 +179,10 @@ class BatchMixin:
             >>> vr = VideoReader("video.mp4")
             >>> batch = vr.get_batch_range(0, 100, 10)  # [10, H, W, C]
         """
-        if end is None:
-            end = self.frame_count
-        return self.get_batch(range(start, end, step))
+        # Routed through the slice resolver rather than range() so that
+        # get_batch_range(a, b, s) and vr[a:b:s] cannot disagree about what a
+        # None or negative bound means.
+        return self.get_batch(slice(start, end, step))
 
     def __getitem__(self, key):
         """
@@ -174,7 +232,11 @@ class BatchMixin:
         """
         Shape of the video as (frames, height, width, channels).
 
+        The channel count follows ``color_format``: 3 for "rgb", 4 for "rgba",
+        1 for "gray". It is read from the reader rather than hardcoded so
+        ``vr.shape[1:]`` always matches ``vr.read_frame().shape``.
+
         Returns:
-            Tuple of (frame_count, height, width, 3)
+            Tuple of (frame_count, height, width, channels)
         """
-        return (self.frame_count, self.height, self.width, 3)
+        return (self.frame_count, self.height, self.width, self.channels)

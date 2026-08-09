@@ -1988,22 +1988,31 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("VideoReader::decodeBatch called with {} indices", indices.size());
 
-    if (resizeWidth_ > 0 && resizeHeight_ > 0)
+    // Both capability gates are skipped for an empty batch. Decoding nothing
+    // is decoding nothing whatever the reader is configured for, and Python's
+    // `reader[i:i]` lands here — refusing it would make an empty slice raise
+    // on exactly the readers where an empty slice is the safest thing to ask
+    // for. The empty tensor still reports this reader's own geometry, so it
+    // concatenates with whatever read_frame() produces.
+    if (!indices.empty())
     {
-        throw std::runtime_error(
-            "decode_batch is not supported when resize is configured on the "
-            "VideoReader. Create a reader without the resize argument for batch "
-            "decoding, or call frame_at() in a loop.");
-    }
+        if (resizeWidth_ > 0 && resizeHeight_ > 0)
+        {
+            throw std::runtime_error(
+                "decode_batch is not supported when resize is configured on the "
+                "VideoReader. Create a reader without the resize argument for batch "
+                "decoding, or call frame_at() in a loop.");
+        }
 
-    if (outChannels_ != 3)
-    {
-        throw std::runtime_error(
-            "decode_batch is not supported with color_format='" +
-            std::string(outChannels_ == 1 ? "gray" : "rgba") +
-            "'. Use read_frame()/frame_at() for gray/rgba decoding, or create "
-            "the reader with the default color_format='rgb' for batch "
-            "decoding.");
+        if (outChannels_ != 3)
+        {
+            throw std::runtime_error(
+                "decode_batch is not supported with color_format='" +
+                std::string(outChannels_ == 1 ? "gray" : "rgba") +
+                "'. Use read_frame()/frame_at() for gray/rgba decoding, or create "
+                "the reader with the default color_format='rgb' for batch "
+                "decoding.");
+        }
     }
 
     // Set BEFORE the call, not after: decode_batch seeks and demuxes on the

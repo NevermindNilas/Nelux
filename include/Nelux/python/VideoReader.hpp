@@ -99,6 +99,12 @@ class VideoReader
     {
         return properties.height;
     }
+    /// Channels in a decoded frame, following color_format: 3 "rgb",
+    /// 4 "rgba", 1 "gray". Fixed at construction, so no lock is needed.
+    int getChannels() const
+    {
+        return outChannels_;
+    }
     double getFps() const
     {
         return properties.fps;

@@ -5,6 +5,86 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Slice indexing now follows Python's container rules.** `_to_index_list`
+  resolved a slice with `indices.start or 0` / `indices.stop or frame_count`,
+  so a legitimate `0` or a negative bound was mistaken for "unset". Four
+  documented forms were silently wrong:
+
+  | Expression | Was | Now |
+  |---|---|---|
+  | `vr[:0]`, `vr[0:0]` | decoded the **entire file** (a [N,H,W,3] uint8 tensor — 186 GB on a 1080p feature) | empty |
+  | `vr[:-1]` | empty | every frame but the last |
+  | `vr[-10:]` | `N+10` rows: the last ten, then the whole video again | the last ten |
+  | `vr[::-1]` | empty | the video reversed |
+
+  None of them raised. The existing empty-slice test used `vr[5:5]`, whose
+  endpoints are both truthy, which is how the first row survived.
+
+  Bounds are resolved through `operator.index`, so ints, bools and numpy
+  integer scalars work and floats/strings raise `TypeError` — a bare float
+  subscript means *seconds* in this API (`vr[2.5]`), and reading `vr[2.5:5.0]`
+  as frame indices would be the wrong kind of helpful. Underflowing negative
+  bounds clamp the way a list clamps (`vr[-10**6:]` is the whole clip); a bound
+  past the *end* still raises `IndexError` rather than clamping, which is
+  nelux's long-standing contract and is covered by tests. `slice.indices()` is
+  deliberately not used: it clamps both directions and would turn
+  `vr[n:n+10]` into a silently empty batch.
+
+  Verified against CPython list semantics over 306,180 slices (frame counts
+  0–30 × bounds −25…25, ±1000, `None` × steps ±1…6, ±1000): zero silent
+  disagreements.
+
+- **`get_batch_range()` and the equivalent slice can no longer disagree.** It
+  built a raw `range()`, so negative or `None` arguments meant something
+  different from `vr[start:stop:step]` even though the docs call them the same
+  thing. It now delegates to the slice resolver.
+
+- **An empty batch matches a populated one.** `get_batch([])` short-circuited
+  in Python with a hardcoded `torch.empty(0, H, W, 3, dtype=uint8)`, so on a
+  10-bit source `torch.cat([vr.get_batch([]), vr.get_batch([0])])` raised
+  (uint8 vs uint16), and under `decode_accelerator="nvdec"` it raised again
+  (cpu vs cuda:0). Both C++ backends already build the empty batch to match,
+  and that is now the only path. `VideoReader::decodeBatch` skips its resize
+  and `color_format` capability gates for an empty request — decoding nothing
+  is decoding nothing whatever the reader is configured for, and refusing it
+  would make `vr[i:i]` raise on exactly the readers where an empty slice is
+  the safest thing to ask for.
+
+- **`VideoReader.shape` reports the real channel count.** It hardcoded 3, so a
+  `color_format="gray"` reader claimed `(N, H, W, 3)` while its frames were
+  `(H, W, 1)`.
+
+- **The type stub described an extension that does not exist.** `nelux/py.typed`
+  makes `_nelux.pyi` authoritative for mypy and pyright, and it was missing 14
+  bound members — `min_fps`, `max_fps`, `bit_depth`, `aspect_ratio`, `codec`,
+  `file_path`, `get_frame_count`, `decode_batch`, `reconfigure`, and the five
+  prefetch names. Every prefetch and `reconfigure` example in `llms.txt` was a
+  type error, and nelux's own `BatchMixin` did not type-check against its own
+  stub. Three surviving docstrings were also wrong: `min_fps`/`max_fps` are
+  unconditional copies of `fps` (no rate envelope is measured), `aspect_ratio`
+  is the storage ratio and not the DAR, and `get_frame_count` is not
+  metadata-only on containers without `nb_frames`.
+
+- **Wheels declared no runtime dependencies** while `import nelux` imports
+  numpy unconditionally via `nelux/batch.py`. `pip install nelux` into a
+  torch-only environment failed with `ModuleNotFoundError: numpy`; CI hid it by
+  installing numpy by hand. `dependencies = ["numpy"]` is now declared and the
+  manual CI install is gone, so the release job proves the metadata.
+
+### Added
+
+- **`VideoReader.channels`** — 3 for `color_format="rgb"`, 4 for `"rgba"`,
+  1 for `"gray"`. Previously the channel count was only discoverable by
+  decoding a frame and reading its shape.
+
+- **`tests/test_stub_surface.py`** — walks `_nelux.pyi` with `ast` and compares
+  it against `dir()` of the real extension in both directions, so neither a new
+  binding nor a removed one can drift away from the stub unnoticed.
+
 ## [0.17.0] - 2026-08-09
 
 ### Changed

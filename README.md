@@ -102,7 +102,7 @@ single = vr[42]                             # Single frame [H, W, 3]
 
 # Properties
 print(len(vr))                              # Total frame count
-print(vr.shape)                             # (frames, H, W, 3)
+print(vr.shape)                             # (frames, H, W, channels)
 ```
 
 ### In/Out Point Lists
@@ -239,10 +239,10 @@ per encoder; a second call raises.
 ### Core Features
 
 - **Hardware Acceleration**: NVDEC (decode) and NVENC (encode) on NVIDIA GPUs
-- **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, 3]` (or `[H, W, 3]` `int16` for >8-bit sources; force_8bit=True clamps to uint8 always). No implicit float conversion — you cast/normalize on your side based on your model's expected input
+- **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, C]` (or `uint16` for >8-bit sources; force_8bit=True clamps to uint8 always). `C` follows `color_format` and is readable as `vr.channels`: 3 for `"rgb"`, 4 for `"rgba"`, 1 for `"gray"`. No implicit float conversion — you cast/normalize on your side based on your model's expected input
 - **RGB or Grayscale Output**: `color_format="rgb"` (default) or `color_format="gray"` for single-channel `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only. `encode_frame` also accepts single-channel input (`[H, W, 1]` or `[H, W]`). With a grayscale output `pixel_format` (`"gray"`/`"gray16le"`) it's a **verbatim, full-range data path** — values stored exactly, up to true 16-bit, with a lossless (`ffv1`) round-trip — ideal for depth maps and masks; with a color `pixel_format` the gray input is replicated to RGB
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
-- **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, 3]` with seek minimization, deduplication, and a dedicated random-access decoder
+- **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, C]` with seek minimization, deduplication, and a dedicated random-access decoder
 - **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
 - **In/Out Point Lists**: `set_ranges([(in, out), ...])` restricts iteration to several ascending, non-overlapping segments in one forward pass; `iter_segments()` yields `(segment_index, frame)` so each section can take its own processing path. Frames, seconds, or `"H:MM:SS"` timecodes
@@ -347,15 +347,16 @@ VideoReader(
 
 **Properties:**
 - `width`, `height`, `fps`, `min_fps`, `max_fps`, `duration`, `total_frames`
-- `pixel_format`, `bit_depth`, `aspect_ratio`, `codec`, `has_audio`
+- `pixel_format`, `bit_depth`, `channels`, `aspect_ratio`, `codec`, `has_audio`
 - `properties` (full `VideoProperties` struct)
-- `shape` → `(frame_count, H, W, 3)`  (Python-side `BatchMixin`)
+- `shape` → `(frame_count, H, W, channels)`  (Python-side `BatchMixin`)
 - `frame_count` → cached `get_frame_count()` (Python-side `BatchMixin`)
 
 **Methods:**
-- `read_frame()` / `__next__()` / iteration → next `[H, W, 3]` frame
+- `read_frame()` / `__next__()` / iteration → next `[H, W, C]` frame
 - `frame_at(timestamp: float | index: int)` → random-access frame via secondary decoder (doesn't disturb iteration)
-- `__getitem__(int | float | slice | list | range)` → single frame OR `[B, H, W, 3]` batch
+- `__getitem__(int | float | slice | list | range)` → single frame OR `[B, H, W, C]` batch
+  - slices follow Python container rules: `vr[:0]` is empty, `vr[:-1]` drops the last frame, `vr[-10:]` is the last ten, `vr[::-1]` is reversed. A bound past the end raises `IndexError` rather than clamping
 - `decode_batch(indices: list[int])` → C++ batch path; called by `get_batch` after validation
 - `get_batch(indices)` / `get_batch_range(start, end, step)` → batch decode with seek minimization
 - `set_range(start, end)` / `reset()` → bound iteration (`int` frames, `float` seconds, or `"H:MM:SS"` timecode)
