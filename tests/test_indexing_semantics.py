@@ -162,6 +162,36 @@ class TestSliceNormalization:
             got = vr._slice_to_index_list(s)
             assert got == expected, f"{s!r}: {got} != {expected}"
 
+    def test_frame_count_is_only_paid_for_when_a_bound_needs_it(self):
+        """``frame_count`` costs a full demux pass on a container without
+        ``nb_frames``, so a slice whose bounds resolve without it must not
+        ask. Only a negative bound or an open end that runs to the end of
+        the video does."""
+
+        class Probe:
+            """Wraps the real resolver with a counting ``frame_count``."""
+
+            _slice_to_index_list = VideoReader._slice_to_index_list
+
+            def __init__(self, n):
+                self._n = n
+                self.reads = 0
+
+            @property
+            def frame_count(self):
+                self.reads += 1
+                return self._n
+
+        for s in (slice(None, 0), slice(0, 0), slice(2, 7), slice(0, 10, 2)):
+            p = Probe(20)
+            p._slice_to_index_list(s)
+            assert p.reads == 0, f"{s!r} paid for frame_count without needing it"
+
+        for s in (slice(None, -1), slice(-3, None), slice(None), slice(None, None, -1)):
+            p = Probe(20)
+            p._slice_to_index_list(s)
+            assert p.reads >= 1, f"{s!r} resolved without frame_count"
+
 
 class TestEmptyBatchMatchesPopulated:
     """An empty request must be inert, and must look like a real batch.

@@ -40,27 +40,44 @@ class BatchMixin:
         The returned indices are absolute: callers must not normalise them a
         second time.
         """
-        n = self.frame_count
         step = 1 if s.step is None else operator.index(s.step)
         if step == 0:
             raise ValueError("slice step cannot be zero")
+
+        raw_start = None if s.start is None else operator.index(s.start)
+        raw_stop = None if s.stop is None else operator.index(s.stop)
+
+        # frame_count costs a full demux pass on a container without
+        # nb_frames, so only ask for it when a bound actually depends on it:
+        # a negative bound, or the open end that runs to the end of the video.
+        # vr[:0] and vr[a:b] resolve without it, and an empty result never
+        # reaches the bounds check in get_batch() that would fetch it anyway.
+        needs_n = (
+            (raw_start is None and step < 0)
+            or (raw_stop is None and step > 0)
+            or (raw_start is not None and raw_start < 0)
+            or (raw_stop is not None and raw_stop < 0)
+        )
+        # None rather than a placeholder int: an unguarded read is then a
+        # TypeError, not a silently wrong index.
+        n = self.frame_count if needs_n else None
 
         # Underflow floor. For a forward step the first reachable index is 0;
         # for a reverse step, -1 is the "walked off the front" sentinel that
         # makes range() stop after index 0.
         floor = 0 if step > 0 else -1
 
-        if s.start is None:
+        if raw_start is None:
             start = 0 if step > 0 else n - 1
         else:
-            start = operator.index(s.start)
+            start = raw_start
             if start < 0:
                 start = max(start + n, floor)
 
-        if s.stop is None:
+        if raw_stop is None:
             stop = n if step > 0 else -1
         else:
-            stop = operator.index(s.stop)
+            stop = raw_stop
             if stop < 0:
                 stop = max(stop + n, floor)
 
