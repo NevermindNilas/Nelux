@@ -10,16 +10,23 @@ using namespace nelux::error;
 
 namespace
 {
-// av_read_frame failing is only "the container is broken" for codes that are
-// terminal. EAGAIN means "nothing available yet, retry" on a non-blocking or
-// network source, AVERROR_EXIT means an interrupt callback asked us to stop,
-// and ETIMEDOUT is a network stall -- none of them says the data is bad, and
-// latching them would turn a transient condition into a permanently poisoned
-// reader.
+// AVERROR_EOF is the only code that means "the file ended". Every other
+// failure leaves the stream unfinished, and none of the three read sites can
+// resume from one: each responds by flushing the decoder and draining, so a
+// code exempted here is not retried, it is reported as a complete video.
+//
+// That is why EAGAIN, AVERROR_EXIT and ETIMEDOUT are fatal too, despite
+// naming transient conditions. Nelux sets neither AVFMT_FLAG_NONBLOCK nor an
+// interrupt callback, so the first two cannot arrive; ETIMEDOUT can, from a
+// network source that stalled, and it means the frames after it were never
+// read. Raising is not a permanently poisoned reader either -- a successful
+// seek or reconfigure() clears the latch, so a caller who believes the stall
+// was transient can seek and carry on. Silently returning a short video is
+// the one outcome with no recovery, because nothing tells the caller it
+// happened.
 bool isFatalReadError(int err)
 {
-    return err != AVERROR_EOF && err != AVERROR(EAGAIN) && err != AVERROR_EXIT &&
-           err != AVERROR(ETIMEDOUT);
+    return err != AVERROR_EOF;
 }
 } // namespace
 

@@ -56,10 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode surfaces at `send_packet`. Damaged files may therefore raise at one
   thread count and decode with holes at another.
 
-- `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` from `av_read_frame` are
-  explicitly **not** treated as damage — they are the retry, interrupt and
-  network-stall codes, and latching them would poison a reader over a
-  transient condition.
+- `AVERROR_EOF` is the only `av_read_frame` result that means the file ended.
+  `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` name transient conditions,
+  but none of the three read sites can resume from one — each flushes the
+  decoder and drains — so exempting them would not retry the read, it would
+  report an unfinished stream as a complete video. They raise like any other
+  read failure. Nelux sets neither `AVFMT_FLAG_NONBLOCK` nor an interrupt
+  callback, so the first two cannot arrive at all; `ETIMEDOUT` can, from a
+  network source that stalled, and it means the frames after it were never
+  read. Raising is recoverable — a successful seek or `reconfigure()` clears
+  the latch — while a silent short video is not, because nothing tells the
+  caller it happened.
 
 - FFmpeg error codes in log messages were printed as bare integers
   (`Error receiving frame: -1094995529`). They go through `errorToString()`

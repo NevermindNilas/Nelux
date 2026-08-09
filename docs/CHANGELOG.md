@@ -30,8 +30,11 @@
   only a decoder that fails mid-frame is fatal. Which of the two a given file
   trips is libavcodec's choice and can vary with `num_threads`.
 
-- `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` from the demuxer are
-  treated as transient, not as damage.
+- `AVERROR_EOF` is the only demuxer result that means the file ended.
+  `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` name transient conditions,
+  but no read site can resume from one, so exempting them would report an
+  unfinished stream as a complete video rather than retry it. They raise, and
+  a seek or `reconfigure()` clears the latch if the stall really was transient.
 
 #### **Python indexing surface: slices, empty batches, and a stub that told the truth**
 
