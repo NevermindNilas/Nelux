@@ -345,6 +345,16 @@ class Decoder
     // AVERROR_EOF; consumer drains remaining ordered outputs then returns
     // undefined Tensor.
     std::atomic<bool> fanoutProducerDone_{false};
+    // Non-zero once a decode call has failed with something that is neither
+    // success nor end-of-stream. Sticky: the codec context is not in a defined
+    // state afterwards, so every later call must keep failing rather than
+    // present a short read as a complete video. Cleared only where the stream
+    // is genuinely rebuilt -- a SUCCESSFUL seek (after avcodec_flush_buffers)
+    // and reconfigure(). Deliberately NOT cleared by clearQueue() or
+    // startDecodingThread(): decode_batch and a failed seek both call those,
+    // and neither repositions the stream, so clearing there would launder a
+    // poisoned reader back into a silent short read.
+    std::atomic<int> decodeError_{0};
     size_t convertedFrameBytes = 0;
 
     double lastFrameTimestamp_ = -1.0;
@@ -360,6 +370,18 @@ class Decoder
     void startDecodingThread();
     void stopDecodingThread();
     void clearQueue();
+
+    // Wake every consumer and mark the stream finished. `err` is 0 for a
+    // clean end-of-stream and an FFmpeg error code otherwise. The producer
+    // thread MUST route all of its exits through this: a bare `break` leaves
+    // isFinished false and fanoutProducerDone_ false, and the consumer then
+    // waits on a condition variable nobody will ever notify again.
+    void finishProducer(bool fanout, int err);
+
+    // Throw if a decode has failed. Called by consumers at the points where
+    // they would otherwise report end-of-stream, so buffered frames are still
+    // delivered first and only the tail of the stream turns into an error.
+    void throwIfDecodeFailed() const;
 
     void resetTimestampState();
 

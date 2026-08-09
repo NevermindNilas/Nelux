@@ -1,6 +1,38 @@
 
 ### **Unreleased**
 
+#### **A broken file now fails loudly instead of hanging or lying**
+
+- **Fixed: a mid-stream decode error hung the interpreter.** The producer
+  thread (`prefetch=True`, and every NVDEC reader — it reuses the same loop)
+  exited through a bare `break` when `avcodec_receive_frame` returned anything
+  other than success, EOF or EAGAIN, setting neither `isFinished` nor
+  `fanoutProducerDone_`. The consumer then waited forever on a condition
+  variable with no notifier left alive, holding `lifecycleMu_` exclusively with
+  the GIL released — so `close()` blocked too and Ctrl-C could not be
+  delivered. A corrupt VP9 clip reproduced it every time. Every producer exit
+  now goes through one signalling handshake.
+
+- **Fixed: three silent truncations.** A hard decode error on the sync path, a
+  packet the decoder refused, and `av_read_frame` failing were all reported as
+  a clean end of stream. Concretely: a damaged FFV1 clip returned 29 frames
+  with the default `prefetch=False` and 54 with `prefetch=True`, calling both
+  a complete decode; and a truncated MP4 (an interrupted download) returned its
+  readable prefix and reported success. All three now raise a `RuntimeError`
+  naming the file and the FFmpeg error, after the frames that did decode have
+  been delivered.
+
+- The failure is sticky — cleared only by a successful seek or `reconfigure()`,
+  never by `clearQueue()` — so a second read cannot silently succeed and
+  `decode_batch` cannot launder a poisoned reader.
+
+- A refused packet is skipped with a warning on every path (what ffmpeg does);
+  only a decoder that fails mid-frame is fatal. Which of the two a given file
+  trips is libavcodec's choice and can vary with `num_threads`.
+
+- `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` from the demuxer are
+  treated as transient, not as damage.
+
 #### **Python indexing surface: slices, empty batches, and a stub that told the truth**
 
 - **Fixed: slice indexing ignored Python's container rules.** The resolver read

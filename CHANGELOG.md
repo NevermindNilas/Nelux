@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A mid-stream decode failure could hang the interpreter, permanently.**
+  `Decoder::decodingLoop` — the producer thread behind `prefetch=True` and
+  behind every NVDEC reader, which reuses the base class loop — left through a
+  bare `break` when `avcodec_receive_frame` returned anything that was neither
+  success, `AVERROR_EOF` nor `EAGAIN`. Unlike the EOF exit two lines above it,
+  that path set neither `isFinished` nor `fanoutProducerDone_`, so the consumer
+  waited on a condition variable nobody would notify again. The producer is
+  never respawned either: the restart guard tests `decodingThread.joinable()`,
+  and a `std::thread` whose function has returned is still joinable.
+
+  The blast radius was the whole process, not one stalled iterator.
+  `VideoReader::decodeFrame` holds `lifecycleMu_` exclusively with the GIL
+  released across that wait, so `close()` blocked on the same lock and Ctrl-C
+  could not be delivered. Reproduced with a corrupt VP9 stream and
+  `prefetch=True`: killed at a 30-second timeout, every time.
+
+  Every exit from the producer now goes through one `finishProducer()`
+  handshake.
+
+- **Three ways a broken file was reported as a complete one.** All three
+  returned an undefined tensor, which the reader turns into a clean
+  `StopIteration`:
+
+  - the synchronous path treated a hard `avcodec_receive_frame` failure as
+    end-of-stream;
+  - a refused packet (`avcodec_send_packet` failing) ended the synchronous
+    decode, while the async producer skipped it and carried on — a damaged
+    FFV1 clip returned **29 frames via the default path and 54 with
+    `prefetch=True`**, calling both a success;
+  - `av_read_frame` failing was indistinguishable from the file ending, on all
+    three read sites. A truncated MP4 — an interrupted download, the commonest
+    damage there is — decoded its readable prefix and reported success.
+
+  A decode that fails now raises `RuntimeError` naming the file and the FFmpeg
+  error, **after** delivering the frames that did decode. The failure is
+  sticky: it is cleared only by a successful seek (which flushes the codec) or
+  by `reconfigure()`, so a second read cannot report a clean end of stream, and
+  `decode_batch` cannot launder a poisoned reader by clearing the queue. A
+  refused packet is now skipped with a warning on every path, matching ffmpeg;
+  only a decoder that fails mid-frame is fatal.
+
+  One honest limitation: which of the two an input trips is libavcodec's
+  choice, not nelux's, and it can depend on `num_threads` — frame threading
+  surfaces some bitstream errors at `receive_frame` that a single-threaded
+  decode surfaces at `send_packet`. Damaged files may therefore raise at one
+  thread count and decode with holes at another.
+
+- `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` from `av_read_frame` are
+  explicitly **not** treated as damage — they are the retry, interrupt and
+  network-stall codes, and latching them would poison a reader over a
+  transient condition.
+
+- FFmpeg error codes in log messages were printed as bare integers
+  (`Error receiving frame: -1094995529`). They go through `errorToString()`
+  now.
+
 - **Slice indexing now follows Python's container rules.** `_to_index_list`
   resolved a slice with `indices.start or 0` / `indices.stop or frame_count`,
   so a legitimate `0` or a negative bound was mistaken for "unset". Four
