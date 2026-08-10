@@ -1,6 +1,43 @@
 
 ### **Unreleased**
 
+#### **Encoder defaults: the convenience path now works off Windows, and picks a codec the container can hold**
+
+- **Fixed: `VideoEncoder(path)` raised on every non-Windows wheel.** The
+  default codec was the literal `"h264_mf"` — Media Foundation, Windows only —
+  so `VideoEncoder(out)` and `reader.create_encoder(out)` (which passes no
+  codec) failed in the constructor on Linux and macOS. Every encoder test in
+  the suite passes an explicit `codec=`, which is why nothing caught it. The
+  default is now the first of `libx264`, `libopenh264`, then the platform
+  encoder that exists here *and* is known to fit the container; failing that,
+  the container's own default codec, so `out.webm` gets VP9 and `out.gif` gets
+  gif. Nine muxers answer "cannot tell" rather than yes or no; where Nelux
+  picks the codec that counts as no (`.ogv` gets VP8, `.mpg` MPEG-1), with
+  `mpegts` carved out because it does carry H.264 and cannot say so. A codec
+  the caller names is still judged permissively, so nothing that worked before
+  is rejected. `.ogg` and `.wav`, which have no usable default in this build,
+  now raise at construction naming the container instead of failing at header
+  write.
+
+- **Fixed: `out.ts` produced an MP4.** Container inference was a five-entry
+  extension table that silently fell through to mp4. It now uses
+  `av_guess_format`, so MPEG-TS, FLV, GIF, M4V, MXF, Ogg and every other muxer
+  in the build are reachable. 45 previously-skipped tests run as a result;
+  twelve of those are `.ts`/`.flv` at rates the container quantizes itself, and
+  are asserted against what the ffmpeg CLI writes rather than against the exact
+  fraction.
+
+- **Fixed: matroska rejected codecs it can write.** `avformat_query_codec()`
+  answers 0 for anything matroska would carry through `V_MS/VFW/FOURCC`, so
+  `utvideo`, `ffvhuff` and `magicyuv` in an `.mkv` were refused despite ffmpeg
+  writing them happily. The gate now also accepts a codec the muxer has a
+  fourcc for — while still rejecting `rv10` in `.avi`, where ffmpeg writes
+  fourcc `0` and the file demuxes back as rawvideo.
+
+- **Changed: better encoder errors.** An incompatible codec names the inferred
+  container and the extensions that would work; an unknown codec name suggests
+  similar encoder names instead of dumping ~120 of them to stderr.
+
 #### **A broken file now fails loudly instead of hanging or lying**
 
 - **Fixed: a mid-stream decode error hung the interpreter.** The producer

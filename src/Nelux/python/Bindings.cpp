@@ -603,7 +603,13 @@ Example:
 
 Args:
     output_path (str): Path to the output video file.
-    codec (str, optional): Video codec name. Defaults to "h264_mf".
+    codec (str, optional): Video codec name. Defaults to the first of
+        "libx264", "libopenh264", then the platform encoder (h264_mf on
+        Windows, h264_videotoolbox on macOS) that both exists in this build
+        and is known to fit the container inferred from output_path; if none
+        does, the container's own default video codec (so "out.webm" gets VP9,
+        "out.gif" gets gif and "out.ogv" gets VP8). Raises if the container has
+        no default this build can encode, as ".ogg" and ".wav" do not.
         NVENC codecs: "h264_nvenc", "hevc_nvenc", "av1_nvenc"
     width (int, optional): Frame width. Defaults to 1920.
     height (int, optional): Frame height. Defaults to 1080.

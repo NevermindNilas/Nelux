@@ -214,7 +214,9 @@ enc = reader.create_encoder("out.mp4")   # matches resolution and fps to source
 ```python
 VideoEncoder(
     output_path: str,
-    codec: Optional[str] = None,          # default: "h264_mf" (Windows Media Foundation H.264)
+    codec: Optional[str] = None,          # default: container-aware; libx264 for mp4/mkv/mov/avi/ts,
+                                          #   vp9 for webm, gif for gif, else the
+                                          #   container's own default codec
     width: Optional[int] = None,          # default: 1920
     height: Optional[int] = None,         # default: 1080
     bit_rate: Optional[int] = None,       # default: 4_000_000 (4 Mbps)

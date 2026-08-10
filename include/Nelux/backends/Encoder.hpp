@@ -16,6 +16,65 @@ struct AVAudioFifo;
 namespace nelux
 {
 
+/**
+ * @brief Muxer short name for an output filename, e.g. "matroska" for foo.mkv.
+ *
+ * Delegates to av_guess_format, so every container FFmpeg knows how to write
+ * is reachable, not just the five that used to be hardcoded. Falls back to
+ * "mp4" only when the extension means nothing to FFmpeg.
+ */
+std::string inferContainerFormatForFile(const std::string& filename);
+
+/**
+ * @brief Can @p codecId be written into @p ofmt?
+ *
+ * avformat_query_codec() alone is not authoritative: matroska's query_codec
+ * only consults its native V_ CodecID list and answers 0 for anything it would
+ * carry through V_MS/VFW/FOURCC, so utvideo, ffvhuff and magicyuv all look
+ * unsupported even though `ffmpeg -c:v utvideo out.mkv` writes a valid file.
+ * When the muxer's own codec_tag tables have a fourcc for the codec, the mux
+ * is sound. A negative return from query_codec (AVERROR_PATCHWELCOME, "the
+ * muxer cannot tell") is treated as permitted, as it always was.
+ *
+ * This is the permissive reading, and it is the right one for a codec the
+ * CALLER named: refusing a mux FFmpeg might well perform is worse than letting
+ * it fail at header write with the muxer's own message. Anywhere Nelux picks
+ * the codec itself, use codecDefinitelyFitsContainer() instead.
+ */
+bool codecFitsContainer(const struct AVOutputFormat* ofmt, int codecId);
+
+/**
+ * @brief Is @p codecId known to be writable into @p ofmt?
+ *
+ * The strict reading: "cannot tell" counts as no. Use this when Nelux is
+ * choosing on the caller's behalf and a wrong guess surfaces as an opaque
+ * header-write failure they cannot act on.
+ *
+ * Nine muxers in this build answer AVERROR_PATCHWELCOME for H.264 — mpegts,
+ * mxf, ogv, ogg, yuv4mpegpipe, swf, mpeg and svcd. Treating that as yes made
+ * VideoEncoder("out.ogv") pick libx264 and then die at header write, which is
+ * why the strict form exists. mpegts is carved out: it genuinely carries H.264
+ * and HEVC, and a strict reading alone would hand .ts back to its nominal
+ * default of MPEG-2.
+ */
+bool codecDefinitelyFitsContainer(const struct AVOutputFormat* ofmt, int codecId);
+
+/**
+ * @brief Encoder to use when the caller names no codec.
+ *
+ * Picks the first candidate that both exists in this build and is *known* to
+ * fit the container implied by @p filename, else the container's own default
+ * video codec. The old default was the unconditional literal "h264_mf", which
+ * is Windows-only — VideoEncoder(path) and reader.create_encoder(path)
+ * therefore raised on every Linux and macOS wheel.
+ *
+ * Returns an empty string when this build has no encoder for the container's
+ * default either (`.ogg` wants theora, which is not compiled in; `.wav` has no
+ * video codec at all). The caller is expected to turn that into an error that
+ * names the container and says to pass codec= explicitly.
+ */
+std::string defaultVideoCodecFor(const std::string& filename);
+
 // NVENC supported codecs
 namespace nvenc
 {
