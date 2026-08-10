@@ -287,7 +287,7 @@ bool BatchDecoder::decodeUntilFrame(
                     break;
                 }
                 if (ret < 0) {
-                    NELUX_ERROR("Error decoding frame: {}", ret);
+                    NELUX_ERROR("Error decoding frame: {}", errorToString(ret));
                     av_packet_unref(pkt);
                     av_packet_free(&pkt);
                     return false;

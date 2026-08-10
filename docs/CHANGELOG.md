@@ -1,4 +1,91 @@
 
+### **Unreleased**
+
+#### **A broken file now fails loudly instead of hanging or lying**
+
+- **Fixed: a mid-stream decode error hung the interpreter.** The producer
+  thread (`prefetch=True`, and every NVDEC reader — it reuses the same loop)
+  exited through a bare `break` when `avcodec_receive_frame` returned anything
+  other than success, EOF or EAGAIN, setting neither `isFinished` nor
+  `fanoutProducerDone_`. The consumer then waited forever on a condition
+  variable with no notifier left alive, holding `lifecycleMu_` exclusively with
+  the GIL released — so `close()` blocked too and Ctrl-C could not be
+  delivered. A corrupt VP9 clip reproduced it every time. Every producer exit
+  now goes through one signalling handshake.
+
+- **Fixed: three silent truncations.** A hard decode error on the sync path, a
+  packet the decoder refused, and `av_read_frame` failing were all reported as
+  a clean end of stream. Concretely: a damaged FFV1 clip returned 29 frames
+  with the default `prefetch=False` and 54 with `prefetch=True`, calling both
+  a complete decode; and a truncated MP4 (an interrupted download) returned its
+  readable prefix and reported success. All three now raise a `RuntimeError`
+  naming the file and the FFmpeg error, after the frames that did decode have
+  been delivered.
+
+- The failure is sticky — cleared only by a successful seek or `reconfigure()`,
+  never by `clearQueue()` — so a second read cannot silently succeed and
+  `decode_batch` cannot launder a poisoned reader.
+
+- A refused packet is skipped with a warning on every path (what ffmpeg does);
+  only a decoder that fails mid-frame is fatal. Which of the two a given file
+  trips is libavcodec's choice and can vary with `num_threads`.
+
+- `AVERROR_EOF` is the only demuxer result that means the file ended.
+  `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` name transient conditions,
+  but no read site can resume from one, so exempting them would report an
+  unfinished stream as a complete video rather than retry it. They raise, and
+  a seek or `reconfigure()` clears the latch if the stall really was transient.
+
+#### **Python indexing surface: slices, empty batches, and a stub that told the truth**
+
+- **Fixed: slice indexing ignored Python's container rules.** The resolver read
+  its bounds with `or` fallbacks, so a real `0` or a negative bound looked
+  unset. `vr[:0]` decoded the entire file instead of returning empty (a
+  186 GB tensor on a 1080p feature), `vr[:-1]` returned empty instead of every
+  frame but the last, `vr[-10:]` returned `N+10` rows instead of ten, and
+  `vr[::-1]` returned empty instead of the reversed video. Nothing raised. The
+  one empty-slice test used `vr[5:5]`, whose endpoints are both truthy, which
+  is why this survived.
+
+  Bounds now go through `operator.index` — ints, bools and numpy integer
+  scalars resolve; floats and strings raise `TypeError`, because a bare float
+  subscript already means *seconds* (`vr[2.5]`) and silently reading
+  `vr[2.5:5.0]` as frame indices would be worse than failing. Negative bounds
+  that underflow clamp as a list clamps; a bound past the end still raises
+  `IndexError` rather than clamping, which is the existing contract. Checked
+  against CPython over 306,180 slices with zero silent disagreements.
+
+- **Fixed: `get_batch_range(start, end, step)` and `vr[start:stop:step]`**
+  resolved `None` and negative arguments differently despite the docs calling
+  them equivalent. One resolver now serves both.
+
+- **Fixed: the empty batch did not match a populated one.** `get_batch([])`
+  returned a hardcoded CPU/uint8/3-channel tensor from Python, so concatenating
+  it with a real batch raised on any 10-bit source (uint8 vs uint16) or nvdec
+  reader (cpu vs cuda:0). It now comes from the same C++ path, which already
+  sized it correctly. `VideoReader::decodeBatch` skips its `resize` and
+  `color_format` gates for an empty request, so `vr[i:i]` keeps working on the
+  readers where batch decoding is otherwise unsupported.
+
+- **Fixed: `VideoReader.shape` hardcoded 3 channels**, contradicting
+  `read_frame().shape` on gray and rgba readers.
+
+- **Added: `VideoReader.channels`** (3 / 4 / 1 for rgb / rgba / gray).
+
+- **Fixed: `_nelux.pyi` was missing 14 bound members** — the whole prefetch
+  API, `reconfigure`, `decode_batch`, `get_frame_count`, `file_path`,
+  `min_fps`, `max_fps`, `bit_depth`, `aspect_ratio`, `codec` — while
+  `nelux/py.typed` tells checkers the stub is authoritative. Every prefetch
+  example in `llms.txt` was a type error. Three docstrings were corrected too:
+  `min_fps`/`max_fps` are copies of `fps`, `aspect_ratio` is storage and not
+  display aspect, and `get_frame_count` costs a full demux pass on containers
+  without `nb_frames`. `tests/test_stub_surface.py` now diffs the stub against
+  the extension in both directions.
+
+- **Fixed: the wheel declared no dependencies** but imports numpy at import
+  time, so `pip install nelux` into a torch-only environment failed. numpy is
+  now a declared dependency and the release job no longer installs it by hand.
+
 ### **Version 0.17.0 (2026-08-09)**
 
 #### **FFmpeg is bundled in every wheel, and it is now our own build**

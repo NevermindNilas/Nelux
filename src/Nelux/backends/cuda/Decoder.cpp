@@ -968,6 +968,10 @@ std::optional<Frame> Decoder::acquireDecodedFrame(double* frame_timestamp,
 
     if (frameQueue.empty())
     {
+        // The producer is the base class's decodingLoop, so a mid-stream
+        // decode failure latches there and must surface here rather than
+        // reading as a clean end of stream.
+        throwIfDecodeFailed();
         return std::nullopt;
     }
 
@@ -1176,6 +1180,13 @@ bool Decoder::seek(double timestamp)
 
     avcodec_flush_buffers(codecCtx.get());
     NELUX_TRACE("CUDA DECODER: Seek successful, codec buffers flushed");
+
+    // A successful seek rebuilds the decoder's state from a keyframe, so a
+    // failure latched against the old position no longer applies. This is the
+    // only recovery point: clearQueue() must NOT clear it, or decode_batch
+    // would launder a poisoned reader back into a silent short read.
+    decodeError_.store(0, std::memory_order_relaxed);
+
 
     startDecodingThread();
     return true;

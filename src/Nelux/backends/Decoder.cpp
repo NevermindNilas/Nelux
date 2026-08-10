@@ -8,6 +8,29 @@
 
 using namespace nelux::error;
 
+namespace
+{
+// AVERROR_EOF is the only code that means "the file ended". Every other
+// failure leaves the stream unfinished, and none of the three read sites can
+// resume from one: each responds by flushing the decoder and draining, so a
+// code exempted here is not retried, it is reported as a complete video.
+//
+// That is why EAGAIN, AVERROR_EXIT and ETIMEDOUT are fatal too, despite
+// naming transient conditions. Nelux sets neither AVFMT_FLAG_NONBLOCK nor an
+// interrupt callback, so the first two cannot arrive; ETIMEDOUT can, from a
+// network source that stalled, and it means the frames after it were never
+// read. Raising is not a permanently poisoned reader either -- a successful
+// seek or reconfigure() clears the latch, so a caller who believes the stall
+// was transient can seek and carry on. Silently returning a short video is
+// the one outcome with no recovery, because nothing tells the caller it
+// happened.
+bool isFatalReadError(int err)
+{
+    return err != AVERROR_EOF;
+}
+} // namespace
+
+
 namespace nelux
 {
 // Convert workers idle on cv.wait when queue empty so over-spawning is cheap;
@@ -757,6 +780,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     {
         if (convertedQueue.empty())
         {
+            throwIfDecodeFailed();
             return false;
         }
 
@@ -794,6 +818,12 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     {
         if (frameQueue.empty())
         {
+            // This, not the preconvert branch above, is the branch that runs:
+            // preconvertEnabled is never set true anywhere in the tree. Every
+            // CPU frame_at()/reader[int] returns through here, so a latched
+            // decode failure has to be reported here or it is reported
+            // nowhere.
+            throwIfDecodeFailed();
             return false;
         }
 
@@ -858,7 +888,12 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
             const bool stop = stopDecoding.load(std::memory_order_relaxed);
             const int64_t in_flight = syncProduceSeq_ - syncConsumeSeq_;
             if ((producer_done || stop) && in_flight == 0)
+            {
+                // Everything the producer managed to convert has been handed
+                // over; only now is it honest to report why it stopped.
+                throwIfDecodeFailed();
                 return torch::Tensor();
+            }
             syncConvertOutCv_.wait_for(olk, std::chrono::milliseconds(50));
         }
     }
@@ -875,7 +910,10 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
     if (preconvertEnabled)
     {
         if (convertedQueue.empty())
+        {
+            throwIfDecodeFailed();
             return torch::Tensor();
+        }
 
         ConvertedFrame cf = std::move(convertedQueue.front());
         convertedQueue.pop();
@@ -914,7 +952,10 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
 
     // No-preconvert path: decoder hands raw AVFrame; convert here.
     if (frameQueue.empty())
+    {
+        throwIfDecodeFailed();
         return torch::Tensor();
+    }
 
     Frame frame = std::move(frameQueue.front());
     frameQueue.pop();
@@ -1123,7 +1164,14 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
     // decode_batch can no longer resume from where it left off.
     sharedStreamDirty_.store(true, std::memory_order_relaxed);
     if (syncDrained_)
+    {
+        // Before the short-circuit, not after: every raise site below sets
+        // syncDrained_ first, so checking here is what makes the failure
+        // sticky. Without it the second call after a failure reports a clean
+        // end of stream -- and prefetch=False is the default path.
+        throwIfDecodeFailed();
         return torch::Tensor();
+    }
 
     // Single-threaded fallback (worker count == 0): keep the original
     // tight-loop behavior. Useful for diagnostics.
@@ -1137,6 +1185,11 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 int rret = av_read_frame(formatCtx.get(), pkt.get());
                 if (rret < 0)
                 {
+                    // Only AVERROR_EOF means "the file ended". Anything else
+                    // is a damaged container, and reporting it as EOF returns
+                    // a truncated video that looks complete.
+                    if (isFatalReadError(rret))
+                        decodeError_.store(rret, std::memory_order_release);
                     syncEofReached_ = true;
                     break;
                 }
@@ -1151,8 +1204,12 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                     break;
                 if (sret < 0)
                 {
-                    syncDrained_ = true;
-                    return torch::Tensor();
+                    // A packet the decoder refuses is skipped, not fatal --
+                    // the same thing ffmpeg does, and the same thing the
+                    // async producer already did. Only receive_frame failing
+                    // means the stream itself is unrecoverable.
+                    NELUX_WARN("Error sending packet to decoder: {}",
+                               errorToString(sret));
                 }
                 break;
             }
@@ -1181,12 +1238,22 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             }
             if (ret == AVERROR_EOF)
             {
+                // A latched av_read_frame failure lands here: the decoder
+                // drains cleanly, but the container did not end, it broke.
                 syncDrained_ = true;
+                throwIfDecodeFailed();
                 return torch::Tensor();
             }
             if (ret != AVERROR(EAGAIN))
             {
+                // Not EOF: the stream broke. Reporting an undefined tensor
+                // here would present a truncated decode as a complete video.
                 syncDrained_ = true;
+                decodeError_.store(ret, std::memory_order_release);
+                throwIfDecodeFailed();
+                // Unreachable (the store above guarantees the throw), but
+                // falling out of a `while (true)` on a failing codec context
+                // is the spin this whole change exists to remove.
                 return torch::Tensor();
             }
         }
@@ -1237,7 +1304,27 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 continue;
             }
             syncDrained_ = true;
+            throwIfDecodeFailed();
             return torch::Tensor();
+        }
+
+        // A latched failure means the codec context is done. Do not call
+        // into it again -- the refill block below would return the same error
+        // every iteration with nothing to wait on, spinning on the convert
+        // workers' own mutex while holding VideoReader::lifecycleMu_
+        // exclusively with the GIL released. Drain what the workers already
+        // hold, in order, and let the branch above raise when it runs out.
+        if (decodeError_.load(std::memory_order_acquire) != 0)
+        {
+            std::unique_lock<std::mutex> lk(syncConvertOutMu_);
+            syncConvertOutCv_.wait(lk,
+                                   [&]
+                                   {
+                                       return syncConvertOutMap_.find(
+                                                  syncConsumeSeq_) !=
+                                              syncConvertOutMap_.end();
+                                   });
+            continue;
         }
 
         // 2) Refill in-flight buffer up to cap.
@@ -1262,6 +1349,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 if (in_flight == 0)
                 {
                     syncDrained_ = true;
+                    throwIfDecodeFailed();
                     return torch::Tensor();
                 }
                 std::unique_lock<std::mutex> lk(syncConvertOutMu_);
@@ -1276,8 +1364,16 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             }
             if (ret != AVERROR(EAGAIN))
             {
-                syncDrained_ = true;
-                return torch::Tensor();
+                // Not EOF: the stream broke. Latch the error and pretend the
+                // input ended so the frames already handed to the convert
+                // workers still come out in order; the drain branches above
+                // raise once the last of them has been delivered. Returning
+                // an undefined tensor here would report a truncated decode as
+                // a complete video.
+                decodeError_.store(ret, std::memory_order_release);
+                syncEofReached_ = true;
+                syncFlushSent_ = true;
+                continue;
             }
 
             // Need more packets.
@@ -1286,6 +1382,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 int rret = av_read_frame(formatCtx.get(), pkt.get());
                 if (rret < 0)
                 {
+                    if (isFatalReadError(rret))
+                        decodeError_.store(rret, std::memory_order_release);
                     syncEofReached_ = true;
                 }
                 else if (pkt->stream_index != videoStreamIndex)
@@ -1298,8 +1396,10 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                     av_packet_unref(pkt.get());
                     if (sret < 0 && sret != AVERROR(EAGAIN))
                     {
-                        syncDrained_ = true;
-                        return torch::Tensor();
+                        // Skip the packet; see the note on the single-worker
+                        // path above.
+                        NELUX_WARN("Error sending packet to decoder: {}",
+                                   errorToString(sret));
                     }
                 }
             }
@@ -1315,6 +1415,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 if (in_flight == 0)
                 {
                     syncDrained_ = true;
+                    throwIfDecodeFailed();
                     return torch::Tensor();
                 }
                 std::unique_lock<std::mutex> lk(syncConvertOutMu_);
@@ -1413,6 +1514,13 @@ bool Decoder::seek(double timestamp)
     // Flush codec buffers
     avcodec_flush_buffers(codecCtx.get());
     NELUX_TRACE("Seek successful, codec buffers flushed");
+
+    // A successful seek rebuilds the decoder's state from a keyframe, so a
+    // failure latched against the old position no longer applies. This is the
+    // only recovery point: clearQueue() must NOT clear it, or decode_batch
+    // would launder a poisoned reader back into a silent short read.
+    decodeError_.store(0, std::memory_order_relaxed);
+
 
     // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
     // the async producer here would put two threads on one context
@@ -1572,6 +1680,13 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     // Flush codec buffers to reset decoding from the keyframe
     avcodec_flush_buffers(codecCtx.get());
     NELUX_TRACE("Keyframe seek successful, codec buffers flushed");
+
+    // A successful seek rebuilds the decoder's state from a keyframe, so a
+    // failure latched against the old position no longer applies. This is the
+    // only recovery point: clearQueue() must NOT clear it, or decode_batch
+    // would launder a poisoned reader back into a silent short read.
+    decodeError_.store(0, std::memory_order_relaxed);
+
 
     // Sync mode owns formatCtx/codecCtx on the caller thread; spawning
     // the async producer here would put two threads on one context
@@ -1784,6 +1899,7 @@ void Decoder::reconfigure(const std::string& filePath)
     videoStreamIndex = -1;
     isFinished = false;
     seekRequested = false;
+    decodeError_.store(0, std::memory_order_relaxed);
     cachedFilePath_ = "";
 
     // Also reset batch decoder if it was initialized
@@ -1905,6 +2021,32 @@ void Decoder::clearQueue()
     syncProduceSeq_ = 0;
     syncConsumeSeq_ = 0;
     fanoutProducerDone_.store(false, std::memory_order_relaxed);
+}
+
+void Decoder::finishProducer(bool fanout, int err)
+{
+    if (err != 0)
+        decodeError_.store(err, std::memory_order_release);
+    if (fanout)
+    {
+        fanoutProducerDone_.store(true, std::memory_order_release);
+        syncConvertOutCv_.notify_all();
+    }
+    std::unique_lock<std::mutex> lock(queueMutex);
+    isFinished = true;
+    queueCond.notify_all();
+}
+
+void Decoder::throwIfDecodeFailed() const
+{
+    const int err = decodeError_.load(std::memory_order_acquire);
+    if (err == 0)
+        return;
+    throw error::CxException("Decoding failed part way through '" +
+                             cachedFilePath_ + "': " + errorToString(err) +
+                             ". The frames decoded before the failure were "
+                             "returned; the input is corrupt, truncated, or "
+                             "was cut short.");
 }
 
 void Decoder::resetTimestampState()
@@ -2084,20 +2226,23 @@ void Decoder::decodingLoop()
 
         if (ret == AVERROR_EOF)
         {
-            if (fanout)
-            {
-                fanoutProducerDone_.store(true, std::memory_order_release);
-                syncConvertOutCv_.notify_all();
-            }
-            std::unique_lock<std::mutex> lock(queueMutex);
-            isFinished = true;
-            queueCond.notify_all();
+            finishProducer(fanout, 0);
             break;
         }
 
         if (ret != AVERROR(EAGAIN))
         {
-            NELUX_WARN("Error receiving frame: {}", ret);
+            // Must signal exactly as EOF does. Leaving through a bare break
+            // used to strand every consumer: decodeNextFrameTensor waits on
+            // isFinished / fanoutProducerDone_, neither of which was set, and
+            // the producer is never respawned because a returned std::thread
+            // is still joinable. VideoReader holds lifecycleMu_ exclusively
+            // with the GIL released across that wait, so the hang took the
+            // whole interpreter with it -- close() blocked on the same lock
+            // and Ctrl-C could not be delivered. Reproducible with a corrupt
+            // VP9 stream ("Failed to read frame header") and prefetch=True.
+            NELUX_WARN("Error receiving frame: {}", errorToString(ret));
+            finishProducer(fanout, ret);
             break;
         }
 
@@ -2115,7 +2260,7 @@ void Decoder::decodingLoop()
             }
             else if (sendRet < 0)
             {
-                NELUX_WARN("Error sending pending packet: {}", sendRet);
+                NELUX_WARN("Error sending pending packet: {}", errorToString(sendRet));
                 packetPending = false;
                 av_packet_unref(pkt.get());
             }
@@ -2129,7 +2274,8 @@ void Decoder::decodingLoop()
         }
 
         // Read a new packet from file
-        if (av_read_frame(formatCtx.get(), pkt.get()) >= 0)
+        const int readRet = av_read_frame(formatCtx.get(), pkt.get());
+        if (readRet >= 0)
         {
             if (pkt->stream_index == videoStreamIndex)
             {
@@ -2144,7 +2290,7 @@ void Decoder::decodingLoop()
                 {
                     if (sendRet < 0)
                     {
-                        NELUX_WARN("Error sending packet to decoder: {}", sendRet);
+                        NELUX_WARN("Error sending packet to decoder: {}", errorToString(sendRet));
                     }
                     // Success or fatal error: consume packet
                     av_packet_unref(pkt.get());
@@ -2158,10 +2304,23 @@ void Decoder::decodingLoop()
         }
         else
         {
-            // EOF handling: flush decoder
+            // EOF handling: flush decoder. A read failure that is not
+            // AVERROR_EOF is a damaged container, not the end of the file --
+            // latch it so the consumer raises once the flush has drained
+            // instead of reporting a short video as complete.
+            if (isFatalReadError(readRet))
+                decodeError_.store(readRet, std::memory_order_release);
             avcodec_send_packet(codecCtx.get(), nullptr);
         }
     }
+
+    // Falling out of the loop means stopDecoding was set. stopDecodingThread()
+    // notifies and then joins, so a consumer cannot be left waiting here --
+    // but signalling anyway is what makes "every exit goes through
+    // finishProducer" true rather than an invariant upheld by a caller in
+    // another function. err=0, so a failure latched by the break paths above
+    // survives.
+    finishProducer(fanout, 0);
 }
 
 int64_t Decoder::get_frame_count()

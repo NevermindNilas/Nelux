@@ -436,7 +436,9 @@ jobs:
           . /tmp/cpuenv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install numpy  # nelux/batch.py imports numpy; the torch CPU index doesn't carry it
+          # numpy is NOT installed by hand: it is a declared dependency of the
+          # wheel, so pip must pull it in on its own here. If this job starts
+          # failing on "No module named 'numpy'", the metadata regressed.
           python -m pip install dist/*.whl
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__)"

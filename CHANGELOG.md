@@ -5,6 +5,149 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A mid-stream decode failure could hang the interpreter, permanently.**
+  `Decoder::decodingLoop` — the producer thread behind `prefetch=True` and
+  behind every NVDEC reader, which reuses the base class loop — left through a
+  bare `break` when `avcodec_receive_frame` returned anything that was neither
+  success, `AVERROR_EOF` nor `EAGAIN`. Unlike the EOF exit two lines above it,
+  that path set neither `isFinished` nor `fanoutProducerDone_`, so the consumer
+  waited on a condition variable nobody would notify again. The producer is
+  never respawned either: the restart guard tests `decodingThread.joinable()`,
+  and a `std::thread` whose function has returned is still joinable.
+
+  The blast radius was the whole process, not one stalled iterator.
+  `VideoReader::decodeFrame` holds `lifecycleMu_` exclusively with the GIL
+  released across that wait, so `close()` blocked on the same lock and Ctrl-C
+  could not be delivered. Reproduced with a corrupt VP9 stream and
+  `prefetch=True`: killed at a 30-second timeout, every time.
+
+  Every exit from the producer now goes through one `finishProducer()`
+  handshake.
+
+- **Three ways a broken file was reported as a complete one.** All three
+  returned an undefined tensor, which the reader turns into a clean
+  `StopIteration`:
+
+  - the synchronous path treated a hard `avcodec_receive_frame` failure as
+    end-of-stream;
+  - a refused packet (`avcodec_send_packet` failing) ended the synchronous
+    decode, while the async producer skipped it and carried on — a damaged
+    FFV1 clip returned **29 frames via the default path and 54 with
+    `prefetch=True`**, calling both a success;
+  - `av_read_frame` failing was indistinguishable from the file ending, on all
+    three read sites. A truncated MP4 — an interrupted download, the commonest
+    damage there is — decoded its readable prefix and reported success.
+
+  A decode that fails now raises `RuntimeError` naming the file and the FFmpeg
+  error, **after** delivering the frames that did decode. The failure is
+  sticky: it is cleared only by a successful seek (which flushes the codec) or
+  by `reconfigure()`, so a second read cannot report a clean end of stream, and
+  `decode_batch` cannot launder a poisoned reader by clearing the queue. A
+  refused packet is now skipped with a warning on every path, matching ffmpeg;
+  only a decoder that fails mid-frame is fatal.
+
+  One honest limitation: which of the two an input trips is libavcodec's
+  choice, not nelux's, and it can depend on `num_threads` — frame threading
+  surfaces some bitstream errors at `receive_frame` that a single-threaded
+  decode surfaces at `send_packet`. Damaged files may therefore raise at one
+  thread count and decode with holes at another.
+
+- `AVERROR_EOF` is the only `av_read_frame` result that means the file ended.
+  `AVERROR(EAGAIN)`, `AVERROR_EXIT` and `ETIMEDOUT` name transient conditions,
+  but none of the three read sites can resume from one — each flushes the
+  decoder and drains — so exempting them would not retry the read, it would
+  report an unfinished stream as a complete video. They raise like any other
+  read failure. Nelux sets neither `AVFMT_FLAG_NONBLOCK` nor an interrupt
+  callback, so the first two cannot arrive at all; `ETIMEDOUT` can, from a
+  network source that stalled, and it means the frames after it were never
+  read. Raising is recoverable — a successful seek or `reconfigure()` clears
+  the latch — while a silent short video is not, because nothing tells the
+  caller it happened.
+
+- FFmpeg error codes in log messages were printed as bare integers
+  (`Error receiving frame: -1094995529`). They go through `errorToString()`
+  now.
+
+- **Slice indexing now follows Python's container rules.** `_to_index_list`
+  resolved a slice with `indices.start or 0` / `indices.stop or frame_count`,
+  so a legitimate `0` or a negative bound was mistaken for "unset". Four
+  documented forms were silently wrong:
+
+  | Expression | Was | Now |
+  |---|---|---|
+  | `vr[:0]`, `vr[0:0]` | decoded the **entire file** (a [N,H,W,3] uint8 tensor — 186 GB on a 1080p feature) | empty |
+  | `vr[:-1]` | empty | every frame but the last |
+  | `vr[-10:]` | `N+10` rows: the last ten, then the whole video again | the last ten |
+  | `vr[::-1]` | empty | the video reversed |
+
+  None of them raised. The existing empty-slice test used `vr[5:5]`, whose
+  endpoints are both truthy, which is how the first row survived.
+
+  Bounds are resolved through `operator.index`, so ints, bools and numpy
+  integer scalars work and floats/strings raise `TypeError` — a bare float
+  subscript means *seconds* in this API (`vr[2.5]`), and reading `vr[2.5:5.0]`
+  as frame indices would be the wrong kind of helpful. Underflowing negative
+  bounds clamp the way a list clamps (`vr[-10**6:]` is the whole clip); a bound
+  past the *end* still raises `IndexError` rather than clamping, which is
+  nelux's long-standing contract and is covered by tests. `slice.indices()` is
+  deliberately not used: it clamps both directions and would turn
+  `vr[n:n+10]` into a silently empty batch.
+
+  Verified against CPython list semantics over 306,180 slices (frame counts
+  0–30 × bounds −25…25, ±1000, `None` × steps ±1…6, ±1000): zero silent
+  disagreements.
+
+- **`get_batch_range()` and the equivalent slice can no longer disagree.** It
+  built a raw `range()`, so negative or `None` arguments meant something
+  different from `vr[start:stop:step]` even though the docs call them the same
+  thing. It now delegates to the slice resolver.
+
+- **An empty batch matches a populated one.** `get_batch([])` short-circuited
+  in Python with a hardcoded `torch.empty(0, H, W, 3, dtype=uint8)`, so on a
+  10-bit source `torch.cat([vr.get_batch([]), vr.get_batch([0])])` raised
+  (uint8 vs uint16), and under `decode_accelerator="nvdec"` it raised again
+  (cpu vs cuda:0). Both C++ backends already build the empty batch to match,
+  and that is now the only path. `VideoReader::decodeBatch` skips its resize
+  and `color_format` capability gates for an empty request — decoding nothing
+  is decoding nothing whatever the reader is configured for, and refusing it
+  would make `vr[i:i]` raise on exactly the readers where an empty slice is
+  the safest thing to ask for.
+
+- **`VideoReader.shape` reports the real channel count.** It hardcoded 3, so a
+  `color_format="gray"` reader claimed `(N, H, W, 3)` while its frames were
+  `(H, W, 1)`.
+
+- **The type stub described an extension that does not exist.** `nelux/py.typed`
+  makes `_nelux.pyi` authoritative for mypy and pyright, and it was missing 14
+  bound members — `min_fps`, `max_fps`, `bit_depth`, `aspect_ratio`, `codec`,
+  `file_path`, `get_frame_count`, `decode_batch`, `reconfigure`, and the five
+  prefetch names. Every prefetch and `reconfigure` example in `llms.txt` was a
+  type error, and nelux's own `BatchMixin` did not type-check against its own
+  stub. Three surviving docstrings were also wrong: `min_fps`/`max_fps` are
+  unconditional copies of `fps` (no rate envelope is measured), `aspect_ratio`
+  is the storage ratio and not the DAR, and `get_frame_count` is not
+  metadata-only on containers without `nb_frames`.
+
+- **Wheels declared no runtime dependencies** while `import nelux` imports
+  numpy unconditionally via `nelux/batch.py`. `pip install nelux` into a
+  torch-only environment failed with `ModuleNotFoundError: numpy`; CI hid it by
+  installing numpy by hand. `dependencies = ["numpy"]` is now declared and the
+  manual CI install is gone, so the release job proves the metadata.
+
+### Added
+
+- **`VideoReader.channels`** — 3 for `color_format="rgb"`, 4 for `"rgba"`,
+  1 for `"gray"`. Previously the channel count was only discoverable by
+  decoding a frame and reading its shape.
+
+- **`tests/test_stub_surface.py`** — walks `_nelux.pyi` with `ast` and compares
+  it against `dir()` of the real extension in both directions, so neither a new
+  binding nor a removed one can drift away from the stub unnoticed.
+
 ## [0.17.0] - 2026-08-09
 
 ### Changed

@@ -1,6 +1,5 @@
 from types import TracebackType
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
-import os
 import torch
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +20,16 @@ class LogLevel(Enum):
     error = 4
     critical = 5
     off = 6
+
+# py::enum_::export_values() also publishes every level as a module attribute,
+# so nelux._nelux.info is the same object as LogLevel.info.
+trace: LogLevel
+debug: LogLevel
+info: LogLevel
+warn: LogLevel
+error: LogLevel
+critical: LogLevel
+off: LogLevel
 
 def set_log_level(level: LogLevel) -> None:
     """
@@ -124,8 +133,45 @@ class VideoReader:
         ...
 
     @property
+    def channels(self) -> int:
+        """Channels in a decoded frame: 3 for "rgb", 4 for "rgba", 1 for "gray"."""
+        ...
+
+    @property
     def fps(self) -> float:
-        """Frames per second."""
+        """Frames per second (avg_frame_rate)."""
+        ...
+
+    @property
+    def min_fps(self) -> float:
+        """Always equal to :attr:`fps` today — no per-frame rate envelope is
+        measured. For VFR use ``properties['is_vfr']`` / ``r_frame_rate``."""
+        ...
+
+    @property
+    def max_fps(self) -> float:
+        """Always equal to :attr:`fps` today — see :attr:`min_fps`."""
+        ...
+
+    @property
+    def bit_depth(self) -> int:
+        """Bits per component of the source pixel format."""
+        ...
+
+    @property
+    def aspect_ratio(self) -> float:
+        """Storage aspect ratio, width / height. NOT the display aspect ratio
+        on anamorphic sources — see ``properties['display_aspect_ratio']``."""
+        ...
+
+    @property
+    def codec(self) -> str:
+        """Short codec name of the video stream, e.g. "h264"."""
+        ...
+
+    @property
+    def file_path(self) -> str:
+        """Path to the currently loaded video file."""
         ...
 
     @property
@@ -364,6 +410,71 @@ class VideoReader:
 
         Returns:
             Union[torch.Tensor, numpy.ndarray]: The decoded video frame based on backend setting.
+        """
+        ...
+
+    def get_frame_count(self) -> int:
+        """
+        Total frame count, cached after the first call.
+
+        Read from container metadata (``nb_frames``) when it is present. For
+        containers that omit it — MKV/WebM and most VFR files — the first call
+        pays one demux-only pass over the whole file.
+        """
+        ...
+
+    def decode_batch(self, indices: Sequence[int]) -> torch.Tensor:
+        """
+        Decode the frames at ``indices`` as one ``[B, H, W, C]`` tensor.
+
+        Always a ``torch.Tensor``, including under ``backend="numpy"``. Indices
+        must already be non-negative and in bounds — ``VideoReader.get_batch``
+        is the checked wrapper. An empty list returns a ``[0, H, W, C]`` tensor
+        with the dtype and device a populated batch would have had, and is the
+        one request accepted on readers batch decoding otherwise rejects
+        (``resize=``, ``color_format="gray"``/``"rgba"``).
+        """
+        ...
+
+    def start_prefetch(
+        self, buffer_size: int = 16, start_immediately: bool = True
+    ) -> None:
+        """
+        Start background frame prefetching.
+
+        Args:
+            buffer_size (int, optional): Frames to buffer ahead. Default 16.
+            start_immediately (bool, optional): Start the decode thread now
+                (default) rather than on first frame access.
+        """
+        ...
+
+    def stop_prefetch(self) -> None:
+        """Stop background prefetching and clear the buffer."""
+        ...
+
+    @property
+    def prefetch_buffered(self) -> int:
+        """Frames currently sitting in the prefetch buffer."""
+        ...
+
+    @property
+    def is_prefetching(self) -> bool:
+        """True while the background prefetch thread is running."""
+        ...
+
+    @property
+    def prefetch_size(self) -> int:
+        """Maximum number of frames the prefetch buffer holds."""
+        ...
+
+    def reconfigure(self, file_path: str) -> None:
+        """
+        Point the reader at a new file, reusing the decoder instance.
+
+        Much cheaper than constructing a new VideoReader. Every property is
+        re-read from the new file, the output dtype follows its bit depth, and
+        iteration state resets to the start.
         """
         ...
 
