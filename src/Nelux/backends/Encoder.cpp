@@ -1,6 +1,7 @@
 ﻿#include "Encoder.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -853,17 +854,70 @@ void Encoder::validateCodecContainerCompatibility()
     const AVCodec* codec = avcodec_find_encoder_by_name(properties.codec.c_str());
     if (!codec)
     {
-        std::cerr << "[Encoder] Failed to open video codec: " << properties.codec
-                  << "\n";
-        PrintSupportedVideoEncoders(); // <---- print them now!
-        throw std::runtime_error("Invalid codec specified: " + properties.codec);
+        // Previously this dumped all ~120 encoder names to stderr and then
+        // threw a message that named none of them. Put the useful part in the
+        // exception -- the names that look like what was asked for -- and
+        // point at the API that lists the rest.
+        std::string wanted = properties.codec;
+        std::transform(wanted.begin(), wanted.end(), wanted.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // Not `near`: MSVC still reserves it from the 16-bit memory models.
+        std::vector<std::string> nearMisses;
+        void* it = nullptr;
+        while (const AVCodec* c = av_codec_iterate(&it))
+        {
+            if (!av_codec_is_encoder(c) || c->type != AVMEDIA_TYPE_VIDEO || !c->name)
+                continue;
+            const std::string name = c->name;
+            if (name.find(wanted) != std::string::npos ||
+                wanted.find(name) != std::string::npos)
+            {
+                nearMisses.push_back(name);
+                if (nearMisses.size() == 8)
+                    break;
+            }
+        }
+        std::string hint;
+        for (const auto& n : nearMisses)
+            hint += (hint.empty() ? std::string() : std::string(", ")) + n;
+
+        throw std::runtime_error(
+            "No video encoder named '" + properties.codec + "' in this FFmpeg build." +
+            (hint.empty() ? std::string()
+                          : " Did you mean one of: " + hint + "?") +
+            " Call nelux.get_available_encoders() for the full list.");
     }
 
-    if (!avformat_query_codec(formatCtx->oformat, codec->id, 0))
+    if (codecFitsContainer(formatCtx->oformat, codec->id))
+        return;
+
+    // Name the container, and name somewhere the codec would actually work --
+    // "is not supported by the inferred container format" left the caller to
+    // guess both which container was inferred and what to do about it.
+    //
+    // Strict predicate: an extension we suggest has to work. mpegts answers
+    // "cannot tell" for every codec, so the permissive form put .ts on every
+    // one of these lists -- including for gif, which MPEG-TS cannot carry.
+    std::string suggestions;
+    for (const char* ext : {".mkv", ".mov", ".mp4", ".avi", ".webm", ".ts", ".nut"})
     {
-        throw std::runtime_error("The codec " + properties.codec +
-                                 " is not supported by the inferred container format.");
+        const AVOutputFormat* alt = av_guess_format(nullptr, ext, nullptr);
+        if (alt && codecDefinitelyFitsContainer(alt, codec->id))
+        {
+            if (!suggestions.empty())
+                suggestions += ", ";
+            suggestions += ext;
+        }
     }
+
+    const char* container =
+        formatCtx->oformat && formatCtx->oformat->name ? formatCtx->oformat->name : "?";
+    throw std::runtime_error(
+        "The " + properties.codec + " encoder cannot be written into a '" +
+        container + "' container (inferred from the output file extension)." +
+        (suggestions.empty()
+             ? std::string(" No container this build can write accepts it.")
+             : " Try one of these extensions instead: " + suggestions + "."));
 }
 
 
@@ -1595,21 +1649,134 @@ void Encoder::close()
 /**
  * Infers the container format based on the file extension.
  */
+std::string inferContainerFormatForFile(const std::string& filename)
+{
+    // av_guess_format knows every muxer this build ships, so .ts, .flv, .m4v,
+    // .gif, .ogv and the rest reach their own muxer. The five-entry table this
+    // replaced fell through to "mp4" for everything else, which did not fail:
+    // it silently wrote an MP4 into a file named .ts.
+    if (const AVOutputFormat* ofmt =
+            av_guess_format(nullptr, filename.c_str(), nullptr))
+    {
+        // The name can be a comma-separated list of aliases ("matroska,webm");
+        // avformat_alloc_output_context2 wants a single one.
+        std::string name = ofmt->name ? ofmt->name : "";
+        const auto comma = name.find(',');
+        if (comma != std::string::npos)
+            name.erase(comma);
+        if (!name.empty())
+            return name;
+    }
+    return "mp4"; // extension means nothing to FFmpeg
+}
+
+namespace
+{
+
+/**
+ * Does the muxer carry a codec its own query_codec cannot answer for?
+ *
+ * Nine muxers return AVERROR_PATCHWELCOME rather than a verdict. For eight of
+ * them the container's own default is the honest answer. mpegts is the
+ * exception: H.264 and HEVC in MPEG-TS is what broadcast is made of, and
+ * `ffmpeg -c:v libx264 out.ts` writes one happily -- the muxer simply has no
+ * query_codec table to say so. Without this, .ts would silently drop to
+ * MPEG-2, which is a worse default than the one being fixed.
+ *
+ * Deliberately not extended to mxf, whose H.264 support is intra-only and
+ * would fail for the long-GOP output the default candidates produce.
+ */
+bool muxerKnownToCarry(const AVOutputFormat* ofmt, AVCodecID id)
+{
+    if (!ofmt || !ofmt->name)
+        return false;
+    if (std::strcmp(ofmt->name, "mpegts") != 0)
+        return false;
+    return id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC;
+}
+
+/** Shared by both fit predicates: does the muxer have a fourcc for the codec? */
+bool muxerHasTagFor(const AVOutputFormat* ofmt, AVCodecID id)
+{
+    unsigned int tag = 0;
+    return ofmt->codec_tag && av_codec_get_tag2(ofmt->codec_tag, id, &tag);
+}
+
+} // namespace
+
+bool codecFitsContainer(const AVOutputFormat* ofmt, int codecId)
+{
+    if (!ofmt)
+        return false;
+    const auto id = static_cast<AVCodecID>(codecId);
+    const int q = avformat_query_codec(ofmt, id, FF_COMPLIANCE_NORMAL);
+    if (q != 0)
+        return true; // 1 = yes; negative = "cannot tell", historically allowed
+
+    return muxerHasTagFor(ofmt, id);
+}
+
+bool codecDefinitelyFitsContainer(const AVOutputFormat* ofmt, int codecId)
+{
+    if (!ofmt)
+        return false;
+    const auto id = static_cast<AVCodecID>(codecId);
+    if (avformat_query_codec(ofmt, id, FF_COMPLIANCE_NORMAL) == 1)
+        return true;
+
+    // A fourcc is proof the muxer can write it even when query_codec says 0
+    // (matroska's V_MS/VFW/FOURCC path), so it counts under the strict reading
+    // too. "Cannot tell" does not, except for the muxers we know first-hand.
+    return muxerHasTagFor(ofmt, id) || muxerKnownToCarry(ofmt, id);
+}
+
+std::string defaultVideoCodecFor(const std::string& filename)
+{
+    const std::string container = inferContainerFormatForFile(filename);
+    const AVOutputFormat* ofmt = av_guess_format(container.c_str(), nullptr, nullptr);
+
+    // libx264 first on every platform: it is bundled in every wheel
+    // (tools/ffmpeg.lock), opens predictably, and is what ffmpeg itself picks
+    // for an .mp4. The platform encoders are fallbacks, not preferences --
+    // h264_mf in particular refuses to open at some frame rates.
+    static const char* const kCandidates[] = {
+        "libx264",
+        "libopenh264",
+#if defined(_WIN32)
+        "h264_mf",
+#elif defined(__APPLE__)
+        "h264_videotoolbox",
+#endif
+    };
+
+    for (const char* name : kCandidates)
+    {
+        const AVCodec* enc = avcodec_find_encoder_by_name(name);
+        // Strict: picking on the caller's behalf, "cannot tell" is not a yes.
+        // The permissive reading here is what made VideoEncoder("out.ogv")
+        // choose libx264 and fail at header write with no usable message.
+        if (enc && codecDefinitelyFitsContainer(ofmt, enc->id))
+            return name;
+    }
+
+    // Nothing H.264-shaped fits: honour what the container itself defaults to,
+    // so VideoEncoder("out.webm") and VideoEncoder("out.gif") work instead of
+    // failing the compatibility check with an H.264 name the user never chose.
+    if (ofmt && ofmt->video_codec != AV_CODEC_ID_NONE)
+    {
+        if (const AVCodec* enc = avcodec_find_encoder(ofmt->video_codec))
+            return enc->name;
+    }
+
+    // No default this build can honour: .ogg wants theora and .wav has no
+    // video codec at all. Returning libx264 here would only move the failure
+    // to header write; the caller raises with the container named instead.
+    return std::string();
+}
+
 std::string Encoder::inferContainerFormat(const std::string& filename) const
 {
-    std::string extension = fs::path(filename).extension().string();
-    if (extension == ".mp4")
-        return "mp4";
-    if (extension == ".mkv")
-        return "matroska";
-    if (extension == ".mov")
-        return "mov";
-    if (extension == ".webm")
-        return "webm";
-    if (extension == ".avi")
-        return "avi";
-
-    return "mp4"; // Default to MP4 if unknown
+    return inferContainerFormatForFile(filename);
 }
 
 } // namespace nelux

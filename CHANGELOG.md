@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The default encoder was Windows-only, so `VideoEncoder(path)` raised on
+  every Linux and macOS wheel.** `props.codec = codec.value_or("h264_mf")` was
+  an unconditional literal, and `h264_mf` is Media Foundation — Windows only,
+  as `tools/ffmpeg.lock` itself records. That took the whole convenience path
+  down with it, including `reader.create_encoder(out)`, which passes no codec.
+  The suite never caught it because every existing encoder test passes an
+  explicit `codec=`.
+
+  The default is now the first candidate that exists in this build *and* is
+  known to fit the container inferred from the filename: `libx264`, then
+  `libopenh264`, then the platform encoder (`h264_mf` / `h264_videotoolbox`).
+  If none fits, the container's own default video codec is used — so
+  `VideoEncoder("out.webm")` gets VP9 and `VideoEncoder("out.gif")` gets gif,
+  where both used to fail the compatibility check with an H.264 name the caller
+  never chose. libx264 leads on every platform because it is bundled in every
+  wheel and opens predictably; `h264_mf` refuses to open at some frame rates.
+
+  "Known to fit" is strict, and that distinction matters: nine muxers in this
+  build answer `AVERROR_PATCHWELCOME` — "cannot tell" — rather than yes or no.
+  Reading that as yes hands all nine libx264, which then fails at
+  `avformat_write_header` with a message naming a codec the caller never chose.
+  Where Nelux picks the codec itself, "cannot tell" counts as no, so `.ogv`
+  gets VP8, `.y4m` `wrapped_avframe`, `.swf` FLV1, `.mpg` MPEG-1 and
+  `.vob`/`.mxf` MPEG-2. `mpegts` is the one carve-out: it genuinely carries
+  H.264 and HEVC and has no `query_codec` table to say so, and a strict reading
+  alone would hand `.ts` back to its nominal default of MPEG-2.
+
+  A codec the *caller* names is still judged permissively — refusing a mux
+  FFmpeg might well perform is worse than letting it fail with the muxer's own
+  message — so this tightening cannot reject anything that worked before.
+
+  Two containers have no default this build can honour: `.ogg` wants theora,
+  which is not compiled in, and `.wav` has no video codec at all. Both now
+  raise at construction, naming the container and saying to pass `codec=`,
+  rather than failing later at header write.
+
+- **`out.ts` wrote an MP4.** Container inference was a five-entry extension
+  table (`.mp4`/`.mkv`/`.mov`/`.webm`/`.avi`) that returned `"mp4"` for
+  everything else. It did not fail — it produced an MP4 in a file named `.ts`.
+  Inference now goes through `av_guess_format`, so every muxer this build ships
+  is reachable: MPEG-TS, FLV, GIF, M4V, MXF, Ogg and the rest.
+
+  Consequence for the suite: 45 tests that used to skip with "not supported by
+  the inferred container format" now run. Twelve of them are `.ts` and `.flv`
+  at 119.88, 239.76 and 47.96 fps, where the container quantizes the rate on
+  its own clock (90 kHz and 1 kHz) before the encoder gets a say — MPEG-TS
+  reports `120/1` for 119.88 and both snap 47.96 to `48000/1001`. Those twelve
+  are now asserted against what the ffmpeg CLI writes for the same rate, codec
+  and container, rather than against the exact fraction. Parity rather than a
+  tolerance, because a tolerance wide enough to admit the container's `120/1`
+  (a 1.0e-3 error) is also wide enough to admit a genuine collapse of 23.976 to
+  24 (also 1.0e-3), which is the defect that suite exists to catch. 23.976,
+  29.97, 47.952 and 59.94 are exact on both containers and stay strict.
+
+- **Codecs matroska can write were refused.** The gate was
+  `avformat_query_codec() != 0`, and matroska's `query_codec` only consults its
+  native `V_` CodecID list — it answers 0 for everything it would carry through
+  `V_MS/VFW/FOURCC`. So `utvideo`, `ffvhuff` and `magicyuv` in an `.mkv` were
+  all rejected even though `ffmpeg -c:v utvideo out.mkv` writes a valid file
+  (fourccs `ULRA`, `FFVH`, `MAGY` are in the muxer's own tag table). The gate
+  now also accepts a codec the muxer has a fourcc for.
+
+  It is deliberately *not* relaxed further. `rv10` in `.avi` stays rejected:
+  ffmpeg accepts it, writes fourcc `0x00000000`, and the result demuxes back
+  as rawvideo — a file that silently is not what it claims is worse than an
+  error.
+
+### Changed
+
+- Encoder error messages name the problem and a way out. A codec the container
+  cannot hold now reports which container was inferred and which extensions
+  *do* accept that codec; an unknown codec name suggests the encoders whose
+  names resemble it instead of printing all ~120 to stderr and then throwing a
+  message that named none of them.
+
 - **A mid-stream decode failure could hang the interpreter, permanently.**
   `Decoder::decodingLoop` — the producer thread behind `prefetch=True` and
   behind every NVDEC reader, which reuses the base class loop — left through a

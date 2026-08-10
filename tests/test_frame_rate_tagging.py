@@ -17,6 +17,7 @@ through untouched.
 from __future__ import annotations
 
 import math
+
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -34,9 +35,12 @@ HERE = Path(__file__).resolve().parent
 
 
 def _find_tool(name: str) -> str | None:
-    bundled = HERE.parent / "external" / "ffmpeg" / "bin" / f"{name}.exe"
-    if bundled.exists():
-        return str(bundled)
+    # Both spellings: the ".exe" the bundled Windows build uses, and the bare
+    # name on the Linux and macOS wheels this module also has to run on.
+    for candidate in (name, f"{name}.exe"):
+        bundled = HERE.parent / "external" / "ffmpeg" / "bin" / candidate
+        if bundled.exists():
+            return str(bundled)
     return shutil.which(name)
 
 
@@ -275,7 +279,35 @@ def _rational(text: str) -> Fraction:
     return Fraction(int(num), int(den or 1))
 
 
-def _assert_rate(path: Path, expected: Fraction, label: str) -> None:
+def _ffmpeg_reference_rates(
+    suffix: str, expected: Fraction, codec: str, tmp: Path
+) -> set[Fraction] | None:
+    """What the ffmpeg CLI itself writes for this rate, codec and container.
+
+    Used only where a container quantizes the rate on its own (see
+    ``_assert_rate``). Returns None when no ffmpeg binary is available.
+    """
+    if FFMPEG is None:
+        return None
+    ref = tmp / f"ffmpeg_reference{suffix}"
+    subprocess.run(
+        [FFMPEG, "-y", "-v", "error", "-f", "lavfi",
+         "-i", f"testsrc2=size=320x240:rate={expected.numerator}/{expected.denominator}",
+         "-frames:v", str(FRAME_COUNT), "-c:v", codec, str(ref)],
+        check=True, capture_output=True, timeout=120,
+    )
+    stream = _probe(ref)["streams"][0]
+    out = set()
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        text = stream.get(key)
+        if text and text not in ("0/0", "N/A") and _rational(text) != 0:
+            out.add(_rational(text))
+    return out
+
+
+def _assert_rate(
+    path: Path, expected: Fraction, label: str, codec: str = "libx264"
+) -> None:
     """The file must carry `expected`, and must not carry it rounded.
 
     Two assertions, because a couple of (codec, container) pairs legitimately
@@ -299,6 +331,15 @@ def _assert_rate(path: Path, expected: Fraction, label: str) -> None:
         60000/1001 and below report the fraction in both fields, so this is
         FFmpeg's own behaviour and it only appears above the NTSC rates the
         format was built for.
+      * MPEG-TS and FLV at 119.88, 239.76 and 47.96 -- both carry timing on a
+        fixed, coarse clock (90 kHz and 1 kHz) and quantize those three rates
+        before an encoder gets a say: 90000/119.88 is 750.75 ticks. TS reports
+        120/1 in both fields, FLV reports 120/1 and 959/8, and 47.96 snaps to
+        48000/1001 in both. The ffmpeg CLI writing the same rate into the same
+        container reports the identical values, and the same rates into .mp4
+        keep the exact fraction, so it is the container and not the encoder.
+        23.976, 29.97, 47.952 and 59.94 are exact on both containers and are
+        held to the strict assertion like everything else.
 
     So: at least one reported rate must be `expected`, and no reported rate may
     be `expected` rounded to a whole number. The second half is what the
@@ -336,7 +377,33 @@ def _assert_rate(path: Path, expected: Fraction, label: str) -> None:
     want = float(expected)
     shown = ", ".join(f"{k}={v}" for k, v in reported.items())
 
-    assert any(math.isclose(float(v), want, rel_tol=1e-4) for v in reported.values()), (
+    exact = any(math.isclose(float(v), want, rel_tol=1e-4) for v in reported.values())
+    collapsed = expected.denominator != 1 and any(
+        math.isclose(float(v), round(want), rel_tol=1e-9) for v in reported.values()
+    )
+
+    # MPEG-TS and FLV quantize three of these rates themselves (see the
+    # docstring). The exemption is deliberately NOT a tolerance: a tolerance
+    # wide enough to admit the 120/1 that TS reports for 119.88 is a 1.0e-3
+    # relative error, and collapsing 23.976 to 24 is *also* 1.0e-3 -- so any
+    # tolerance that lets the container off the hook also lets through the one
+    # defect this module exists to catch. Parity is the stronger claim: nelux
+    # must report exactly what the ffmpeg CLI reports for the same rate, codec
+    # and container. It is consulted only where the assertions below do not
+    # already hold, which is 12 of the 366 cases.
+    if path.suffix.lower() in (".ts", ".flv") and (not exact or collapsed):
+        reference = _ffmpeg_reference_rates(path.suffix, expected, codec, path.parent)
+        if reference is None:
+            pytest.skip("no ffmpeg CLI to take the container-quantisation reference from")
+        assert set(reported.values()) == reference, (
+            f"{label}: {path.name} carries {shown}, but the ffmpeg CLI writing "
+            f"{expected} into the same container with the same codec reports "
+            f"{', '.join(str(r) for r in sorted(reference))}. This container "
+            f"quantises the rate; nelux has to quantise it the same way."
+        )
+        return
+
+    assert exact, (
         f"{label}: {path.name} carries {shown}, none of which is {expected} "
         f"({want:.6f} fps). Nearest integer is {round(want)}"
         + (" -- this is the rounding bug"
@@ -389,7 +456,7 @@ def test_ntsc_film_rate_is_not_rounded(case: Case, tmp_path: Path):
     fps, expected = RATES_BY_LABEL["ntsc_film"]
     out = tmp_path / f"out.{case.container}"
     _open_or_skip(case, fps, out)
-    _assert_rate(out, expected, f"{case.id}@{fps}")
+    _assert_rate(out, expected, f"{case.id}@{fps}", case.codec)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
@@ -401,7 +468,7 @@ def test_every_rate_survives_every_encoder(case: Case, label: str, tmp_path: Pat
 
     out = tmp_path / f"out.{case.container}"
     _open_or_skip(case, fps, out)
-    _assert_rate(out, expected, f"{case.id}@{fps}")
+    _assert_rate(out, expected, f"{case.id}@{fps}", case.codec)
 
 
 @pytest.mark.parametrize("label,fps,expected", RATES)

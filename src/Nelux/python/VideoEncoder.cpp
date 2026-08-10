@@ -107,7 +107,32 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
 {
     // Populate video encoding settings
     nelux::Encoder::EncodingProperties props;
-    props.codec = codec.value_or("h264_mf");
+    // Not a literal: the old unconditional "h264_mf" is a Windows-only
+    // encoder, so every default-codec construction raised on the Linux and
+    // macOS wheels. defaultVideoCodecFor() also respects the container, so
+    // VideoEncoder("out.webm") picks something webm can actually hold.
+    if (codec.has_value())
+    {
+        props.codec = *codec;
+    }
+    else
+    {
+        props.codec = nelux::defaultVideoCodecFor(filename);
+        if (props.codec.empty())
+        {
+            // .ogg defaults to theora and .wav has no video codec at all;
+            // neither is encodable here. Say so now, with the container named,
+            // rather than letting avformat_write_header fail on a codec the
+            // caller never chose and cannot see.
+            throw std::runtime_error(
+                "No default video encoder for a '" +
+                nelux::inferContainerFormatForFile(filename) +
+                "' container in this build (inferred from '" + filename +
+                "'). Pass codec= explicitly, or use an extension whose default "
+                "codec is available -- call nelux.get_available_encoders() for "
+                "the list.");
+        }
+    }
     props.width = width.value_or(1920);
     props.height = height.value_or(1080);
     props.bitRate = bitRate.value_or(4000000); // 4 Mbps default
