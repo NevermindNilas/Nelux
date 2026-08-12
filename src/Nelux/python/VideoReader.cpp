@@ -1,5 +1,6 @@
 // Python/VideoReader.cpp
 #include "python/VideoReader.hpp"
+#include <cpu/ResizeFilter.hpp>
 #include <algorithm> // For std::transform
 #include <cstring> // For std::memcpy
 #include <iostream>
@@ -26,30 +27,9 @@ namespace py = pybind11;
 
 namespace
 {
-// Map an ffmpeg swscale scaler name to its SWS_* flag. The accepted names
-// mirror ffmpeg's own -sws_flags scaler options so callers can reuse the exact
-// vocabulary they already know. Throws std::invalid_argument on an unknown name.
-int swsFlagFromResizeFilter(const std::string& name)
-{
-    std::string n = name;
-    std::transform(n.begin(), n.end(), n.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (n.empty() || n == "bilinear")                      return SWS_BILINEAR;
-    if (n == "fast_bilinear" || n == "fastbilinear")       return SWS_FAST_BILINEAR;
-    if (n == "bicubic")                                    return SWS_BICUBIC;
-    if (n == "experimental" || n == "x")                   return SWS_X;
-    if (n == "neighbor" || n == "point" || n == "nearest") return SWS_POINT;
-    if (n == "area")                                       return SWS_AREA;
-    if (n == "bicublin")                                   return SWS_BICUBLIN;
-    if (n == "gauss" || n == "gaussian")                   return SWS_GAUSS;
-    if (n == "sinc")                                       return SWS_SINC;
-    if (n == "lanczos")                                    return SWS_LANCZOS;
-    if (n == "spline")                                     return SWS_SPLINE;
-    throw std::invalid_argument(
-        "Unknown resize_filter: '" + name +
-        "'. Valid options: fast_bilinear, bilinear, bicubic, experimental, "
-        "neighbor, area, bicublin, gauss, sinc, lanczos, spline.");
-}
+// The scaler-name -> SWS_* flag mapping lives in <cpu/ResizeFilter.hpp> so the
+// encoder-side resize accepts the same vocabulary.
+using nelux::conversion::cpu::swsFlagFromResizeFilter;
 } // namespace
 
 double neluxParseTimecode(const std::string& timecode)

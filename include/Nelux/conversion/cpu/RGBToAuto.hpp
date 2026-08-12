@@ -29,15 +29,24 @@ namespace cpu
 class RGBToAutoConverter
 {
   public:
+    // srcWidth/srcHeight (0 = same as destination) let one sws_scale pass fold
+    // a spatial resize into the pixel-format conversion it already does; there
+    // is no separate scaling stage. swsFlags picks the scaling kernel and only
+    // matters when the sizes differ (SWS_BILINEAR is ffmpeg's default).
     RGBToAutoConverter(int dstWidth, int dstHeight, AVPixelFormat dstPixFmt,
                        AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED,
-                       AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED)
-        : width(dstWidth), height(dstHeight), dst_fmt(dstPixFmt),
+                       AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED,
+                       int srcWidth = 0, int srcHeight = 0,
+                       int swsFlags = SWS_BILINEAR)
+        : width(dstWidth), height(dstHeight),
+          src_width(srcWidth > 0 ? srcWidth : dstWidth),
+          src_height(srcHeight > 0 ? srcHeight : dstHeight),
+          sws_flags(swsFlags), dst_fmt(dstPixFmt),
           dst_colorspace(colorspace), dst_color_range(colorRange)
     {
-        NELUX_DEBUG("Initializing RGBToAutoConverter ({}x{}, cs={}, range={})", width,
-                    height, static_cast<int>(colorspace),
-                    static_cast<int>(colorRange));
+        NELUX_DEBUG("Initializing RGBToAutoConverter ({}x{} -> {}x{}, cs={}, range={})",
+                    src_width, src_height, width, height,
+                    static_cast<int>(colorspace), static_cast<int>(colorRange));
     }
 
     ~RGBToAutoConverter()
@@ -91,9 +100,9 @@ class RGBToAutoConverter
             // previous SWS_ACCURATE_RND combo was slower without quality
             // benefit. See v0.11.0 decode-side change for the same reasoning
             // (tests/output/pixfmt_matrix/REPORT.md).
-            swsContext =
-                sws_getContext(width, height, src_fmt, width, height, dst_fmt,
-                               SWS_BILINEAR, nullptr, nullptr, nullptr);
+            swsContext = sws_getContext(src_width, src_height, src_fmt, width,
+                                        height, dst_fmt, sws_flags, nullptr,
+                                        nullptr, nullptr);
 
             if (!swsContext)
                 throw std::runtime_error(
@@ -135,18 +144,41 @@ class RGBToAutoConverter
             default:                     dstCsId = SWS_CS_ITU601;    break;
             }
 
-            const int srcRange = 1; // RGB input is always full range
-            const int* srcMatrix = sws_getCoefficients(SWS_CS_ITU709); // unused for RGB src
-            const int* dstMatrix = sws_getCoefficients(dstCsId);
-            sws_setColorspaceDetails(swsContext, srcMatrix, srcRange, dstMatrix,
-                                     dstRange, 0, 1 << 16, 1 << 16);
+            // The colorspace details are only OURS to set when the destination
+            // actually has a YUV matrix to apply. Two cases must leave them
+            // alone, both measured against ffmpeg's own scale filter:
+            //  * gray SOURCE (the encoder's resized verbatim-gray path):
+            //    gray->gray is a pure resample, and touching the details
+            //    re-inits swscale's luma range converters — a GRAY16 constant
+            //    came out multiplied by 257/256 (30000 -> 30116) where ffmpeg
+            //    is exact.
+            //  * RGB DESTINATION (rgb24 codecs like qtrle/rawvideo): swscale
+            //    scales RGB->RGB through an internal YUV round trip, and our
+            //    709-source/601-destination pair skews that trip (MAD 2.8,
+            //    max 22 vs vf_scale on noise). vf_scale passes consistent
+            //    matrices; with no matrix of ours to pick, so must we — the
+            //    context's own defaults are consistent. Unreachable before
+            //    encoder-side resize existed: same-size RGB->RGB is swscale's
+            //    unscaled memcpy special case, which never touches a matrix.
+            const AVPixFmtDescriptor* srcDesc = av_pix_fmt_desc_get(src_fmt);
+            const AVPixFmtDescriptor* dstDesc = av_pix_fmt_desc_get(dst_fmt);
+            const bool graySrc = srcDesc && srcDesc->nb_components == 1;
+            const bool rgbDst = dstDesc && (dstDesc->flags & AV_PIX_FMT_FLAG_RGB);
+            if (!graySrc && !rgbDst)
+            {
+                const int srcRange = 1; // RGB input is always full range
+                const int* srcMatrix = sws_getCoefficients(SWS_CS_ITU709); // unused for RGB src
+                const int* dstMatrix = sws_getCoefficients(dstCsId);
+                sws_setColorspaceDetails(swsContext, srcMatrix, srcRange, dstMatrix,
+                                         dstRange, 0, 1 << 16, 1 << 16);
+            }
         }
 
         // Prepare source data/stride. Packed, so one plane; the row stride comes
         // from the format (RGB24 = 3 bytes/pixel, RGB48LE = 6).
         const uint8_t* srcData[4] = {static_cast<const uint8_t*>(buffer), nullptr,
                                      nullptr, nullptr};
-        const int srcStride = av_image_get_linesize(src_fmt, width, 0);
+        const int srcStride = av_image_get_linesize(src_fmt, src_width, 0);
         if (srcStride <= 0)
             throw std::runtime_error("RGBToAutoConverter: unsupported source format");
         int srcLineSize[4] = {srcStride, 0, 0, 0};
@@ -176,8 +208,8 @@ class RGBToAutoConverter
                 std::cerr << "!! WARNING: dstData[" << i << "] is NULL !!\n";
         }
 
-        int result = sws_scale(swsContext, srcData, srcLineSize, 0, height, dstData,
-                               dstLineSize);
+        int result = sws_scale(swsContext, srcData, srcLineSize, 0, src_height,
+                               dstData, dstLineSize);
         if (result <= 0)
         {
             throw std::runtime_error("sws_scale failed in RGBToAutoConverter");
@@ -189,6 +221,9 @@ class RGBToAutoConverter
     SwsContext* swsContext = nullptr;
     int width;
     int height;
+    int src_width;
+    int src_height;
+    int sws_flags;
     AVPixelFormat src_fmt = AV_PIX_FMT_RGB24;  // layout the cached context was built for
     AVPixelFormat dst_fmt;
     AVColorSpace dst_colorspace;

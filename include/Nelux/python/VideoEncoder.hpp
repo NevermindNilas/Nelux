@@ -35,6 +35,12 @@ class VideoEncoder
     // can pass exact ffmpeg-cli preset names like "medium" or "p4").
     // `extraOptions` are arbitrary AVOption key/value pairs forwarded to
     // avcodec_open2 — applied AFTER built-in options so they override.
+    // `resize` opts the encoder into scaling input frames to width x height:
+    // encodeFrame then accepts any [H,W,C]/[H,W] input size (locked by the
+    // first frame) and the spatial scale folds into the swscale pass the
+    // convert pipeline already runs — there is no separate resize stage.
+    // `resizeFilter` picks the scaling kernel (same names as the reader's
+    // resize_filter / ffmpeg's -sws_flags).
     VideoEncoder(const std::string& filename,
                  std::optional<std::string> codec = std::nullopt,
                  std::optional<int> width = std::nullopt,
@@ -47,7 +53,9 @@ class VideoEncoder
                  std::optional<int> cq = std::nullopt,
                  std::optional<std::string> pixelFormat = std::nullopt,
                  std::optional<std::string> presetStr = std::nullopt,
-                 std::map<std::string, std::string> extraOptions = {});
+                 std::map<std::string, std::string> extraOptions = {},
+                 bool resize = false,
+                 const std::string& resizeFilter = "bilinear");
 
     ~VideoEncoder();
 
@@ -90,6 +98,19 @@ class VideoEncoder
     std::unique_ptr<nelux::Encoder> encoder;
     int width, height;
     AVPixelFormat outputPixelFormat;  // Actual pixel format used
+
+    // --- Encoder-side resize (opt-in) ----------------------------------------
+    // When resizeEnabled_, encodeFrame accepts input of any spatial size and
+    // the convert pipeline's sws pass scales it to width x height. The source
+    // size is read from the first frame's shape and locked (srcWidth_ == 0
+    // means "not locked yet"): every cached SwsContext and staging buffer
+    // downstream is built for exactly one source size, so a later frame with a
+    // different size is an error, not a silent re-init. Guarded by
+    // lifecycleMu_ like the rest of the pipeline state.
+    bool resizeEnabled_ = false;
+    int resizeFlags_ = SWS_BILINEAR;  // scaling kernel (shared SWS_* mapping)
+    int srcWidth_ = 0;
+    int srcHeight_ = 0;
     
 #ifdef NELUX_ENABLE_CUDA
     // GPU converter for zero-copy encoding when tensor is on CUDA
@@ -137,7 +158,11 @@ class VideoEncoder
     // codec in-line. Used for gray-output pixfmts so single-channel data (depth
     // maps) round-trips exactly. RGB input to a gray-output encoder is converted
     // to luma via grayRgbConverter_.
-    void encodeGrayVerbatim(torch::Tensor frame);
+    // inW/inH are the input frame's dimensions (== width/height unless resize
+    // is enabled); grayInput says whether the caller passed a single-channel
+    // frame (decided from the shape by encodeFrameLocked, which knows the
+    // resize mode).
+    void encodeGrayVerbatim(torch::Tensor frame, int inW, int inH, bool grayInput);
     std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter> grayRgbConverter_;
 #ifdef NELUX_ENABLE_CUDA
     // GPU: wait input-ready, RGB->NV12 on stream, copy into CUDA AVFrame, send.

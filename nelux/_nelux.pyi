@@ -494,6 +494,11 @@ class VideoEncoder:
         cq: Optional[int] = None,
         pixel_format: Optional[str] = None,
         options: Optional[Dict[str, str]] = None,
+        resize: bool = False,
+        resize_filter: Literal[
+            "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
+            "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
+        ] = "bilinear",
     ) -> None:
         """
         Create a VideoEncoder; pass None for defaults.
@@ -501,6 +506,18 @@ class VideoEncoder:
         preset accepts an int (mapped per codec) or a str forwarded straight to
         ffmpeg (e.g. "veryfast", "p4", "medium"). options is a dict of extra
         AVOption key/value pairs applied after the built-in options.
+
+        resize=True lets ``encode_frame`` accept input frames of any spatial
+        size and scales them to ``width`` x ``height`` inside the libswscale
+        pass the encoder already runs (one fused scale+convert, no separate
+        resize stage). The input size is read from the first frame's shape and
+        locked for the encode; a later frame with a different size raises, and
+        input must be an explicit HWC layout ([H,W,3], [H,W,4], [H,W,1] or
+        [H,W]) rather than a flat 1-D buffer. ``resize_filter`` picks the
+        scaling kernel (same names as :class:`VideoReader`'s ``resize_filter``
+        / ffmpeg's ``-sws_flags``); it only takes effect when the sizes differ.
+        A CUDA tensor whose size differs from the output takes the CPU staging
+        path — the fused NVENC GPU kernel converts but does not scale.
 
         fps is tagged as an exact rational, never rounded to an integer. NTSC
         abbreviations snap to their true fraction (23.976 -> 24000/1001, 29.97

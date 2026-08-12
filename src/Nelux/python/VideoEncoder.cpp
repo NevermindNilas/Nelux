@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <cpu/RGBToAuto.hpp>
+#include <cpu/ResizeFilter.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <CudaStream.hpp>  // nelux::currentCudaStream (no eager c10_cuda link)
@@ -74,8 +75,14 @@ VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<int> cq,
                            std::optional<std::string> pixelFormat,
                            std::optional<std::string> presetStr,
-                           std::map<std::string, std::string> extraOptions)
+                           std::map<std::string, std::string> extraOptions,
+                           bool resize, const std::string& resizeFilter)
 {
+    // Parse the filter name even when resize is off, so a typo raises at
+    // construction rather than being silently carried until (never) used.
+    resizeFlags_ = nelux::conversion::cpu::swsFlagFromResizeFilter(resizeFilter);
+    resizeEnabled_ = resize;
+
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
                                               fps, preset, cq, pixelFormat,
                                               presetStr, std::move(extraOptions));
@@ -236,35 +243,37 @@ void VideoEncoder::addPassthrough(const std::string& source, bool audio,
 
 void VideoEncoder::encodeFrame(torch::Tensor frame)
 {
-    // Validate input size up front, while the GIL is still held so this raises
-    // as a clean Python exception. The convert pipeline consumes exactly
-    // width*height*3 RGB bytes; accept either a 3-channel HWC RGB frame or a
-    // single-channel grayscale frame (H*W, shape H×W or H×W×1). A grayscale
-    // frame is replicated to RGB below so the rest of the pipeline is unchanged
-    // (R==G==B => the encoder sees neutral chroma / exact luma).
-    const int64_t rgbElems = static_cast<int64_t>(width) * height * 3;
-    const int64_t rgbaElems = static_cast<int64_t>(width) * height * 4;
-    const int64_t grayElems = static_cast<int64_t>(width) * height;
-    const bool grayInput = (frame.numel() == grayElems);
-    const bool rgbaInput = (frame.numel() == rgbaElems);
-    if (frame.numel() != rgbElems && !grayInput && !rgbaInput)
-        throw std::invalid_argument(
-            "encode_frame: tensor has " + std::to_string(frame.numel()) +
-            " elements, expected " + std::to_string(rgbElems) + " (" +
-            std::to_string(height) + "x" + std::to_string(width) +
-            "x3 HWC RGB), " + std::to_string(rgbaElems) + " (" +
-            std::to_string(height) + "x" + std::to_string(width) +
-            "x4 HWC RGBA) or " + std::to_string(grayElems) + " (" +
-            std::to_string(height) + "x" + std::to_string(width) +
-            " grayscale)");
-
-    // The element count alone does not pin down the layout: a CHW [3,H,W] frame,
-    // a transposed [W,H], or a mismatched-but-equal-area shape would pass the
-    // count check and then be memcpy'd as HWC, producing scrambled output.
-    // Require the documented HWC layout — [H,W,3], [H,W,1], or [H,W] — while
-    // still accepting a flat 1-D buffer (count already validated) for callers
-    // that pass raw contiguous bytes.
+    // Validate input shape up front, while the GIL is still held so this raises
+    // as a clean Python exception.
+    if (!resizeEnabled_)
     {
+        // Fixed-size mode: the convert pipeline consumes exactly
+        // width*height*3 RGB bytes; accept either a 3-channel HWC RGB frame or
+        // a single-channel grayscale frame (H*W, shape H×W or H×W×1). A
+        // grayscale frame is replicated to RGB below so the rest of the
+        // pipeline is unchanged (R==G==B => neutral chroma / exact luma).
+        const int64_t rgbElems = static_cast<int64_t>(width) * height * 3;
+        const int64_t rgbaElems = static_cast<int64_t>(width) * height * 4;
+        const int64_t grayElems = static_cast<int64_t>(width) * height;
+        const bool grayInput = (frame.numel() == grayElems);
+        const bool rgbaInput = (frame.numel() == rgbaElems);
+        if (frame.numel() != rgbElems && !grayInput && !rgbaInput)
+            throw std::invalid_argument(
+                "encode_frame: tensor has " + std::to_string(frame.numel()) +
+                " elements, expected " + std::to_string(rgbElems) + " (" +
+                std::to_string(height) + "x" + std::to_string(width) +
+                "x3 HWC RGB), " + std::to_string(rgbaElems) + " (" +
+                std::to_string(height) + "x" + std::to_string(width) +
+                "x4 HWC RGBA) or " + std::to_string(grayElems) + " (" +
+                std::to_string(height) + "x" + std::to_string(width) +
+                " grayscale)");
+
+        // The element count alone does not pin down the layout: a CHW [3,H,W]
+        // frame, a transposed [W,H], or a mismatched-but-equal-area shape would
+        // pass the count check and then be memcpy'd as HWC, producing scrambled
+        // output. Require the documented HWC layout — [H,W,3], [H,W,1], or
+        // [H,W] — while still accepting a flat 1-D buffer (count already
+        // validated) for callers that pass raw contiguous bytes.
         const int64_t d = frame.dim();
         bool shapeOk = false;
         if (d == 1)
@@ -287,6 +296,34 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
                 std::to_string(height) + "x" + std::to_string(width) + "x1], or [" +
                 std::to_string(height) + "x" + std::to_string(width) +
                 "] (grayscale); got shape [" + got + "]");
+        }
+    }
+    else
+    {
+        // Resize mode: the input size is read from the frame itself, so the
+        // layout must be explicit — [H,W,3], [H,W,4], [H,W,1] or [H,W]. A flat
+        // 1-D buffer carries no shape to read the source size from, so it is
+        // rejected here rather than guessed at. (Whether this frame's size
+        // matches the one locked by the first frame is checked under the
+        // lifecycle lock, where the lock is written.)
+        const int64_t d = frame.dim();
+        bool shapeOk = false;
+        if (d == 2)
+            shapeOk = (frame.size(0) > 0 && frame.size(1) > 0);
+        else if (d == 3)
+            shapeOk = (frame.size(0) > 0 && frame.size(1) > 0 &&
+                       (frame.size(2) == 3 || frame.size(2) == 4 ||
+                        frame.size(2) == 1));
+        if (!shapeOk)
+        {
+            std::string got;
+            for (int64_t i = 0; i < d; ++i)
+                got += (i ? "x" : "") + std::to_string(frame.size(i));
+            throw std::invalid_argument(
+                "encode_frame: with resize=True the input must be an explicit "
+                "HWC layout — [H,W,3] (RGB), [H,W,4] (RGBA), [H,W,1] or [H,W] "
+                "(grayscale) — because the source size is read from the shape; "
+                "got shape [" + got + "]");
         }
     }
 
@@ -323,8 +360,37 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     if (!encoder)
         throw std::runtime_error("Encoder is not initialized");
 
-    const int64_t grayElems = static_cast<int64_t>(width) * height;
-    const bool grayInput = (frame.numel() == grayElems);
+    // Resolve the input dimensions. Without resize the input must match the
+    // output exactly (validated in encodeFrame); with resize the frame's own
+    // shape is the source size, locked by the first frame — every cached
+    // SwsContext and staging buffer downstream is built for one source size,
+    // so a later frame with a different size is an error, not a re-init.
+    int inW = width, inH = height;
+    if (resizeEnabled_)
+    {
+        inH = static_cast<int>(frame.size(0));
+        inW = static_cast<int>(frame.size(1));
+        if (srcWidth_ == 0)
+        {
+            srcWidth_ = inW;
+            srcHeight_ = inH;
+        }
+        else if (inW != srcWidth_ || inH != srcHeight_)
+            throw std::invalid_argument(
+                "encode_frame: resize input size was locked to " +
+                std::to_string(srcHeight_) + "x" + std::to_string(srcWidth_) +
+                " by the first frame; got " + std::to_string(inH) + "x" +
+                std::to_string(inW) +
+                ". All frames of one encode must share one input size.");
+    }
+
+    const int64_t grayElems = static_cast<int64_t>(inW) * inH;
+    // With resize on, the shape is explicit (1-D was rejected in encodeFrame),
+    // so channel count comes from the shape; without it the element count
+    // against the fixed dimensions is the historical, still-unambiguous test.
+    const bool grayInput = resizeEnabled_
+                               ? (frame.dim() == 2 || frame.size(2) == 1)
+                               : (frame.numel() == grayElems);
 
     // Verbatim grayscale data path: when the output pixel format is a plain
     // single-plane gray format the codec actually accepts, fill it directly
@@ -333,7 +399,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // throughput-critical path — so it never mixes with the async submit thread.
     if (isGrayVerbatimPixfmt(outputPixelFormat))
     {
-        encodeGrayVerbatim(frame);
+        encodeGrayVerbatim(frame, inW, inH, grayInput);
         return;
     }
 
@@ -363,11 +429,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
             g = g.contiguous();
 
         torch::Tensor rgb = torch::empty(
-            {height, width, 3},
+            {inH, inW, 3},
             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
         const uint8_t* src = g.data_ptr<uint8_t>();
         uint8_t* dst = rgb.data_ptr<uint8_t>();
-        const int64_t n = static_cast<int64_t>(width) * height;
+        const int64_t n = static_cast<int64_t>(inW) * inH;
         for (int64_t i = 0; i < n; ++i)
         {
             const uint8_t v = src[i];
@@ -396,9 +462,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // A 4-channel [H,W,4] input carries alpha. It is what makes ProRes 4444 /
     // 4444 XQ (yuva444p10le) reachable: swscale copies the alpha plane straight
     // through, and for a destination without alpha it simply drops it, exactly
-    // as `ffmpeg -pix_fmt rgba -c:v ...` does.
+    // as `ffmpeg -pix_fmt rgba -c:v ...` does. (Counted against the INPUT
+    // dimensions — after the grayscale replication above, the frame is 3-ch
+    // [inH,inW,3] in both modes, so the element-count test stays unambiguous.)
     const int srcChannels =
-        (frame.numel() == static_cast<int64_t>(width) * height * 4) ? 4 : 3;
+        (frame.numel() == static_cast<int64_t>(inW) * inH * 4) ? 4 : 3;
     const AVPixelFormat srcFmt =
         (srcChannels == 4) ? (deep ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGBA)
                            : (deep ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24);
@@ -413,8 +481,12 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // Alpha and deep-colour input fall through to the CPU staging path: the
     // fused GPU convert kernel is 8-bit RGB-only, and the CPU path handles a
     // CUDA tensor natively (one stream-ordered D2H straight into staging).
+    // A resize with a genuinely different input size falls through too: the
+    // fused kernel converts but does not scale, so correctness over throughput
+    // — same policy as the deep/4-channel cases. (When resize is off,
+    // inW/inH == width/height by construction and this changes nothing.)
     if (frame.device().is_cuda() && encoder->isHardwareEncoder() && !deep &&
-        srcChannels == 3)
+        srcChannels == 3 && inW == width && inH == height)
     {
         int deviceIndex = frame.device().index();
         if (deviceIndex < 0)
@@ -546,7 +618,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     startEncodeWorkersIfNeeded();
     ensureConvertPipeline();   // CPU path needs the swscale convert pool
 
-    const size_t rgbBytes = static_cast<size_t>(width) * height * srcChannels *
+    const size_t rgbBytes = static_cast<size_t>(inW) * inH * srcChannels *
                             (deep ? 2 : 1);
 
     std::vector<uint8_t>* staging = nullptr;
@@ -617,13 +689,12 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     cvConvert.notify_one();
 }
 
-void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
+void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
+                                      bool grayInput)
 {
     const AVPixelFormat pf = outputPixelFormat;
     const bool is16 = (pf == AV_PIX_FMT_GRAY16LE || pf == AV_PIX_FMT_GRAY16BE);
     const bool isBE = (pf == AV_PIX_FMT_GRAY16BE);
-    const int64_t grayElems = static_cast<int64_t>(width) * height;
-    const bool grayInput = (frame.numel() == grayElems);
 
     // Precondition: called only from encodeFrameLocked, i.e. with lifecycleMu_
     // held exclusively and the GIL already dropped. That is what serialises the
@@ -652,6 +723,51 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
     f.allocateBuffer(32);
     uint8_t* dst = f.getData(0);
     const int stride = f.getLineSize(0);
+
+    if (grayInput && (inW != width || inH != height))
+    {
+        // Resized single-channel path (resize=True with a different input
+        // size): the verbatim promise is "values normalized to the output bit
+        // depth, full range"; the spatial scale then runs gray->gray through
+        // the same one-pass swscale the RGB paths use, at the output depth so
+        // 16-bit data is resampled at 16-bit precision, never through 8-bit
+        // RGB. Same-size input keeps the exact direct-fill path below.
+        torch::Tensor g = frame.reshape({inH, inW});
+        AVPixelFormat srcGrayFmt;
+        if (!is16)
+        {
+            if (g.is_floating_point())
+                g = (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
+            else if (g.scalar_type() == torch::ScalarType::UInt16)
+                g = (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
+            else if (g.dtype() != torch::kUInt8)
+                g = g.clamp(0, 255).to(torch::kUInt8);
+            srcGrayFmt = AV_PIX_FMT_GRAY8;
+        }
+        else
+        {
+            // Feed swscale little-endian 16-bit; a GRAY16BE destination is
+            // byte-swapped by swscale itself.
+            if (g.is_floating_point())
+                g = (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
+            else if (g.dtype() == torch::kUInt8)
+                g = g.to(torch::kInt32) * 257;
+            else
+                g = g.to(torch::kInt32).clamp(0, 65535);
+            g = g.to(torch::kUInt16);
+            srcGrayFmt = AV_PIX_FMT_GRAY16LE;
+        }
+        g = g.contiguous();
+
+        if (!grayRgbConverter_)
+            grayRgbConverter_ =
+                std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
+                    width, height, pf, AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_JPEG,
+                    inW, inH, resizeFlags_);
+        grayRgbConverter_->convert(f, g.data_ptr(), srcGrayFmt);
+        encoder->encodeFrame(f);
+        return;
+    }
 
     if (grayInput)
     {
@@ -712,12 +828,17 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame)
         else if (rgb.dtype() != torch::kUInt8)
             rgb = rgb.clamp(0, 255).to(torch::kUInt8);
         const int64_t ch =
-            (rgb.numel() == static_cast<int64_t>(width) * height * 4) ? 4 : 3;
-        rgb = rgb.reshape({height, width, ch}).contiguous();
+            (rgb.numel() == static_cast<int64_t>(inW) * inH * 4) ? 4 : 3;
+        rgb = rgb.reshape({inH, inW, ch}).contiguous();
+        // Built with the (locked) input size; when resize is off inW/inH equal
+        // width/height and this is the converter it always was. Shared with
+        // the resized single-channel path above — convert() rebuilds its
+        // cached context when the per-call source format changes.
         if (!grayRgbConverter_)
             grayRgbConverter_ =
                 std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
-                    width, height, pf, AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_JPEG);
+                    width, height, pf, AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_JPEG,
+                    inW, inH, resizeFlags_);
         // convert() rebuilds its cached context when the source format changes,
         // so a session mixing 3- and 4-channel frames stays correct.
         grayRgbConverter_->convert(f, rgb.data_ptr<uint8_t>(),
@@ -815,11 +936,16 @@ void VideoEncoder::ensureConvertPipeline()
     }
 
     // One converter (own SwsContext) per convert worker — SwsContext is not
-    // safe to share across threads.
+    // safe to share across threads. Reached only from encodeFrameLocked AFTER
+    // the first frame locked the source size, so with resize enabled
+    // srcWidth_/srcHeight_ are already set; without resize they are 0 and the
+    // converter's source defaults to the destination size (the historical
+    // convert-only context, same SWS_BILINEAR flags).
     converters.reserve(numConvertWorkers);
     for (int i = 0; i < numConvertWorkers; ++i)
         converters.push_back(std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
-            width, height, outputPixelFormat, props.colorspace, props.colorRange));
+            width, height, outputPixelFormat, props.colorspace, props.colorRange,
+            srcWidth_, srcHeight_, resizeFlags_));
 
     for (int i = 0; i < numConvertWorkers; ++i)
         convertWorkers.emplace_back([this, i] { convertWorkerLoop(i); });
