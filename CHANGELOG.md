@@ -40,8 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verified against every software encoder family in the bundled FFmpeg
   (libx264, libx265, mpeg1/mpeg2/mpeg4, msmpeg4v2/msmpeg4, wmv1/wmv2, flv,
   h263p, mjpeg, ffv1, ffvhuff, huffyuv, utvideo, magicyuv, qtrle, prores /
-  prores_aw / prores_ks, libvpx / libvpx-vp9, libsvtav1, libaom-av1, gif,
-  rawvideo) plus the hardware encoders available per machine (NVENC h264/hevc,
+  prores_aw / prores_ks, dnxhd (DNxHR), libvpx / libvpx-vp9, libsvtav1,
+  libaom-av1, gif, rawvideo) plus the hardware encoders available per machine
+  (NVENC h264/hevc,
   QSV h264/hevc, h264_mf), downscale and upscale, in
   `tests/test_encoder_resize.py`.
 

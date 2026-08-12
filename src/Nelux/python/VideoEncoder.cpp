@@ -64,6 +64,34 @@ namespace
             return AVRational{30, 1};
         return q;
     }
+
+    // Normalize a single-channel tensor to verbatim 8-bit gray samples.
+    // Float [0,1] scales to 0-255; a 16-bit source is downscaled uniformly
+    // (v*255/65535). Shared by the direct-fill and resized gray paths, which
+    // must agree on this mapping exactly.
+    torch::Tensor normalizeGrayTo8(torch::Tensor g)
+    {
+        if (g.is_floating_point())
+            return (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
+        if (g.scalar_type() == torch::ScalarType::UInt16)
+            return (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
+        if (g.dtype() != torch::kUInt8)
+            return g.clamp(0, 255).to(torch::kUInt8);
+        return g;
+    }
+
+    // Normalize to full-precision 16-bit gray, returned as int32 in 0-65535
+    // (the direct-fill path writes bytes from int32; the resized path narrows
+    // to uint16 for swscale). Float [0,1] -> 0-65535; an 8-bit source is
+    // promoted exactly (v*257); a 16-bit source passes through verbatim.
+    torch::Tensor normalizeGrayTo16(torch::Tensor g)
+    {
+        if (g.is_floating_point())
+            return (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
+        if (g.dtype() == torch::kUInt8)
+            return g.to(torch::kInt32) * 257;
+        return g.to(torch::kInt32).clamp(0, 65535);
+    }
 } // namespace
 
     //NOTE --- USED HWC
@@ -736,25 +764,14 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         AVPixelFormat srcGrayFmt;
         if (!is16)
         {
-            if (g.is_floating_point())
-                g = (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
-            else if (g.scalar_type() == torch::ScalarType::UInt16)
-                g = (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
-            else if (g.dtype() != torch::kUInt8)
-                g = g.clamp(0, 255).to(torch::kUInt8);
+            g = normalizeGrayTo8(g);
             srcGrayFmt = AV_PIX_FMT_GRAY8;
         }
         else
         {
             // Feed swscale little-endian 16-bit; a GRAY16BE destination is
             // byte-swapped by swscale itself.
-            if (g.is_floating_point())
-                g = (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
-            else if (g.dtype() == torch::kUInt8)
-                g = g.to(torch::kInt32) * 257;
-            else
-                g = g.to(torch::kInt32).clamp(0, 65535);
-            g = g.to(torch::kUInt16);
+            g = normalizeGrayTo16(g).to(torch::kUInt16);
             srcGrayFmt = AV_PIX_FMT_GRAY16LE;
         }
         g = g.contiguous();
@@ -774,15 +791,8 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         torch::Tensor g = frame.reshape({height, width});
         if (!is16)
         {
-            // 8-bit output: keep 8-bit samples verbatim. Float [0,1] scales to
-            // 0-255; a 16-bit source is downscaled uniformly (v*255/65535).
-            if (g.is_floating_point())
-                g = (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
-            else if (g.scalar_type() == torch::ScalarType::UInt16)
-                g = (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
-            else if (g.dtype() != torch::kUInt8)
-                g = g.clamp(0, 255).to(torch::kUInt8);
-            g = g.contiguous();
+            // 8-bit output: keep 8-bit samples verbatim.
+            g = normalizeGrayTo8(g).contiguous();
             const uint8_t* src = g.data_ptr<uint8_t>();
             for (int r = 0; r < height; ++r)
                 std::memcpy(dst + static_cast<size_t>(r) * stride,
@@ -790,16 +800,8 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         }
         else
         {
-            // 16-bit output: preserve full precision. Float [0,1] -> 0-65535;
-            // an 8-bit source is promoted exactly (v*257); a 16-bit source is
-            // stored verbatim.
-            if (g.is_floating_point())
-                g = (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
-            else if (g.dtype() == torch::kUInt8)
-                g = g.to(torch::kInt32) * 257;
-            else
-                g = g.to(torch::kInt32).clamp(0, 65535);
-            g = g.contiguous();
+            // 16-bit output: preserve full precision.
+            g = normalizeGrayTo16(g).contiguous();
             const int32_t* src = g.data_ptr<int32_t>();
             for (int r = 0; r < height; ++r)
             {

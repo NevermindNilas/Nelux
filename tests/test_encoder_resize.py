@@ -148,6 +148,10 @@ MATRIX = {
     "prores":      ("prores", "mov", 5, {}),
     "prores_aw":   ("prores_aw", "mov", 5, {}),
     "prores_ks":   ("prores_ks", "mov", 5, {"pixel_format": "yuv422p10le"}),
+    # Classic DNxHD only accepts fixed size/bitrate/pixfmt triples; the DNxHR
+    # profiles take arbitrary geometry, which is what a resized encode needs.
+    "dnxhd":       ("dnxhd", "mov", 8, {"pixel_format": "yuv422p",
+                                        "options": {"profile": "dnxhr_lb"}}),
     "libvpx":      ("libvpx", "webm", 8, {}),
     "libvpx-vp9":  ("libvpx-vp9", "webm", 8, {}),
     "libsvtav1":   ("libsvtav1", "mkv", 8, {}),
@@ -339,6 +343,40 @@ def test_uint16_deep_input_resizes(tmp_path):
     d = next(iter(r)).float()
     ref = _reference(frame.to(torch.int32).float().div(257).round(), OUT_W, OUT_H)
     assert (d - ref).abs().mean() <= 6
+
+
+def test_resize_off_rgb_destination_is_still_lossless(tmp_path):
+    """Regression pin for the colorspace-details change: with resize OFF, a
+    same-size convert to an RGB destination (qtrle's rgb24) is swscale's
+    unscaled special case and must stay a lossless round trip, exactly as it
+    was before the details were left at swscale's defaults for RGB."""
+    out = tmp_path / "rgbdst.mov"
+    torch.manual_seed(3)
+    f = torch.randint(0, 256, (OUT_H, OUT_W, 3), dtype=torch.uint8)
+    with nelux.VideoEncoder(str(out), codec="qtrle", width=OUT_W,
+                            height=OUT_H, fps=25) as enc:
+        for _ in range(3):
+            enc.encode_frame(f)
+    d = next(iter(nelux.VideoReader(str(out))))
+    assert torch.equal(d, f), "same-size rgb24 round trip is no longer lossless"
+
+
+def test_rgb_input_to_gray_output_resizes(tmp_path):
+    """RGB into a gray-verbatim output format with resize: the converter is
+    built for the input size and scales while taking luma."""
+    out = tmp_path / "rgb2gray.mkv"
+    frame = _gradient_frames()[0]
+    with nelux.VideoEncoder(str(out), codec="ffv1", width=OUT_W, height=OUT_H,
+                            fps=25, pixel_format="gray", resize=True) as enc:
+        for _ in range(3):
+            enc.encode_frame(frame)
+    r = nelux.VideoReader(str(out), color_format="gray")
+    assert r.width == OUT_W and r.height == OUT_H
+    d = next(iter(r)).squeeze().float()
+    # Full-range BT.601 luma of the scaled gradient.
+    ref = _reference(frame, OUT_W, OUT_H)
+    luma = 0.299 * ref[..., 0] + 0.587 * ref[..., 1] + 0.114 * ref[..., 2]
+    assert (d - luma).abs().mean() <= 4
 
 
 def test_byte_exact_parity_with_ffmpeg_scale(tmp_path):
