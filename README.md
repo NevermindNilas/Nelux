@@ -75,7 +75,7 @@ reader = VideoReader("input.mp4", decode_accelerator="nvdec")
 # Iterate frames — HWC uint8 by default (matches torchcodec convention)
 for frame in reader:
     print(frame.shape)   # torch.Size([1080, 1920, 3]) — HWC
-    print(frame.dtype)   # torch.uint8 for 8-bit sources; torch.int16 for >8-bit
+    print(frame.dtype)   # torch.uint8 for 8-bit sources; torch.uint16 for >8-bit
                          # (override with force_8bit=True to always return uint8)
 
     # Permute to BCHW + cast to float when feeding to an ML model
@@ -246,6 +246,8 @@ per encoder; a second call raises.
 - **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
 - **In/Out Point Lists**: `set_ranges([(in, out), ...])` restricts iteration to several ascending, non-overlapping segments in one forward pass; `iter_segments()` yields `(segment_index, frame)` so each section can take its own processing path. Frames, seconds, or `"H:MM:SS"` timecodes
+- **Encoder-Side Resize**: `VideoEncoder(..., resize=True, resize_filter=...)` scales input frames to the output size inside the swscale pass the encoder already runs — one fused scale+convert, byte-identical to `ffmpeg -vf scale=WxH:flags=bilinear`, so no `F.interpolate` pass before encoding
+- **Decode-Free Metadata**: `nelux.probe(path)` returns the full ffprobe-equivalent dict without opening a decoder, allocating a frame buffer or spawning threads — and without the subprocess spawn an `ffprobe` call pays
 
 ### Performance Knobs
 
@@ -341,7 +343,11 @@ VideoReader(
     resize: tuple[int, int] | None = None,         # decoder-side scale to (W, H)
     prefetch: bool = False,                        # background producer thread
     convert_workers: int | None = None,            # None = min(hw, 16); 0 = polite
-    color_format: Literal["rgb", "gray"] = "rgb",  # "gray" = [H, W, 1] luma (CPU only)
+    color_format: Literal["rgb", "gray", "rgba"] = "rgb",  # "gray" = [H, W, 1] luma,
+                                                   #   "rgba" = [H, W, 4] with alpha
+                                                   #   (both CPU decode only)
+    resize_filter: str = "bilinear",               # sws kernel for resize, CPU only
+    motion_vectors: bool = False,                  # opt-in MV export (costs decode time)
 )
 ```
 
@@ -367,6 +373,71 @@ VideoReader(
 - `start_prefetch()` / `stop_prefetch()` / `prefetch_buffered` / `is_prefetching` → runtime prefetch control
 - `supported_codecs()` → list of codecs the linked libavcodec can decode
 
+### VideoEncoder
+
+```python
+VideoEncoder(
+    output_path: str,
+    codec: str | None = None,          # container-aware default; see below
+    width: int | None = None,          # 1920
+    height: int | None = None,         # 1080
+    bit_rate: int | None = None,       # 4_000_000
+    fps: float | None = None,          # 30.0, tagged as an exact rational
+    preset: int | str | None = None,   # 1..N per codec, or an ffmpeg preset name
+    cq: int | None = None,             # constant quality, lower = better
+    pixel_format: str | None = None,   # "yuv420p"
+    options: dict[str, str] | None = None,  # extra AVOptions, applied last
+    resize: bool = False,              # scale any input size to width x height
+    resize_filter: str = "bilinear",   # sws kernel for that scale
+)
+```
+
+The default `codec` is the first of `libx264`, `libopenh264`, then the platform
+encoder (`h264_mf` on Windows, `h264_videotoolbox` on macOS) that both exists in
+the build and fits the container inferred from `output_path`; failing that, the
+container's own default (`.webm` → VP9, `.gif` → gif). `fps` is never rounded to
+an integer — 23.976 becomes 24000/1001, and the codec time base follows.
+
+**Methods:**
+- `encode_frame(frame)` → encode one `[H, W, 3]` RGB, `[H, W, 4]` RGBA, or `[H, W, 1]`/`[H, W]` grayscale tensor (CPU or CUDA). `uint8` for 8-bit output; `uint16`/float `[0,1]` carry full precision into >8-bit formats
+- `add_passthrough(source, audio, subtitles, start, end, allow_transcode)` → copy/transcode audio + subtitle streams, before the first frame
+- `close()` / context manager → flush, write trailers, finalize
+- `is_hardware_encoder` → True when NVENC is in use
+
+#### Encoder-side resize
+
+`resize=True` lets `encode_frame` take frames of any spatial size and scales them
+to `width`×`height` inside the libswscale pass the encoder already runs — one
+fused scale+convert, no separate resize stage, byte-identical to
+`ffmpeg -vf scale=WxH:flags=bilinear`:
+
+```python
+with VideoEncoder("out.mp4", width=1920, height=1080, fps=30.0,
+                  resize=True, resize_filter="lanczos") as enc:
+    for frame in frames_2160p:        # (2160, 3840, 3) uint8
+        enc.encode_frame(frame)
+```
+
+The input size locks to the first frame's shape (a later mismatch raises), and
+input must be an explicit HWC layout. A CUDA tensor at a different size takes
+the CPU staging path; same-size CUDA input keeps the zero-copy GPU path.
+
+### Module-level helpers
+
+```python
+import nelux
+
+nelux.probe("video.mp4")        # decode-free metadata dict — same keys as
+                                #   VideoReader.properties, no decoder opened,
+                                #   no frame buffer allocated, no threads spawned
+nelux.get_available_encoders()  # [{"name", "long_name", "is_hardware"}, ...]
+nelux.get_nvenc_encoders()      # NVENC-only subset
+nelux.set_log_level(nelux.LogLevel.debug)
+nelux.diagnose_runtime_dlls()   # Windows: report runtime DLLs that failed to load
+
+nelux.__version__, nelux.__cuda_support__, nelux.__torch_abi__, nelux.__ffmpeg_version__
+```
+
 ---
 
 ## Documentation
@@ -383,7 +454,7 @@ VideoReader(
 - **PyTorch**: 2.13+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
 - **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
 - **GPU**: compute capability 7.5+ (Turing, GTX 16xx / RTX 20xx and newer) for the published CUDA wheels. CUDA 13 dropped Pascal and Volta, so Maxwell/Pascal/Volta cards need a source build against CUDA 12.x (`CUDAARCHS=61 pip install .`) even though they have NVDEC silicon.
-- **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 12+ (Apple Silicon, CPU only)
+- **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 14+ (Apple Silicon, CPU only)
 
 ---
 
@@ -409,7 +480,10 @@ FFmpeg comes from `external/ffmpeg/`, populated by `tools/download_ffmpeg.ps1`
 either has the exact pinned TAS-FFMPEG or fails loudly. On Windows the build
 also needs MSVC 18 (or compatible).
 
-See [BUILD.md](docs/BUILD.md) for detailed build instructions.
+`CMakePresets.json` carries ready-made configure/build presets
+(`x64-release-cuda`, `x64-release-cpu`, and debug equivalents) if you would
+rather drive CMake directly. For Linux prerequisites — vcpkg, CMake and the
+system packages the build needs — see [docs/linux.md](docs/linux.md).
 
 ---
 
