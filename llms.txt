@@ -15,16 +15,17 @@ import torch  # MUST be imported before nelux
 from nelux import VideoReader, VideoEncoder
 
 # READ: Iterate frames (NVDEC GPU decode)
-# Returns HWC tensor: [H, W, 3] with native dtype (uint8 for 8-bit, uint16 for 10/12/16-bit)
+# Returns HWC tensor: [H, W, C] with native dtype (uint8 for 8-bit, uint16 for 10/12/16-bit)
+# C = 3 for color_format="rgb" (default), 4 for "rgba", 1 for "gray"
 reader = VideoReader("input.mp4", decode_accelerator="nvdec")
 for frame in reader:
     output = model(frame)
 
-# READ: Batch access — returns [B, H, W, 3]
+# READ: Batch access — returns [B, H, W, C] (always a torch.Tensor)
 batch = reader.get_batch([0, 10, 20])
 batch = reader[0:100:10]
 
-# READ: Random access — returns [H, W, 3]
+# READ: Random access — returns [H, W, C]
 frame = reader.frame_at(100)       # by index
 frame = reader.frame_at(2.5)       # by timestamp (seconds)
 frame = reader[100]                # by index
@@ -96,7 +97,7 @@ VideoReader(
 - `color_format="rgb"` (default) → 3-channel HWC `[H, W, 3]`; `"gray"` (aliases `"grayscale"`, `"l"`) → single-channel HWC `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average); `"rgba"` → 4-channel HWC `[H, W, 4]` carrying the source alpha plane (ProRes 4444 / 4444 XQ, VP9 or PNG with alpha; alpha is straight, not premultiplied, and a source without alpha yields a fully opaque plane, matching `ffmpeg -pix_fmt rgba`). Both `"gray"` and `"rgba"` are CPU-decode only and not supported by `decode_batch()`. Read the resulting channel count off `reader.channels`.
 - `prefetch=True` → decode on a background thread. Off by default: the producer/consumer queue handoff costs ~2.5x more than the parallelism saves at typical decode speeds.
 - `convert_workers=N` → size of the YUV→RGB libswscale convert pool. `None` (default) uses `min(hw_concurrency, 16)` for max throughput; `0` disables the pool (single-threaded convert, matching torchcodec's CPU footprint at the cost of fanout fps); a positive int pins the count.
-- `motion_vectors=True` → enable per-frame motion-vector export. Off by default so the decoder skips FFmpeg's motion-vector side-data construction (a real decode-time cost, ~+25% throughput at 4K); `read_frame_with_motion_vectors()` raises while it is off. Never changes decoded pixels.
+- `motion_vectors=True` → enable per-frame motion-vector export. Off by default so the decoder skips FFmpeg's motion-vector side-data construction (a real decode-time cost that grows with resolution: measured +6.6% throughput at 720p, +17.1% at 1080p, +18.5% at 4K); `read_frame_with_motion_vectors()` raises while it is off. Never changes decoded pixels.
 - `resize=(w, h)` scales frames during decode (CPU: libswscale; NVDEC: cuvid `resize=WxH`). Reported dims and frame shapes reflect the target. `resize_filter` picks the CPU-path scaling kernel (ffmpeg `-sws_flags` names: `bilinear` default, `bicubic`, `lanczos`, `area`, `spline`, …); it governs spatial rescaling only, never color conversion, and is CPU-decode only (NVDEC rejects a non-default value — cuvid uses its own hardware scaler).
 
 ### Properties (read-only)
@@ -159,9 +160,9 @@ container omits `nb_frames` (MKV/WebM/VFR). For an exact count call
 
 ```python
 # Sequential
-for frame in reader:                 # [H, W, 3]
+for frame in reader:                 # [H, W, C]
     ...
-frame = reader.read_frame()          # [H, W, 3]
+frame = reader.read_frame()          # [H, W, C]
 reader.reset()                       # back to start (or start of range)
 
 # Random access — does not disturb iterator state
@@ -170,7 +171,7 @@ frame = reader.frame_at(2.5)         # by float timestamp (seconds)
 frame = reader[100]                  # by int
 frame = reader[2.5]                  # by float
 
-# Batch access — returns [B, H, W, 3] torch.Tensor
+# Batch access — returns [B, H, W, C] torch.Tensor
 batch = reader.get_batch([0, 10, 20])
 batch = reader.get_batch_range(0, 100, 10)
 batch = reader[0:100:10]             # slice
@@ -178,21 +179,46 @@ batch = reader[[0, 10, 20]]          # list
 batch = reader[range(0, 100, 10)]    # range
 batch = reader[torch.tensor([0,5,9])]
 
-len(reader)                          # respects set_range
+len(reader)                          # exact whole-file count; NOT range-aware
+                                     #   (set_range/set_ranges do not change it)
 ```
 
 `get_batch` deduplicates indices, sorts for sequential decode, and supports
-negative indices. `decode_batch(indices)` is the unchecked C++ path `get_batch`
-calls after validation — indices must already be non-negative and in bounds.
+negative indices. `decode_batch(indices)` is the C++ path `get_batch` calls
+after normalizing: it bounds-checks, but does not resolve negative indices, so
+pass absolute ones.
 
 Slices follow Python container rules: `reader[:0]` is empty, `reader[:-1]` drops
 the last frame, `reader[-10:]` is the last ten, `reader[::-1]` is reversed. A
-bound past the end raises `IndexError` rather than clamping. An empty request
-returns a `[0, H, W, C]` tensor with the dtype and device a populated batch
-would have had, and is the one request accepted on readers where batch decoding
-is otherwise rejected (`resize=`, `color_format="gray"`/`"rgba"`).
+bound past the end raises `IndexError` rather than clamping — but the index list
+is materialised before it is validated, so overshoot by a little
+(`reader[0:len(reader)+1]`), never by `10**9`. An empty request returns a
+`[0, H, W, C]` tensor with the dtype and device a populated batch would have
+had, and is the one request accepted on readers where batch decoding is
+otherwise rejected (`resize=`, `color_format="gray"`/`"rgba"`).
 
 Batch decode always returns a `torch.Tensor`, including under `backend="numpy"`.
+
+### Motion Vectors
+
+```python
+# Opt-in at construction; CPU decode only (NVDEC does not surface side-data).
+reader = VideoReader("video.mp4", decode_accelerator="cpu", motion_vectors=True)
+
+frame, vectors = reader.read_frame_with_motion_vectors()   # the ONLY MV reader
+reader.frame_type                    # "I" | "P" | "B" | "" for the last frame
+```
+
+Each entry in `vectors` is a dict with 10 keys, mirroring FFmpeg's
+`AV_FRAME_DATA_MOTION_VECTORS`: `source` (1 = past reference, 2 = future), `w`,
+`h` (block size), `src_x`, `src_y` (reference position), `dst_x`, `dst_y` (this
+frame's position), `motion_x`, `motion_y` (signed, in `motion_scale` units) and
+`motion_scale` (divisor, e.g. 4 for quarter-pel H.264). Divide
+`motion_x`/`motion_y` by `motion_scale` for pixel-space displacement.
+
+I-frames — and codecs or decoder builds that do not export the side data —
+return an empty list. Calling `read_frame_with_motion_vectors()` without
+`motion_vectors=True` raises.
 
 ### Frame Ranges
 
@@ -293,7 +319,7 @@ VideoEncoder(
 )
 ```
 
-- `preset` as an int maps through a per-codec table (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1=slowest..9=fastest`, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`); as a str it goes straight to `av_dict_set("preset", value)`, for parity with `ffmpeg -preset <name>`.
+- `preset` as an int maps through a per-codec table, always **low = faster** (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1..9` → SVT `12..4` i.e. fastest to slowest, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`); as a str it goes straight to `av_dict_set("preset", value)`, for parity with `ffmpeg -preset <name>`.
 - `options` forwards codec-specific AVOption key/value pairs to `avcodec_open2` after the built-in options, so entries here override them: `options={"tune": "film", "x264-params": "ref=3"}`.
 
 Supported `pixel_format` values include `"yuv420p"`, `"nv12"`, `"yuv444p"`, `"p010"`, `"gray"`, `"gray16le"`. Grayscale formats are software-only; NVENC falls back to NV12 with a warning.
@@ -533,7 +559,7 @@ reader.set_ranges([(0, 100), (100, 200)])   # OK: touching is allowed
 │                    C++ Backend (_nelux)                      │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
 │  │ CPU Decoder │  │CUDA Decoder │  │   Encoder   │         │
-│  │  (libyuv)   │  │   (NVDEC)   │  │(CPU / NVENC)│         │
+│  │ (libswscale)│  │   (NVDEC)   │  │(CPU / NVENC)│         │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
 ├─────────┼────────────────┼────────────────┼─────────────────┤
 │         │     CUDA Kernels (NV12/P010/NV16/YUV444 ↔ RGB)   │

@@ -8,6 +8,8 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
 - [Quick Start](#quick-start)
 - [VideoReader](#videoreader)
   - [Constructor Parameters](#constructor-parameters)
+    - [Decoder-Side Resize](#decoder-side-resize)
+    - [Alpha and Grayscale Output](#alpha-and-grayscale-output)
   - [Video Properties](#video-properties)
   - [Reading Frames](#reading-frames)
   - [Motion Vectors](#motion-vectors)
@@ -20,9 +22,12 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
   - [Hardware Acceleration (NVDEC)](#hardware-acceleration-nvdec)
 - [VideoEncoder](#videoencoder)
   - [Encoder-Side Resize](#encoder-side-resize)
+  - [Accepted Input Frames](#accepted-input-frames)
   - [Audio / Subtitle Passthrough](#audio--subtitle-passthrough)
 - [Logging](#logging)
-- [Module Attributes](#module-attributes-and-helpers)
+- [Module Attributes and Helpers](#module-attributes-and-helpers)
+- [Complete Example: ML Inference Pipeline](#complete-example-ml-inference-pipeline)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -307,7 +312,7 @@ reader = VideoReader("video.mp4")
 
 # Using iterator
 for frame in reader:
-    # frame: torch.Tensor, shape (H, W, 3), dtype uint8
+    # frame: torch.Tensor, shape (H, W, C), uint8 (uint16 for >8-bit sources)
     process(frame)
 
 # Using read_frame()
@@ -376,7 +381,7 @@ frame = reader[5.5]               # Frame at 5.5 seconds
 ```python
 reader = VideoReader("video.mp4")
 
-len(reader)              # Exact frame count (respects set range)
+len(reader)              # Exact whole-file frame count (same as get_frame_count())
 reader.total_frames      # Fast count: nb_frames, else an fps × duration estimate
 reader.get_frame_count() # Exact count, cached. Reads nb_frames when present;
                          #   otherwise pays one demux-only pass over the file
@@ -388,6 +393,10 @@ reader.shape             # (frame_count, height, width, channels)
 > an estimate, while `get_frame_count()` / `len(reader)` match
 > `ffprobe -count_packets`. Check `reader.properties["nb_frames"] > 0` to see
 > which case you are in without triggering the pass.
+>
+> None of the three is range-aware: `len(reader)` counts the whole file whether
+> or not `set_range`/`set_ranges` is active. Size a bounded loop from the range
+> you passed in (`reader.ranges`), not from `len()`.
 
 ---
 
@@ -416,8 +425,9 @@ batch = reader[[-3, -2, -1]]                  # Last 3 frames
 # Duplicates are handled efficiently
 batch = reader.get_batch([5, 10, 5, 20])      # Decodes each unique frame once
 
-# Alternatively, use decode_batch — the unchecked C++ path get_batch calls
-# after validation; indices must already be non-negative and in bounds
+# Alternatively, use decode_batch — the C++ path get_batch calls after
+# normalizing. It bounds-checks, but does not resolve negative indices, so
+# pass absolute ones
 batch = reader.decode_batch([0, 50, 100])     # [3, H, W, C] tensor
 ```
 
@@ -431,11 +441,15 @@ batch = reader.decode_batch([0, 50, 100])     # [3, H, W, C] tensor
 Slices follow Python container semantics rather than clamping:
 
 ```python
-reader[:0]        # empty batch
-reader[:-1]       # every frame but the last
-reader[-10:]      # the last ten frames
-reader[::-1]      # reversed
-reader[0:10**9]   # IndexError — a bound past the end raises, it does not clamp
+reader[:0]                 # empty batch
+reader[:-1]                # every frame but the last
+reader[-10:]               # the last ten frames
+reader[::-1]               # reversed
+reader[0:len(reader) + 1]  # IndexError — a bound past the end raises, it does
+                           #   not clamp. Keep the overshoot small: the index
+                           #   list is materialised before it is validated, so
+                           #   an absurd bound (reader[0:10**9]) allocates
+                           #   before it raises
 ```
 
 A batch always comes back as a `torch.Tensor`, including under
@@ -694,7 +708,7 @@ VideoEncoder(
 | `height` | `int` | `1080` | Output height |
 | `bit_rate` | `int` | `4000000` | Video bitrate (bits/s) |
 | `fps` | `float` | `30.0` | Output frame rate, tagged as an exact rational (see below) |
-| `preset` | `int \| str` | Auto | `int`: 1..N mapped per codec (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1=slowest..9=fastest`, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`). `str`: forwarded straight to ffmpeg (`"veryfast"`, `"medium"`, `"p4"`) |
+| `preset` | `int \| str` | Auto | `int`: 1..N mapped per codec, always **low = faster** (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1..9` → SVT `12..4`, i.e. fastest to slowest, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`). `str`: forwarded straight to ffmpeg (`"veryfast"`, `"medium"`, `"p4"`) |
 | `cq` | `int` | Auto | Constant quality (0-51, or 0-63 depending on codec); lower is better |
 | `pixel_format` | `str` | `"yuv420p"` | Output pixel format |
 | `options` | `dict[str, str]` | `None` | Extra AVOption pairs applied **after** the built-in options, so they override them: `options={"tune": "film", "x264-params": "ref=3"}` |
@@ -748,7 +762,8 @@ encoder = VideoEncoder(
 
 # Encode frames
 for frame in frames:
-    encoder.encode_frame(frame)  # (H, W, 3) RGB, or (H, W, 1)/(H, W) grayscale uint8
+    encoder.encode_frame(frame)  # (H, W, 3) RGB, (H, W, 4) RGBA, or
+                                 #   (H, W, 1)/(H, W) grayscale
 
 encoder.close()
 
@@ -758,7 +773,7 @@ encoder.close()
 # pixel_format the gray input is replicated to RGB instead.
 ```
 
-#### Accepted input frames
+### Accepted Input Frames
 
 `encode_frame` takes a 3-channel RGB frame (`H×W×3`), a 4-channel RGBA frame
 (`H×W×4`) or a single-channel frame (`H×W` or `H×W×1`).
@@ -785,6 +800,11 @@ with VideoEncoder("output.mp4", width=1920, height=1080, fps=30.0) as encoder:
         encoder.encode_frame(frame)
 # Automatically closed
 ```
+
+Outside a `with` block, `close()` must be called explicitly — it flushes the
+encoder and writes the trailers, and a file left unclosed is unplayable.
+`encoder.is_hardware_encoder` reports whether the chosen codec resolved to a
+hardware encoder (NVENC).
 
 ### Creating Encoder from Reader
 

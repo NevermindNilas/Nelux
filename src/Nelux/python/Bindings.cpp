@@ -627,9 +627,10 @@ Args:
         cannot exceed 65535; a finer rate is approximated there to within
         ~1e-8 while the stream is still tagged with the exact rate.
     preset (int | str, optional): Encoding preset.
-        - int: 1..N mapped through a per-codec table:
+        - int: 1..N mapped through a per-codec table, low = faster throughout:
             * libx264/libx265: 1=ultrafast..9=veryslow
-            * libsvtav1: 1=slowest..9=fastest (mapped to SVT 12..4)
+            * libsvtav1: 1=fastest..9=slowest (mapped to SVT 12..4, where SVT's
+              own scale runs 0=slowest to 13=fastest)
             * libaom-av1: maps to cpu-used 0..8
             * NVENC: 1..7 mapped to p1..p7
         - str: passed straight through to ``av_dict_set("preset", value)``,

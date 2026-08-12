@@ -240,7 +240,7 @@ per encoder; a second call raises.
 
 - **Hardware Acceleration**: NVDEC (decode) and NVENC (encode) on NVIDIA GPUs
 - **Native HWC `uint8` Output**: frames decoded directly into a `torch.Tensor` of shape `[H, W, C]` (or `uint16` for >8-bit sources; force_8bit=True clamps to uint8 always). `C` follows `color_format` and is readable as `vr.channels`: 3 for `"rgb"`, 4 for `"rgba"`, 1 for `"gray"`. No implicit float conversion — you cast/normalize on your side based on your model's expected input
-- **RGB or Grayscale Output**: `color_format="rgb"` (default) or `color_format="gray"` for single-channel `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only. `encode_frame` also accepts single-channel input (`[H, W, 1]` or `[H, W]`). With a grayscale output `pixel_format` (`"gray"`/`"gray16le"`) it's a **verbatim, full-range data path** — values stored exactly, up to true 16-bit, with a lossless (`ffv1`) round-trip — ideal for depth maps and masks; with a color `pixel_format` the gray input is replicated to RGB
+- **RGB, RGBA or Grayscale Output**: `color_format="rgb"` (default), `"rgba"` for `[H, W, 4]` carrying the source alpha plane (ProRes 4444 / 4444 XQ, VP9, PNG; straight alpha, opaque when the source has none — matching `ffmpeg -pix_fmt rgba`), or `"gray"` for single-channel `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). `"rgba"` and `"gray"` are CPU decode only. `encode_frame` also accepts single-channel input (`[H, W, 1]` or `[H, W]`). With a grayscale output `pixel_format` (`"gray"`/`"gray16le"`) it's a **verbatim, full-range data path** — values stored exactly, up to true 16-bit, with a lossless (`ffv1`) round-trip — ideal for depth maps and masks; with a color `pixel_format` the gray input is replicated to RGB
 - **CPU Path Matches ffmpeg Byte-for-Byte**: pure libswscale convert pipeline, default `SWS_BILINEAR` flags; output is bit-identical to `ffmpeg -vf format=rgb24` on every common YUV/RGB format (see [CHANGELOG v0.11.0](docs/CHANGELOG.md))
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, C]` with seek minimization, deduplication, and a dedicated random-access decoder
 - **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
@@ -270,7 +270,11 @@ CPU path supports anything libavcodec can decode (h264, hevc, vp8/9, av1, mpeg2/
 
 ## Benchmarks
 
-H.264 decode → RGB tensor throughput, measured on **Intel i9-13900K (24 logical cores) + RTX 3090, Windows 11, FFmpeg 8.x, PyTorch 2.11+cu130, nelux 0.11.0**. Each row is the **median of 5 fresh subprocess runs**, 600 frames per run (300 at 4K). Output is HWC `uint8` for every decoder (apples-to-apples).
+H.264 decode → RGB tensor throughput, measured on **Intel i9-13900K (24 logical
+cores) + RTX 3090, Windows 11, FFmpeg 8.x, PyTorch 2.11+cu130, nelux 0.11.0** —
+the last release these were re-measured on; the decode path has since gained
+work that shifts them (motion-vector gating in 0.16.0, the 0.17.0 batch-decode
+rewrite). Each row is the **median of 5 fresh subprocess runs**, 600 frames per run (300 at 4K). Output is HWC `uint8` for every decoder (apples-to-apples).
 
 ### Headline: nelux default vs torchcodec vs ffmpeg (CPU)
 
@@ -395,8 +399,10 @@ VideoEncoder(
 The default `codec` is the first of `libx264`, `libopenh264`, then the platform
 encoder (`h264_mf` on Windows, `h264_videotoolbox` on macOS) that both exists in
 the build and fits the container inferred from `output_path`; failing that, the
-container's own default (`.webm` → VP9, `.gif` → gif). `fps` is never rounded to
-an integer — 23.976 becomes 24000/1001, and the codec time base follows.
+container's own default (`.webm` → VP9, `.gif` → gif, `.ogv` → VP8). Containers
+with no default this build can encode — `.ogg`, `.wav` — raise instead. `fps` is
+never rounded to an integer: 23.976 becomes 24000/1001, and the codec time base
+follows.
 
 **Methods:**
 - `encode_frame(frame)` → encode one `[H, W, 3]` RGB, `[H, W, 4]` RGBA, or `[H, W, 1]`/`[H, W]` grayscale tensor (CPU or CUDA). `uint8` for 8-bit output; `uint16`/float `[0,1]` carry full precision into >8-bit formats
@@ -483,7 +489,9 @@ also needs MSVC 18 (or compatible).
 `CMakePresets.json` carries ready-made configure/build presets
 (`x64-release-cuda`, `x64-release-cpu`, and debug equivalents) if you would
 rather drive CMake directly. For Linux prerequisites — vcpkg, CMake and the
-system packages the build needs — see [docs/linux.md](docs/linux.md).
+system packages the build needs — see [docs/linux.md](docs/linux.md); take its
+FFmpeg step from `tools/download_ffmpeg.sh` above rather than from vcpkg, which
+that page predates.
 
 ---
 
