@@ -2,7 +2,7 @@
 
 > **Purpose**: Enable AI assistants to understand and correctly use Nelux instantly.
 > **Library**: Nelux — High-performance Python video decoding/encoding with GPU acceleration
-> **Version**: 0.12.2
+> **Version**: 0.18.0
 > **License**: AGPL-3.0
 > **Source**: https://github.com/NevermindNilas/NeLux
 
@@ -42,7 +42,7 @@ pip install nelux
 Official wheels (v0.9.0+):
 - **Windows x64** — CPU + CUDA (NVDEC/NVENC)
 - **Linux x86_64** (manylinux_2_28+) — CPU + CUDA
-- **macOS arm64** (Apple Silicon, ≥12.0) — CPU + PyTorch MPS (no CUDA on macOS)
+- **macOS arm64** (Apple Silicon, ≥14.0) — CPU + PyTorch MPS (no CUDA on macOS)
 
 **Critical Requirement**: Import `torch` BEFORE `nelux`:
 ```python
@@ -50,10 +50,19 @@ import torch                        # ← FIRST
 from nelux import VideoReader       # ← SECOND
 ```
 
-**FFmpeg shared libraries required on the system**:
-- Windows: FFmpeg DLLs on `PATH` (or use `os.add_dll_directory(...)`); self-built wheels bundle runtime DLLs.
-- Linux: system FFmpeg (e.g., `apt install ffmpeg` or distro equivalent).
-- macOS: Homebrew FFmpeg (`brew install ffmpeg`).
+**FFmpeg is bundled in the wheel** (since 0.17.0) — nothing to install, nothing
+to put on `PATH`. Every wheel carries the same pinned build
+([TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 8.1.2), tagged so it
+is identifiable at runtime:
+
+```python
+nelux.__ffmpeg_version__             # "8.1.2-tas"
+```
+
+Anything else means another FFmpeg of the same soname won the load (common on
+Windows, where the first DLL of a given name serves the whole process);
+`"unknown"` means the extension predates the attribute or — on Windows — no
+FFmpeg could be loaded at all.
 
 ---
 
@@ -64,24 +73,30 @@ from nelux import VideoReader       # ← SECOND
 ```python
 VideoReader(
     input_path: str,
-    num_threads: int = os.cpu_count() // 2,
+    num_threads: int = 0,                 # 0 = ffmpeg auto-detect
     force_8bit: bool = False,
     backend: Literal["pytorch", "numpy"] = "pytorch",
     decode_accelerator: Literal["cpu", "nvdec"] = "cpu",
     cuda_device_index: int = 0,
     resize: tuple[int, int] | None = None,
-    color_format: Literal["rgb", "gray"] = "rgb",
+    prefetch: bool = False,               # background producer thread
+    convert_workers: int | None = None,   # None = min(hw_concurrency, 16); 0 = single-threaded
+    color_format: Literal["rgb", "gray", "rgba"] = "rgb",
     resize_filter: Literal[
         "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
         "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
     ] = "bilinear",
+    motion_vectors: bool = False,         # opt-in, costs decode time
 )
 ```
 
 - `backend="pytorch"` → `torch.Tensor`; `backend="numpy"` → `numpy.ndarray` (always CPU, memory-owned copy).
 - `decode_accelerator="nvdec"` → frames stay on GPU as CUDA tensors. Auto-falls back to CPU on NVDEC failure.
 - `force_8bit=True` → output always `uint8` regardless of source bit depth.
-- `color_format="rgb"` (default) → 3-channel HWC `[H, W, 3]`; `color_format="gray"` (aliases `"grayscale"`, `"l"`) → single-channel HWC `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average). CPU decode only; not supported by `decode_batch()`.
+- `color_format="rgb"` (default) → 3-channel HWC `[H, W, 3]`; `"gray"` (aliases `"grayscale"`, `"l"`) → single-channel HWC `[H, W, 1]` luma (libswscale BT.601/709-correct, not a channel average); `"rgba"` → 4-channel HWC `[H, W, 4]` carrying the source alpha plane (ProRes 4444 / 4444 XQ, VP9 or PNG with alpha; alpha is straight, not premultiplied, and a source without alpha yields a fully opaque plane, matching `ffmpeg -pix_fmt rgba`). Both `"gray"` and `"rgba"` are CPU-decode only and not supported by `decode_batch()`. Read the resulting channel count off `reader.channels`.
+- `prefetch=True` → decode on a background thread. Off by default: the producer/consumer queue handoff costs ~2.5x more than the parallelism saves at typical decode speeds.
+- `convert_workers=N` → size of the YUV→RGB libswscale convert pool. `None` (default) uses `min(hw_concurrency, 16)` for max throughput; `0` disables the pool (single-threaded convert, matching torchcodec's CPU footprint at the cost of fanout fps); a positive int pins the count.
+- `motion_vectors=True` → enable per-frame motion-vector export. Off by default so the decoder skips FFmpeg's motion-vector side-data construction (a real decode-time cost, ~+25% throughput at 4K); `read_frame_with_motion_vectors()` raises while it is off. Never changes decoded pixels.
 - `resize=(w, h)` scales frames during decode (CPU: libswscale; NVDEC: cuvid `resize=WxH`). Reported dims and frame shapes reflect the target. `resize_filter` picks the CPU-path scaling kernel (ffmpeg `-sws_flags` names: `bilinear` default, `bicubic`, `lanczos`, `area`, `spline`, …); it governs spatial rescaling only, never color conversion, and is CPU-decode only (NVDEC rejects a non-default value — cuvid uses its own hardware scaler).
 
 ### Properties (read-only)
@@ -89,22 +104,56 @@ VideoReader(
 | Property | Type | Description |
 |---|---|---|
 | `width`, `height` | int | Dimensions in pixels |
-| `fps` | float | Nominal frames per second |
-| `min_fps`, `max_fps` | float | VFR bounds |
+| `fps` | float | Nominal frames per second (`avg_frame_rate`) |
+| `min_fps`, `max_fps` | float | Always equal to `fps` today; for VFR use `properties["is_vfr"]` / `r_frame_rate` |
 | `duration` | float | Total duration (seconds) |
-| `total_frames` | int | Total frame count |
-| `frame_count` | int | Alias of `total_frames` (BatchMixin) |
-| `shape` | tuple | `(frame_count, H, W, 3)` |
+| `total_frames` | int | Fast count: `nb_frames`, else an `fps × duration` estimate |
+| `frame_count` | int | Exact count via `get_frame_count()` — one demux-only pass when the container omits `nb_frames`, cached (BatchMixin) |
+| `shape` | tuple | `(frame_count, H, W, channels)` |
+| `channels` | int | 3 for `"rgb"`, 4 for `"rgba"`, 1 for `"gray"` |
 | `pixel_format` | str | Source pixel format (e.g., `"yuv420p"`) |
 | `bit_depth` | int | Bit depth (8, 10, 12, 16) |
-| `aspect_ratio` | float | `width / height` |
+| `aspect_ratio` | float | Storage aspect ratio, `width / height` (DAR is `properties["display_aspect_ratio"]`) |
 | `codec` | str | Video codec name |
 | `has_audio` | bool | Audio track present |
 | `file_path` | str | Currently loaded file |
-| `properties` | dict | All props as dictionary |
+| `properties` | dict | Full ffprobe-equivalent metadata dict (see below) |
 | `is_prefetching` | bool | Prefetch thread active |
 | `prefetch_buffered` | int | Frames in buffer |
 | `prefetch_size` | int | Buffer capacity |
+| `frame_type` | str | Type of the last decoded frame: `"I"`, `"P"`, `"B"`, or `""` |
+| `ranges`, `current_segment` | list, int | Configured segments; index of the segment the last frame came from (`-1` if none) |
+
+### Metadata (`properties` / `probe`)
+
+`reader.properties` is a superset of the individual accessors, read in-process
+from libav (no `ffprobe` subprocess):
+
+```python
+p = reader.properties
+p["width"], p["height"], p["bit_depth"], p["pixel_format"]
+p["avg_frame_rate"], p["r_frame_rate"]      # exact rationals, e.g. "24000/1001"
+p["avg_frame_rate_num"], p["avg_frame_rate_den"], p["is_vfr"]
+p["nb_frames"], p["total_frames"], p["duration"], p["start_time"]
+p["codec"], p["codec_name"], p["codec_long_name"], p["profile"], p["level"]
+p["color_primaries"], p["color_transfer"], p["color_space"], p["color_range"]
+p["sample_aspect_ratio"], p["display_aspect_ratio"], p["field_order"]
+p["bit_rate"], p["format_bit_rate"], p["format_name"], p["nb_streams"]
+p["has_audio"], p["audio_codec"], p["audio_sample_rate"], p["audio_channels"]
+```
+
+For metadata **without decoding**, use `nelux.probe(path)` — same dict, but it
+opens no decoder, allocates no frame buffer and spawns no threads:
+
+```python
+import nelux
+meta = nelux.probe("video.mp4")      # dict, same keys as VideoReader.properties
+```
+
+`total_frames` is fast but falls back to an `fps × duration` estimate when the
+container omits `nb_frames` (MKV/WebM/VFR). For an exact count call
+`get_frame_count()` / `len(reader)` (demux-only pass, cached), or check
+`p["nb_frames"] > 0` first to see whether the container count is authoritative.
 
 ### Reading Methods
 
@@ -132,7 +181,18 @@ batch = reader[torch.tensor([0,5,9])]
 len(reader)                          # respects set_range
 ```
 
-`get_batch` deduplicates indices, sorts for sequential decode, and supports negative indices.
+`get_batch` deduplicates indices, sorts for sequential decode, and supports
+negative indices. `decode_batch(indices)` is the unchecked C++ path `get_batch`
+calls after validation — indices must already be non-negative and in bounds.
+
+Slices follow Python container rules: `reader[:0]` is empty, `reader[:-1]` drops
+the last frame, `reader[-10:]` is the last ten, `reader[::-1]` is reversed. A
+bound past the end raises `IndexError` rather than clamping. An empty request
+returns a `[0, H, W, C]` tensor with the dtype and device a populated batch
+would have had, and is the one request accepted on readers where batch decoding
+is otherwise rejected (`resize=`, `color_format="gray"`/`"rgba"`).
+
+Batch decode always returns a `torch.Tensor`, including under `backend="numpy"`.
 
 ### Frame Ranges
 
@@ -221,15 +281,24 @@ VideoEncoder(
     height: Optional[int] = None,         # default: 1080
     bit_rate: Optional[int] = None,       # default: 4_000_000 (4 Mbps)
     fps: Optional[float] = None,          # default: 30.0
-    preset: Optional[int] = None,         # NVENC preset (1–7)
-    cq: Optional[int] = None,             # NVENC constant quality (0–51, lower = better); overrides bitrate if set
+    preset: Optional[Union[int, str]] = None,  # int 1..N mapped per codec, or an
+                                          #   ffmpeg preset name passed straight through
+                                          #   ("medium", "veryfast", "p4", ...)
+    cq: Optional[int] = None,             # constant quality (0–51 / 0–63 by codec, lower = better);
+                                          #   disables bitrate mode where required
     pixel_format: Optional[str] = None,   # default: "yuv420p"
+    options: Optional[Dict[str, str]] = None,  # extra AVOptions, applied AFTER the built-ins
     resize: bool = False,                 # accept any input size, scale to width x height
     resize_filter: str = "bilinear",      # scaling kernel (ffmpeg -sws_flags names)
 )
 ```
 
+- `preset` as an int maps through a per-codec table (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1=slowest..9=fastest`, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`); as a str it goes straight to `av_dict_set("preset", value)`, for parity with `ffmpeg -preset <name>`.
+- `options` forwards codec-specific AVOption key/value pairs to `avcodec_open2` after the built-in options, so entries here override them: `options={"tune": "film", "x264-params": "ref=3"}`.
+
 Supported `pixel_format` values include `"yuv420p"`, `"nv12"`, `"yuv444p"`, `"p010"`, `"gray"`, `"gray16le"`. Grayscale formats are software-only; NVENC falls back to NV12 with a warning.
+
+dtype decides precision: `uint8` takes the 8-bit path; against a >8-bit output format (`yuv422p10le`, `yuv420p10le`, `p010`, …) a `uint16` tensor is carried through at full 16-bit precision and a float tensor in `[0, 1]` scales to the full 16-bit range. A 4-channel frame's alpha reaches the file only if the output `pixel_format` has an alpha plane (`yuva444p10le` with ProRes 4444 / 4444 XQ); otherwise it is dropped, as `ffmpeg -pix_fmt rgba` does. Deep or 4-channel CUDA input takes the CPU staging path rather than the zero-copy GPU convert (that fused kernel is 8-bit RGB-only).
 
 - `resize=True` lets `encode_frame` take frames of any spatial size and scales them to `width` × `height` inside the swscale pass the encoder already runs (one fused scale+convert; byte-identical to `ffmpeg -vf scale=WxH:flags=bilinear`). The input size locks to the first frame's shape (a different later size raises), and input must be an explicit HWC layout (`[H,W,3]`/`[H,W,4]`/`[H,W,1]`/`[H,W]` — no flat 1-D buffers). `resize_filter` uses the same scaler names as `VideoReader`'s `resize_filter` and only matters when the sizes differ. A CUDA tensor at a different size takes the CPU staging path (the fused NVENC GPU kernel converts but does not scale); same-size CUDA input keeps the zero-copy GPU path.
 
@@ -238,7 +307,8 @@ Grayscale output (`"gray"`/`"gray16le"`/`"gray16be"`) is a **verbatim, full-rang
 ### Methods & Properties
 
 ```python
-encoder.encode_frame(frame)          # [H, W, 3] RGB or [H, W, 1]/[H, W] grayscale uint8 tensor (CPU or CUDA)
+encoder.encode_frame(frame)          # [H, W, 3] RGB, [H, W, 4] RGBA, or [H, W, 1]/[H, W]
+                                     #   grayscale tensor (CPU or CUDA)
 encoder.close()                      # finalize file
 encoder.is_hardware_encoder          # True if NVENC
 ```
@@ -345,14 +415,19 @@ set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical
 
 ```python
 import nelux
-nelux.__version__                    # "0.12.2"
+nelux.__version__                    # "0.18.0"
 nelux.__cuda_support__               # True if compiled with CUDA
+nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.13"
+nelux.__ffmpeg_version__             # FFmpeg loaded at runtime, e.g. "8.1.2-tas"
 
-from nelux import get_available_encoders, get_nvenc_encoders, diagnose_runtime_dlls
+from nelux import (get_available_encoders, get_nvenc_encoders,
+                   diagnose_runtime_dlls, probe)
 
 get_available_encoders()             # [{"name", "long_name", "is_hardware"}, ...]
 get_nvenc_encoders()                 # NVENC-only subset
 diagnose_runtime_dlls()              # Windows: report missing runtime DLLs
+probe("video.mp4")                   # decode-free metadata dict
+reader.supported_codecs()            # decoders the linked libavcodec provides
 ```
 
 ---
@@ -361,10 +436,11 @@ diagnose_runtime_dlls()              # Windows: report missing runtime DLLs
 
 ```python
 __all__ = [
-    "__version__", "__cuda_support__",
+    "__version__", "__torch_abi__", "__cuda_support__", "__ffmpeg_version__",
     "VideoReader", "VideoEncoder",
     "set_log_level", "LogLevel",
     "get_available_encoders", "get_nvenc_encoders",
+    "probe",
     "diagnose_runtime_dlls",
 ]
 ```
@@ -375,8 +451,8 @@ __all__ = [
 
 | Component | Value |
 |---|---|
-| Shape (single) | `[H, W, 3]` (HWC, RGB) |
-| Shape (batch) | `[B, H, W, 3]` |
+| Shape (single) | `[H, W, C]` (HWC) — `C` = 3 `"rgb"`, 4 `"rgba"`, 1 `"gray"` |
+| Shape (batch) | `[B, H, W, C]`, always a `torch.Tensor` |
 | dtype (8-bit source) | `uint8` |
 | dtype (10/12/16-bit source) | `uint16` |
 | dtype (with `force_8bit=True`) | `uint8` |
@@ -550,8 +626,12 @@ def process_video(input_path, output_path, model):
 
 ## Requirements
 
-- Python **3.13+**
-- PyTorch 2.0+ (2.13.0 recommended; CUDA build required for NVDEC/NVENC)
-- CUDA 11.8+ (for NVDEC/NVENC on Windows/Linux)
-- FFmpeg shared libraries available to the process
-- Windows 10/11, Linux (manylinux_2_28+), or macOS 12.0+ (arm64)
+- Python **3.13+** (`requires-python = ">=3.13"`)
+- PyTorch **2.13.x** — each wheel is built against one torch minor, is
+  build-tagged (`213torch`) and raises `ImportError` under a different minor.
+  The matching CUDA torch wheel supplies the CUDA runtime the NVDEC path needs.
+- CUDA **13.x** for the published NVDEC/NVENC wheels; GPU compute capability
+  7.5+ (Turing or newer). Pre-Turing NVDEC cards need a source build against
+  CUDA 12.x. CPU-only builds drop this entirely.
+- FFmpeg — **bundled in the wheel**, nothing to install
+- Windows 10/11, Linux (manylinux_2_28+), or macOS 14.0+ (arm64)
