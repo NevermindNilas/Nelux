@@ -1,5 +1,35 @@
 
-### **Unreleased**
+### **Version 0.18.0 (2026-08-12)**
+
+#### **Encoder-side resize: scale to the output size inside the encoder**
+
+- **Added: `VideoEncoder(..., resize=True, resize_filter=...)`.**
+  `encode_frame` now accepts frames of any spatial size and scales them to
+  `width` × `height` inside the libswscale pass the convert pipeline already
+  runs — one fused scale+convert per frame, no separate resize stage, no
+  intermediate buffer, pipelined on the convert workers so the scale hides
+  behind the encoder. Output is **byte-identical to
+  `ffmpeg -vf scale=WxH:flags=bilinear`** for YUV and RGB destinations
+  (lossless ffv1/qtrle round-trips). `resize_filter` takes the same scaler
+  names as the reader's decoder-side resize (`bilinear` default, `bicubic`,
+  `lanczos`, `area`, `spline`, …). The input size locks to the first frame's
+  shape; a different later size raises. RGBA alpha scales alongside color
+  (ProRes 4444), deep uint16/float input resamples at RGB48LE precision, the
+  verbatim grayscale data path resamples at the output bit depth (a constant
+  16-bit plane stays exact), and a CUDA tensor whose size differs from the
+  output takes the CPU staging path (the fused NVENC kernel converts but does
+  not scale). `resize=False` (default) changes nothing. Verified across every
+  software encoder family in the bundled FFmpeg plus per-machine NVENC/QSV/MF
+  hardware encoders, downscale and upscale (`tests/test_encoder_resize.py`).
+
+- **Fixed: scaling to an RGB pixel format used mismatched colour matrices.**
+  swscale scales RGB→RGB through an internal YUV round trip; the converter
+  handed it BT.709 source coefficients against a BT.601 destination table
+  (up to 22/255 off vs `ffmpeg -vf scale`), and touching the details on a
+  gray→gray resample multiplied GRAY16 values by 257/256. Both cases now
+  leave swscale's own consistent defaults in place. Neither path was
+  reachable before encoder-side resize existed (same-size RGB→RGB is
+  swscale's unscaled copy special case).
 
 #### **Encoder defaults: the convenience path now works off Windows, and picks a codec the container can hold**
 

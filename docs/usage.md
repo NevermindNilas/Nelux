@@ -586,6 +586,8 @@ VideoEncoder(
     preset: Optional[int] = None,
     cq: Optional[int] = None,
     pixel_format: Optional[str] = None,
+    resize: bool = False,
+    resize_filter: str = "bilinear",
 )
 ```
 
@@ -600,6 +602,29 @@ VideoEncoder(
 | `preset` | `int` | Auto | NVENC/x26x preset (1-9) |
 | `cq` | `int` | Auto | Constant quality (0-51) |
 | `pixel_format` | `str` | Auto | Output pixel format |
+| `resize` | `bool` | `False` | Accept input frames of any size and scale them to `width`×`height` |
+| `resize_filter` | `str` | `"bilinear"` | Scaling kernel for the encoder-side resize (ffmpeg `-sws_flags` names) |
+
+### Encoder-Side Resize
+
+With `resize=True` the encoder scales input frames to `width`×`height` inside
+the libswscale pass it already runs — one fused scale+convert per frame, no
+separate resize stage, and the result is byte-identical to
+`ffmpeg -vf scale=WxH:flags=bilinear`. The input size is read from the first
+frame's shape and locked for the encode; frames must use an explicit HWC
+layout (`[H,W,3]`, `[H,W,4]`, `[H,W,1]` or `[H,W]`).
+
+```python
+# 4K in, 1080p out — no F.interpolate, no extra buffer
+with VideoEncoder("out.mp4", width=1920, height=1080, fps=30.0,
+                  resize=True, resize_filter="lanczos") as encoder:
+    for frame in frames_2160p:            # (2160, 3840, 3) uint8
+        encoder.encode_frame(frame)
+```
+
+A CUDA tensor whose size differs from the output takes the CPU staging path
+(the fused NVENC GPU kernel converts but does not scale); same-size CUDA
+input keeps the zero-copy GPU path.
 
 ### Basic Usage
 

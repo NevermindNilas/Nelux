@@ -5,9 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] - 2026-08-12
+
+### Added
+
+- **Encoder-side resize: `VideoEncoder(..., resize=True, resize_filter=...)`.**
+  `encode_frame` then accepts frames of any spatial size and scales them to
+  `width` × `height` inside the libswscale pass the convert pipeline already
+  runs — one fused scale+convert per frame, no separate resize stage, no
+  intermediate buffer, and the scale is hidden behind the encoder on the
+  convert-worker pool. Output is **byte-identical to
+  `ffmpeg -vf scale=WxH:flags=bilinear`** for both YUV and RGB destinations
+  (verified via lossless ffv1/qtrle round-trips). `resize_filter` accepts the
+  same scaler names as the reader's decoder-side resize (ffmpeg `-sws_flags`:
+  `bilinear` default, `bicubic`, `lanczos`, `area`, `spline`, …).
+
+  The input size is read from the first frame's shape and locked for the
+  encode — a later frame with a different size raises rather than silently
+  re-initializing the pipeline — and input must be an explicit HWC layout
+  (`[H,W,3]`, `[H,W,4]`, `[H,W,1]` or `[H,W]`); a flat 1-D buffer carries no
+  shape to read the size from. All input paths participate: RGB, RGBA (alpha
+  is scaled alongside color into ProRes 4444), single-channel (replicated,
+  then scaled), deep uint16/float into >8-bit formats (staged as RGB48LE and
+  resampled at full precision), and the verbatim grayscale data path
+  (`gray`/`gray16le`/`gray16be`), which resamples at the output bit depth —
+  never through 8-bit RGB — and keeps a constant plane exact. A CUDA tensor
+  whose size differs from the output takes the CPU staging path (the fused
+  NVENC GPU kernel converts but does not scale — correctness over throughput,
+  same policy as deep/4-channel input); same-size CUDA input keeps the
+  zero-copy GPU path. With `resize=False` (default) nothing changes: the
+  strict shape validation and every existing path are untouched, and same-size
+  contexts are built with the same flags as before.
+
+  Verified against every software encoder family in the bundled FFmpeg
+  (libx264, libx265, mpeg1/mpeg2/mpeg4, msmpeg4v2/msmpeg4, wmv1/wmv2, flv,
+  h263p, mjpeg, ffv1, ffvhuff, huffyuv, utvideo, magicyuv, qtrle, prores /
+  prores_aw / prores_ks, dnxhd (DNxHR), libvpx / libvpx-vp9, libsvtav1,
+  libaom-av1, gif, rawvideo) plus the hardware encoders available per machine
+  (NVENC h264/hevc,
+  QSV h264/hevc, h264_mf), downscale and upscale, in
+  `tests/test_encoder_resize.py`.
 
 ### Fixed
+
+- **RGB-destination scaling used mismatched colour matrices.** Scaling to an
+  RGB pixel format (`rgb24` codecs such as qtrle or rawvideo) runs through
+  swscale's internal YUV round trip, and the encoder's converter handed it
+  BT.709 source coefficients with a BT.601 destination table — skewing the
+  output by up to 22/255 against `ffmpeg -vf scale` on the same input. The
+  converter now leaves the colorspace details at swscale's own consistent
+  defaults when the destination is RGB (and when the source is gray, where
+  touching them multiplied GRAY16 values by 257/256). Unreachable before
+  encoder-side resize existed: a same-size RGB→RGB convert is swscale's
+  unscaled copy special case, which never touches a matrix.
 
 - **The default encoder was Windows-only, so `VideoEncoder(path)` raised on
   every Linux and macOS wheel.** `props.codec = codec.value_or("h264_mf")` was

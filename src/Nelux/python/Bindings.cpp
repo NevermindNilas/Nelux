@@ -176,7 +176,7 @@ const char* loadedFFmpegVersion()
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.17.0";
+    m.attr("__version__") = "0.18.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Identity of the FFmpeg actually loaded into this process, not the one we
@@ -557,7 +557,8 @@ Example:
                     std::optional<int> bit_rate, std::optional<double> fps,
                     py::object preset, std::optional<int> cq,
                     std::optional<std::string> pixel_format,
-                    std::optional<std::map<std::string, std::string>> options)
+                    std::optional<std::map<std::string, std::string>> options,
+                    bool resize, const std::string& resize_filter)
                  {
                      // Dispatch `preset` on Python type: int → existing 1..N
                      // mapping table per codec; str → forwarded straight to
@@ -591,7 +592,7 @@ Example:
                      return std::make_shared<nelux::VideoEncoder>(
                          output_path, codec, width, height, bit_rate, fps,
                          presetInt, cq, pixel_format, presetStr,
-                         std::move(extraOptions));
+                         std::move(extraOptions), resize, resize_filter);
                  }),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
@@ -599,6 +600,8 @@ Example:
              py::arg("preset") = py::none(),
              py::arg("cq") = py::none(), py::arg("pixel_format") = py::none(),
              py::arg("options") = py::none(),
+             py::arg("resize") = false,
+             py::arg("resize_filter") = "bilinear",
              R"doc(Create a video encoder.
 
 Args:
@@ -644,11 +647,31 @@ Args:
         built-in options (preset, crf, ...), so entries here override any of
         them. Lets you reach codec-specific knobs nelux doesn't wrap explicitly:
         ``options={"tune": "film", "x264-params": "ref=3", "cpu-used": "8"}``.
+    resize (bool, optional): When True, ``encode_frame`` accepts input frames of
+        any spatial size and scales them to ``width`` x ``height`` inside the
+        libswscale pass the encoder already runs — one fused scale+convert, no
+        separate resize stage or intermediate buffer. The input size is read
+        from the first frame's shape and locked for the encode; a later frame
+        with a different size raises. Input must then be an explicit HWC layout
+        ([H,W,3], [H,W,4], [H,W,1] or [H,W]) — flat 1-D buffers carry no shape
+        to read the size from. A CUDA tensor whose size differs from the output
+        takes the CPU staging path (the fused NVENC GPU kernel converts but
+        does not scale). Defaults to False: input must match ``width`` x
+        ``height`` exactly, as before.
+    resize_filter (str, optional): libswscale scaling kernel for the
+        encoder-side resize; only takes effect when ``resize=True`` and the
+        input size differs from the output. Same names as the reader's
+        ``resize_filter`` / ffmpeg's ``-sws_flags``: "fast_bilinear", "bilinear"
+        (default), "bicubic", "experimental", "neighbor", "area", "bicublin",
+        "gauss", "sinc", "lanczos", "spline".
 )doc")
         .def("encode_frame", &nelux::VideoEncoder::encodeFrame, py::arg("frame"),
              R"doc(Encode one video frame.
 
-Accepts H×W×3 (RGB), H×W×4 (RGBA) or H×W / H×W×1 (grayscale), HWC.
+Accepts H×W×3 (RGB), H×W×4 (RGBA) or H×W / H×W×1 (grayscale), HWC. Without
+``resize=True`` the size must match the encoder's ``width`` x ``height``
+exactly; with it, any spatial size is accepted (locked by the first frame)
+and scaled to the output size inside the convert pass.
 
 dtype decides precision. uint8 takes the 8-bit path unchanged. When the output
 ``pixel_format`` stores more than 8 bits per component (ProRes' yuv422p10le /
