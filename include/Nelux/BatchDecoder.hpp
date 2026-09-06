@@ -1,8 +1,9 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <algorithm>
+#include <utility>
 #include <vector>
-#include <map>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -241,7 +242,9 @@ private:
         int stream_idx,
         int64_t target_frame,
         int64_t& current_frame,
-        AVFrame* frame);
+        AVFrame* frame,
+        AVPacket* pkt,
+        double fps);
 
     /**
      * @brief Copy a decoded frame to the output tensor at specified positions
@@ -254,6 +257,15 @@ private:
         AVFrame* frame,
         torch::Tensor& output,
         const std::vector<size_t>& positions,
+        SwsContext* sws_ctx);
+    // Zero-alloc fan-out: scatter one decoded frame to `count` batch
+    // positions. Identical pixels to the vector overload; avoids the
+    // per-target std::vector alloc on the hot path.
+    void copyFrameToOutput(
+        AVFrame* frame,
+        torch::Tensor& output,
+        const size_t* positions,
+        size_t count,
         SwsContext* sws_ctx);
 };
 

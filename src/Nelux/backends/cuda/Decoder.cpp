@@ -320,8 +320,11 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
                           cudaGetErrorString(err));
     }
 
-    // Create CUDA stream for decoder operations
-    err = cudaStreamCreate(&cudaStream_);
+    // Create CUDA stream for decoder operations. Non-blocking so decode work
+    // never implicitly syncs with unrelated torch NULL-stream ops on the same
+    // device. Ordering with the consumer is still enforced via explicit events
+    // (decodeCompleteEvent_/consumerSyncEvent_) and the producer-block protocol.
+    err = cudaStreamCreateWithFlags(&cudaStream_, cudaStreamNonBlocking);
     if (err != cudaSuccess)
     {
         throw CxException(std::string("Failed to create CUDA stream: ") +

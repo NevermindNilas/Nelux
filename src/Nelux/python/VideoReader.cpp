@@ -910,7 +910,13 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         // exists for the case the enum grows a CPU-resident in-place backend
         // (the shape a QSV/xpu decode path would take), where `t` really would
         // be the shared member on the host and a view would alias it.
-        torch::Tensor cpu_tensor = t.cpu().contiguous();
+        // Fast path: CPU-contiguous tensors skip the redundant .cpu().contiguous()
+        // round-trip (one refcount bump + contiguity check instead of a dispatch).
+        torch::Tensor cpu_tensor;
+        if (t.device().is_cpu() && t.is_contiguous())
+            cpu_tensor = t;
+        else
+            cpu_tensor = t.cpu().contiguous();
         if (tensor.defined() && cpu_tensor.data_ptr() == tensor.data_ptr())
             cpu_tensor = cpu_tensor.clone();
 
@@ -1048,9 +1054,10 @@ py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties
     props["max_fps"] = properties.max_fps; // New property
     props["duration"] = properties.duration;
     props["total_frames"] = properties.totalFrames;
-    props["pixel_format"] = av_get_pix_fmt_name(properties.pixelFormat)
-                                ? av_get_pix_fmt_name(properties.pixelFormat)
-                                : "Unknown";
+    props["pixel_format"] = ([&]() -> const char* {
+        const char* n = av_get_pix_fmt_name(properties.pixelFormat);
+        return n ? n : "Unknown";
+    })();
     props["has_audio"] = properties.hasAudio;
     props["bit_depth"] = properties.bitDepth;
     props["aspect_ratio"] = properties.aspectRatio; // New property

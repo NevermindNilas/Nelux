@@ -1493,7 +1493,7 @@ bool Encoder::encodeFrame(const Frame& frame)
                 av_frame_free(&hwFrame);
             return false;
         }
-        writePacket(); // calls av_interleaved_write_frame()
+        writePacket(); // single-stream av_write_frame, or interleaved with passthrough
     }
 
     // Clean up the hardware frame
@@ -1544,11 +1544,19 @@ void Encoder::writePacket()
 
     stampPacketDuration();
     av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base, videoStream->time_base);
-    if (int ret = av_interleaved_write_frame(formatCtx.get(), pkt.get()); ret < 0)
+    // Single-stream fast path: with no passthrough there is exactly one stream
+    // already in pts order, so the mux-queue sort in av_interleaved_write_frame
+    // is pure overhead (malloc/compare per packet). Identical bytes, less CPU.
+    int writeRet = hasPassthrough
+        ? av_interleaved_write_frame(formatCtx.get(), pkt.get())
+        : av_write_frame(formatCtx.get(), pkt.get());
+    if (writeRet < 0)
     {
         // Surface muxing / I/O failures (disk full, broken pipe). Without this
         // the write silently fails and encoding reports success.
-        NELUX_ERROR("av_interleaved_write_frame failed: {}", errorToString(ret));
+        NELUX_ERROR("{} failed: {}", hasPassthrough ? "av_interleaved_write_frame"
+                                                     : "av_write_frame",
+                    errorToString(writeRet));
     }
 }
 
@@ -1581,10 +1589,14 @@ void Encoder::close()
             stampPacketDuration();
             av_packet_rescale_ts(pkt.get(), videoCodecCtx->time_base,
                                  videoStream->time_base);
-            if (int wret = av_interleaved_write_frame(formatCtx.get(), pkt.get());
-                wret < 0)
+            int wret = hasPassthrough
+                ? av_interleaved_write_frame(formatCtx.get(), pkt.get())
+                : av_write_frame(formatCtx.get(), pkt.get());
+            if (wret < 0)
             {
-                NELUX_ERROR("av_interleaved_write_frame failed on close: {}",
+                NELUX_ERROR("{} failed on close: {}",
+                            hasPassthrough ? "av_interleaved_write_frame"
+                                            : "av_write_frame",
                             errorToString(wret));
                 break;
             }

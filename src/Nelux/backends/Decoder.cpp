@@ -425,6 +425,17 @@ void Decoder::setProperties()
         "aspectRatio={}",
         properties.width, properties.height, properties.fps, properties.duration,
         properties.totalFrames, properties.aspectRatio);
+
+    // Cache seconds-per-tick once: getFrameTimestamp() previously called
+    // av_q2d(stream->time_base) + reloaded the stream pointer per frame.
+    // Identical arithmetic, one division at open instead of one per frame.
+    secPerTick_ = 0.0;
+    if (formatCtx && videoStreamIndex >= 0 &&
+        static_cast<size_t>(videoStreamIndex) < formatCtx->nb_streams &&
+        formatCtx->streams[videoStreamIndex])
+    {
+        secPerTick_ = av_q2d(formatCtx->streams[videoStreamIndex]->time_base);
+    }
 }
 
 // Decode-free metadata probe: open the container, read stream info, and extract
@@ -793,7 +804,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         {
             *frame_timestamp = cf.timestamp;
         }
-        setLastMotionVectors(std::move(cf.motionVectors));
+        if (motionVectorsEnabled_)
+            setLastMotionVectors(std::move(cf.motionVectors));
         lastFrameType_ = cf.frameType;
 
         if (!buffer)
@@ -837,7 +849,8 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             *frame_timestamp = getFrameTimestamp(frame.get());
         }
 
-        setLastMotionVectors(extractMotionVectors(frame.get()));
+        if (motionVectorsEnabled_)
+            setLastMotionVectors(extractMotionVectors(frame.get()));
         setLastFrameType(frame.get());
         converter->convert(frame, buffer);
         return true;
@@ -873,11 +886,16 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
                 SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
                     *frame_timestamp = e.timestamp;
-                setLastMotionVectors(std::move(e.motionVectors));
+                if (motionVectorsEnabled_)
+                    setLastMotionVectors(std::move(e.motionVectors));
                 lastFrameType_ = e.frameType;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
-                // Wake producer in case it was throttled on in-flight cap.
+                // Wake throttled parties. Must be notify_all: this CV has TWO
+                // waiter classes with different predicates — convert workers
+                // (queue non-empty) and the fanout producer (in-flight below
+                // cap). notify_one can land on an idle worker that re-sleeps
+                // on an empty queue, stranding the producer.
                 olk.unlock();
                 syncConvertWorkCv_.notify_all();
                 // Zero-copy wrap on this (consumer/main) thread, not the worker.
@@ -922,7 +940,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
 
         if (frame_timestamp)
             *frame_timestamp = cf.timestamp;
-        setLastMotionVectors(std::move(cf.motionVectors));
+        if (motionVectorsEnabled_)
+            setLastMotionVectors(std::move(cf.motionVectors));
         lastFrameType_ = cf.frameType;
 
         if (cf.tensor.defined())
@@ -965,7 +984,8 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
     if (frame_timestamp)
         *frame_timestamp = getFrameTimestamp(frame.get());
 
-    setLastMotionVectors(extractMotionVectors(frame.get()));
+    if (motionVectorsEnabled_)
+        setLastMotionVectors(extractMotionVectors(frame.get()));
     setLastFrameType(frame.get());
     const int elemSize =
         (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
@@ -1041,7 +1061,12 @@ void Decoder::syncConvertWorkerLoop()
         SyncConvertOutEntry entry;
         entry.buffer = acquireOutputBuffer(nbytes);
         entry.timestamp = getFrameTimestamp(w.frame.get());
-        entry.motionVectors = extractMotionVectors(w.frame.get());
+        // MV side-data is only populated when the codec was opened with
+        // EXPORT_MVS (motionVectorsEnabled_). Skipping the lookup + vector
+        // alloc when disabled saves a side-data scan per frame; pixels,
+        // order and timing are unaffected.
+        if (motionVectorsEnabled_)
+            entry.motionVectors = extractMotionVectors(w.frame.get());
         entry.frameType = av_get_picture_type_char(w.frame.get()->pict_type);
         local_converter->convert(w.frame, entry.buffer.get());
 
@@ -1049,7 +1074,9 @@ void Decoder::syncConvertWorkerLoop()
             std::lock_guard<std::mutex> lk(syncConvertOutMu_);
             syncConvertOutMap_.emplace(w.seq, std::move(entry));
         }
-        syncConvertOutCv_.notify_all();
+        // Exactly one consumer waits on this condition; notify_one avoids
+        // waking every convert worker on every frame.
+        syncConvertOutCv_.notify_one();
     }
 }
 
@@ -1223,18 +1250,24 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             {
                 if (frame_timestamp)
                     *frame_timestamp = getFrameTimestamp(f);
-                setLastMotionVectors(extractMotionVectors(f));
+                if (motionVectorsEnabled_)
+                    setLastMotionVectors(extractMotionVectors(f));
                 setLastFrameType(f);
+                // Pooled plain-heap buffer + from_blob wrap: avoids a
+                // torch-CPU-allocator alloc per frame on this path, matching
+                // the worker path. Pixels identical, only the allocation
+                // source changes.
                 const int elemSize =
                     (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
-                const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
-                torch::Tensor t = torch::empty(
-                    {properties.height, properties.width, outChannels_},
-                    torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+                const size_t nbytes = static_cast<size_t>(properties.width) *
+                                      static_cast<size_t>(properties.height) *
+                                      static_cast<size_t>(outChannels_) *
+                                      static_cast<size_t>(elemSize);
+                auto buf = acquireOutputBuffer(nbytes);
                 if (converter)
-                    converter->convert(syncFrame_, t.data_ptr());
+                    converter->convert(syncFrame_, buf.get());
                 av_frame_unref(f);
-                return t;
+                return tensorFromPooledBuffer(std::move(buf));
             }
             if (ret == AVERROR_EOF)
             {
@@ -1273,7 +1306,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 SyncConvertOutEntry e = std::move(it->second);
                 if (frame_timestamp)
                     *frame_timestamp = e.timestamp;
-                setLastMotionVectors(std::move(e.motionVectors));
+                if (motionVectorsEnabled_)
+                    setLastMotionVectors(std::move(e.motionVectors));
                 lastFrameType_ = e.frameType;
                 syncConvertOutMap_.erase(it);
                 syncConsumeSeq_++;
@@ -1702,6 +1736,22 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     {
         NELUX_WARN("Received a null frame pointer.");
         return -1.0;
+    }
+
+    // Fast path: cached seconds-per-tick (populated in setProperties()).
+    // Identical to the per-frame av_q2d() computation below; falls back to
+    // the stream lookup only when the cache was never populated (e.g. a
+    // decoder constructed without setProperties, or after a timeline reset).
+    if (secPerTick_ != 0.0)
+    {
+        int64_t ts = frame->best_effort_timestamp;
+        if (ts == AV_NOPTS_VALUE)
+            ts = frame->pts;
+        if (ts == AV_NOPTS_VALUE)
+            ts = frame->pkt_dts;
+        if (ts == AV_NOPTS_VALUE)
+            return -1.0;
+        return static_cast<double>(ts) * secPerTick_;
     }
 
     // Define a lambda to convert AV_TIME_BASE to seconds
@@ -2138,7 +2188,8 @@ void Decoder::decodingLoop()
                 }
                 syncConvertWorkCv_.notify_one();
                 // Wake any consumer waiting on output (it polls map).
-                syncConvertOutCv_.notify_all();
+                // Only one consumer exists; notify_one avoids herd wakeups.
+                syncConvertOutCv_.notify_one();
                 av_frame_unref(localFrame.get());
                 continue;
             }
@@ -2146,7 +2197,8 @@ void Decoder::decodingLoop()
             {
                 ConvertedFrame cf;
                 cf.timestamp = getFrameTimestamp(localFrame.get());
-                cf.motionVectors = extractMotionVectors(localFrame.get());
+                if (motionVectorsEnabled_)
+                    cf.motionVectors = extractMotionVectors(localFrame.get());
                 cf.frameType = av_get_picture_type_char(localFrame.get()->pict_type);
                 const int elemSize =
                     (force_8bit || properties.bitDepth <= 8) ? 1 : 2;

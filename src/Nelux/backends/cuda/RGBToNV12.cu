@@ -106,6 +106,29 @@ static const float kOffsetBT2020Full[3] = {0.0f, 128.0f, 128.0f};
 // Set the RGB to YUV conversion matrix in constant memory
 //------------------------------------------------------------------------------
 void SetMatRgb2Yuv(int iMatrix, int colorRange, cudaStream_t stream) {
+    // Cache the last-uploaded (device, matrix, range): the encoder uses one
+    // triplet for the whole session, so without this every frame pays 2x H2D
+    // constant uploads that serialize the encode stream. Identical constants,
+    // fewer uploads.
+    //
+    // The key MUST include the device: __constant__ storage is per-device, so
+    // a (matrix, range)-only key would skip a needed upload when the same
+    // thread encodes on a second GPU (or after a device reset) and silently
+    // tint every frame with stale constants. A key mismatch always
+    // re-uploads, so the failure mode of a stale key is one redundant upload,
+    // never wrong pixels. Single submit thread per converter, so thread_local
+    // needs no mutex (cf. the mutex-guarded decode-side cache in NV12ToRGB.cu
+    // which is shared across threads).
+    static thread_local int cachedDevice = -1;
+    static thread_local int cachedMatrix = -1;
+    static thread_local int cachedRange = -1;
+    int curDevice = -1;
+    if (cudaGetDevice(&curDevice) != cudaSuccess)
+        curDevice = -1;
+    if (curDevice == cachedDevice && iMatrix == cachedMatrix &&
+        colorRange == cachedRange) {
+        return;
+    }
     const float (*mat)[3] = nullptr;
     const float *offset = nullptr;
 
@@ -132,6 +155,9 @@ void SetMatRgb2Yuv(int iMatrix, int colorRange, cudaStream_t stream) {
     
     cudaMemcpyToSymbolAsync(matRgb2Yuv, mat, sizeof(float) * 9, 0, cudaMemcpyHostToDevice, stream);
     cudaMemcpyToSymbolAsync(yuvOffset, offset, sizeof(float) * 3, 0, cudaMemcpyHostToDevice, stream);
+    cachedDevice = curDevice;
+    cachedMatrix = iMatrix;
+    cachedRange = colorRange;
 }
 
 //------------------------------------------------------------------------------

@@ -150,8 +150,10 @@ class BatchMixin:
             # Already absolute — _slice_to_index_list resolved the negatives
             # against frame_count, and adding it again would move them twice.
             normalized = self._slice_to_index_list(indices)
+            n = None
         else:
             normalized = self._to_index_list(indices)
+            n = None
             if normalized:
                 # Only pay for frame_count when a negative index needs it: on
                 # a container without nb_frames the first call demuxes the
@@ -169,8 +171,14 @@ class BatchMixin:
             # too.
             return self.decode_batch([])
 
-        # Validate bounds
-        frame_count = self.frame_count
+        # Validate bounds. Reuse the frame_count already fetched for negative
+        # normalisation when available (one fewer Python->C++ round-trip).
+        # frame_count is immutable per file and cached in C++, so reuse is
+        # exact. Note: the slice path resolves negatives inside
+        # _slice_to_index_list (which fetches its own count), so slices still
+        # fetch once there and once here — both cache hits, not extra demux
+        # passes.
+        frame_count = n if n is not None else self.frame_count
         for idx in normalized:
             if not (0 <= idx < frame_count):
                 raise IndexError(f"Frame index {idx} out of bounds [0, {frame_count})")

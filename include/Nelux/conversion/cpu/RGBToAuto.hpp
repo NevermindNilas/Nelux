@@ -172,25 +172,40 @@ class RGBToAutoConverter
                 sws_setColorspaceDetails(swsContext, srcMatrix, srcRange, dstMatrix,
                                          dstRange, 0, 1 << 16, 1 << 16);
             }
+
+            // Cache loop-invariants: source stride + destination plane count.
+            // Previously recomputed per frame (av_image_get_linesize,
+            // av_pix_fmt_count_planes); identical values, zero per-frame cost.
+            cachedSrcStride_ = av_image_get_linesize(src_fmt, src_width, 0);
+            int np = av_pix_fmt_count_planes(dst_fmt);
+            if (np <= 0)
+                np = 1;
+            if (np > 4)
+                np = 4;
+            cachedNumPlanes_ = np;
         }
 
         // Prepare source data/stride. Packed, so one plane; the row stride comes
-        // from the format (RGB24 = 3 bytes/pixel, RGB48LE = 6).
+        // from the format (RGB24 = 3 bytes/pixel, RGB48LE = 6). Cached at
+        // context-build time (see cachedSrcStride_); recomputed here only if
+        // the context was built for a different source format (defensive).
         const uint8_t* srcData[4] = {static_cast<const uint8_t*>(buffer), nullptr,
                                      nullptr, nullptr};
-        const int srcStride = av_image_get_linesize(src_fmt, src_width, 0);
-        if (srcStride <= 0)
-            throw std::runtime_error("RGBToAutoConverter: unsupported source format");
-        int srcLineSize[4] = {srcStride, 0, 0, 0};
+        int srcLineSize[4] = {cachedSrcStride_, 0, 0, 0};
+        if (srcPixFmt != src_fmt || cachedSrcStride_ <= 0)
+        {
+            const int srcStride = av_image_get_linesize(srcPixFmt, src_width, 0);
+            if (srcStride <= 0)
+                throw std::runtime_error("RGBToAutoConverter: unsupported source format");
+            srcLineSize[0] = srcStride;
+        }
 
-        // Prepare destination data/stride (planes)
+        // Prepare destination data/stride (planes). Plane count is cached at
+        // context-build time; per-frame work is only the pointer/stride fetch.
         uint8_t* dstData[4] = {nullptr, nullptr, nullptr, nullptr};
         int dstLineSize[4] = {0, 0, 0, 0};
 
-        // Single-plane formats (gray, gray16le, packed RGB) expose only plane 0.
-        int numPlanes = av_pix_fmt_count_planes(dst_fmt);
-        if (numPlanes <= 0) numPlanes = 1;
-        if (numPlanes > 4) numPlanes = 4;
+        const int numPlanes = (cachedNumPlanes_ > 0) ? cachedNumPlanes_ : 1;
 
         for (int i = 0; i < numPlanes; ++i)
         {
@@ -198,14 +213,9 @@ class RGBToAutoConverter
             dstLineSize[i] = frame.getLineSize(i);
         }
 
-        if (!srcData[0])
+        if (!srcData[0] || !dstData[0])
         {
-            throw std::runtime_error("Source data pointer is null");
-        }
-        for (int i = 0; i < numPlanes; ++i)
-        {
-            if (!dstData[i])
-                std::cerr << "!! WARNING: dstData[" << i << "] is NULL !!\n";
+            throw std::runtime_error("RGBToAutoConverter: null data pointer");
         }
 
         int result = sws_scale(swsContext, srcData, srcLineSize, 0, src_height,
@@ -228,6 +238,9 @@ class RGBToAutoConverter
     AVPixelFormat dst_fmt;
     AVColorSpace dst_colorspace;
     AVColorRange dst_color_range;
+    // Loop-invariants cached when swsContext is (re)built.
+    int cachedSrcStride_ = 0;
+    int cachedNumPlanes_ = 0;
 };
 
 } // namespace cpu

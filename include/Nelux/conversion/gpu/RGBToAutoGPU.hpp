@@ -218,21 +218,27 @@ public:
                      : ""));
         }
 
-        // Synchronize to ensure conversion is complete
-        cudaError_t syncErr = stream ? cudaStreamSynchronize(stream)
-                                     : cudaDeviceSynchronize();
-        if (syncErr != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("RGBToAutoGPUConverter: conversion kernel failed: ") +
-                cudaGetErrorString(syncErr));
-        }
+        // Async-only: no blocking sync here. The convert kernel, the
+        // copyToCudaFrame D2D and (for the CPU path) the blocking D2H copy all
+        // run on the same stream, so one synchronize() after the copy covers
+        // the whole chain. Previously this function blocked AND the caller
+        // blocked again (two stalls per frame). Callers must still sync via
+        // synchronize() (NVENC path) or rely on the blocking D2H copy (CPU
+        // path) before reading the output. Pixels unchanged.
     }
     
     /**
      * @brief Copy converted YUV data from CUDA buffer to CPU AVFrame
-     * 
+     *
      * This downloads the data from GPU to CPU for use with software
      * encoders or av_hwframe_transfer_data.
+     *
+     * BARRIER CONTRACT: convert() is async-only, and the blocking D2H copies
+     * below do NOT order against prior async work when `stream` is
+     * non-blocking. Call synchronize() after copyToCudaFrame/copyToCpuFrame
+     * (or before reading getCudaBuffer() directly) before consuming the
+     * output. The live NVENC path does convert → copyToCudaFrame →
+     * synchronize() on one stream, which is correctly ordered.
      */
     void copyToCpuFrame(AVFrame* frame)
     {
@@ -296,6 +302,9 @@ public:
     
     /**
      * @brief Get pointer to CUDA NV12 buffer (for direct NVENC upload)
+     *
+     * Raw accessor: the caller must synchronize() the stream after convert()
+     * before reading through this pointer.
      */
     uint8_t* getCudaBuffer() const { return cudaNv12Buffer; }
     

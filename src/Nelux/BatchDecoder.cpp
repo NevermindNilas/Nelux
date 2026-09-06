@@ -261,16 +261,19 @@ bool BatchDecoder::decodeUntilFrame(
     int stream_idx,
     int64_t target_frame,
     int64_t& current_frame,
-    AVFrame* frame)
+    AVFrame* frame,
+    AVPacket* pkt,
+    double fps)
 {
-    AVPacket* pkt = av_packet_alloc();
+    // pkt + fps are hoisted by decode_batch (one alloc + one av_q2d per batch
+    // instead of per target). Pixels/timing identical; only allocation churn
+    // changes.
     if (!pkt) {
-        throw std::runtime_error("Failed to allocate packet");
+        throw std::runtime_error("decodeUntilFrame: null packet");
     }
 
     bool success = false;
     AVStream* stream = fmt_ctx->streams[stream_idx];
-    double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
     
     // Decode frames until we reach target
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -289,7 +292,6 @@ bool BatchDecoder::decodeUntilFrame(
                 if (ret < 0) {
                     NELUX_ERROR("Error decoding frame: {}", errorToString(ret));
                     av_packet_unref(pkt);
-                    av_packet_free(&pkt);
                     return false;
                 }
 
@@ -307,7 +309,6 @@ bool BatchDecoder::decodeUntilFrame(
                 if (current_frame >= target_frame) {
                     success = true;
                     av_packet_unref(pkt);
-                    av_packet_free(&pkt);
                     return true;
                 }
             }
@@ -333,12 +334,10 @@ bool BatchDecoder::decodeUntilFrame(
         NELUX_TRACE("Drained frame {}, target is {}", current_frame, target_frame);
 
         if (current_frame >= target_frame) {
-            av_packet_free(&pkt);
             return true;
         }
     }
 
-    av_packet_free(&pkt);
     return success;
 }
 
@@ -348,7 +347,17 @@ void BatchDecoder::copyFrameToOutput(
     const std::vector<size_t>& positions,
     SwsContext* sws_ctx)
 {
-    NELUX_TRACE("Copying frame to {} positions", positions.size());
+    copyFrameToOutput(frame, output, positions.data(), positions.size(), sws_ctx);
+}
+
+void BatchDecoder::copyFrameToOutput(
+    AVFrame* frame,
+    torch::Tensor& output,
+    const size_t* positions,
+    size_t count,
+    SwsContext* sws_ctx)
+{
+    NELUX_TRACE("Copying frame to {} positions", count);
 
     // Handle dimension mismatch by scaling (can happen after reconfigure with different video sizes)
     bool needsScaling = (frame->width != config_.width || frame->height != config_.height);
@@ -447,7 +456,7 @@ void BatchDecoder::copyFrameToOutput(
     const size_t frameBytes = static_cast<size_t>(config_.height) * rowBytes;
     uint8_t* out_base = output.data_ptr<uint8_t>();
 
-    uint8_t* first = out_base + positions.front() * frameBytes;
+    uint8_t* first = out_base + positions[0] * frameBytes;
     uint8_t* dstData[4] = {first, nullptr, nullptr, nullptr};
     int dstLines[4] = {rowBytes, 0, 0, 0};
 
@@ -457,7 +466,7 @@ void BatchDecoder::copyFrameToOutput(
 
     // Duplicate indices in the request share one decode; fan the finished slice
     // out to the remaining positions.
-    for (size_t i = 1; i < positions.size(); ++i)
+    for (size_t i = 1; i < count; ++i)
         std::memcpy(out_base + positions[i] * frameBytes, first, frameBytes);
 }
 
@@ -486,18 +495,49 @@ torch::Tensor BatchDecoder::decode_batch(
         }
     }
 
-    // Build position map: frame_idx -> [output_positions]
-    std::map<int64_t, std::vector<size_t>> position_map;
-    for (size_t i = 0; i < indices.size(); i++) {
-        position_map[indices[i]].push_back(i);
-    }
+    // Build position map WITHOUT std::map: sort (index, position) pairs once.
+    // A map pays one RB-tree node alloc per unique frame + O(log U) per
+    // insert/lookup; a contiguous sort is allocation-free after the initial
+    // reserve and keeps the dedup/sort fusion trivial. Pixels identical.
+    struct Req { int64_t idx; size_t pos; };
+    std::vector<Req> reqs;
+    reqs.reserve(indices.size());
+    for (size_t i = 0; i < indices.size(); ++i)
+        reqs.push_back({indices[i], i});
+    std::sort(reqs.begin(), reqs.end(),
+              [](const Req& a, const Req& b) { return a.idx < b.idx; });
 
-    // Get sorted unique frames
+    // Compact to unique targets + [begin,end) spans into reqs.
     std::vector<int64_t> sorted_frames;
-    sorted_frames.reserve(position_map.size());
-    for (const auto& pair : position_map) {
-        sorted_frames.push_back(pair.first);
+    sorted_frames.reserve(reqs.size());
+    std::vector<std::pair<size_t, size_t>> spans;
+    spans.reserve(reqs.size());
+    for (size_t i = 0; i < reqs.size();) {
+        size_t j = i + 1;
+        while (j < reqs.size() && reqs[j].idx == reqs[i].idx)
+            ++j;
+        sorted_frames.push_back(reqs[i].idx);
+        spans.emplace_back(i, j);
+        i = j;
     }
+    auto positionsFor = [&](size_t k, const size_t** out, size_t* n) {
+        // Scatter-gather without a per-target vector alloc: positions for
+        // target k live in reqs[spans[k]] as Req structs. Materialise into a
+        // reused thread_local scratch buffer (exact resize; retains the
+        // largest duplicate-group size per thread, harmless). Each result is
+        // consumed synchronously by copyFrameToOutput before the next fill,
+        // so no interleaving is possible; distinct threads get distinct
+        // scratch buffers.
+        static thread_local std::vector<size_t> scratch;
+        const auto [b, e] = spans[k];
+        const size_t cnt = e - b;
+        if (scratch.size() < cnt)
+            scratch.resize(cnt);
+        for (size_t t = 0; t < cnt; ++t)
+            scratch[t] = reqs[b + t].pos;
+        *out = scratch.data();
+        *n = cnt;
+    };
 
     NELUX_DEBUG("Decoding {} unique frames from {} total requests",
                 sorted_frames.size(), indices.size());
@@ -547,6 +587,12 @@ torch::Tensor BatchDecoder::decode_batch(
     if (!frame) {
         throw std::runtime_error("Failed to allocate AVFrame");
     }
+    // Hoisted packet: one alloc per batch instead of one per target.
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        av_frame_free(&frame);
+        throw std::runtime_error("Failed to allocate packet");
+    }
 
     // True while current_frame is PROVABLY the first ordinal >= the target it
     // was decoded for, which is the precondition for reusing the frame in hand.
@@ -558,7 +604,8 @@ torch::Tensor BatchDecoder::decode_batch(
     bool exactPosition = false;
 
     try {
-        for (int64_t target_frame : sorted_frames) {
+        for (size_t si = 0; si < sorted_frames.size(); ++si) {
+            const int64_t target_frame = sorted_frames[si];
             NELUX_TRACE("Processing target frame {}, current={}", target_frame, current_frame);
 
             // The frame already in hand is frequently the answer, and on a
@@ -589,8 +636,10 @@ torch::Tensor BatchDecoder::decode_batch(
             if (exactPosition && target_frame <= current_frame) {
                 NELUX_TRACE("Target {} already satisfied by frame {} in hand",
                             target_frame, current_frame);
-                copyFrameToOutput(frame, output, position_map[target_frame],
-                                  sws_ctx);
+                const size_t* posPtr = nullptr;
+                size_t posCount = 0;
+                positionsFor(si, &posPtr, &posCount);
+                copyFrameToOutput(frame, output, posPtr, posCount, sws_ctx);
                 continue;
             }
 
@@ -628,7 +677,8 @@ torch::Tensor BatchDecoder::decode_batch(
 
             // Decode until we reach target frame
             bool reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
-                                            target_frame, current_frame, frame);
+                                            target_frame, current_frame, frame,
+                                            pkt, fps);
 
             // Backstop for containers whose seek granularity does not match
             // their timeline. On MPEG-TS the demuxer seeks by binary-searching
@@ -666,7 +716,8 @@ torch::Tensor BatchDecoder::decode_batch(
                         "frame " + std::to_string(target_frame));
                 current_frame = -1;
                 reached = decodeUntilFrame(codec_ctx, fmt_ctx, stream_idx,
-                                           target_frame, current_frame, frame);
+                                           target_frame, current_frame, frame,
+                                           pkt, fps);
                 recoveryRescanned = true;
 
                 // A rescan that beat a genuine mid-file seek is evidence that
@@ -712,8 +763,12 @@ torch::Tensor BatchDecoder::decode_batch(
                                     : exactPosition);
 
             // Copy frame to all requesting positions
-            const std::vector<size_t>& positions = position_map[target_frame];
-            copyFrameToOutput(frame, output, positions, sws_ctx);
+            {
+                const size_t* posPtr = nullptr;
+                size_t posCount = 0;
+                positionsFor(si, &posPtr, &posCount);
+                copyFrameToOutput(frame, output, posPtr, posCount, sws_ctx);
+            }
 
             // Deliberately not unref'd here: the next target may be satisfied
             // by this very frame (see the reuse at the top of the loop), so its
@@ -731,10 +786,12 @@ torch::Tensor BatchDecoder::decode_batch(
             // read (copyFrameToOutput) after that point, never re-decoded into.
         }
     } catch (...) {
+        av_packet_free(&pkt);
         av_frame_free(&frame);
         throw;
     }
 
+    av_packet_free(&pkt);
     av_frame_free(&frame);
 
     // Publish the position for the next call. A drained decoder cannot accept

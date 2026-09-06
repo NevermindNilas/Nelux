@@ -794,9 +794,15 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
             // 8-bit output: keep 8-bit samples verbatim.
             g = normalizeGrayTo8(g).contiguous();
             const uint8_t* src = g.data_ptr<uint8_t>();
-            for (int r = 0; r < height; ++r)
-                std::memcpy(dst + static_cast<size_t>(r) * stride,
-                            src + static_cast<size_t>(r) * width, width);
+            // Contiguous fast path: stride == width is the common
+            // allocateBuffer(32) case; one memcpy instead of H calls.
+            // Identical bytes, fewer call/branch overheads per frame.
+            if (stride == width)
+                std::memcpy(dst, src, static_cast<size_t>(width) * height);
+            else
+                for (int r = 0; r < height; ++r)
+                    std::memcpy(dst + static_cast<size_t>(r) * stride,
+                                src + static_cast<size_t>(r) * width, width);
         }
         else
         {

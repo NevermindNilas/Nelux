@@ -362,6 +362,9 @@ class Decoder
     double timestampOffset_ = 0.0;
     bool timestampOffsetInitialized_ = false;
     int timestampDebugCount_ = 0;
+    // Cached seconds-per-tick for the video stream's time_base (av_q2d once in
+    // setProperties/reconfigure instead of per-frame). 0.0 = not yet cached.
+    double secPerTick_ = 0.0;
     std::vector<MotionVector> lastMotionVectors_;
     mutable std::mutex motionVectorsMutex_;
     char lastFrameType_ = '?';
