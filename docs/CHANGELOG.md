@@ -11,7 +11,7 @@
   release gate: precision and worker mode now enter the CPU constructor before
   any background conversion starts. Repeated startup/early-close tests cover
   native/8-bit output, RGB/RGBA/gray, resize, and zero/one/four convert workers.
-- Full local suite on PyTorch 2.14: **1,852 passed, 201 skipped, zero failures**.
+- Full local suite on PyTorch 2.14: **1,888 passed, 201 skipped, zero failures**.
   CPU-only PyTorch 2.14 can also import and decode with the CUDA-enabled build.
 - Added corpus-driven reference validation and mandatory installed-wheel range
   gates on Windows/Linux/macOS. Manifests isolate holdout groups, inputs are
