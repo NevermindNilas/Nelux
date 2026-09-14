@@ -53,10 +53,10 @@ PyTorch must be importable **before** `nelux` — the package uses torch's C++ r
 
 ```bash
 # Linux CUDA
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu132
 
 # macOS / Linux CPU
-pip install torch torchvision
+pip install torch==2.14.0 torchvision==0.29.0
 ```
 
 ---
@@ -128,9 +128,15 @@ vr.clear_ranges()      # back to the whole file
 ```
 
 Segments must be ascending and non-overlapping (touching is fine). Plain
-`for frame in vr` still yields bare frames, all segments back to back. See
+`for frame in vr` still yields bare frames, all segments back to back. Both
+units use `[in, out)`: time outpoints are exclusive, with times relative to the
+first decoded frame. Frame ranges count decoded frames, including VFR; exact
+selection decodes through gaps, so large skipped portions take decode time. See
 [Multiple Segments](docs/usage.md#multiple-segments-inout-point-lists) for the
-seam and seek semantics.
+timing, EOF, and timestamp-availability rules.
+
+[Corpus validation](docs/corpus-validation.md) covers reproducible reference
+checks, real-video holdout registration, and the installed-wheel CI gates.
 
 ### Motion Vectors
 
@@ -457,7 +463,7 @@ nelux.__version__, nelux.__cuda_support__, nelux.__torch_abi__, nelux.__ffmpeg_v
 ## Requirements
 
 - **Python**: 3.13+ (see `pyproject.toml` `requires-python`)
-- **PyTorch**: 2.13+ (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
+- **PyTorch**: 2.14.x for current `214torch` wheels (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
 - **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
 - **GPU**: compute capability 7.5+ (Turing, GTX 16xx / RTX 20xx and newer) for the published CUDA wheels. CUDA 13 dropped Pascal and Volta, so Maxwell/Pascal/Volta cards need a source build against CUDA 12.x (`CUDAARCHS=61 pip install .`) even though they have NVDEC silicon.
 - **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 14+ (Apple Silicon, CPU only)

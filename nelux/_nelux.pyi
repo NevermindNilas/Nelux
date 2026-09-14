@@ -266,7 +266,9 @@ class VideoReader:
         self, start: Union[int, float, str], end: Union[int, float, str]
     ) -> None:
         """
-        Restrict playback to a single frame or time range.
+        Restrict playback to [start, end), with an exclusive end in both units.
+        Times are relative to the first decoded frame's presentation timestamp.
+        Missing or decreasing timestamps raise; frame ranges still work.
 
         Args:
             start (int|float|str): Start frame index, timestamp (s) or "H:MM:SS"
@@ -290,9 +292,11 @@ class VideoReader:
         frames back to back -- use ``iter_segments()`` for
         ``(segment_index, frame)`` tuples, or read ``current_segment``.
 
-        Frame bounds are exact. Time bounds carry one frame of slack on ``end``
-        (long-standing single-range behaviour), so back-to-back time segments can
-        repeat the frame on the seam.
+        Frame ranges count actual decoded frames, including on VFR inputs.
+        Time ranges select start <= presentation time < end, relative to the
+        first decoded frame. Missing or decreasing timestamps raise RuntimeError.
+        Adjacent segments do not repeat boundary frames. Skipped portions are
+        decoded forward; negative indices require a separate full decode.
 
         Args:
             ranges: Non-empty sequence of (start, end) pairs.

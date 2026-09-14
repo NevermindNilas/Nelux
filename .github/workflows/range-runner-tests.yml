@@ -1,0 +1,33 @@
+name: Corpus runner tests
+on:
+  pull_request:
+    paths:
+      - 'tools/range_corpus.py'
+      - 'tools/generate_range_corpus.py'
+      - 'tools/run_wheel_range_gate.py'
+      - 'tools/tests/**'
+      - '.github/actions/range-gate/**'
+      - '.github/workflows/**'
+  push:
+    branches: [master, main]
+    paths:
+      - 'tools/**'
+      - '.github/actions/range-gate/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runner-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+      - run: python -m pip install pytest pyyaml
+      - run: python -m pytest tools/tests -q

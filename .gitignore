@@ -1,4 +1,5 @@
 .vs/*
+.venv_torch214/
 out/*
 ffmpy.egg-info/*
 build/*

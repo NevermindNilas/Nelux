@@ -1,4 +1,45 @@
 
+### **Version 0.19.0 (2026-09-14)**
+
+- **PyTorch 2.14:** release builds use torch 2.14.0 and torchvision 0.29.0;
+  Windows/Linux retain the CUDA 13.2 wheel index. Wheels are ABI-tagged
+  `214torch` and require PyTorch 2.14.x at runtime.
+- Fixed `frame_at(5)` being interpreted as five seconds instead of frame five
+  with the new binding stack. Integer indices and floating timestamps now
+  dispatch explicitly, including NumPy numeric scalars.
+- Full local suite on PyTorch 2.14: **1,852 passed, 201 skipped, zero failures**.
+  CPU-only PyTorch 2.14 can also import and decode with the CUDA-enabled build.
+- Added corpus-driven reference validation and mandatory installed-wheel range
+  gates on Windows/Linux/macOS. Manifests isolate holdout groups, inputs are
+  hashed, and bounded workers report successful cuts separately from rejections,
+  unsupported backends, mismatches, crashes, and timeouts. See
+  [corpus validation](corpus-validation.md).
+- Fixed a VP9 superframe packet loss in the single-threaded convert fallback,
+  including incorrect negative-bound frame counts. NVDEC VP9 time ranges now
+  obtain timestamps from a software decoder while retaining hardware output,
+  avoiding CUVID's shifted superframe display timestamps.
+- Fixed in/out range selection on VFR, timestamp gaps, raw streams, offset
+  timelines, and open GOPs by counting decoded frames from the real beginning.
+  Negative indices use a separate full decode instead of an estimated total;
+  bounds beyond EOF return only the available frames. Replaying/resetting a
+  reader reopens it instead of relying on a timestamp seek to zero.
+- **Time range behavior change:** all outpoints are now exclusive (`[start,
+  end)`), with no extra-frame allowance. Seconds/timecodes are relative to the
+  first decoded frame's PTS. Missing or decreasing timestamps raise explicitly;
+  non-finite bounds are rejected. The NVDEC FPS-derived frame cap was removed.
+- Initialized decoder `pkt_timebase`, including CUVID's packet/display clock
+  conversion, and reject CUVID's synthetic timestamps when the source has no
+  initial packet timing.
+- Preserve demuxer corruption flags on the hardware path: CUVID can stop before
+  a later demux read reports truncation, which previously looked like clean EOF.
+  Successful NVDEC reconfiguration now clears the previous decode error.
+- **Performance tradeoff:** range starts and gaps now decode forward on every
+  backend. Large skipped portions take linear decode time; negative bounds add
+  a full counting pass. Batch and random-access selection are unchanged.
+- Added codec/container range identity tests across CPU modes and available
+  NVDEC, including fractional rates, VFR, B-frames, missing/repeated/discontinuous
+  timestamps, offsets, EOF, replay, and exact segment seams.
+
 ### **Version 0.18.0 (2026-08-12)**
 
 #### **Encoder-side resize: scale to the output size inside the encoder**

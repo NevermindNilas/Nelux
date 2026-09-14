@@ -13,7 +13,7 @@ import tempfile
 import pytest
 import torch
 
-from nelux import VideoEncoder
+from nelux import VideoEncoder, VideoReader
 
 W, H = 64, 64
 FRAME = torch.randint(0, 256, (H, W, 3), dtype=torch.uint8)
@@ -83,34 +83,45 @@ class TestEncoderDimensionValidation:
         enc.close()
 
 
-class TestEncoderKnownGaps:
-    """Tests that document known silent-accept behaviors.
+class TestEncoderInputValidation:
+    """Supported float inputs and directory creation, plus actual invalid inputs."""
 
-    These should raise errors but currently don't. Marked xfail so the
-    suite stays green; when a fix is applied, the XPASS signals the gap
-    is closed and the assertions can be updated to expect an exception.
-    """
-
-    @pytest.mark.xfail(strict=False, reason="nelux does not validate output path existence")
-    def test_invalid_output_path_raises(self):
+    def test_invalid_output_path_raises(self, tmp_path):
+        # Missing directories are deliberately created. A regular file in the
+        # parent position is genuinely invalid and is portable across platforms.
+        parent = tmp_path / "not-a-directory"
+        parent.write_text("sentinel")
         with pytest.raises((RuntimeError, OSError, ValueError)):
-            enc = _default_encoder(r"D:\no\such\dir\out.mp4")
+            enc = _default_encoder(str(parent / "out.mp4"))
             try:
                 enc.encode_frame(FRAME)
             finally:
                 enc.close()
+        assert parent.read_text() == "sentinel"
 
-    @pytest.mark.xfail(strict=False, reason="nelux silently accepts float32 tensor")
-    def test_float_dtype_raises(self):
-        path = _temp_path()
-        enc = _default_encoder(path)
+    def test_missing_output_directory_is_created(self, tmp_path):
+        path = tmp_path / "new" / "nested" / "out.mp4"
+        enc = _default_encoder(str(path))
         try:
-            with pytest.raises((RuntimeError, TypeError, ValueError)):
-                enc.encode_frame(torch.rand(H, W, 3, dtype=torch.float32))
+            enc.encode_frame(FRAME)
         finally:
             enc.close()
+        assert path.is_file() and path.stat().st_size > 0
 
-    @pytest.mark.xfail(strict=False, reason="nelux silently accepts CHW tensor")
+    def test_normalized_float_dtype_round_trip(self, tmp_path):
+        path = tmp_path / "float.mkv"
+        frame = torch.zeros((H, W, 3), dtype=torch.float32)
+        frame[:, W // 2:, :] = 1.0
+        enc = _default_encoder(str(path), codec="ffv1", pixel_format="bgr0")
+        try:
+            enc.encode_frame(frame)
+        finally:
+            enc.close()
+        with VideoReader(str(path)) as reader:
+            decoded = list(reader)
+        assert len(decoded) == 1
+        assert torch.equal(decoded[0], (frame * 255).to(torch.uint8))
+
     def test_chw_shape_raises(self):
         path = _temp_path()
         enc = _default_encoder(path)

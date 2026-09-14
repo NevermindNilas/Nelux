@@ -176,7 +176,7 @@ const char* loadedFFmpegVersion()
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.18.0";
+    m.attr("__version__") = "0.19.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Identity of the FFmpeg actually loaded into this process, not the one we
@@ -364,11 +364,25 @@ Args:
             "__iter__", [](VideoReader& self) -> VideoReader& { return self.iter(); },
             py::return_value_policy::reference_internal)
         .def("__next__", &VideoReader::next)
-        .def("frame_at", py::overload_cast<double>(&VideoReader::frameAt),
-             R"doc(Return the frame at or after the given timestamp (seconds).
-Uses the secondary decoder; does not disturb iteration.)doc")
-        .def("frame_at", py::overload_cast<int>(&VideoReader::frameAt),
-             R"doc(Return the frame at or after the given frame index.
+        .def("frame_at", [](VideoReader& self, py::object position)
+             {
+                 // Some pybind/torch combinations accept integers in the
+                 // floating overload's first pass. Dispatch by numeric kind
+                 // explicitly so frame_at(5) can never mean five seconds.
+                 // __index__ also preserves NumPy integer-scalar support.
+                 if (PyIndex_Check(position.ptr()))
+                 {
+                     py::object index = py::reinterpret_steal<py::object>(
+                         PyNumber_Index(position.ptr()));
+                     if (!index)
+                         throw py::error_already_set();
+                     return self.frameAt(index.cast<int>());
+                 }
+                 if (PyNumber_Check(position.ptr()))
+                     return self.frameAt(position.cast<double>());
+                 throw py::type_error("frame_at expects an integer frame index or a floating timestamp");
+             }, py::arg("pos"),
+             R"doc(Return a frame by integer index or floating timestamp (seconds).
 Uses the secondary decoder; does not disturb iteration.)doc")
         .def("get_frame_count", &VideoReader::getFrameCount,
              "Total frame count, cached after the first call. Read from container "
@@ -417,9 +431,12 @@ Iterating then yields every segment's frames back to back. Use
 ``iter_segments()`` to get ``(segment_index, frame)`` tuples, or read
 ``current_segment`` after pulling a frame.
 
-Frame bounds are exact. Time bounds carry one frame of slack on ``end`` (the
-long-standing single-range behaviour), so back-to-back time segments can repeat
-the frame on the seam -- use frame indices when the seam has to be exact.
+Both frame and time ranges use [start, end): adjacent segments never repeat a
+boundary frame. Times are presentation timestamps relative to the first decoded
+frame; missing or decreasing timestamps raise RuntimeError. Frame ranges count
+decoded frames, including on VFR inputs. Skipped portions are decoded forward,
+so large gaps cost decode time. Negative indices require a separate full decode
+to locate the real end of the stream.
 )doc")
         .def("clear_ranges", &VideoReader::clearRanges,
              "Drop every configured range so iteration covers the whole file.")

@@ -253,10 +253,8 @@ class VideoReader
      * Each pair is (start, end) with an EXCLUSIVE end, the same convention
      * setRangeByFrames() uses. Negative indices count back from the end.
      * Segments must be ascending and non-overlapping (segment i+1 may start
-     * exactly where segment i ends); anything else throws. That restriction is
-     * what lets iteration run as one forward pass, which is the only strategy
-     * available on the CPU sync path (a mid-stream flush-seek there trips an
-     * internal FFmpeg assertion under frame threading).
+     * exactly where segment i ends); anything else throws. Iteration counts
+     * decoded frames in one forward pass, without inferring ordinals from FPS.
      *
      * @param ranges Non-empty list of (start_frame, end_frame_exclusive) pairs.
      */
@@ -265,10 +263,9 @@ class VideoReader
     /**
      * @brief Restrict iteration to several time segments, played back in order.
      *
-     * Same ordering rules as setRangesByFrames(). The upper bound carries the
-     * one-frame slack the single-range timestamp path has always applied, so
-     * back-to-back time segments can repeat the frame on the seam; frame-based
-     * segments are exact.
+     * Same ordering rules as setRangesByFrames(), with an exclusive upper bound.
+     * Times are relative to the first decoded frame's presentation timestamp.
+     * Missing or decreasing timestamps raise instead of guessing from FPS.
      *
      * @param ranges Non-empty list of (start_seconds, end_seconds) pairs.
      */
@@ -472,55 +469,21 @@ class VideoReader
     }
 
     void ensureRandDecoder();
-    bool seekToFrame(int frame_number);
     torch::ScalarType findTypeFromBitDepth();
+    int exactRangeFrameCount();
+    torch::Tensor decodeRangeFrame();
 
     // ---- Multi-segment iteration ----
     // Load segments_[index] into the active start_frame/end_frame/start_time/
     // end_time fields, so every existing single-range code path keeps working
     // unchanged and only ever sees one range at a time.
     void applySegment(size_t index);
-    // Move to the next segment, repositioning the decoder if needed. Returns
+    // Move to the next segment, retaining the decoded boundary frame. Returns
     // false when the active segment was the last one.
     bool advanceToNextSegment();
-    // Walk the decoder from wherever it currently is to the start of the active
-    // segment. Unlike iter()'s initial positioning this never assumes the
-    // reader sits at frame 0.
-    void repositionToActiveSegment();
     // Where the frame that was just decoded sits relative to the active range:
     // -1 before it (discard), 0 inside it (emit), 1 past it (segment finished).
     int classifyAgainstActiveRange() const;
-    // Every path can seek. The CPU sync path (prefetch=False) used to be
-    // excluded on the theory that avcodec_flush_buffers on a frame-threaded
-    // codec context trips FFmpeg's `fctx->async_lock` assertion — but the flush
-    // was never the problem. Decoder::seek/seekToNearestKeyframe stop the
-    // producer, flush on a quiesced context, and then unconditionally called
-    // startDecodingThread() again, putting the async producer back onto the
-    // same AVFormatContext/AVCodecContext that the sync consumer drives on the
-    // caller thread. Two threads on one context is what tripped the assertion.
-    // Those restarts are now guarded by !syncMode_ (matching initialize() and
-    // reconfigure()), so seeking is safe here and set_range no longer has to
-    // decode and discard every frame from zero.
-    // Evaluated UNDER the lock, because the answer is read out of the decoder's
-    // AVFormatContext (hasZeroBasedTimeline inspects the video stream's
-    // start_time) and close() frees that context. A pinned shared_ptr keeps the
-    // Decoder object alive but not its contexts, so asking this question off a
-    // pin would race a concurrent close()/reconfigure().
-    bool canSeekMidStream()
-    {
-        return underReaderLock([](nelux::Decoder& d)
-                               { return canSeekMidStream(d); });
-    }
-
-    static bool canSeekMidStream(nelux::Decoder& dec)
-    {
-        // Seeking needs frame indices and frame timestamps to share an origin;
-        // on a container that starts at a non-zero timestamp they do not, and a
-        // seek lands somewhere other than the requested frame. Those fall back
-        // to decoding forward, exactly as this path always did.
-        return dec.hasZeroBasedTimeline();
-    }
-
     // Copy a decoder out from under the lifecycle lock. Anything that
     // dereferences a decoder across a point where the GIL is released — its own
     // release, or a nested decodeFrame() — must hold the result for the whole
@@ -597,11 +560,8 @@ class VideoReader
         }
         return run();
     }
-    // Rewind to the true first frame before a fresh iteration. Seeks to zero
-    // when the stream's timeline allows it (see canSeekMidStream) and falls
-    // back to a full decoder reconfigure otherwise -- the same rebuild iter()
-    // uses to force NVDEC back to frame 0. No-op when nothing has been decoded
-    // yet.
+    // Reopen a touched decoder to restore the true first frame and its pre-roll.
+    // No-op when nothing has been decoded yet.
     void rewindForFreshIteration();
 
     double frameDuration() const
@@ -706,8 +666,17 @@ class VideoReader
     double current_timestamp; // Add this line
     double nvdecTimestampOffset_ = 0.0;
     bool nvdecTimestampOffsetInitialized_ = false;
-    int rangeFrameLimit_ = -1;
-    int rangeFramesEmitted_ = 0;
+    // Time ranges use presentation time relative to the first decoded frame.
+    // Keep this separate from the raw timestamp used by random access.
+    std::optional<double> rangeTimeOrigin_;
+    std::optional<double> rangeLastTimestamp_;
+    double rangeTimestamp_ = 0.0;
+    bool rangeTimestampError_ = false;
+    bool rangeFinished_ = false;
+    // CUVID VP9 superframes can carry incorrect display timestamps even when
+    // pixels/ordinals are correct. Time ranges pair them with a software timing
+    // decoder. Access and teardown are protected by lifecycleMu_.
+    std::shared_ptr<nelux::Decoder> rangeTimingDecoder_;
     // True once a frame has been pulled from the main decoder, so a following
     // iter() knows the stream no longer sits at frame 0. Cleared by any rewind.
     bool streamTouched_ = false;

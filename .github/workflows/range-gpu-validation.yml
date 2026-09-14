@@ -1,0 +1,51 @@
+name: Validate wheel on a provisioned GPU runner
+# Never run untrusted pull-request code on a self-hosted machine.
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: JSON label list for an existing trusted GPU runner
+        default: '["self-hosted", "nelux-gpu"]'
+        required: true
+      build_run_id:
+        description: Successful wheel-build workflow run ID in this repository
+        required: true
+      artifact_name:
+        description: Exact wheel artifact name matching this machine and Python
+        required: true
+      python_version:
+        type: choice
+        options: ['3.14', '3.13']
+        default: '3.14'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  gpu-ranges:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python_version }}
+      - name: Install matching PyTorch
+        run: python -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu132
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+      - name: Fetch pinned reference tools (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tools/download_ffmpeg.ps1 -Force
+      - name: Fetch pinned reference tools (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tools/download_ffmpeg.sh
+      - uses: ./.github/actions/range-gate
+        with:
+          artifact-name: gpu-range-validation-${{ github.run_id }}
+          require-nvdec: 'true'

@@ -43,8 +43,8 @@ pip install ./nelux-*.whl
 
 **Requirements:**
 - Python 3.13+
-- PyTorch 2.13.x — each wheel is built against a single torch minor, is
-  build-tagged (`213torch`) and raises `ImportError` under a different one.
+- PyTorch 2.14.x — each wheel is built against a single torch minor, is
+  build-tagged (`214torch`) and raises `ImportError` under a different one.
   `import torch` must precede `import nelux`.
 
 FFmpeg is **bundled in the wheel** — nothing to install, nothing to put on
@@ -471,7 +471,7 @@ reader = VideoReader("video.mp4")
 reader.set_range(100, 200)  # Frames 100-199 (end is exclusive)
 
 # Set range by timestamps (seconds)
-reader.set_range(5.0, 10.0)  # 5s to 10s
+reader.set_range(5.0, 10.0)  # Frame presentation times >= 5s and < 10s
 
 # Set range by timecode string
 reader.set_range("0:00:05", "0:00:10")
@@ -540,17 +540,40 @@ reader.clear_ranges()  # back to iterating the whole file
   or across the list, raises `ValueError`.
 - Segments must be **ascending and non-overlapping**. A segment may start exactly
   where the previous one ends (`[(0, 100), (100, 200)]` is fine); going backwards
-  or overlapping raises. That restriction is what keeps playback to a single
-  forward pass, which is the only strategy available with `prefetch=False` (that
-  path uses a frame-threaded codec context that cannot be seeked safely).
-- Negative frame indices count back from the end, as in `set_range`.
-- Frame bounds are exact. Time bounds carry one frame of slack on `end` (the
-  long-standing `set_range` behaviour), so back-to-back *time* segments can repeat
-  the frame on the seam — use frame indices when the seam must be exact.
-- Gaps between segments are skipped with a seek when the backend allows it and the
-  gap exceeds roughly a second of frames; smaller gaps are decoded through, since
-  a keyframe seek can land further back than it skips. With `prefetch=False` gaps
-  are always decoded through, so a large gap costs linear decode time.
+  or overlapping raises. Playback proceeds in one forward pass.
+- Both frame and time ranges use **`[start, end)`**. Adjacent segments do not
+  repeat a boundary frame. Time outpoints no longer include the historical
+  extra frame of slack.
+- Frame indices count actual decoded frames in presentation order, including
+  VFR inputs and streams with missing timestamps. No `frame / fps` approximation
+  is used. Bounds beyond the real EOF return the available frames, or nothing
+  if the entire range lies past EOF.
+- Seconds and timecodes are relative to the **first decoded frame's presentation
+  timestamp**, rather than the container's raw timestamp origin. They select
+  frames whose presentation times satisfy `start <= time < end`; they do not
+  include an earlier frame merely because its display duration overlaps `start`.
+  Floating-point conversion roundoff is tolerated at boundaries. Non-finite
+  bounds are rejected. Missing or decreasing frame timestamps raise a
+  `RuntimeError` when encountered; use integer frame ranges for those streams.
+  A raw elementary stream without source timestamps cannot supply exact time cuts.
+- NVDEC VP9 time ranges use a small software decoder to obtain display
+  timestamps because CUVID can misassign timestamps after VP9 superframes.
+  Output frames remain on the GPU. This adds CPU decode work to VP9 time cuts;
+  integer frame ranges do not need that timing decoder.
+- Skipped portions are decoded forward on CPU and NVDEC to preserve frame
+  identity. **Large inpoints and gaps cost linear decode time.** Replaying a
+  reader reopens the input to restore its real beginning and decoder pre-roll.
+- Negative frame indices count back from the real decoded EOF. Resolving them
+  requires a separate full decode, without changing the main reader's position.
+  Prefer non-negative bounds when startup latency matters.
+
+These guarantees concern range selection on inputs the chosen decoder can read.
+They do not add codec/profile support to NVDEC or to the bundled FFmpeg build.
+The regression matrix in `tests/test_range_edgecases.py` checks frame identity
+against sequential decoding and time boundaries against ffprobe timestamps;
+unsupported hardware combinations are reported as skips. `frame_at`, indexing,
+and batch random access have their own seeking behavior and are not covered by
+these range guarantees.
 
 **Timecode format:** `"H:MM:SS[.ms]"`, `"MM:SS[.ms]"` or `"SS[.ms]"` — e.g.
 `"1:30:05.5"`, `"90:00"`, `"12.5"`. Any number of hour digits.
@@ -901,9 +924,9 @@ nelux.set_log_level(LogLevel.off)    # Silence all output
 ```python
 import nelux
 
-nelux.__version__        # str:  Library version (e.g., "0.18.0")
+nelux.__version__        # str:  Library version (e.g., "0.19.0")
 nelux.__cuda_support__   # bool: True if CUDA/NVDEC support is compiled in
-nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.13"
+nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.14"
 nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "8.1.2-tas"
 ```
 

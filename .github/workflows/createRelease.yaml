@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install scikit-build-core pybind11 numpy ninja
-          python -m pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu132
+          python -m pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu132
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -267,6 +267,11 @@ jobs:
             exit 1
           }
 
+      - name: Mandatory installed-wheel range gate
+        uses: ./.github/actions/range-gate
+        with:
+          artifact-name: range-gate-windows-${{ matrix.python-version }}
+
       - name: Upload Windows wheel
         uses: actions/upload-artifact@v4
         with:
@@ -312,7 +317,7 @@ jobs:
 
       - name: Install PyTorch (CUDA)
         run: |
-          python -m pip install torch==2.13.0 torchvision==0.28.0 \
+          python -m pip install torch==2.14.0 torchvision==0.29.0 \
             --index-url https://download.pytorch.org/whl/cu132
 
       - name: Install CUDA toolkit (RHEL8)
@@ -435,7 +440,7 @@ jobs:
           python -m venv /tmp/cpuenv
           . /tmp/cpuenv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "torch==2.14.0" --index-url https://download.pytorch.org/whl/cpu
           # numpy is NOT installed by hand: it is a declared dependency of the
           # wheel, so pip must pull it in on its own here. If this job starts
           # failing on "No module named 'numpy'", the metadata regressed.
@@ -452,6 +457,11 @@ jobs:
           echo "OK: no eager CUDA libs in NEEDED"
           python tests/wheel_smoke_test.py
           deactivate
+
+      - name: Mandatory installed-wheel range gate
+        uses: ./.github/actions/range-gate
+        with:
+          artifact-name: range-gate-linux-${{ matrix.python }}
 
       - name: Upload Linux wheel
         uses: actions/upload-artifact@v4
@@ -494,7 +504,7 @@ jobs:
 
       - name: Install PyTorch (CPU, arm64)
         run: |
-          python -m pip install torch==2.13.0 torchvision==0.28.0
+          python -m pip install torch==2.14.0 torchvision==0.29.0
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -587,6 +597,11 @@ jobs:
           # vendored dylibs or this step has verified nothing.
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python tests/wheel_smoke_test.py
+
+      - name: Mandatory installed-wheel range gate
+        uses: ./.github/actions/range-gate
+        with:
+          artifact-name: range-gate-macos-${{ matrix.python-version }}
 
       - name: Upload macOS wheel
         uses: actions/upload-artifact@v4

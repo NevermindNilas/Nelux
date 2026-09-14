@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nelux import VideoReader
+from tests.range_tools import FFMPEG
 
 W, H, N, FPS, GOP = 320, 192, 300, 30, 100
 # The index is split across R and G. The step sizes keep every marker clear of
@@ -58,7 +59,7 @@ def marker_clip(tmp_path_factory):
         raw += f.tobytes()
 
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        [FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
          "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
          "-c:v", "libx264", "-preset", "veryfast", "-qp", "0",
          "-g", str(GOP), "-keyint_min", str(GOP), "-sc_threshold", "0",
@@ -69,7 +70,7 @@ def marker_clip(tmp_path_factory):
 
 def _have_ffmpeg():
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
         return True
     except (OSError, subprocess.CalledProcessError):
         return False
@@ -87,6 +88,15 @@ def _iter_indices(path, accel, start, count, **kwargs):
 
 class TestSetRangeFrameIdentity:
     """GitHub #57: set_range + iterate must yield frames `start ...`, not `K + start`."""
+
+    @pytest.mark.parametrize("backend", ["pytorch", "numpy"])
+    def test_frame_at_distinguishes_frame_indices_from_seconds(self, marker_clip, backend):
+        with VideoReader(marker_clip, backend=backend, force_8bit=True) as reader:
+            for position, expected in [(5, 5), (np.int64(5), 5), (5.0, 150), (np.float64(5.0), 150)]:
+                frame = reader.frame_at(position)
+                if isinstance(frame, np.ndarray):
+                    frame = torch.from_numpy(frame)
+                assert _index_of(frame) == expected
 
     @pytest.mark.parametrize("accel", ACCELS)
     @pytest.mark.parametrize("start", STARTS)
@@ -131,6 +141,4 @@ class TestSetRangeFrameIdentity:
                          decode_accelerator="cpu") as r:
             r.set_range(137 / FPS, 140 / FPS)
             got = [_index_of(f) for f in r]
-        assert got, "timestamp range yielded no frames"
-        assert got[0] == 137
-        assert got == list(range(got[0], got[0] + len(got)))
+        assert got == [137, 138, 139]

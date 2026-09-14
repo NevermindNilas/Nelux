@@ -358,6 +358,10 @@ class Decoder
     size_t convertedFrameBytes = 0;
 
     double lastFrameTimestamp_ = -1.0;
+    // CUVID can invent PTS even when the source provides no initial timing.
+    // 0 unknown, 1 initial packet timestamp present, -1 absent. Producer writes,
+    // hardware consumer reads; reset only with the producer stopped.
+    std::atomic<int> inputTimestampOrigin_{0};
     bool lastTimestampValid_ = false;
     double timestampOffset_ = 0.0;
     bool timestampOffsetInitialized_ = false;

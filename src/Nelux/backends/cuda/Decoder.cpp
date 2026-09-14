@@ -615,6 +615,9 @@ void Decoder::initCodecContextWithHwAccel()
     codecCtx->thread_count = 1;
     codecCtx->thread_type = 0;
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
+    // CUVID rescales packet PTS to its own clock and back using pkt_timebase,
+    // not time_base. Leaving it unset can generate/reorder wrong timestamps.
+    codecCtx->pkt_timebase = formatCtx->streams[videoStreamIndex]->time_base;
 
     // Build codec options. cuvid accepts "resize=WxH" for GPU-side scaling.
     AVDictionary* opts = nullptr;
@@ -1567,6 +1570,9 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Restart decoding thread
     hwInitialized_ = true;
+    // The new demuxer/codec opened successfully; errors from the previous file
+    // must no longer poison EOF on this one. Match the software reconfigure.
+    decodeError_.store(0, std::memory_order_relaxed);
     if (!syncMode_)
         startDecodingThread();
 

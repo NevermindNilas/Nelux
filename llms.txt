@@ -2,7 +2,7 @@
 
 > **Purpose**: Enable AI assistants to understand and correctly use Nelux instantly.
 > **Library**: Nelux — High-performance Python video decoding/encoding with GPU acceleration
-> **Version**: 0.18.0
+> **Version**: 0.19.0
 > **License**: AGPL-3.0
 > **Source**: https://github.com/NevermindNilas/NeLux
 
@@ -252,11 +252,13 @@ reader.clear_ranges()                # back to the whole file
 
 Rules: one unit for the whole list (mixing frames and times raises); segments must
 be ascending and non-overlapping (touching allowed, e.g. `[(0, 100), (100, 200)]`);
-negative frame indices count back from the end. Frame bounds are exact; time bounds
-carry one frame of slack on `end`, so adjacent *time* segments can repeat the seam
-frame. Gaps are seeked over when the backend allows it and the gap exceeds ~1s of
-frames, otherwise decoded through; with `prefetch=False` gaps are always decoded
-through (that path cannot seek).
+negative frame indices count back from the real decoded EOF (a separate counting
+pass). Both units use exclusive outpoints `[start, end)`. Time ranges use actual
+presentation timestamps relative to the first decoded frame and reject missing
+or decreasing timestamps. Adjacent segments do not repeat a seam frame. Ranges
+decode through skipped portions on every backend, so large gaps cost linear
+decode time. NVDEC VP9 time ranges additionally use software timestamps because
+CUVID can shift timestamps after superframes; output remains on the GPU.
 
 ### Prefetch API (Background Buffering)
 
@@ -441,9 +443,9 @@ set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical
 
 ```python
 import nelux
-nelux.__version__                    # "0.18.0"
+nelux.__version__                    # "0.19.0"
 nelux.__cuda_support__               # True if compiled with CUDA
-nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.13"
+nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.14"
 nelux.__ffmpeg_version__             # FFmpeg loaded at runtime, e.g. "8.1.2-tas"
 
 from nelux import (get_available_encoders, get_nvenc_encoders,
@@ -629,6 +631,7 @@ def process_video(input_path, output_path, model):
 
 ## Version History Highlights
 
+- **0.19.0** (2026-09-14): PyTorch 2.14.0 / torchvision 0.29.0, `214torch` ABI-tagged wheels; exact decoded-frame range counting, exclusive first-frame-relative time bounds, VP9 superframe fixes, explicit integer-versus-time `frame_at` dispatch, and corpus-driven installed-wheel CI gates. Large range gaps now decode linearly; NVDEC VP9 time cuts add CPU timing decode work.
 - **0.18.0** (2026-08-12): **Encoder-side resize** — `VideoEncoder(..., resize=True, resize_filter=...)` accepts input frames of any size and scales them to `width`×`height` inside the encoder's existing swscale pass (fused scale+convert, byte-identical to `ffmpeg -vf scale=WxH:flags=bilinear`, verified across every bundled software encoder family plus NVENC/QSV). Input size locks to the first frame; RGBA alpha, deep uint16/float and the verbatim gray data path all resample correctly (gray at output bit depth). Also fixes RGB-destination scaling colour-matrix skew (unreachable pre-resize) and ships the container-aware default codec + `av_guess_format` container inference fixes from the unreleased train.
 - **0.17.0** (2026-07-25): **Critical CUDA fix** — the architecture guard sat after `enable_language(CUDA)`, so it was dead code and every wheel shipped a single architecture; PTX only JITs forward, so every older GPU failed every kernel launch with `cudaErrorNoKernelImageForDevice` and returned fully black frames. Device code is now built for `75;80;86;89;90` (+`60;70` on CUDA <13, +`100;120` on CUDA >=12.8), and CUDA launches are error-checked instead of silently no-opping. Published CUDA 13 wheels need compute capability 7.5+. Also fixes `set_range(start, end)` returning frames at `keyframe + start` on NVDEC (#57), a process abort on `set_range(start_time > 0)` with CPU frame threading (#60), and CPU batch decode converting YUV→RGB with BT.601 regardless of the stream's `color_space` (#58, up to 40/255 error on bt709). `decode_batch` is **3-8x faster** (cached scaler + row `memcpy` + frame threading, byte-exact); `NELUX_ENABLE_AVX2` now defaults OFF (measured no-op, and it hard-required AVX2); encoder convert workers capped at 4 (+2.0% on 720p mpeg4, byte-identical output, ~74 MB less pool RAM at 4K).
 - **0.16.0** (2026-07-19): Motion-vector export is now opt-in via `VideoReader(motion_vectors=True)`. Off by default, the CPU decoder skips libavcodec's per-frame motion-vector side-data construction, raising decode throughput (720p +6.6%, 1080p +17.1%, 4K +18.5%, byte-identical output). BREAKING: the motion-vector read API is consolidated to `read_frame_with_motion_vectors()`; `read_motion_vectors()` and the `motion_vectors` / `motion_vectors_array` properties are removed (`frame_type` stays). Also fixes RGB→P210 10-bit 4:2:2 encode scaling (`<<6`→`<<8`) and guards NVENC `b_ref_mode` behind `max_b_frames > 0`.
@@ -653,8 +656,8 @@ def process_video(input_path, output_path, model):
 ## Requirements
 
 - Python **3.13+** (`requires-python = ">=3.13"`)
-- PyTorch **2.13.x** — each wheel is built against one torch minor, is
-  build-tagged (`213torch`) and raises `ImportError` under a different minor.
+- PyTorch **2.14.x** — each wheel is built against one torch minor, is
+  build-tagged (`214torch`) and raises `ImportError` under a different minor.
   The matching CUDA torch wheel supplies the CUDA runtime the NVDEC path needs.
 - CUDA **13.x** for the published NVDEC/NVENC wheels; GPU compute capability
   7.5+ (Turing or newer). Pre-Turing NVDEC cards need a source build against

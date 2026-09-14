@@ -17,14 +17,13 @@ import pytest
 import torch
 
 from nelux import VideoReader
+from tests.range_tools import FFMPEG
 
 W, H, N, FPS, GOP = 320, 192, 300, 30, 100
 BASE, HI_STEP, LO_STEP, RADIX = 24, 10, 7, 32
 
 ACCELS = ["cpu"] + (["nvdec"] if torch.cuda.is_available() else [])
-# prefetch=False selects the CPU sync path, which uses a frame-threaded codec
-# context and therefore cannot seek at all -- it has to reach each segment by
-# decoding and discarding. Both CPU modes need covering.
+# Exact ranges count decoded frames on both the sync and prefetch pipelines.
 CPU_MODES = [True, False]
 
 
@@ -41,7 +40,7 @@ def _index_of(frame):
 
 def _have_ffmpeg():
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
         return True
     except (OSError, subprocess.CalledProcessError):
         return False
@@ -61,7 +60,7 @@ def marker_clip(tmp_path_factory):
         raw += f.tobytes()
 
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        [FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
          "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
          "-c:v", "libx264", "-preset", "veryfast", "-qp", "0",
          "-g", str(GOP), "-keyint_min", str(GOP), "-sc_threshold", "0",
@@ -168,7 +167,7 @@ class TestFrameSegmentIdentity:
 
 
 class TestRewindOnReiteration:
-    """The sync CPU path cannot seek, so a fresh iter() has to rebuild it.
+    """A fresh iteration must restore the physical beginning of the stream.
 
     Without that it silently resumed from wherever the previous pass stopped --
     reporting frame index 0 while decoding somewhere else entirely -- or yielded
@@ -243,19 +242,14 @@ class TestTimeSegments:
         with _reader(marker_clip) as r:
             r.set_ranges([(0.0, 2.0 / FPS), (137 / FPS, 139 / FPS)])
             got = [_index_of(f) for f in r]
-        assert got[0] == 0
-        # The upper time bound carries one frame of slack, so bound the check to
-        # the two runs rather than an exact count.
-        assert 137 in got
-        assert got == sorted(got)
+        assert got == [0, 1, 137, 138]
 
     def test_timecode_strings_parse_to_seconds(self, marker_clip):
         with _reader(marker_clip) as r:
             r.set_ranges([("0:00:00", "0:00:01"), ("0:00:04", "0:00:05")])
             assert r.ranges == [(0.0, 1.0), (4.0, 5.0)]
             got = [_index_of(f) for f in r]
-        assert got[0] == 0
-        assert 4 * FPS in got
+        assert got == list(range(FPS)) + list(range(4 * FPS, 5 * FPS))
 
     def test_set_range_accepts_timecode(self, marker_clip):
         with _reader(marker_clip) as r:

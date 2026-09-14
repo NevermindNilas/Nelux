@@ -123,6 +123,7 @@ Decoder::Decoder(Decoder&& other) noexcept
       converter(std::move(other.converter))
 {
     NELUX_DEBUG("BASE DECODER: Decoder move constructor called");
+    inputTimestampOrigin_.store(other.inputTimestampOrigin_.load());
     resizeWidth_ = other.resizeWidth_;
     resizeHeight_ = other.resizeHeight_;
     other.videoStreamIndex = -1;
@@ -142,6 +143,7 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         pkt = std::move(other.pkt);
         videoStreamIndex = other.videoStreamIndex;
         properties = std::move(other.properties);
+        inputTimestampOrigin_.store(other.inputTimestampOrigin_.load());
         frame = std::move(other.frame);
         converter = std::move(other.converter);
         resizeWidth_ = other.resizeWidth_;
@@ -661,6 +663,7 @@ void Decoder::initCodecContext()
                 "thread_type={}",
                 codecCtx->thread_count, codecCtx->thread_type);
     codecCtx->time_base = formatCtx->streams[videoStreamIndex]->time_base;
+    codecCtx->pkt_timebase = formatCtx->streams[videoStreamIndex]->time_base;
     // Motion-vector export is opt-in. Enabling AV_CODEC_FLAG2_EXPORT_MVS makes
     // libavcodec compute + retain per-block motion vectors every frame — a real
     // per-frame cost that grows with resolution (~+25% decode throughput at 4K
@@ -1207,44 +1210,10 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
         AVFrame* f = syncFrame_.get();
         while (true)
         {
-            while (!syncEofReached_)
-            {
-                int rret = av_read_frame(formatCtx.get(), pkt.get());
-                if (rret < 0)
-                {
-                    // Only AVERROR_EOF means "the file ended". Anything else
-                    // is a damaged container, and reporting it as EOF returns
-                    // a truncated video that looks complete.
-                    if (isFatalReadError(rret))
-                        decodeError_.store(rret, std::memory_order_release);
-                    syncEofReached_ = true;
-                    break;
-                }
-                if (pkt->stream_index != videoStreamIndex)
-                {
-                    av_packet_unref(pkt.get());
-                    continue;
-                }
-                int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
-                av_packet_unref(pkt.get());
-                if (sret == AVERROR(EAGAIN))
-                    break;
-                if (sret < 0)
-                {
-                    // A packet the decoder refuses is skipped, not fatal --
-                    // the same thing ffmpeg does, and the same thing the
-                    // async producer already did. Only receive_frame failing
-                    // means the stream itself is unrecoverable.
-                    NELUX_WARN("Error sending packet to decoder: {}",
-                               errorToString(sret));
-                }
-                break;
-            }
-            if (syncEofReached_ && !syncFlushSent_)
-            {
-                avcodec_send_packet(codecCtx.get(), nullptr);
-                syncFlushSent_ = true;
-            }
+            // Drain every frame from the previous packet before reading more.
+            // VP9 superframes can produce multiple display frames per packet.
+            // Sending first used to hit EAGAIN, unref the unaccepted packet,
+            // and silently lose frames (including in negative-range counting).
             int ret = avcodec_receive_frame(codecCtx.get(), f);
             if (ret == 0)
             {
@@ -1289,6 +1258,53 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 // is the spin this whole change exists to remove.
                 return torch::Tensor();
             }
+            // receive_frame asked for input. FFmpeg's send/receive contract
+            // forbids both sides returning EAGAIN without progress.
+            if (syncEofReached_)
+            {
+                if (!syncFlushSent_)
+                {
+                    const int sent = avcodec_send_packet(codecCtx.get(), nullptr);
+                    if (sent < 0 && sent != AVERROR_EOF)
+                    {
+                        syncDrained_ = true;
+                        decodeError_.store(sent, std::memory_order_release);
+                        throwIfDecodeFailed();
+                    }
+                    syncFlushSent_ = true;
+                }
+                else
+                {
+                    syncDrained_ = true;
+                    decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
+                    throwIfDecodeFailed();
+                }
+                continue;
+            }
+            const int read = av_read_frame(formatCtx.get(), pkt.get());
+            if (read < 0)
+            {
+                if (isFatalReadError(read))
+                    decodeError_.store(read, std::memory_order_release);
+                syncEofReached_ = true;
+                continue;
+            }
+            if (pkt->stream_index != videoStreamIndex)
+            {
+                av_packet_unref(pkt.get());
+                continue;
+            }
+            const int sent = avcodec_send_packet(codecCtx.get(), pkt.get());
+            av_packet_unref(pkt.get());
+            if (sent == AVERROR(EAGAIN))
+            {
+                syncDrained_ = true;
+                decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
+                throwIfDecodeFailed();
+            }
+            if (sent < 0)
+                NELUX_WARN("Error sending packet to decoder: {}", errorToString(sent));
+
         }
     }
 
@@ -1735,8 +1751,14 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     if (!frame)
     {
         NELUX_WARN("Received a null frame pointer.");
-        return -1.0;
+        return std::numeric_limits<double>::quiet_NaN();
     }
+
+    // CUVID synthesizes a clock for elementary streams without packet timing.
+    // Such a value is not an observed presentation timestamp and cannot define
+    // an exact time range. Frame-index ranges do not require timestamps.
+    if (frame->format == AV_PIX_FMT_CUDA && inputTimestampOrigin_.load() < 0)
+        return std::numeric_limits<double>::quiet_NaN();
 
     // Fast path: cached seconds-per-tick (populated in setProperties()).
     // Identical to the per-frame av_q2d() computation below; falls back to
@@ -1750,7 +1772,7 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
         if (ts == AV_NOPTS_VALUE)
             ts = frame->pkt_dts;
         if (ts == AV_NOPTS_VALUE)
-            return -1.0;
+            return std::numeric_limits<double>::quiet_NaN();
         return static_cast<double>(ts) * secPerTick_;
     }
 
@@ -1786,8 +1808,8 @@ double Decoder::getFrameTimestamp(AVFrame* frame)
     }
 
     // If all timestamp fields are invalid, log a warning and handle accordingly
-    NELUX_WARN("Frame has no valid timestamp. Returning -1.0");
-    return -1.0;
+    NELUX_WARN("Frame has no valid timestamp. Returning NaN");
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 std::vector<Decoder::MotionVector>
@@ -2101,6 +2123,7 @@ void Decoder::throwIfDecodeFailed() const
 
 void Decoder::resetTimestampState()
 {
+    inputTimestampOrigin_.store(0);
     lastFrameTimestamp_ = -1.0;
     lastTimestampValid_ = false;
     timestampOffset_ = 0.0;
@@ -2331,6 +2354,15 @@ void Decoder::decodingLoop()
         {
             if (pkt->stream_index == videoStreamIndex)
             {
+                if (inputTimestampOrigin_.load() == 0)
+                    inputTimestampOrigin_.store(
+                        pkt->pts != AV_NOPTS_VALUE || pkt->dts != AV_NOPTS_VALUE ? 1 : -1);
+                // CUVID's bitstream filter can report EOF immediately after a
+                // truncated packet, before the next demux read exposes the
+                // partial-file error. Preserve the demuxer's corruption flag
+                // so draining hardware frames cannot turn that into clean EOF.
+                if (codecCtx->hw_device_ctx && (pkt->flags & AV_PKT_FLAG_CORRUPT))
+                    decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
                 int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
                 if (sendRet == AVERROR(EAGAIN))
                 {

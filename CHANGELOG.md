@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-09-14
+
+### Compatibility
+
+- Release wheels now target **PyTorch 2.14.x**, with torchvision 0.29.0 in the
+  build environments and CUDA 13.2 (`cu132`) torch wheels on Windows/Linux.
+  Wheel filenames carry the `214torch` ABI tag; other PyTorch minors are rejected
+  at import. Python 3.13/3.14 and the existing platform targets are unchanged.
+
+### Fixed
+
+- `frame_at` now explicitly distinguishes integer frame indices (including
+  NumPy integer scalars) from floating timestamps. This fixes integers being
+  interpreted as seconds with the PyTorch 2.14 binding stack.
+- VP9 superframes no longer lose packets in the zero-convert-worker synchronous
+  path. Draining frames before sending more input also fixes negative range
+  bounds that previously undercounted the real EOF.
+- NVDEC VP9 time cuts use software display timestamps, paired with hardware
+  output ordinals, instead of CUVID's sometimes shifted superframe timestamps.
+  Output remains on the GPU; VP9 time ranges incur additional CPU decode work.
+- In/out range frame identity on VFR, offset and discontinuous timelines, open
+  GOPs, and raw streams. Ranges count actual decoded frames; negative bounds
+  use a separate full decode, and bounds beyond EOF return available frames.
+- Reader rewind/replay restores the physical beginning by reopening the input.
+- Decoder packet time bases are initialized, including CUVID's timestamp
+  conversion. CUVID's synthetic clock is not accepted as source timing when
+  the initial packet has no timestamp.
+- NVDEC preserves demuxer corruption flags instead of reporting truncated input
+  as clean EOF, and clears the previous decode error on successful reconfigure.
+
+### Changed
+
+- Time ranges now use exclusive outpoints (`[start, end)`) with no extra frame
+  of slack, and seconds relative to the first decoded frame's PTS. Missing or
+  decreasing timestamps raise rather than silently guessing; non-finite bounds
+  are rejected.
+- Exact range selection decodes through inpoints and gaps on every backend.
+  Large skips take linear decode time, and negative bounds add a counting pass.
+  Batch and random-access APIs retain their separate selection semantics.
+
+### Tests
+
+- Added a hash-pinned corpus runner with separate regression/holdout groups,
+  external FFmpeg comparisons, known-frame markers, seeded cuts/state sequences,
+  subprocess deadlines, and separate success/rejection/unsupported/error counts.
+- Repaired-wheel range gates now run before wheel uploads in all platform build
+  and release workflows. Gates use disposable environments and archive evidence;
+  separate workflows test the runner and explicitly validate provisioned GPUs.
+- Added a codec/container matrix checking frame identity against sequential
+  decoding and time boundaries against ffprobe, across CPU modes and available
+  NVDEC. Covers fractional/VFR timing, offsets, missing/repeated/discontinuous
+  PTS, B-frames, EOF, replay, negative bounds, and adjacent segment seams.
+
 ## [0.18.0] - 2026-08-12
 
 ### Added
