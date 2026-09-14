@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CPU decoder output precision and conversion-worker mode are now configured
+  before background threads start. This fixes a high-bit-depth prefetch startup
+  race that could pair a 16-bit converter with an 8-bit output buffer, observed
+  as a macOS Python 3.14 crash during release validation.
 - `frame_at` now explicitly distinguishes integer frame indices (including
   NumPy integer scalars) from floating timestamps. This fixes integers being
   interpreted as seconds with the PyTorch 2.14 binding stack.

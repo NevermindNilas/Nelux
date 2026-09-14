@@ -185,16 +185,9 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
             resizeWidth_, resizeHeight_, syncMode, outChannels_, resizeFilter_,
-            motionVectorsEnabled_);
-        decoder->setForce8Bit(force_8bit);
+            motionVectorsEnabled_, force_8bit, convertWorkers);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
-
-        // Apply user-supplied convert_workers override before any decode
-        // call spawns the worker pool (lazy-start in startSyncConvertWorkers).
-        // -1 sentinel = keep the ctor-time default (defaultConvertWorkers()).
-        if (convertWorkers >= 0)
-            decoder->setSyncConvertWorkers(convertWorkers);
 
         // Random-access decoder is now lazy-loaded in ensureRandDecoder()
 
@@ -642,9 +635,7 @@ torch::Tensor VideoReader::decodeRangeFrame()
                     // timestamps, missing timing, and superframe display order.
                     rangeTimingDecoder_ = nelux::createDecoder(
                         filePath, 2, nelux::DecodeAccelerator::CPU, 0, 32, 32,
-                        true, 1, SWS_BILINEAR, false);
-                    rangeTimingDecoder_->setForce8Bit(true);
-                    rangeTimingDecoder_->setSyncConvertWorkers(1);
+                        true, 1, SWS_BILINEAR, false, true, 1);
                 }
                 double stamp = 0.0;
                 auto timingFrame = rangeTimingDecoder_->decodeNextFrameTensorSync(&stamp);
@@ -1305,8 +1296,7 @@ void VideoReader::ensureRandDecoder()
             fresh = nelux::createDecoder(
                 path, numThreads, decodeAccelerator, cudaDeviceIndex,
                 resizeWidth_, resizeHeight_, /*syncMode=*/true, outChannels_,
-                resizeFilter_, motionVectorsEnabled_);
-            fresh->setForce8Bit(force_8bit);
+                resizeFilter_, motionVectorsEnabled_, force_8bit);
         }
 
         {

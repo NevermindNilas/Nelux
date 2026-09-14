@@ -39,7 +39,8 @@ createDecoder(const std::string& filename, int numThreads,
               DecodeAccelerator accelerator = DecodeAccelerator::CPU,
               int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
               bool syncMode = false, int outChannels = 3,
-              int resizeFilter = SWS_BILINEAR, bool motionVectors = false)
+              int resizeFilter = SWS_BILINEAR, bool motionVectors = false,
+              bool force8Bit = false, int convertWorkers = -1)
 {
     switch (accelerator)
     {
@@ -49,13 +50,16 @@ createDecoder(const std::string& filename, int numThreads,
             // syncMode is false), so it is passed into the ctor rather than set
             // afterward — otherwise the producer races on the channel count.
             // resizeFilter (SWS_* scaling kernel) and motionVectors (opt-in MV
-            // export flag, consumed at codec-open) are passed for the same reason.
+            // export flag, consumed at codec-open), precision and worker count
+            // are passed for the same reason. Changing precision after workers
+            // capture their converter configuration can overrun output buffers.
             if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
                     filename, numThreads, resizeWidth, resizeHeight, syncMode,
-                    outChannels, resizeFilter, motionVectors);
+                    outChannels, resizeFilter, motionVectors, force8Bit, convertWorkers);
             return std::make_shared<nelux::backends::cpu::Decoder>(
-                filename, numThreads, syncMode, outChannels, motionVectors);
+                filename, numThreads, syncMode, outChannels, motionVectors,
+                force8Bit, convertWorkers);
 
         case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA
@@ -63,8 +67,14 @@ createDecoder(const std::string& filename, int numThreads,
             // resizeFilter does not apply. The VideoReader layer rejects a
             // non-default resize_filter combined with nvdec so this is never
             // reached with a filter the caller expects to take effect.
-            return std::make_shared<nelux::backends::cuda::Decoder>(
-                filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
+            {
+                auto decoder = std::make_shared<nelux::backends::cuda::Decoder>(
+                    filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
+                // Hardware production queues unconverted surfaces. Its pixel
+                // conversion starts on the consumer only after factory return.
+                decoder->setForce8Bit(force8Bit);
+                return decoder;
+            }
 #else
             throw std::runtime_error(
                 "NVDEC acceleration requested but Nelux was not built with CUDA support. "

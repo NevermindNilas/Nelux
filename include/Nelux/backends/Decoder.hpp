@@ -167,9 +167,10 @@ class Decoder
     // Select the decoded output color format by channel count: 1 = grayscale
     // (GRAY8 / GRAY16LE), 3 = RGB (default), 4 = RGBA (RGBA / RGBA64LE, the
     // only way an alpha-bearing source such as ProRes 4444 reaches the caller).
-    // Must be called before the first decode call (after construction, like
-    // setForce8Bit): it reconfigures the converter and the pooled buffer
-    // geometry. CPU path only — the NVDEC decoder does not override this.
+    // Configure before producers/workers start (the factory passes this into
+    // the CPU constructor). Setters require a quiescent decoder: changing
+    // layout or precision while workers run invalidates their buffer sizes.
+    // CPU path only — the NVDEC decoder does not override this.
     void setOutputChannels(int channels);
     void setColorFormat(bool grayscale) { setOutputChannels(grayscale ? 1 : 3); }
 

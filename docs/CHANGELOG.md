@@ -7,6 +7,10 @@
 - Fixed `frame_at(5)` being interpreted as five seconds instead of frame five
   with the new binding stack. Integer indices and floating timestamps now
   dispatch explicitly, including NumPy numeric scalars.
+- Fixed a high-bit-depth CPU prefetch startup race found by the macOS 3.14
+  release gate: precision and worker mode now enter the CPU constructor before
+  any background conversion starts. Repeated startup/early-close tests cover
+  native/8-bit output, RGB/RGBA/gray, resize, and zero/one/four convert workers.
 - Full local suite on PyTorch 2.14: **1,852 passed, 201 skipped, zero failures**.
   CPU-only PyTorch 2.14 can also import and decode with the CUDA-enabled build.
 - Added corpus-driven reference validation and mandatory installed-wheel range

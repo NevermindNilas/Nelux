@@ -9,7 +9,8 @@ class Decoder : public nelux::Decoder
 {
   public:
     Decoder(const std::string& filePath, int numThreads, bool syncMode = false,
-            int outChannels = 3, bool motionVectors = false)
+            int outChannels = 3, bool motionVectors = false, bool force8Bit = false,
+            int convertWorkers = -1)
         : nelux::Decoder( numThreads)
     {
         // Set the output channel count BEFORE initialize() so the converter and
@@ -22,6 +23,9 @@ class Decoder : public nelux::Decoder
         // Motion-vector export must likewise be decided before initialize()
         // opens the codec (the flag is consumed at avcodec_open2 time).
         motionVectorsEnabled_ = motionVectors;
+        force_8bit = force8Bit;
+        if (convertWorkers >= 0)
+            setSyncConvertWorkers(convertWorkers);
         if (syncMode)
             setSyncMode(true);
         initialize(filePath);
@@ -29,7 +33,8 @@ class Decoder : public nelux::Decoder
 
     Decoder(const std::string& filePath, int numThreads, int resizeWidth,
             int resizeHeight, bool syncMode = false, int outChannels = 3,
-            int resizeFilter = SWS_BILINEAR, bool motionVectors = false)
+            int resizeFilter = SWS_BILINEAR, bool motionVectors = false,
+            bool force8Bit = false, int convertWorkers = -1)
         : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
     {
         requireOutputChannels(outChannels);
@@ -38,6 +43,9 @@ class Decoder : public nelux::Decoder
         // convert-worker pool bake it into their sws contexts on first build.
         if (resizeFilter > 0) resizeFlags_ = resizeFilter;
         motionVectorsEnabled_ = motionVectors;
+        force_8bit = force8Bit;
+        if (convertWorkers >= 0)
+            setSyncConvertWorkers(convertWorkers);
         if (syncMode)
             setSyncMode(true);
         initialize(filePath);

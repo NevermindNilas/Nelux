@@ -14,7 +14,8 @@ import tempfile
 from range_corpus import REPO, bounded_process, resolve_tool, sha256, write_json
 from generate_range_corpus import generate
 
-TESTS = ["test_set_range_identity.py", "test_set_ranges_segments.py", "test_range_edgecases.py"]
+TESTS = ["test_set_range_identity.py", "test_set_ranges_segments.py", "test_range_edgecases.py",
+         "test_reader_startup.py"]
 PLUGIN = '''
 from pathlib import Path
 import pytest
