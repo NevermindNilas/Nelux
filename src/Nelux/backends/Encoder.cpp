@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #ifdef _WIN32
@@ -169,6 +170,14 @@ namespace fs = std::filesystem;
 namespace nelux
 {
 
+bool movRejectsAudioCopy(const AVOutputFormat* ofmt, int codecId)
+{
+    const auto codec = static_cast<AVCodecID>(codecId);
+    return ofmt && ofmt->name && std::strcmp(ofmt->name, "mov") == 0 &&
+           (codec == AV_CODEC_ID_OPUS || codec == AV_CODEC_ID_VORBIS ||
+            codec == AV_CODEC_ID_FLAC || codec == AV_CODEC_ID_TRUEHD);
+}
+
 Encoder::Encoder(const std::string& filename, const EncodingProperties& properties)
     : properties(properties), filename(filename) // Store filename
 {
@@ -283,6 +292,19 @@ void Encoder::addInputStreams(const std::string& source, bool wantAudio,
     if (!wantAudio && !wantSubtitles)
         return;
 
+    // These values are converted to AV_TIME_BASE ticks for seeking/rebasing.
+    // NaN silently disables the packet gate and infinity (or a huge finite
+    // value) can overflow that conversion, yielding an empty audio track.
+    constexpr double maxSeekSec =
+        static_cast<double>(std::numeric_limits<int64_t>::max() / AV_TIME_BASE);
+    if (!std::isfinite(startSec) || startSec < 0.0 || startSec >= maxSeekSec)
+        throw std::invalid_argument("start must be finite and nonnegative");
+    if (!std::isfinite(endSec) || endSec >= maxSeekSec ||
+        (endSec < 0.0 && endSec != -1.0) ||
+        (endSec >= 0.0 && endSec < startSec))
+        throw std::invalid_argument(
+            "end must be -1 (unbounded) or finite and no earlier than start");
+
     this->allowTranscode = allowTranscodeArg;
 
     std::string src = normalizePath(source);
@@ -306,8 +328,10 @@ void Encoder::addInputStreams(const std::string& source, bool wantAudio,
         // Prefer stream copy when the output container accepts the codec as-is
         // (e.g. AAC into mp4). Otherwise, if transcoding is allowed, decode +
         // re-encode to the container's default codec; else skip + warn.
-        const bool copyable = avformat_query_codec(
-            formatCtx->oformat, in->codecpar->codec_id, FF_COMPLIANCE_NORMAL);
+        const bool copyable =
+            !movRejectsAudioCopy(formatCtx->oformat, in->codecpar->codec_id) &&
+            avformat_query_codec(formatCtx->oformat, in->codecpar->codec_id,
+                                 FF_COMPLIANCE_NORMAL);
 
         bool ok = false;
         if (copyable)
@@ -470,6 +494,9 @@ bool Encoder::setupAudioTranscode(AVStream* in)
     ps.srcIndex = in->index;
     ps.outStream = out;
     ps.mode = PassMode::TranscodeAudio;
+    // The first decoded frame establishes the output timeline. Initialising
+    // at zero here collapses intentionally delayed audio tracks onto frame 0.
+    ps.nextPts = AV_NOPTS_VALUE;
     ps.dec = std::move(dec);
     ps.enc = std::move(enc);
     ps.swr = swr;
@@ -704,6 +731,27 @@ void Encoder::transcodeAudioPacket(PassStream& ps, AVPacket* p)
             break;
         }
 
+        if (ps.nextPts == AV_NOPTS_VALUE)
+        {
+            // Decoder timestamps use pkt_timebase (set from the input stream
+            // in setupAudioTranscode). Preserve a source track's initial
+            // offset, while rebasing a trimmed window onto video frame zero.
+            const int64_t ts = frame->best_effort_timestamp != AV_NOPTS_VALUE
+                                   ? frame->best_effort_timestamp : frame->pts;
+            if (ts != AV_NOPTS_VALUE)
+            {
+                const AVRational inBase = inputFormatCtx->streams[ps.srcIndex]->time_base;
+                const int64_t start = av_rescale_q(
+                    static_cast<int64_t>(passStartSec * AV_TIME_BASE),
+                    AVRational{1, AV_TIME_BASE}, inBase);
+                ps.nextPts = std::max<int64_t>(
+                    0, av_rescale_q(ts - start, inBase,
+                                    AVRational{1, ps.enc->sample_rate}));
+            }
+            else
+                ps.nextPts = 0;
+        }
+
         // Resample the decoded frame into the encoder's format and stage it in
         // the FIFO (which lets us cut exact encoder-frame-sized chunks).
         int dstNb = (int)swr_get_out_samples(ps.swr, frame->nb_samples);
@@ -812,7 +860,10 @@ void Encoder::pumpPassthrough(double uptoSec)
                 continue;
             }
             double t = packetTimeSec(inPkt.get());
-            if (t < passStartSec)
+            // Opus/Vorbis may begin with a negative-timestamp priming packet.
+            // At start=0 it is needed by the decoder to recover samples at
+            // t=0; dropping it shortens an otherwise untrimmed audio track.
+            if (passStartSec > 0.0 && t < passStartSec)
             {
                 av_packet_unref(inPkt.get());  // residual pre-start after seek
                 continue;

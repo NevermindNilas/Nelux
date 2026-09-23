@@ -101,6 +101,10 @@ class Decoder
         int audioChannels = 0;
         std::string audioChannelLayout;
         int64_t audioBitRate = 0;
+
+        // Every subtitle stream's canonical codec name, in container order.
+        // Empty when the source has no subtitle streams.
+        std::vector<std::string> subtitleCodecs;
     };
 
     // Fill VideoProperties from a demuxed container + codec parameters WITHOUT

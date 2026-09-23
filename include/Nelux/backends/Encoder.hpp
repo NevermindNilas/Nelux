@@ -59,6 +59,10 @@ bool codecFitsContainer(const struct AVOutputFormat* ofmt, int codecId);
  */
 bool codecDefinitelyFitsContainer(const struct AVOutputFormat* ofmt, int codecId);
 
+// MOV's codec query accepts a few audio codecs the muxer rejects or writes
+// under nonstandard tags. Shared by encoder passthrough and stream merging.
+bool movRejectsAudioCopy(const struct AVOutputFormat* ofmt, int codecId);
+
 /**
  * @brief Encoder to use when the caller names no codec.
  *
@@ -243,7 +247,7 @@ class Encoder
     AVPacketPtr inPkt;                        // reusable read buffer for source
     bool allowTranscode = false;             // re-encode streams that can't copy
     double passStartSec = 0.0;                // trim start (seconds)
-    double passEndSec = -1.0;                 // trim end (<0 = no limit)
+    double passEndSec = -1.0;                 // trim end (-1 = no limit)
     bool hasPassthrough = false;              // any stream copied/transcoded?
     bool hasPending = false;                  // inPkt holds an un-written packet
     bool passDone = false;                    // source exhausted / past endSec

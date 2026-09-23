@@ -219,6 +219,7 @@ try:
         get_available_encoders,
         get_nvenc_encoders,
         probe,
+        merge_streams,
     )
 except ImportError as e:
     if os.name == "nt":
@@ -332,5 +333,6 @@ __all__ = [
     "get_available_encoders",
     "get_nvenc_encoders",
     "probe",
+    "merge_streams",
     "diagnose_runtime_dlls",
 ]

@@ -1,5 +1,6 @@
 ﻿#include "VideoEncoder.hpp"
 #include "VideoReader.hpp"
+#include "StreamMuxer.hpp"
 #include <optional>
 #include <utility>
 #include <pybind11/pybind11.h>
@@ -176,7 +177,7 @@ const char* loadedFFmpegVersion()
 PYBIND11_MODULE(_nelux, m)
 {
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.19.0";
+    m.attr("__version__") = "0.20.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Identity of the FFmpeg actually loaded into this process, not the one we
@@ -779,6 +780,24 @@ Example:
              });
 
     // ---------- Module-level functions -----------
+    m.def(
+        "merge_streams",
+        [](const std::string& video_source, const std::string& audio_source,
+           const std::string& output)
+        {
+            py::gil_scoped_release release;
+            nelux::mergeStreams(video_source, audio_source, output);
+        },
+        py::arg("video_source"), py::arg("audio_source"), py::arg("output"),
+        R"doc(Copy the primary video and audio streams from separate files into one output.
+
+The streams are interleaved without decoding or re-encoding. Their own start
+timestamps are normalized to zero, preserving packet spacing for separate
+downloaded tracks. Stream tags are copied, and output is replaced only
+after the container trailer is successfully written. The output extension
+selects the container. Incompatible codecs raise ValueError.
+)doc");
+
     m.def(
         "probe",
         [](const std::string& path) -> py::dict

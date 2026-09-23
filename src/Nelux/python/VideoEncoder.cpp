@@ -1,9 +1,11 @@
 ﻿#include "python/VideoEncoder.hpp"
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <cpu/RGBToAuto.hpp>
 #include <cpu/ResizeFilter.hpp>
@@ -14,6 +16,7 @@
 
 extern "C"
 {
+#include <libavutil/buffer.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 }
@@ -25,6 +28,69 @@ namespace nelux
 
 namespace
 {
+    bool highEntropyPackedImage(const uint8_t* pixels, int width, int height,
+                                int channels)
+    {
+        const int rowBytes = width * channels;
+        if (width < 64 || height < 64 || rowBytes < 1024)
+            return false;
+        const int yStep = std::max(1, height / 64);
+        const int xStep = std::max(1, width / 64);
+        const int sampleChannels = std::min(channels, 3); // ignore an opaque alpha plane
+
+        auto residualEntropy = [&](int rowLag) {
+            std::array<unsigned int, 256> histogram{};
+            size_t count = 0;
+            for (int y = rowLag; y < height; y += yStep)
+            {
+                const uint8_t* row = pixels + static_cast<size_t>(y) * rowBytes;
+                const uint8_t* previous = rowLag
+                    ? pixels + static_cast<size_t>(y - rowLag) * rowBytes
+                    : nullptr;
+                for (int x = rowLag ? 0 : 1; x < width; x += xStep)
+                {
+                    for (int channel = 0; channel < sampleChannels; ++channel)
+                    {
+                        const int offset = x * channels + channel;
+                        const uint8_t residual = row[offset] -
+                            (rowLag ? previous[offset] : row[offset - channels]);
+                        ++histogram[residual];
+                        ++count;
+                    }
+                }
+            }
+            if (count < 1024)
+                return 0.0;
+            double entropy = 0.0;
+            for (unsigned int n : histogram)
+            {
+                if (n)
+                {
+                    const double p = static_cast<double>(n) / count;
+                    entropy -= p * std::log2(p);
+                }
+            }
+            return entropy;
+        };
+
+        if (residualEntropy(0) <= 7.5)
+            return false;
+        // zlib can find repeated rows within its 32 KiB history even when
+        // each row itself resembles noise. Check every row lag that fits the
+        // window before choosing uncompressed blocks; a five-row repeating
+        // texture at 1080p is 50x smaller with normal compression.
+        const int maxLag = std::min({32, height - 1, 32768 / rowBytes});
+        for (int lag = 1; lag <= maxLag; ++lag)
+            if (residualEntropy(lag) <= 7.5)
+                return false;
+        return true;
+    }
+
+    void releaseCpuTensor(void* opaque, uint8_t*)
+    {
+        delete static_cast<torch::Tensor*>(opaque);
+    }
+
     // Turn a frame rate given as a double into the exact rational the muxer
     // should tag, without ever collapsing it to an integer.
     //
@@ -110,6 +176,8 @@ VideoEncoder::VideoEncoder(const std::string& filename,
     // construction rather than being silently carried until (never) used.
     resizeFlags_ = nelux::conversion::cpu::swsFlagFromResizeFilter(resizeFilter);
     resizeEnabled_ = resize;
+    const bool explicitPngCompression =
+        extraOptions.count("compression_level") || extraOptions.count("pred");
 
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
                                               fps, preset, cq, pixelFormat,
@@ -129,6 +197,20 @@ VideoEncoder::VideoEncoder(const std::string& filename,
     // has to be the post-open truth rather than the pre-open request.
     this->props = encoder->Properties();
     this->outputPixelFormat = props.pixelFormat;
+    // A plain still-image path cannot use image2's numbered multi-frame
+    // output. Keep its one frame on the caller thread instead of creating the
+    // video fan-out pool (several AVFrames and five threads for one image).
+    directStillImage_ =
+        nelux::inferContainerFormatForFile(filename) == "image2" &&
+        (props.codec == "png" || props.codec == "mjpeg") &&
+        filename.find('%') == std::string::npos;
+    outputPath_ = filename;
+    adaptivePngStill_ = directStillImage_ && props.codec == "png" &&
+                        !explicitPngCompression;
+    const auto threadsOption = props.extraOptions.find("threads");
+    borrowStillImageInput_ = directStillImage_ &&
+                             threadsOption != props.extraOptions.end() &&
+                             threadsOption->second == "1";
 }
 
 nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
@@ -200,13 +282,36 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     // String preset (preferred when set) + arbitrary AVOptions
     if (presetStr.has_value())
         props.presetStr = *presetStr;
+    const bool stillImagePath =
+        nelux::inferContainerFormatForFile(filename) == "image2" &&
+        filename.find('%') == std::string::npos;
+    if (stillImagePath && props.codec == "png")
+    {
+        // FFmpeg's default PNG compression spends far longer on the first
+        // still than TAS's OpenCV path. Level 1 + UP remains lossless; explicit
+        // caller options can trade speed for a different file size.
+        extraOptions.try_emplace("compression_level", "1");
+        extraOptions.try_emplace("pred", "up");
+        extraOptions.try_emplace("threads", "1");
+    }
+    else if (stillImagePath && props.codec == "mjpeg")
+    {
+        // Huffman tables affect size, not decoded pixels. Avoid multi-thread
+        // setup for the one-frame case; callers can request optimal tables.
+        extraOptions.try_emplace("huffman", "default");
+        extraOptions.try_emplace("threads", "1");
+    }
     props.extraOptions = std::move(extraOptions);
 
-    // Auto-pick colorspace from resolution. Mirrors decoder convention
-    // (AutoToRGB: height>576 => BT.709, else BT.601).
+    // Auto-pick colorspace from resolution for video. A standalone JPEG uses
+    // JFIF's BT.601 YCbCr matrix at every size: image2 carries no BT.709
+    // video tag, so choosing 709 for an HD JPEG visibly shifts its colors
+    // when image readers decode it as 601.
     if (props.colorspace == AVCOL_SPC_UNSPECIFIED)
     {
-        if (props.height > 576)
+        const bool jpegImage = props.codec == "mjpeg" &&
+                               nelux::inferContainerFormatForFile(filename) == "image2";
+        if (props.height > 576 && !jpegImage)
         {
             props.colorspace = AVCOL_SPC_BT709;
             props.colorPrimaries = AVCOL_PRI_BT709;
@@ -261,7 +366,7 @@ void VideoEncoder::addPassthrough(const std::string& source, bool audio,
             // streams must be registered before that. workersStarted flips on
             // the first frame — and it is only a meaningful gate because the
             // lock makes this check and that flip mutually exclusive.
-            if (workersStarted)
+            if (workersStarted || directStillImageEncoded_)
                 throw std::runtime_error(
                     "add_passthrough must be called before the first encode_frame");
             encoder->addInputStreams(source, audio, subtitles, start, end,
@@ -420,6 +525,11 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
                                ? (frame.dim() == 2 || frame.size(2) == 1)
                                : (frame.numel() == grayElems);
 
+    if (directStillImage_ && directStillImageEncoded_)
+        throw std::runtime_error(
+            "A single-image output accepts one frame; use a numbered %d path "
+            "for an image sequence.");
+
     // Verbatim grayscale data path: when the output pixel format is a plain
     // single-plane gray format the codec actually accepts, fill it directly
     // (full-range, up to 16-bit) instead of funnelling through the 8-bit RGB24
@@ -427,6 +537,8 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // throughput-critical path — so it never mixes with the async submit thread.
     if (isGrayVerbatimPixfmt(outputPixelFormat))
     {
+        if (directStillImage_)
+            directStillImageEncoded_ = true;
         encodeGrayVerbatim(frame, inW, inH, grayInput);
         return;
     }
@@ -638,6 +750,12 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         frame = frame.contiguous();
     }
 
+    if (directStillImage_)
+    {
+        encodeStillImageDirect(frame, srcFmt, inW, inH, srcChannels, deep);
+        return;
+    }
+
     // Hand the frame to the fan-out convert pipeline. The caller pays for ONE
     // copy of the RGB bytes into a recycled staging buffer; a pool of convert
     // workers does the (single-threaded, ~80%-of-the-cost) swscale RGB->YUV in
@@ -715,6 +833,91 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         convertQueue.push_back(ConvertJob{staging, yuv, seq, srcFmt});
     }
     cvConvert.notify_one();
+}
+
+void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
+                                          AVPixelFormat srcFmt, int inW, int inH,
+                                          int srcChannels, bool deep)
+{
+    directStillImageEncoded_ = true;
+    if (frame.device().is_cuda())
+        frame = frame.to(torch::kCPU);
+    if (!frame.is_contiguous())
+        frame = frame.contiguous();
+
+    if (adaptivePngStill_ &&
+        (srcFmt == AV_PIX_FMT_RGB24 || srcFmt == AV_PIX_FMT_RGBA) &&
+        highEntropyPackedImage(frame.data_ptr<uint8_t>(), inW, inH, srcChannels))
+    {
+        // A high-entropy image has little to deflate. The PNG codec chooses
+        // its zlib level when opened, so replace the still-unfed encoder with
+        // a stored-stream one before handing it the frame. Explicit caller
+        // compression settings bypass this heuristic entirely.
+        encoder->close();
+        encoder.reset();
+        props.extraOptions["compression_level"] = "0";
+        props.extraOptions["pred"] = "none";
+        encoder = std::make_unique<nelux::Encoder>(outputPath_, props);
+        props = encoder->Properties();
+        outputPixelFormat = props.pixelFormat;
+    }
+
+    nelux::Frame image;
+    image.get()->format = outputPixelFormat;
+    image.get()->width = width;
+    image.get()->height = height;
+    image.get()->colorspace = props.colorspace;
+    image.get()->color_primaries = props.colorPrimaries;
+    image.get()->color_trc = props.colorTrc;
+    image.get()->color_range = props.colorRange;
+    image.get()->pts = AV_NOPTS_VALUE;
+
+    if (srcFmt == outputPixelFormat && inW == width && inH == height &&
+        borrowStillImageInput_)
+    {
+        // PNG accepts packed RGB24/RGBA directly. Attach the contiguous CPU
+        // tensor as a read-only AVBufferRef; its C++ holder keeps storage alive
+        // even if the codec retains a frame reference until close(). No RGB
+        // staging copy or swscale context is needed for this identity path.
+        const size_t rowBytes = static_cast<size_t>(width) * srcChannels *
+                                (deep ? 2 : 1);
+        auto holder = std::make_unique<torch::Tensor>(frame);
+        auto* data = static_cast<uint8_t*>(frame.data_ptr());
+        AVBufferRef* buffer = av_buffer_create(
+            data, rowBytes * height, releaseCpuTensor, holder.get(),
+            AV_BUFFER_FLAG_READONLY);
+        if (!buffer)
+            throw std::bad_alloc();
+        holder.release();
+        image.get()->buf[0] = buffer;
+        image.get()->data[0] = data;
+        image.get()->linesize[0] = static_cast<int>(rowBytes);
+    }
+    else
+    {
+        image.allocateBuffer(32);
+        if (srcFmt == outputPixelFormat && inW == width && inH == height)
+        {
+            // A multi-threaded codec may read the AVFrame after encode_frame
+            // returns. Snapshot caller-owned pixels before allowing mutation.
+            const size_t rowBytes = static_cast<size_t>(width) * srcChannels *
+                                    (deep ? 2 : 1);
+            const auto* src = static_cast<const uint8_t*>(frame.data_ptr());
+            for (int y = 0; y < height; ++y)
+                std::memcpy(image.getData(0) + static_cast<size_t>(y) * image.getLineSize(0),
+                            src + static_cast<size_t>(y) * rowBytes, rowBytes);
+        }
+        else
+        {
+            nelux::conversion::cpu::RGBToAutoConverter converter(
+                width, height, outputPixelFormat, props.colorspace, props.colorRange,
+                srcWidth_, srcHeight_, resizeFlags_);
+            converter.convert(image, frame.data_ptr(), srcFmt);
+        }
+    }
+
+    if (!encoder->encodeFrame(image))
+        throw std::runtime_error("Failed to encode still image");
 }
 
 void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,

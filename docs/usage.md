@@ -271,6 +271,9 @@ p["audio_sample_rate"]                  # int
 p["audio_channels"]                     # int
 p["audio_channel_layout"]               # str:  e.g. "stereo", "5.1"
 p["audio_bit_rate"]                     # int
+
+# Subtitles (all subtitle streams, in container order)
+p["subtitle_codecs"]                    # list[str]: e.g. ["subrip", "ass"]
 ```
 
 #### Metadata-only: `nelux.probe()`
@@ -815,6 +818,61 @@ dropped, as `ffmpeg -pix_fmt rgba` does. A CUDA tensor that is deep or
 whose fused kernel is 8-bit RGB-only — so a p010 NVENC encode keeps its extra
 bits whichever device the tensor came from.
 
+### Image Sequences and Single Images
+
+The output extension selects the `image2` muxer for PNG and JPEG. A `%d`
+pattern in the path writes one file per `encode_frame` call; FFmpeg's default
+sequence number starts at 1:
+
+```python
+with VideoEncoder("frames_%08d.png", codec="png", width=640, height=360,
+                  pixel_format="rgb24") as encoder:
+    for frame in frames:  # H×W×3 uint8 RGB
+        encoder.encode_frame(frame)
+# frames_00000001.png, frames_00000002.png, ...
+```
+
+PNG can preserve 16-bit RGB data. Pass an HWC `torch.uint16` frame with
+`pixel_format="rgb48be"`; requesting `rgb48le` can fall back to 8-bit
+`rgb24`, since the PNG encoder accepts big-endian 16-bit RGB.
+For single-channel depth maps, pass an HW `torch.uint16` frame with
+`pixel_format="gray16be"`; `VideoReader(..., color_format="gray")` preserves
+the samples exactly when no resize is requested.
+
+```python
+with VideoEncoder("depth_%08d.png", codec="png", width=640, height=360,
+                  pixel_format="rgb48be") as encoder:
+    encoder.encode_frame(rgb16)
+```
+
+For JPEG, use `codec="mjpeg"` and `pixel_format="yuvj444p"` to retain full
+chroma resolution. The options below match FFmpeg's `-qmin 1 -q:v 1` quality
+setting. Image2 JPEG output uses the BT.601 color matrix at every resolution,
+including HD frames:
+
+```python
+with VideoEncoder("frames_%08d.jpg", codec="mjpeg", width=640, height=360,
+                  pixel_format="yuvj444p",
+                  options={"qmin": "1", "flags": "+qscale",
+                           "global_quality": "118"}) as encoder:
+    for frame in frames:
+        encoder.encode_frame(frame)
+```
+
+To write one still image, use a plain `still.png` or `still.jpg` path and
+encode exactly one frame. Still images can report `total_frames=0` in header
+metadata; `get_frame_count()`, `frame_at(0)`, and integer indexing resolve the
+actual one-frame count.
+
+Plain still paths encode synchronously without starting the video worker pool.
+For those paths, PNG defaults to fast lossless compression
+(`compression_level=1`, `pred=up`); nearly incompressible RGB stills use
+stored PNG blocks to avoid costly compression attempts. JPEG defaults to one
+codec thread with standard Huffman tables. Explicit compression/filter
+`options` disable PNG's content-based choice and override the defaults.
+Numbered sequences keep the throughput-oriented worker pipeline. To favor a
+smaller still PNG over encode speed, pass a higher `compression_level`.
+
 ### With Context Manager
 
 ```python
@@ -844,6 +902,29 @@ with reader.create_encoder("output.mp4") as encoder:
 
 ### Audio / Subtitle Passthrough
 
+For video and audio already downloaded as separate files, use `merge_streams`:
+
+```python
+import torch
+import nelux
+
+nelux.merge_streams("video_only.mp4", "audio_only.m4a", "merged.mp4")
+```
+
+This copies the primary video and audio streams into the container named by
+the output extension. It does not decode or re-encode either stream. Each
+input's stream start time is normalized to zero; packet spacing, frame rate,
+and stream tags are preserved. The completed file replaces the output
+only after the container trailer is written. The source codecs must both fit
+the destination container (for example, H.264 + AAC in MP4 or VP9 + Opus in
+WebM); an incompatible codec raises an error naming it. Use `VideoEncoder`
+when transcoding is needed.
+
+`merge_streams` is for local file paths and copies one video and one audio
+stream. It does not select alternate tracks, subtitles, or trim ranges. An
+empty selected track or packets without timestamps raise an error before the
+output is replaced.
+
 `add_passthrough` copies (or transcodes) audio and subtitle streams from a
 source file into the encoded output, with an optional `[start, end)` trim.
 
@@ -865,12 +946,14 @@ encoder.add_passthrough(
 | `subtitles` | `bool` | `True` | Copy subtitle streams |
 | `start` | `float` | `0.0` | Trim window start in seconds; copied streams rebase to `t=0` |
 | `end` | `float` | `None` | Trim window end in seconds (`None` = to source end) |
-| `allow_transcode` | `bool` | `True` | Re-encode streams the output container cannot stream-copy (e.g. AAC→WebM, SubRip→MP4) instead of dropping them |
+| `allow_transcode` | `bool` | `True` | Re-encode streams the output container cannot stream-copy (e.g. AAC→WebM, Opus/FLAC/TrueHD→MOV, SubRip→MP4) instead of dropping them |
 
 **Rules:**
 - Must be called **before** the first `encode_frame`. Calling it afterward raises `RuntimeError`.
 - Only **one** passthrough source per encoder; a second call raises `RuntimeError`.
 - Match the `[start, end)` window to the video frames you actually push.
+- MOV audio from Opus, Vorbis, FLAC, or TrueHD sources is encoded as AAC. MOV rejects or writes an incompatible direct copy despite its codec query reporting support; `allow_transcode=False` omits that audio.
+- `start` must be finite and nonnegative. `end` must be finite and at least `start`; use `None` for no end point.
 
 ```python
 import torch
@@ -924,7 +1007,7 @@ nelux.set_log_level(LogLevel.off)    # Silence all output
 ```python
 import nelux
 
-nelux.__version__        # str:  Library version (e.g., "0.19.0")
+nelux.__version__        # str:  Library version (e.g., "0.20.0")
 nelux.__cuda_support__   # bool: True if CUDA/NVDEC support is compiled in
 nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.14"
 nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "8.1.2-tas"

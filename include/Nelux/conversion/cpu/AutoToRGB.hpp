@@ -10,6 +10,8 @@ extern "C"
 }
 
 #include "Frame.hpp"
+#include <cstddef>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -168,6 +170,25 @@ class AutoToRGBConverter
                                 av_frame->data[0] +
                                     static_cast<size_t>(i) * av_frame->linesize[0],
                                 rowBytes);
+                return;
+            }
+            if (!srcEightBit && src_fmt == AV_PIX_FMT_GRAY16BE)
+            {
+                // PNG stores 16-bit gray samples big-endian. swscale's
+                // GRAY16BE -> GRAY16LE path changes some sample values even
+                // with full-range metadata; a byte swap preserves depth data.
+                uint8_t* dst_ptr = static_cast<uint8_t*>(buffer);
+                for (int i = 0; i < height; ++i)
+                {
+                    const uint8_t* src_row = av_frame->data[0] +
+                                             static_cast<std::ptrdiff_t>(i) * av_frame->linesize[0];
+                    uint8_t* dst_row = dst_ptr + static_cast<size_t>(i) * width * 2;
+                    for (int x = 0; x < width; ++x)
+                    {
+                        dst_row[2 * x] = src_row[2 * x + 1];
+                        dst_row[2 * x + 1] = src_row[2 * x];
+                    }
+                }
                 return;
             }
         }

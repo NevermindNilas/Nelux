@@ -26,7 +26,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   endif()
 endif()
 
-project(Nelux VERSION 0.19.0 LANGUAGES CXX)
+project(Nelux VERSION 0.20.0 LANGUAGES CXX)
 
 # ─── Compiler options ─── 
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.
@@ -517,7 +517,7 @@ if(NELUX_BUILD_PYTHON)
   endif()
 endif()
 
-file(GLOB_RECURSE NELUX_SOURCES
+file(GLOB_RECURSE NELUX_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/conversion/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/*.cpp

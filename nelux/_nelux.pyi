@@ -224,6 +224,7 @@ class VideoReader:
             has_audio (bool)
             audio_codec, audio_channel_layout (str)
             audio_sample_rate, audio_channels, audio_bit_rate (int)
+            subtitle_codecs (list[str])             - all subtitle streams in container order
         """
         ...
 
@@ -531,6 +532,16 @@ class VideoEncoder:
         exception is the legacy "mpeg4" encoder, whose time base denominator
         cannot exceed 65535; a finer rate is approximated there to within ~1e-8
         while the stream is still tagged with the exact rate.
+
+        PNG/JPEG image sequences use a numbered output path such as
+        ``frames_%08d.png`` or ``frames_%08d.jpg``. Numbering starts at 1.
+        Use ``codec="png", pixel_format="rgb24"`` for 8-bit PNG, or
+        ``pixel_format="rgb48be"`` with uint16 RGB frames for 16-bit PNG.
+        Use ``codec="mjpeg", pixel_format="yuvj444p"`` for JPEG. A path
+        without a number pattern writes a single image when exactly one
+        frame is encoded. Plain PNG/JPEG stills encode synchronously; PNG uses
+        fast lossless compression and stores high-entropy RGB data without
+        costly compression attempts. Explicit ``options`` override defaults.
         """
         ...
 
@@ -608,6 +619,15 @@ class VideoEncoder:
     def is_hardware_encoder(self) -> bool:
         """True if using hardware-accelerated encoding (NVENC)."""
         ...
+
+def merge_streams(video_source: str, audio_source: str, output: str) -> None:
+    """Stream-copy the primary video and audio tracks from separate files.
+
+    Each input track is rebased by its stream start time. The output extension
+    selects a container that must support both codecs. The completed output
+    replaces any prior file only after a successful mux.
+    """
+    ...
 
 def probe(path: str) -> Dict[str, object]:
     """

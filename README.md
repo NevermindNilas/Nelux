@@ -235,8 +235,8 @@ with reader.create_encoder("clip.mp4") as enc:
 ```
 
 `allow_transcode=True` (default) re-encodes streams the output container can't
-stream-copy (e.g. AAC→WebM) instead of dropping them. One passthrough source
-per encoder; a second call raises.
+stream-copy (e.g. AAC→WebM or Opus/FLAC/TrueHD→MOV) instead of dropping them. One
+passthrough source per encoder; a second call raises.
 
 ---
 
@@ -251,6 +251,7 @@ per encoder; a second call raises.
 - **Batch Decoding**: `get_batch([...])` / `vr[start:stop:step]` returns `[B, H, W, C]` with seek minimization, deduplication, and a dedicated random-access decoder
 - **Motion Vector Export** (opt-in via `motion_vectors=True`): `read_frame_with_motion_vectors()` returns `(frame, vectors)` from FFmpeg decoder side-data; off by default so the common decode path stays fast. See [preview + schema above](#motion-vectors) and [`examples/motion_vector_overlay.py`](examples/motion_vector_overlay.py)
 - **Audio / Subtitle Passthrough**: `encoder.add_passthrough(source, audio, subtitles, start, end)` copies (or transcodes) audio + subtitle streams from a source into the output, with optional `[start, end)` trim + rebase to t=0
+- **Two-Input Stream Merge**: `nelux.merge_streams(video_source, audio_source, output)` combines separately downloaded video and audio tracks in-process without re-encoding when both codecs fit the output container
 - **In/Out Point Lists**: `set_ranges([(in, out), ...])` restricts iteration to several ascending, non-overlapping segments in one forward pass; `iter_segments()` yields `(segment_index, frame)` so each section can take its own processing path. Frames, seconds, or `"H:MM:SS"` timecodes
 - **Encoder-Side Resize**: `VideoEncoder(..., resize=True, resize_filter=...)` scales input frames to the output size inside the swscale pass the encoder already runs — one fused scale+convert, byte-identical to `ffmpeg -vf scale=WxH:flags=bilinear`, so no `F.interpolate` pass before encoding
 - **Decode-Free Metadata**: `nelux.probe(path)` returns the full ffprobe-equivalent dict without opening a decoder, allocating a frame buffer or spawning threads — and without the subprocess spawn an `ffprobe` call pays
@@ -416,6 +417,27 @@ follows.
 - `close()` / context manager → flush, write trailers, finalize
 - `is_hardware_encoder` → True when NVENC is in use
 
+#### PNG and JPEG frames
+
+`VideoEncoder` also writes numbered image sequences through FFmpeg's `image2`
+muxer. Use a printf-style number in the filename; numbering starts at 1:
+
+```python
+with VideoEncoder("frames_%08d.png", codec="png", width=1920, height=1080,
+                  pixel_format="rgb24") as enc:
+    for frame in frames:
+        enc.encode_frame(frame)
+```
+
+For a 16-bit PNG, pass a `uint16` RGB frame and set
+`pixel_format="rgb48be"`. The PNG encoder does not accept `rgb48le`; that
+request can fall back to 8-bit `rgb24`. For JPEG, use `codec="mjpeg"`,
+`pixel_format="yuvj444p"`, and `options={"qmin": "1", "flags": "+qscale",
+"global_quality": "118"}` for the equivalent of FFmpeg's `-qmin 1 -q:v 1`.
+A path without `%d`, such as `still.png` or `still.jpg`, works when encoding
+exactly one frame and uses the synchronous still-image path. PNG stills use
+faster lossless compression by default; pass `options` to choose another level.
+
 #### Encoder-side resize
 
 `resize=True` lets `encode_frame` take frames of any spatial size and scales them
@@ -442,6 +464,7 @@ import nelux
 nelux.probe("video.mp4")        # decode-free metadata dict — same keys as
                                 #   VideoReader.properties, no decoder opened,
                                 #   no frame buffer allocated, no threads spawned
+nelux.merge_streams("video.mp4", "audio.m4a", "merged.mp4")  # stream copy
 nelux.get_available_encoders()  # [{"name", "long_name", "is_hardware"}, ...]
 nelux.get_nvenc_encoders()      # NVENC-only subset
 nelux.set_log_level(nelux.LogLevel.debug)

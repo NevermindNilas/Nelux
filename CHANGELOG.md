@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `merge_streams(video_source, audio_source, output)` copies the primary video
+  and audio tracks from separate files into a compatible container in-process.
+  It normalizes each input's start time and replaces the output after a
+  successful mux.
+- `probe()` and `VideoReader.properties` now report `subtitle_codecs` for every
+  subtitle stream in container order.
+- Documented and tested numbered PNG/JPEG sequences and 16-bit PNG output
+  through `VideoEncoder`.
+
+### Fixed
+
+- MOV outputs now transcode Opus/Vorbis passthrough audio to AAC when
+  `allow_transcode=True`, instead of failing when the muxer writes its header.
+- MOV audio handling also covers FLAC and TrueHD, preserves delayed audio-track
+  offsets and untrimmed codec priming, and rejects invalid trim bounds.
+- `merge_streams()` now rejects empty selected tracks and untimed packets with
+  a clear error while preserving any existing output.
+- Full-range 16-bit grayscale PNG decoding now preserves exact sample values;
+  indexed access also works for still images without a header frame count.
+- HD JPEG image output now uses JFIF's BT.601 color matrix instead of the
+  video-resolution BT.709 default, removing a visible color shift.
+- Plain PNG/JPEG stills now encode synchronously with speed-oriented codec
+  defaults, avoiding the video worker pool for one image. RGB PNG stills select
+  stored blocks for high-entropy content; output remains lossless and explicit
+  codec options override the defaults.
+- Reader reconfiguration now clears audio metadata when the new source has no
+  audio stream.
+
 ## [0.19.0] - 2026-09-14
 
 ### Compatibility

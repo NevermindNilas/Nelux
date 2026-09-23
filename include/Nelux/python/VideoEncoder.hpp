@@ -98,6 +98,11 @@ class VideoEncoder
     std::unique_ptr<nelux::Encoder> encoder;
     int width, height;
     AVPixelFormat outputPixelFormat;  // Actual pixel format used
+    std::string outputPath_;
+    bool directStillImage_ = false;   // one image2 file, no numbered pattern
+    bool directStillImageEncoded_ = false;
+    bool borrowStillImageInput_ = false; // safe only when codec has one thread
+    bool adaptivePngStill_ = false;   // caller left PNG compression unspecified
 
     // --- Encoder-side resize (opt-in) ----------------------------------------
     // When resizeEnabled_, encodeFrame accepts input of any spatial size and
@@ -147,6 +152,8 @@ class VideoEncoder
     // underEncoderLock() so the lock/GIL dance lives in exactly one place.
     // Both run with lifecycleMu_ held exclusively and the GIL dropped.
     void encodeFrameLocked(torch::Tensor& frame);
+    void encodeStillImageDirect(torch::Tensor& frame, AVPixelFormat srcFmt,
+                                int inW, int inH, int srcChannels, bool deep);
     void closeLocked();
     void convertWorkerLoop(int workerId);
     void encodeSubmitLoop();

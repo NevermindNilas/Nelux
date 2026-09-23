@@ -10,6 +10,7 @@
 #include <optional>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <torch/torch.h> // Ensure you have included the necessary Torch headers
 
@@ -1075,6 +1076,7 @@ py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties
     props["audio_channels"] = properties.audioChannels;
     props["audio_channel_layout"] = properties.audioChannelLayout;
     props["audio_bit_rate"] = properties.audioBitRate;
+    props["subtitle_codecs"] = py::cast(properties.subtitleCodecs);
 
     return props;
 }
@@ -1104,14 +1106,17 @@ py::object VideoReader::operator[](py::object key)
     auto norm_idx = [&](long long idx) -> long long
     {
         if (idx < 0)
-            idx = static_cast<long long>(properties.totalFrames) +
-                  idx; // Pythonic negatives
+            idx = static_cast<long long>(getFrameCount()) + idx;
         return idx;
     };
 
     auto check_idx_range = [&](long long idx)
     {
-        if (idx < 0 || idx >= properties.totalFrames)
+        // Header-derived totalFrames can be zero for a still image or an
+        // undercount for a container without nb_frames. Only pay for the
+        // exact demux count when the requested index needs it.
+        if (idx < 0 ||
+            (idx >= properties.totalFrames && idx >= getFrameCount()))
         {
             throw py::index_error("Frame index out of range: " + std::to_string(idx));
         }
@@ -1435,7 +1440,8 @@ torch::Tensor VideoReader::decodeFrameAt(int frame_index)
 {
     NELUX_TRACE("decodeFrameAt(index={}) using rand_decoder", frame_index);
 
-    if (frame_index < 0 || frame_index >= properties.totalFrames)
+    if (frame_index < 0 ||
+        (frame_index >= properties.totalFrames && frame_index >= getFrameCount()))
         throw std::out_of_range("Frame index out of range");
 
     // Random access uses the raw container timeline: decodeFrameAt(double)

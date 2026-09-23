@@ -298,12 +298,25 @@ void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
     properties.pixelFormat = AVPixelFormat(vpar->format);
     properties.bitDepth = bitDepthFromFormat(vpar->format);
 
-    // Detect audio stream presence and capture the first audio track's details.
+    // Detect audio stream presence, capture the first audio track's details,
+    // and expose every subtitle codec for callers deciding whether to copy or
+    // transcode subtitle streams. Clear values before scanning: reconfigure()
+    // reuses VideoProperties across files.
     properties.hasAudio = false;
+    properties.audioCodec.clear();
+    properties.audioSampleRate = 0;
+    properties.audioChannels = 0;
+    properties.audioChannelLayout.clear();
+    properties.audioBitRate = 0;
+    properties.subtitleCodecs.clear();
     for (unsigned int i = 0; i < formatCtx->nb_streams; ++i)
     {
         const AVCodecParameters* apar = formatCtx->streams[i]->codecpar;
-        if (apar->codec_type == AVMEDIA_TYPE_AUDIO)
+        if (apar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        {
+            properties.subtitleCodecs.emplace_back(avcodec_get_name(apar->codec_id));
+        }
+        else if (apar->codec_type == AVMEDIA_TYPE_AUDIO && !properties.hasAudio)
         {
             properties.hasAudio = true;
             const AVCodecDescriptor* adesc =
@@ -318,7 +331,6 @@ void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
             {
                 properties.audioChannelLayout = layout;
             }
-            break;
         }
     }
 
