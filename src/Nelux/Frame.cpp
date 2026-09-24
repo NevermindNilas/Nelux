@@ -1,3 +1,4 @@
+#include <spdlog/spdlog.h>
 // Frame.cpp
 
 #include "Frame.hpp"
@@ -196,7 +197,6 @@ Frame& Frame::operator=(Frame&& other) noexcept
  */
 AVFrame* Frame::get() const
 {
-    NELUX_TRACE("Frame::get() called: Returning AVFrame pointer");
     return frame;
 }
 
@@ -289,7 +289,6 @@ int Frame::getLineSize(int plane) const
  */
 int64_t Frame::getPts() const
 {
-    NELUX_TRACE("Frame::getPts() called: pts = {}", frame->pts);
     return frame->pts;
 }
 
@@ -312,9 +311,7 @@ void Frame::setPts(int64_t pts)
  */
 Frame::operator bool() const
 {
-    bool isValid = frame != nullptr;
-    NELUX_TRACE("Frame::operator bool() called: isValid = {}", isValid);
-    return isValid;
+    return frame != nullptr;
 }
 
 /**

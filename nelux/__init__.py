@@ -3,9 +3,11 @@
 Nelux - High-performance video decoding and encoding library.
 """
 
+import copy
+import ctypes
+import functools
 import os
 import sys
-import ctypes
 from typing import Dict, List
 
 # Check for PyTorch first
@@ -16,11 +18,17 @@ if "torch" not in sys.modules:
         "  import torch"
     )
 
+# Module-global path state. package_dir/libs_dir used to be locals of the
+# Windows-only setup branch while the diagnosis helpers re-derived them (and
+# re-split PATH) on every call; hoisting keeps the success-path import
+# straight-line and gives the failure-only diagnostics one place to read from.
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LIBS_DIR = os.path.join(_PACKAGE_DIR, "nelux.libs")
+package_dir = _PACKAGE_DIR
+libs_dir = _LIBS_DIR
+
 # Setup DLL paths on Windows
 if os.name == "nt":
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    libs_dir = os.path.join(package_dir, "nelux.libs")
-
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(package_dir)
         if os.path.exists(libs_dir):
@@ -32,8 +40,47 @@ if os.name == "nt":
         os.environ["PATH"] = ";".join(path_entries) + ";" + os.environ["PATH"]
 
 
+_NT_PATH_RAW = None
+_NT_PATH_DIRS: tuple = ()
+
+
+def _nt_path_dirs() -> tuple:
+    """Hoisted PATH split for the Windows DLL search.
+
+    Re-split only when PATH actually changed since the last call, so the
+    diagnosis path pays ~0 in the steady state but still sees late
+    os.add_dll_directory/PATH edits (diagnose_runtime_dlls is public API).
+    """
+    global _NT_PATH_RAW, _NT_PATH_DIRS
+    raw = os.environ.get("PATH", "")
+    if raw != _NT_PATH_RAW:
+        _NT_PATH_RAW = raw
+        _NT_PATH_DIRS = tuple(p for p in raw.split(";") if p)
+    return _NT_PATH_DIRS
+
+
+# LoadLibraryEx flag for existence-only probes: map the image as data without
+# running DllMain or resolving its imports. Failure diagnosis only.
+_LOAD_LIBRARY_AS_DATAFILE = 0x00000002
+
+
+def _dll_exists_noexec(dll_name: str) -> bool:
+    """True if the loader can find/map dll_name without executing anything."""
+    try:
+        ctypes.WinDLL(dll_name, winmode=_LOAD_LIBRARY_AS_DATAFILE)
+        return True
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=8)
 def _read_required_dlls_windows(extension_path: str) -> List[str]:
-    """Read direct DLL imports from a PE binary when possible."""
+    """Read direct DLL imports from a PE binary when possible.
+
+    pefile stays a function-local import: the success-path import must never
+    pay for (or require) it. Results are cached - diagnosis reads the same
+    image repeatedly (the extension plus each transitive hit).
+    """
     try:
         import pefile  # type: ignore
 
@@ -55,10 +102,12 @@ def _read_required_dlls_windows(extension_path: str) -> List[str]:
 
 
 def _resolve_dll_path_windows(dll_name: str) -> str | None:
+    if os.name != "nt":
+        return None
     search_dirs: List[str] = [package_dir]
     if os.path.exists(libs_dir):
         search_dirs.append(libs_dir)
-    search_dirs.extend([p for p in os.environ.get("PATH", "").split(";") if p])
+    search_dirs.extend(_nt_path_dirs())
 
     for base in search_dirs:
         candidate = os.path.join(base, dll_name)
@@ -97,6 +146,12 @@ def _likely_missing_transitive_dlls(dll_name: str) -> List[str]:
         if _resolve_dll_path_windows(dep):
             continue
 
+        if not _dll_exists_noexec(dep):
+            # Not mappable even as data: a real LoadLibrary fails the same
+            # way (ERROR_MOD_NOT_FOUND) without paying for the full search.
+            missing.append(dep)
+            continue
+
         try:
             ctypes.WinDLL(dep)
         except OSError:
@@ -121,8 +176,14 @@ def _ffmpeg_dll_fallbacks(dll_name: str) -> List[str]:
     return _FFMPEG_DLL_FALLBACKS.get(base, [dll_name])
 
 
+@functools.lru_cache(maxsize=1)
 def diagnose_runtime_dlls() -> Dict[str, object]:
-    """Diagnose missing runtime DLLs for Nelux on Windows."""
+    """Diagnose missing runtime DLLs for Nelux on Windows.
+
+    Memoized: the answer cannot change within a process unless DLLs appear
+    on disk/PATH mid-run; call diagnose_runtime_dlls.cache_clear() first in
+    that case.
+    """
     if os.name != "nt":
         return {
             "platform": os.name,
@@ -170,6 +231,23 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
         "ntdll.dll",
     }
 
+    def _record(dll: str, load_err: OSError) -> None:
+        for fallback in _ffmpeg_dll_fallbacks(dll):
+            if fallback.lower() == dll.lower():
+                continue
+            # Existence-only: a sibling FFmpeg build on disk (or mappable
+            # without executing anything) satisfies the requirement, and no
+            # foreign DllMain runs during diagnosis. A present-but-unloadable
+            # fallback still leaves its sibling required entries reporting
+            # the true missing dependency.
+            if _resolve_dll_path_windows(fallback) is not None or _dll_exists_noexec(fallback):
+                return
+        nested = _likely_missing_transitive_dlls(dll)
+        if nested:
+            missing[dll] = f"{load_err} | likely dependency: {', '.join(nested)}"
+        else:
+            missing[dll] = str(load_err)
+
     checked: List[str] = []
     missing: Dict[str, str] = {}
     for dll in required:
@@ -177,27 +255,19 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
         if low in ignored_exact or low.startswith(ignored_prefixes):
             continue
         checked.append(dll)
+        if _resolve_dll_path_windows(dll) is None and not _dll_exists_noexec(dll):
+            # os.path.exists screen first, then the no-exec probe: neither
+            # runs foreign code. The one real LoadLibrary below serves only
+            # the authentic loader message (identical to the old flow).
+            try:
+                ctypes.WinDLL(dll)
+            except OSError as load_err:
+                _record(dll, load_err)
+            continue
         try:
             ctypes.WinDLL(dll)
         except OSError as load_err:
-            fallback_loaded = False
-            for fallback in _ffmpeg_dll_fallbacks(dll):
-                if fallback.lower() == dll.lower():
-                    continue
-                try:
-                    ctypes.WinDLL(fallback)
-                    fallback_loaded = True
-                    break
-                except OSError:
-                    pass
-            if fallback_loaded:
-                continue
-
-            nested = _likely_missing_transitive_dlls(dll)
-            if nested:
-                missing[dll] = f"{load_err} | likely dependency: {', '.join(nested)}"
-            else:
-                missing[dll] = str(load_err)
+            _record(dll, load_err)
 
     return {
         "platform": os.name,
@@ -218,7 +288,7 @@ try:
         LogLevel,
         get_available_encoders,
         get_nvenc_encoders,
-        probe,
+        probe as _probe_native,
         merge_streams,
     )
 except ImportError as e:
@@ -260,7 +330,10 @@ except ImportError as e:
 # Fetched with getattr rather than in the import list above so an extension
 # built before this attribute existed degrades to "unknown" instead of tripping
 # the missing-DLL diagnostic, which would point at entirely the wrong problem.
-from . import _nelux as _nelux_ext
+# Reuse the already-imported extension module instead of re-entering the
+# import machinery: `from . import _nelux` here would redundantly resolve a
+# module sys.modules already holds after the import above.
+_nelux_ext = sys.modules[__name__ + "._nelux"]
 
 __ffmpeg_version__ = getattr(_nelux_ext, "__ffmpeg_version__", "unknown")
 del _nelux_ext
@@ -273,6 +346,65 @@ if __torch_abi__ != "unknown" and _torch_abi != __torch_abi__:
         f"but the imported PyTorch is {sys.modules['torch'].__version__}. "
         "Install the Nelux wheel tagged for your PyTorch minor version."
     )
+
+# ---- probe() result cache ---------------------------------------------------
+# find_stream_info costs ~4ms per file; the probe-then-open pattern (and any
+# repeated metadata read) used to pay it every time. A process-wide LRU of 64
+# entries keyed by (absolute path, mtime, size) serves repeats from memory
+# and invalidates itself on any file change. No threads, no IO beyond one
+# os.stat per call.
+_PROBE_CACHE_SIZE = 64
+
+
+@functools.lru_cache(maxsize=_PROBE_CACHE_SIZE)
+def _probe_cached(abs_path: str, mtime_ns: int, size: int) -> Dict[str, object]:
+    return _probe_native(abs_path)
+
+
+def probe(path: str) -> Dict[str, object]:
+    """Read full video metadata without decoding.
+
+    Opens the container and reads stream info only — no decoder is opened, no
+    resolution-sized buffer is allocated, and no threads are spawned — then
+    returns the same dict as :attr:`VideoReader.properties`. Use this for
+    metadata-only opens: it strips the decoder-init/allocation overhead of
+    constructing a ``VideoReader`` and avoids the subprocess spawn that an
+    external ``ffprobe`` call pays.
+
+    Results are cached process-wide (LRU, 64 entries) keyed by absolute path
+    plus file mtime and size, so repeats cost one ``os.stat`` instead of a
+    native ``find_stream_info`` pass. Any file change invalidates its entry;
+    call :func:`probe_cache_clear` to drop the whole cache. The returned dict
+    is a copy — mutating it never pollutes the cache.
+
+    Args:
+        path (str): Path to the video file.
+
+    Returns:
+        Dict[str, object]: Metadata dict, identical in shape to
+        :attr:`VideoReader.properties`.
+    """
+    try:
+        abs_path = os.path.abspath(os.fspath(path))
+    except TypeError:
+        return _probe_native(path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        # Unstatable (missing file, bad dir, ...): let the native probe raise
+        # its original error, uncached.
+        return _probe_native(path)
+    return copy.deepcopy(_probe_cached(abs_path, st.st_mtime_ns, st.st_size))
+
+
+def probe_cache_clear() -> None:
+    """Drop every cached :func:`probe` result.
+
+    The next probe of each file pays one native pass again. Useful in
+    long-lived processes after out-of-band file replacement, and in tests
+    that need a cold cache.
+    """
+    _probe_cached.cache_clear()
 
 # Import batch mixin
 from .batch import BatchMixin
@@ -321,6 +453,60 @@ class VideoReader(BatchMixin, _VideoReaderBase):
             yield self.current_segment, frame
 
 
+def suggest_config(path=None):
+    """Report-only Pareto suggestion; never auto-applied.
+
+    Returns ``(workers, prefetch, expected)`` where ``workers`` is a
+    ``convert_workers`` value and ``prefetch`` a bool for ``start_prefetch``.
+    The reader defaults are untouched — pass the values explicitly if you
+    want them::
+
+        workers, prefetch, _ = nelux.suggest_config("clip.mp4")
+        reader = nelux.VideoReader("clip.mp4", convert_workers=workers)
+        if prefetch:
+            reader.start_prefetch(buffer_size=16)
+
+    Knee (1080p-class, workers {0,2,4,8,16} x prefetch {F,T} matrix):
+    ``workers=4, prefetch=False`` reaches ~60% of peak fps at ~30% of peak
+    RSS. More workers buy diminishing fps for linear RSS; prefetch only pays
+    when per-frame consumer work outweighs the ~2.5x queue handoff cost.
+    See ``tests/comprehensive_bench.py --pareto`` and its Pareto CSV/plot.
+
+    Args:
+        path: optional clip path. When given and probed successfully, the
+            note names the resolution; the suggestion itself stays at the
+            knee (4, False) unless the clip is >= 4K pixels, where the
+            report notes workers=8 as the next Pareto point — still returned
+            as information, never applied.
+    """
+    workers, prefetch = 4, False
+    note = ("knee: workers=4 ~60% fps at ~30% RSS "
+            "(1080p Pareto matrix; prefetch off unless consumer-bound)")
+    res = ""
+    if path is not None:
+        try:
+            meta = probe(str(path))
+            w, h = int(meta.get("width", 0)), int(meta.get("height", 0))
+            if w and h:
+                res = f"{w}x{h}"
+                if w * h >= 3840 * 2160:
+                    note += ("; at 4K+ the next Pareto point is workers=8 "
+                             "(still report-only)")
+        except Exception:
+            pass
+    expected = {
+        "workers": workers,
+        "prefetch": prefetch,
+        "fps_fraction_of_peak": 0.6,
+        "rss_fraction_of_peak": 0.3,
+        "mb_per_fps": "see Pareto CSV (rss_peak_mb / fps_median)",
+        "resolution": res,
+        "note": note,
+        "auto_applied": False,
+    }
+    return workers, prefetch, expected
+
+
 __all__ = [
     "__version__",
     "__torch_abi__",
@@ -333,6 +519,8 @@ __all__ = [
     "get_available_encoders",
     "get_nvenc_encoders",
     "probe",
+    "probe_cache_clear",
     "merge_streams",
     "diagnose_runtime_dlls",
+    "suggest_config",
 ]

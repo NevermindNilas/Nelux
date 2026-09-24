@@ -2,6 +2,7 @@
 
 
 #include "Logger.hpp"
+#include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace nelux
@@ -25,6 +26,13 @@ std::shared_ptr<spdlog::logger>& Logger::get_logger()
 void Logger::set_level(spdlog::level::level_enum level)
 {
     get_logger()->set_level(level);
+}
+
+spdlog::logger* Logger::get_raw()
+{
+    // get_logger() creates on first use; .get() avoids shared_ptr churn.
+    // Never null after creation; null only if called during static teardown.
+    return get_logger().get();
 }
 
 } // namespace nelux

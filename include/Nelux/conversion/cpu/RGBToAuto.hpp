@@ -9,6 +9,8 @@ extern "C"
 }
 
 #include "Frame.hpp"
+#include <Logger.hpp>
+#include <spdlog/spdlog.h>
 #include <iostream>
 #include <stdexcept>
 

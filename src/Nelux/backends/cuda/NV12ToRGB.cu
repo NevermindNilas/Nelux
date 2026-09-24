@@ -27,6 +27,7 @@
 namespace nelux::backends::cuda
 {
 
+
 //------------------------------------------------------------------------------
 // Color space standards (matches FFmpeg AVCOL_SPC_* values where applicable)
 //------------------------------------------------------------------------------
@@ -54,6 +55,11 @@ enum ColorRange {
 // Using constant memory for faster access (cached and broadcast to all threads)
 //------------------------------------------------------------------------------
 __constant__ float matYuv2Rgb[3][3];
+// High-bit-depth kernels use pre-scaled coefficients. They must not share the
+// 8-bit symbol: each path has its own cache and may alternate on one device.
+__constant__ float matYuv2RgbScaled[3][3];
+
+template<class T> __device__ __forceinline__ T Clamp(T x, T lower, T upper);
 
 //------------------------------------------------------------------------------
 // RGB pixel types for vectorized access
@@ -299,6 +305,332 @@ void SetMatYuv2Rgb(int iMatrix, cudaStream_t stream) {
     SetMatYuv2Rgb(iMatrix, ColorRange_Limited, stream);
 }
 
+template<class T> __device__ __forceinline__ T Clamp(T x, T lower, T upper);
+
+// ===== Implementer E: P010 separate Y/UV + real bitDepth (10/12/16) =====
+// Fused scale: host uploads mat*kNorm (kNorm = 255/((2^bd-1)<<(16-bd)),
+// constexpr reciprocal (no runtime div). Device uses (y-low16) with scaled
+// matrix, float only (no half). low16/mid16 are 4096/32768 for MSB-aligned
+// limited-range data regardless of bd (16<<(bd-8)<<(16-bd)=4096).
+static std::mutex g_matCacheScaledMu;
+static int g_matScaledMatrix = -1;
+static int g_matScaledRange = -1;
+static int g_matScaledBitDepth = -1;
+static cudaStream_t g_matScaledStream = nullptr;
+
+inline float p016KNormForBitDepth(int bitDepth) {
+    // constexpr-equivalent reciprocal, hoisted: no per-pixel division.
+    // 10: 255/(1023<<6)=255/65472, 12: 255/(4095<<4)=255/65520, 16: 255/65535.
+    switch (bitDepth) {
+        case 10: return 255.0f / 65472.0f;
+        case 12: return 255.0f / 65520.0f;
+        case 16:
+        default: return 255.0f / 65535.0f;
+    }
+}
+
+void SetMatYuv2RgbScaled(int iMatrix, int colorRange, int bitDepth, cudaStream_t stream) {
+    if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
+        bitDepth = 16;
+    {
+        std::lock_guard<std::mutex> lk(g_matCacheScaledMu);
+        if (stream == g_matScaledStream && iMatrix == g_matScaledMatrix &&
+            colorRange == g_matScaledRange && bitDepth == g_matScaledBitDepth)
+            return;
+    }
+    const float (*mat)[3] = nullptr;
+    bool isFullRange = (colorRange == ColorRange_Full);
+    switch (iMatrix) {
+        case ColorSpaceStandard_BT709:
+        case ColorSpaceStandard_Unspecified:
+        default:
+            mat = isFullRange ? kMatBT709Full : kMatBT709Limited;
+            break;
+        case ColorSpaceStandard_BT601:
+        case ColorSpaceStandard_BT470BG:
+            mat = isFullRange ? kMatBT601Full : kMatBT601Limited;
+            break;
+        case ColorSpaceStandard_BT2020:
+        case ColorSpaceStandard_BT2020C:
+            mat = isFullRange ? kMatBT2020Full : kMatBT2020Limited;
+            break;
+        case ColorSpaceStandard_SMPTE240M:
+            mat = kMatSMPTE240MLimit;
+            break;
+        case ColorSpaceStandard_FCC:
+            mat = kMatFCCLimited;
+            break;
+    }
+    const float kNorm = p016KNormForBitDepth(bitDepth);
+    // Fuse scale into host matrix: mat' = mat * kNorm.
+    float scaled[3][3];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            scaled[r][c] = mat[r][c] * kNorm;
+    cudaError_t err = cudaMemcpyToSymbol(
+        matYuv2RgbScaled, scaled, sizeof(float) * 9, 0, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) {
+        std::lock_guard<std::mutex> lk(g_matCacheScaledMu);
+        g_matScaledStream = stream;
+        g_matScaledMatrix = iMatrix;
+        g_matScaledRange = colorRange;
+        g_matScaledBitDepth = bitDepth;
+    }
+}
+
+// BitDepth-correct conversion using the scaled matrix (float only).
+// low16/mid16 hoisted as constants (4096/32768 limited, 0/32768 full).
+template<int BitDepth>
+__device__ __forceinline__ RGB24 YuvToRgbBDForPixel(uint16_t y, uint16_t u, uint16_t v, bool fullRange) {
+    const int low16 = fullRange ? 0 : 4096;
+    const int mid16 = 32768;
+    float fy = static_cast<float>(static_cast<int>(y) - low16);
+    float fu = static_cast<float>(static_cast<int>(u) - mid16);
+    float fv = static_cast<float>(static_cast<int>(v) - mid16);
+    // __fmaf_rn: same math, fused rounding (within test tolerance).
+    float rf = __fmaf_rn(matYuv2RgbScaled[0][0], fy, __fmaf_rn(matYuv2RgbScaled[0][1], fu, matYuv2RgbScaled[0][2] * fv));
+    float gf = __fmaf_rn(matYuv2RgbScaled[1][0], fy, __fmaf_rn(matYuv2RgbScaled[1][1], fu, matYuv2RgbScaled[1][2] * fv));
+    float bf = __fmaf_rn(matYuv2RgbScaled[2][0], fy, __fmaf_rn(matYuv2RgbScaled[2][1], fu, matYuv2RgbScaled[2][2] * fv));
+    RGB24 rgb;
+    rgb.r = static_cast<uint8_t>(Clamp(rf + 0.5f, 0.0f, 255.0f));
+    rgb.g = static_cast<uint8_t>(Clamp(gf + 0.5f, 0.0f, 255.0f));
+    rgb.b = static_cast<uint8_t>(Clamp(bf + 0.5f, 0.0f, 255.0f));
+    return rgb;
+}
+
+template<int BitDepth>
+__device__ __forceinline__ RGB48 YuvToRgb48BDForPixel(uint16_t y, uint16_t u, uint16_t v, bool fullRange) {
+    const int low16 = fullRange ? 0 : 4096;
+    const int mid16 = 32768;
+    float fy = static_cast<float>(static_cast<int>(y) - low16);
+    float fu = static_cast<float>(static_cast<int>(u) - mid16);
+    float fv = static_cast<float>(static_cast<int>(v) - mid16);
+    float rf = __fmaf_rn(matYuv2RgbScaled[0][0], fy, __fmaf_rn(matYuv2RgbScaled[0][1], fu, matYuv2RgbScaled[0][2] * fv));
+    float gf = __fmaf_rn(matYuv2RgbScaled[1][0], fy, __fmaf_rn(matYuv2RgbScaled[1][1], fu, matYuv2RgbScaled[1][2] * fv));
+    float bf = __fmaf_rn(matYuv2RgbScaled[2][0], fy, __fmaf_rn(matYuv2RgbScaled[2][1], fu, matYuv2RgbScaled[2][2] * fv));
+    const float kTo16Bit = 257.0f;
+    RGB48 rgb;
+    rgb.r = static_cast<uint16_t>(Clamp(rf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    rgb.g = static_cast<uint16_t>(Clamp(gf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    rgb.b = static_cast<uint16_t>(Clamp(bf * kTo16Bit + 0.5f, 0.0f, 65535.0f));
+    return rgb;
+}
+
+// Packed RGB24 write: uint32+uint16 when 4B-aligned, else byte fallback.
+// Writes 2 pixels (6 bytes). No color-math change.
+__device__ __forceinline__ void writeRgb24x2Packed(uint8_t* dst, RGB24 a, RGB24 b) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(dst);
+    if ((addr & 3u) == 0) {
+        uint32_t w0 = (static_cast<uint32_t>(a.r)) |
+                      (static_cast<uint32_t>(a.g) << 8) |
+                      (static_cast<uint32_t>(a.b) << 16) |
+                      (static_cast<uint32_t>(b.r) << 24);
+        uint16_t w1 = (static_cast<uint16_t>(b.g)) |
+                      (static_cast<uint16_t>(b.b) << 8);
+        *reinterpret_cast<uint32_t*>(dst) = w0;
+        *reinterpret_cast<uint16_t*>(dst + 4) = w1;
+    } else {
+        dst[0] = a.r; dst[1] = a.g; dst[2] = a.b;
+        dst[3] = b.r; dst[4] = b.g; dst[5] = b.b;
+    }
+}
+
+// Separate Y/UV P016 kernels: real bitDepth template, __ldg on Y/UV,
+// const __restrict__, hoisted low/mid/fullRange, 32x4 (128T) + launch_bounds.
+template<int BitDepth>
+__global__ void __launch_bounds__(128, 6) P016SeparateToRgb24KernelBD(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pUV,
+    int nYPitch,
+    int nUVPitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        // Odd tail: scalar with plain loads (even dims never take this branch).
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            const uint16_t* pRowY = reinterpret_cast<const uint16_t*>(pY + yy * nYPitch);
+            const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(pUV + (yy / 2) * nUVPitch);
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const int uvx = xx & ~1;
+                uint16_t yv = pRowY[xx];
+                uint16_t uv0 = pRowUV[uvx];
+                uint16_t uv1 = pRowUV[uvx + 1];
+                RGB24 rgb = YuvToRgbBDForPixel<BitDepth>(yv, uv0, uv1, fullRange);
+                uint8_t* pDst = pRgb + yy * nRgbPitch + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
+        return;
+    }
+    const uint16_t* pSrcY0 = reinterpret_cast<const uint16_t*>(pY + y * nYPitch) + x;
+    const uint16_t* pSrcY1 = reinterpret_cast<const uint16_t*>(pY + (y + 1) * nYPitch) + x;
+    ushort2 y0 = __ldg(reinterpret_cast<const ushort2*>(pSrcY0));
+    ushort2 y1 = __ldg(reinterpret_cast<const ushort2*>(pSrcY1));
+    const uint16_t* pSrcUV = reinterpret_cast<const uint16_t*>(pUV + (y / 2) * nUVPitch) + x;
+    ushort2 uv = __ldg(reinterpret_cast<const ushort2*>(pSrcUV));
+    RGB24 rgb00 = YuvToRgbBDForPixel<BitDepth>(y0.x, uv.x, uv.y, fullRange);
+    RGB24 rgb01 = YuvToRgbBDForPixel<BitDepth>(y0.y, uv.x, uv.y, fullRange);
+    RGB24 rgb10 = YuvToRgbBDForPixel<BitDepth>(y1.x, uv.x, uv.y, fullRange);
+    RGB24 rgb11 = YuvToRgbBDForPixel<BitDepth>(y1.y, uv.x, uv.y, fullRange);
+    uint8_t* pDst0 = pRgb + y * nRgbPitch + x * 3;
+    uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
+    writeRgb24x2Packed(pDst0, rgb00, rgb01);
+    writeRgb24x2Packed(pDst1, rgb10, rgb11);
+}
+
+template<int BitDepth>
+__global__ void __launch_bounds__(128, 6) P016SeparateToRgb48KernelBD(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pUV,
+    int nYPitch,
+    int nUVPitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            const uint16_t* pRowY = reinterpret_cast<const uint16_t*>(pY + yy * nYPitch);
+            const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(pUV + (yy / 2) * nUVPitch);
+            uint16_t* pDst16 = reinterpret_cast<uint16_t*>(pRgb + yy * nRgbPitch);
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const int uvx = xx & ~1;
+                RGB48 rgb = YuvToRgb48BDForPixel<BitDepth>(pRowY[xx], pRowUV[uvx], pRowUV[uvx + 1], fullRange);
+                uint16_t* pDst = pDst16 + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
+        return;
+    }
+    const uint16_t* pSrcY0 = reinterpret_cast<const uint16_t*>(pY + y * nYPitch) + x;
+    const uint16_t* pSrcY1 = reinterpret_cast<const uint16_t*>(pY + (y + 1) * nYPitch) + x;
+    ushort2 y0 = __ldg(reinterpret_cast<const ushort2*>(pSrcY0));
+    ushort2 y1 = __ldg(reinterpret_cast<const ushort2*>(pSrcY1));
+    const uint16_t* pSrcUV = reinterpret_cast<const uint16_t*>(pUV + (y / 2) * nUVPitch) + x;
+    ushort2 uv = __ldg(reinterpret_cast<const ushort2*>(pSrcUV));
+    RGB48 rgb00 = YuvToRgb48BDForPixel<BitDepth>(y0.x, uv.x, uv.y, fullRange);
+    RGB48 rgb01 = YuvToRgb48BDForPixel<BitDepth>(y0.y, uv.x, uv.y, fullRange);
+    RGB48 rgb10 = YuvToRgb48BDForPixel<BitDepth>(y1.x, uv.x, uv.y, fullRange);
+    RGB48 rgb11 = YuvToRgb48BDForPixel<BitDepth>(y1.y, uv.x, uv.y, fullRange);
+    uint16_t* pDst0 = reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+    uint16_t* pDst1 = reinterpret_cast<uint16_t*>(pRgb + (y + 1) * nRgbPitch) + x * 3;
+    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
+    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
+    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
+    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
+}
+
+// YUV444P16 bitDepth-correct kernels (__ldg only per spec, no shared tile yet).
+template<int BitDepth>
+__global__ void __launch_bounds__(128, 6) Yuv444P16ToRgb24KernelBD(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pU,
+    const uint8_t* __restrict__ pV,
+    int nYuvPitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    // Odd-width tail: 4:4:4 carries a U/V pair per pixel, so the last column
+    // is a single scalar convert with plain loads. Even widths never take
+    // this branch.
+    if (x + 1 >= nWidth) {
+        const uint16_t* pRowY =
+            reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch);
+        const uint16_t* pRowU =
+            reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch);
+        const uint16_t* pRowV =
+            reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch);
+        RGB24 rgb = YuvToRgbBDForPixel<BitDepth>(pRowY[x], pRowU[x], pRowV[x],
+                                                 fullRange);
+        uint8_t* pDstTail = pRgb + y * nRgbPitch + x * 3;
+        pDstTail[0] = rgb.r; pDstTail[1] = rgb.g; pDstTail[2] = rgb.b;
+        return;
+    }
+    const uint16_t* pSrcY = reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch) + x;
+    const uint16_t* pSrcU = reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch) + x;
+    const uint16_t* pSrcV = reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch) + x;
+    ushort2 yy = __ldg(reinterpret_cast<const ushort2*>(pSrcY));
+    ushort2 uu = __ldg(reinterpret_cast<const ushort2*>(pSrcU));
+    ushort2 vv = __ldg(reinterpret_cast<const ushort2*>(pSrcV));
+    RGB24 rgb0 = YuvToRgbBDForPixel<BitDepth>(yy.x, uu.x, vv.x, fullRange);
+    RGB24 rgb1 = YuvToRgbBDForPixel<BitDepth>(yy.y, uu.y, vv.y, fullRange);
+    uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+    writeRgb24x2Packed(pDst, rgb0, rgb1);
+}
+
+template<int BitDepth>
+__global__ void __launch_bounds__(128, 6) Yuv444P16ToRgb48KernelBD(
+    const uint8_t* __restrict__ pY,
+    const uint8_t* __restrict__ pU,
+    const uint8_t* __restrict__ pV,
+    int nYuvPitch,
+    uint8_t* __restrict__ pRgb,
+    int nRgbPitch,
+    int nWidth,
+    int nHeight,
+    bool fullRange)
+{
+    int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+    // Odd-width tail (see Yuv444P16ToRgb24KernelBD above): scalar-convert the
+    // last column into RGB48 with plain loads. Even widths never take this
+    // branch.
+    if (x + 1 >= nWidth) {
+        const uint16_t* pRowY =
+            reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch);
+        const uint16_t* pRowU =
+            reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch);
+        const uint16_t* pRowV =
+            reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch);
+        RGB48 rgb = YuvToRgb48BDForPixel<BitDepth>(pRowY[x], pRowU[x],
+                                                   pRowV[x], fullRange);
+        uint16_t* pDstTail =
+            reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+        pDstTail[0] = rgb.r; pDstTail[1] = rgb.g; pDstTail[2] = rgb.b;
+        return;
+    }
+    const uint16_t* pSrcY = reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch) + x;
+    const uint16_t* pSrcU = reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch) + x;
+    const uint16_t* pSrcV = reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch) + x;
+    ushort2 yy = __ldg(reinterpret_cast<const ushort2*>(pSrcY));
+    ushort2 uu = __ldg(reinterpret_cast<const ushort2*>(pSrcU));
+    ushort2 vv = __ldg(reinterpret_cast<const ushort2*>(pSrcV));
+    RGB48 rgb0 = YuvToRgb48BDForPixel<BitDepth>(yy.x, uu.x, vv.x, fullRange);
+    RGB48 rgb1 = YuvToRgb48BDForPixel<BitDepth>(yy.y, uu.y, vv.y, fullRange);
+    uint16_t* pDst = reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+    pDst[0] = rgb0.r; pDst[1] = rgb0.g; pDst[2] = rgb0.b;
+    pDst[3] = rgb1.r; pDst[4] = rgb1.g; pDst[5] = rgb1.b;
+}
+
+
+
 //------------------------------------------------------------------------------
 // Device helper functions
 //------------------------------------------------------------------------------
@@ -348,11 +680,10 @@ __device__ __forceinline__ RGB24 YuvToRgbForPixel(YuvUnit y, YuvUnit u, YuvUnit 
     float fu = static_cast<float>(u) * normScale - midNorm;
     float fv = static_cast<float>(v) * normScale - midNorm;
     
-    // Apply YUV to RGB matrix multiplication
-    // The matrix coefficients are calibrated for 8-bit equivalent inputs
-    float rf = matYuv2Rgb[0][0] * fy + matYuv2Rgb[0][1] * fu + matYuv2Rgb[0][2] * fv;
-    float gf = matYuv2Rgb[1][0] * fy + matYuv2Rgb[1][1] * fu + matYuv2Rgb[1][2] * fv;
-    float bf = matYuv2Rgb[2][0] * fy + matYuv2Rgb[2][1] * fu + matYuv2Rgb[2][2] * fv;
+    // Apply YUV to RGB matrix multiplication (fused: same math, __fmaf_rn).
+    float rf = __fmaf_rn(matYuv2Rgb[0][0], fy, __fmaf_rn(matYuv2Rgb[0][1], fu, matYuv2Rgb[0][2] * fv));
+    float gf = __fmaf_rn(matYuv2Rgb[1][0], fy, __fmaf_rn(matYuv2Rgb[1][1], fu, matYuv2Rgb[1][2] * fv));
+    float bf = __fmaf_rn(matYuv2Rgb[2][0], fy, __fmaf_rn(matYuv2Rgb[2][1], fu, matYuv2Rgb[2][2] * fv));
     
     // Round and clamp to [0, 255]
     RGB24 rgb;
@@ -390,9 +721,9 @@ __device__ __forceinline__ RGB48 YuvToRgb48ForPixel(YuvUnit y, YuvUnit u, YuvUni
     float fu = static_cast<float>(u) * normScale - midNorm;
     float fv = static_cast<float>(v) * normScale - midNorm;
 
-    float rf = matYuv2Rgb[0][0] * fy + matYuv2Rgb[0][1] * fu + matYuv2Rgb[0][2] * fv;
-    float gf = matYuv2Rgb[1][0] * fy + matYuv2Rgb[1][1] * fu + matYuv2Rgb[1][2] * fv;
-    float bf = matYuv2Rgb[2][0] * fy + matYuv2Rgb[2][1] * fu + matYuv2Rgb[2][2] * fv;
+    float rf = __fmaf_rn(matYuv2Rgb[0][0], fy, __fmaf_rn(matYuv2Rgb[0][1], fu, matYuv2Rgb[0][2] * fv));
+    float gf = __fmaf_rn(matYuv2Rgb[1][0], fy, __fmaf_rn(matYuv2Rgb[1][1], fu, matYuv2Rgb[1][2] * fv));
+    float bf = __fmaf_rn(matYuv2Rgb[2][0], fy, __fmaf_rn(matYuv2Rgb[2][1], fu, matYuv2Rgb[2][2] * fv));
 
     // 65535/255 — widen the 0..255 float result onto the full 16-bit range.
     const float kTo16Bit = 257.0f;
@@ -425,7 +756,7 @@ __device__ __forceinline__ RGBA32 YuvToRgbaForPixel(YuvUnit y, YuvUnit u, YuvUni
 /**
  * @brief NV12 to RGB24 kernel - processes 2x2 pixel blocks with vectorized writes
  */
-__global__ void Nv12ToRgb24Kernel(
+__global__ void __launch_bounds__(128, 6) Nv12ToRgb24Kernel(
     const uint8_t* __restrict__ pNv12,
     int nNv12Pitch,
     uint8_t* __restrict__ pRgb,
@@ -439,7 +770,27 @@ __global__ void Nv12ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail: the vectorized 2x2 path below needs x + 1 < nWidth
+    // and y + 1 < nHeight. Convert the 1-3 edge pixels still owned by this
+    // thread with scalar byte loads (the uchar2 loads below would read past
+    // the row end). Even dimensions never take this branch, so their output
+    // is unchanged.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pNv12 + yy * nNv12Pitch + xx);
+                const uint8_t* pUVpx = pNv12 + nSurfaceHeight * nNv12Pitch +
+                                       (yy / 2) * nNv12Pitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                uint8_t* pDst = pRgb + yy * nRgbPitch + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
         return;
     }
     
@@ -487,7 +838,27 @@ __global__ void Nv12ToRgbPlanarKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels into the planar layout. Even dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailPlane = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pNv12 + yy * nNv12Pitch + xx);
+                const uint8_t* pUVpx = pNv12 + nSurfaceHeight * nNv12Pitch +
+                                       (yy / 2) * nNv12Pitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                const int idx = yy * nWidth + xx;
+                pRgbp[idx] = rgb.r;
+                pRgbp[tailPlane + idx] = rgb.g;
+                pRgbp[2 * tailPlane + idx] = rgb.b;
+            }
+        }
         return;
     }
     
@@ -528,7 +899,7 @@ __global__ void Nv12ToRgbPlanarKernel(
 /**
  * @brief NV12 to RGB24 with separate Y and UV plane pointers
  */
-__global__ void Nv12SeparateToRgb24Kernel(
+__global__ void __launch_bounds__(128, 6) Nv12SeparateToRgb24Kernel(
     const uint8_t* __restrict__ pY,
     const uint8_t* __restrict__ pUV,
     int nYPitch,
@@ -542,18 +913,35 @@ __global__ void Nv12SeparateToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels from the separate Y/UV planes. Even dimensions never take this
+    // branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pY + yy * nYPitch + xx);
+                const uint8_t* pUVpx = pUV + (yy / 2) * nUVPitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                uint8_t* pDst = pRgb + yy * nRgbPitch + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
         return;
     }
     
     // Read Y
     const uint8_t* pSrcY = pY + y * nYPitch + x;
-    uchar2 y0 = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 y1 = *reinterpret_cast<const uchar2*>(pSrcY + nYPitch);
+    uchar2 y0 = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 y1 = __ldg(reinterpret_cast<const uchar2*>(pSrcY + nYPitch));
     
-    // Read UV
+    // Read UV (__ldg: read-only cache)
     const uint8_t* pSrcUV = pUV + (y / 2) * nUVPitch + x;
-    uchar2 uv = *reinterpret_cast<const uchar2*>(pSrcUV);
+    uchar2 uv = __ldg(reinterpret_cast<const uchar2*>(pSrcUV));
     
     // Convert
     RGB24 rgb00 = YuvToRgbForPixel<uint8_t>(y0.x, uv.x, uv.y, fullRange);
@@ -561,24 +949,17 @@ __global__ void Nv12SeparateToRgb24Kernel(
     RGB24 rgb10 = YuvToRgbForPixel<uint8_t>(y1.x, uv.x, uv.y, fullRange);
     RGB24 rgb11 = YuvToRgbForPixel<uint8_t>(y1.y, uv.x, uv.y, fullRange);
     
-    // Write RGB24 pixels (3 bytes each) directly to avoid uchar3 padding issues
-    // uchar3 is 4 bytes in CUDA due to alignment, so we can't use RGB24x2 struct
+    // Packed RGB24 writes: uint32+uint16 when 4B-aligned, else byte fallback.
     uint8_t* pDst0 = pRgb + y * nRgbPitch + x * 3;
     uint8_t* pDst1 = pRgb + (y + 1) * nRgbPitch + x * 3;
-    
-    // Row 0: pixels (x, y) and (x+1, y)
-    pDst0[0] = rgb00.r; pDst0[1] = rgb00.g; pDst0[2] = rgb00.b;
-    pDst0[3] = rgb01.r; pDst0[4] = rgb01.g; pDst0[5] = rgb01.b;
-    
-    // Row 1: pixels (x, y+1) and (x+1, y+1)
-    pDst1[0] = rgb10.r; pDst1[1] = rgb10.g; pDst1[2] = rgb10.b;
-    pDst1[3] = rgb11.r; pDst1[4] = rgb11.g; pDst1[5] = rgb11.b;
+    writeRgb24x2Packed(pDst0, rgb00, rgb01);
+    writeRgb24x2Packed(pDst1, rgb10, rgb11);
 }
 
 /**
  * @brief NV12 to RGBA32 (4 bytes/pixel) kernel for alignment safety
  */
-__global__ void Nv12SeparateToRgba32Kernel(
+__global__ void __launch_bounds__(128, 6) Nv12SeparateToRgba32Kernel(
     const uint8_t* __restrict__ pY,
     const uint8_t* __restrict__ pUV,
     int nYPitch,
@@ -592,18 +973,36 @@ __global__ void Nv12SeparateToRgba32Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels into RGBA32 with an opaque alpha plane. Even dimensions never
+    // take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pY + yy * nYPitch + xx);
+                const uint8_t* pUVpx = pUV + (yy / 2) * nUVPitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                uint8_t* pDst = pRgba + yy * nRgbaPitch + xx * 4;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+                pDst[3] = 255;
+            }
+        }
         return;
     }
     
     // Read Y
     const uint8_t* pSrcY = pY + y * nYPitch + x;
-    uchar2 y0 = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 y1 = *reinterpret_cast<const uchar2*>(pSrcY + nYPitch);
+    uchar2 y0 = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 y1 = __ldg(reinterpret_cast<const uchar2*>(pSrcY + nYPitch));
     
-    // Read UV
+    // Read UV (__ldg: read-only cache)
     const uint8_t* pSrcUV = pUV + (y / 2) * nUVPitch + x;
-    uchar2 uv = *reinterpret_cast<const uchar2*>(pSrcUV);
+    uchar2 uv = __ldg(reinterpret_cast<const uchar2*>(pSrcUV));
     
     // Convert
     RGB24 rgb00 = YuvToRgbForPixel<uint8_t>(y0.x, uv.x, uv.y, fullRange);
@@ -632,7 +1031,7 @@ __global__ void Nv12SeparateToRgba32Kernel(
 /**
  * @brief P016 (10-bit NV12) to RGB24 kernel for HDR content
  */
-__global__ void P016ToRgb24Kernel(
+__global__ void __launch_bounds__(128, 6) P016ToRgb24Kernel(
     const uint8_t* __restrict__ pP016,
     int nP016Pitch,
     uint8_t* __restrict__ pRgb,
@@ -645,7 +1044,27 @@ __global__ void P016ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels with plain 16-bit loads (the ushort2 loads below would read
+    // past the row end). Even dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            const uint16_t* pRowY =
+                reinterpret_cast<const uint16_t*>(pP016 + yy * nP016Pitch);
+            const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(
+                pP016 + nSurfaceHeight * nP016Pitch + (yy / 2) * nP016Pitch);
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const int uvx = xx & ~1;
+                RGB24 rgb = YuvToRgbForPixel<uint16_t>(
+                    pRowY[xx], pRowUV[uvx], pRowUV[uvx + 1], fullRange);
+                uint8_t* pDst = pRgb + yy * nRgbPitch + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
         return;
     }
     
@@ -684,7 +1103,7 @@ __global__ void P016ToRgb24Kernel(
  * Same traversal as P016ToRgb24Kernel; the destination is 6 bytes per pixel.
  * nRgbPitch is in BYTES, like every other pitch in this file.
  */
-__global__ void P016ToRgb48Kernel(
+__global__ void __launch_bounds__(128, 6) P016ToRgb48Kernel(
     const uint8_t* __restrict__ pP016,
     int nP016Pitch,
     uint8_t* __restrict__ pRgb,
@@ -697,7 +1116,29 @@ __global__ void P016ToRgb48Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
 
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels into RGB48 with plain 16-bit loads. Even dimensions never take
+    // this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            const uint16_t* pRowY =
+                reinterpret_cast<const uint16_t*>(pP016 + yy * nP016Pitch);
+            const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(
+                pP016 + nSurfaceHeight * nP016Pitch + (yy / 2) * nP016Pitch);
+            uint16_t* pDst16 =
+                reinterpret_cast<uint16_t*>(pRgb + yy * nRgbPitch);
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const int uvx = xx & ~1;
+                RGB48 rgb = YuvToRgb48ForPixel<uint16_t>(
+                    pRowY[xx], pRowUV[uvx], pRowUV[uvx + 1], fullRange);
+                uint16_t* pDst = pDst16 + xx * 3;
+                pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
+            }
+        }
         return;
     }
 
@@ -739,7 +1180,30 @@ __global__ void P016ToRgbPlanarKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels into the planar layout with plain 16-bit loads. Even dimensions
+    // never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailPlane = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            const uint16_t* pRowY =
+                reinterpret_cast<const uint16_t*>(pP016 + yy * nP016Pitch);
+            const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(
+                pP016 + nSurfaceHeight * nP016Pitch + (yy / 2) * nP016Pitch);
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const int uvx = xx & ~1;
+                RGB24 rgb = YuvToRgbForPixel<uint16_t>(
+                    pRowY[xx], pRowUV[uvx], pRowUV[uvx + 1], fullRange);
+                const int idx = yy * nWidth + xx;
+                pRgbp[idx] = rgb.r;
+                pRgbp[tailPlane + idx] = rgb.g;
+                pRgbp[2 * tailPlane + idx] = rgb.b;
+            }
+        }
         return;
     }
     
@@ -795,7 +1259,21 @@ __global__ void Nv16ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail: 4:2:2 shares one UV pair between two horizontal pixels,
+    // so only the last column needs a scalar convert. Even widths never take
+    // this branch.
+    if (x + 1 >= nWidth) {
+        uint8_t yVal = *(pNv16 + y * nNv16Pitch + x);
+        const uint8_t* pUVpx =
+            pNv16 + nSurfaceHeight * nNv16Pitch + y * nNv16Pitch + (x & ~1);
+        RGB24 rgb =
+            YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1], fullRange);
+        uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+        pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
         return;
     }
     
@@ -832,7 +1310,23 @@ __global__ void Nv16ToRgbPlanarKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail (see Nv16ToRgb24Kernel): scalar-convert the last column
+    // into the planar layout. Even widths never take this branch.
+    if (x + 1 >= nWidth) {
+        const int tailPlane = nWidth * nHeight;
+        uint8_t yVal = *(pNv16 + y * nNv16Pitch + x);
+        const uint8_t* pUVpx =
+            pNv16 + nSurfaceHeight * nNv16Pitch + y * nNv16Pitch + (x & ~1);
+        RGB24 rgb =
+            YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1], fullRange);
+        const int idx = y * nWidth + x;
+        pRgbp[idx] = rgb.r;
+        pRgbp[tailPlane + idx] = rgb.g;
+        pRgbp[2 * tailPlane + idx] = rgb.b;
         return;
     }
     
@@ -873,7 +1367,22 @@ __global__ void P216ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail (see Nv16ToRgb24Kernel): scalar-convert the last column
+    // with plain 16-bit loads. Even widths never take this branch.
+    if (x + 1 >= nWidth) {
+        const uint16_t* pRowY =
+            reinterpret_cast<const uint16_t*>(pP216 + y * nP216Pitch);
+        const uint16_t* pRowUV = reinterpret_cast<const uint16_t*>(
+            pP216 + nSurfaceHeight * nP216Pitch + y * nP216Pitch);
+        const int uvx = x & ~1;
+        RGB24 rgb = YuvToRgbForPixel<uint16_t>(pRowY[x], pRowUV[uvx],
+                                               pRowUV[uvx + 1], fullRange);
+        uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+        pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
         return;
     }
     
@@ -903,7 +1412,7 @@ __global__ void P216ToRgb24Kernel(
  * @brief YUV444 planar to RGB24 kernel
  * Each pixel has its own U and V values
  */
-__global__ void Yuv444ToRgb24Kernel(
+__global__ void __launch_bounds__(128, 6) Yuv444ToRgb24Kernel(
     const uint8_t* __restrict__ pY,
     const uint8_t* __restrict__ pU,
     const uint8_t* __restrict__ pV,
@@ -918,7 +1427,19 @@ __global__ void Yuv444ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail: 4:4:4 carries a U/V pair per pixel, so the last column
+    // is a single scalar convert. Even widths never take this branch.
+    if (x + 1 >= nWidth) {
+        uint8_t yVal = *(pY + y * nYuvPitch + x);
+        uint8_t uVal = *(pU + y * nYuvPitch + x);
+        uint8_t vVal = *(pV + y * nYuvPitch + x);
+        RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, uVal, vVal, fullRange);
+        uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+        pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
         return;
     }
     
@@ -927,9 +1448,9 @@ __global__ void Yuv444ToRgb24Kernel(
     const uint8_t* pSrcU = pU + y * nYuvPitch + x;
     const uint8_t* pSrcV = pV + y * nYuvPitch + x;
     
-    uchar2 yy = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 uu = *reinterpret_cast<const uchar2*>(pSrcU);
-    uchar2 vv = *reinterpret_cast<const uchar2*>(pSrcV);
+    uchar2 yy = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 uu = __ldg(reinterpret_cast<const uchar2*>(pSrcU));
+    uchar2 vv = __ldg(reinterpret_cast<const uchar2*>(pSrcV));
     
     // Convert (each pixel gets its own U, V)
     RGB24 rgb0 = YuvToRgbForPixel<uint8_t>(yy.x, uu.x, vv.x, fullRange);
@@ -957,7 +1478,22 @@ __global__ void Yuv444ToRgbPlanarKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail (see Yuv444ToRgb24Kernel): scalar-convert the last
+    // column into the planar layout. Even widths never take this branch.
+    if (x + 1 >= nWidth) {
+        const int tailPlane = nWidth * nHeight;
+        uint8_t yVal = *(pY + y * nYuvPitch + x);
+        uint8_t uVal = *(pU + y * nYuvPitch + x);
+        uint8_t vVal = *(pV + y * nYuvPitch + x);
+        RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, uVal, vVal, fullRange);
+        const int idx = y * nWidth + x;
+        pRgbp[idx] = rgb.r;
+        pRgbp[tailPlane + idx] = rgb.g;
+        pRgbp[2 * tailPlane + idx] = rgb.b;
         return;
     }
     
@@ -967,9 +1503,9 @@ __global__ void Yuv444ToRgbPlanarKernel(
     const uint8_t* pSrcU = pU + y * nYuvPitch + x;
     const uint8_t* pSrcV = pV + y * nYuvPitch + x;
     
-    uchar2 yy = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 uu = *reinterpret_cast<const uchar2*>(pSrcU);
-    uchar2 vv = *reinterpret_cast<const uchar2*>(pSrcV);
+    uchar2 yy = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 uu = __ldg(reinterpret_cast<const uchar2*>(pSrcU));
+    uchar2 vv = __ldg(reinterpret_cast<const uchar2*>(pSrcV));
     
     RGB24 rgb0 = YuvToRgbForPixel<uint8_t>(yy.x, uu.x, vv.x, fullRange);
     RGB24 rgb1 = YuvToRgbForPixel<uint8_t>(yy.y, uu.y, vv.y, fullRange);
@@ -987,7 +1523,7 @@ __global__ void Yuv444ToRgbPlanarKernel(
 /**
  * @brief YUV444 16-bit planar to RGB24 kernel
  */
-__global__ void Yuv444P16ToRgb24Kernel(
+__global__ void __launch_bounds__(128, 6) Yuv444P16ToRgb24Kernel(
     const uint8_t* __restrict__ pY,
     const uint8_t* __restrict__ pU,
     const uint8_t* __restrict__ pV,
@@ -1001,7 +1537,23 @@ __global__ void Yuv444P16ToRgb24Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail (see Yuv444ToRgb24Kernel): scalar-convert the last
+    // column with plain 16-bit loads. Even widths never take this branch.
+    if (x + 1 >= nWidth) {
+        const uint16_t* pRowY =
+            reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch);
+        const uint16_t* pRowU =
+            reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch);
+        const uint16_t* pRowV =
+            reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch);
+        RGB24 rgb = YuvToRgbForPixel<uint16_t>(pRowY[x], pRowU[x], pRowV[x],
+                                               fullRange);
+        uint8_t* pDst = pRgb + y * nRgbPitch + x * 3;
+        pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
         return;
     }
     
@@ -1030,7 +1582,7 @@ __global__ void Yuv444P16ToRgb24Kernel(
  * Same traversal as Yuv444P16ToRgb24Kernel; the destination is 6 bytes per
  * pixel. nRgbPitch is in BYTES.
  */
-__global__ void Yuv444P16ToRgb48Kernel(
+__global__ void __launch_bounds__(128, 6) Yuv444P16ToRgb48Kernel(
     const uint8_t* __restrict__ pY,
     const uint8_t* __restrict__ pU,
     const uint8_t* __restrict__ pV,
@@ -1044,7 +1596,24 @@ __global__ void Yuv444P16ToRgb48Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
 
-    if (x + 1 >= nWidth || y >= nHeight) {
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-width tail (see Yuv444ToRgb24Kernel): scalar-convert the last
+    // column into RGB48 with plain 16-bit loads. Even widths never take this
+    // branch.
+    if (x + 1 >= nWidth) {
+        const uint16_t* pRowY =
+            reinterpret_cast<const uint16_t*>(pY + y * nYuvPitch);
+        const uint16_t* pRowU =
+            reinterpret_cast<const uint16_t*>(pU + y * nYuvPitch);
+        const uint16_t* pRowV =
+            reinterpret_cast<const uint16_t*>(pV + y * nYuvPitch);
+        RGB48 rgb = YuvToRgb48ForPixel<uint16_t>(pRowY[x], pRowU[x], pRowV[x],
+                                                 fullRange);
+        uint16_t* pDst = reinterpret_cast<uint16_t*>(pRgb + y * nRgbPitch) + x * 3;
+        pDst[0] = rgb.r; pDst[1] = rgb.g; pDst[2] = rgb.b;
         return;
     }
 
@@ -1117,10 +1686,10 @@ void launchNv12ToRgb24(
     // {32,64,128,256}x{1,2,4} at 720p/1080p/4K put (32,2) at or within noise of
     // the best result everywhere (4K: 677 GB/s effective, ~72% of an RTX 3090's
     // peak). Wider or taller blocks lose L2 locality on the shared UV row.
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
 
     Nv12ToRgb24Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1145,10 +1714,10 @@ void launchNv12ToRgbPlanar(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Nv12ToRgbPlanarKernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1175,10 +1744,10 @@ void launchNv12ToRgb24Separate(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Nv12SeparateToRgb24Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1207,10 +1776,10 @@ void launchP016ToRgb24(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     P016ToRgb24Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1235,10 +1804,10 @@ void launchP016ToRgb48(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
 
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
 
     P016ToRgb48Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1262,10 +1831,10 @@ void launchP016ToRgbPlanar(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     P016ToRgbPlanarKernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1587,7 +2156,27 @@ __global__ void Nv12ToBchwNormalizedKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels straight into normalized BCHW with plain byte loads. Even
+    // dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailStride = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pY + yy * nYPitch + xx);
+                const uint8_t* pUVpx = pUV + (yy / 2) * nUVPitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                const int idx = yy * nWidth + xx;
+                pOutput[0 * tailStride + idx] = (rgb.r * invStd.x) - mean.x;
+                pOutput[1 * tailStride + idx] = (rgb.g * invStd.y) - mean.y;
+                pOutput[2 * tailStride + idx] = (rgb.b * invStd.z) - mean.z;
+            }
+        }
         return;
     }
     
@@ -1599,12 +2188,12 @@ __global__ void Nv12ToBchwNormalizedKernel(
     
     // Read Y values
     const uint8_t* pSrcY = pY + y * nYPitch + x;
-    uchar2 y0 = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 y1 = *reinterpret_cast<const uchar2*>(pSrcY + nYPitch);
+    uchar2 y0 = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 y1 = __ldg(reinterpret_cast<const uchar2*>(pSrcY + nYPitch));
     
-    // Read UV
+    // Read UV (__ldg: read-only cache)
     const uint8_t* pSrcUV = pUV + (y / 2) * nUVPitch + x;
-    uchar2 uv = *reinterpret_cast<const uchar2*>(pSrcUV);
+    uchar2 uv = __ldg(reinterpret_cast<const uchar2*>(pSrcUV));
     
     // Convert 4 pixels
     RGB24 rgb00 = YuvToRgbForPixel<uint8_t>(y0.x, uv.x, uv.y, fullRange);
@@ -1662,7 +2251,30 @@ __global__ void Nv12ToBchwNormalizedFP16Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert the edge
+    // pixels into normalized FP16 BCHW with plain byte loads. Even dimensions
+    // never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailStride = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pY + yy * nYPitch + xx);
+                const uint8_t* pUVpx = pUV + (yy / 2) * nUVPitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                const int idx = yy * nWidth + xx;
+                pOutput[0 * tailStride + idx] =
+                    __float2half((rgb.r * invStd.x) - mean.x);
+                pOutput[1 * tailStride + idx] =
+                    __float2half((rgb.g * invStd.y) - mean.y);
+                pOutput[2 * tailStride + idx] =
+                    __float2half((rgb.b * invStd.z) - mean.z);
+            }
+        }
         return;
     }
     
@@ -1672,12 +2284,12 @@ __global__ void Nv12ToBchwNormalizedFP16Kernel(
     
     // Read Y values
     const uint8_t* pSrcY = pY + y * nYPitch + x;
-    uchar2 y0 = *reinterpret_cast<const uchar2*>(pSrcY);
-    uchar2 y1 = *reinterpret_cast<const uchar2*>(pSrcY + nYPitch);
+    uchar2 y0 = __ldg(reinterpret_cast<const uchar2*>(pSrcY));
+    uchar2 y1 = __ldg(reinterpret_cast<const uchar2*>(pSrcY + nYPitch));
     
-    // Read UV
+    // Read UV (__ldg: read-only cache)
     const uint8_t* pSrcUV = pUV + (y / 2) * nUVPitch + x;
-    uchar2 uv = *reinterpret_cast<const uchar2*>(pSrcUV);
+    uchar2 uv = __ldg(reinterpret_cast<const uchar2*>(pSrcUV));
     
     // Convert 4 pixels
     RGB24 rgb00 = YuvToRgbForPixel<uint8_t>(y0.x, uv.x, uv.y, fullRange);
@@ -1740,10 +2352,10 @@ void launchNv12ToBchwNormalized(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Nv12ToBchwNormalizedKernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1784,10 +2396,10 @@ void launchNv12ToBchwNormalizedFP16(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Nv12ToBchwNormalizedFP16Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -1825,7 +2437,32 @@ __global__ void Nv12BatchToBchwKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail (see Nv12ToRgb24Kernel): scalar-convert this frame's
+    // edge pixels into its normalized BCHW slice with plain byte loads. Even
+    // dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailFrameStride = 3 * nWidth * nHeight;
+        const int tailCStride = nWidth * nHeight;
+        float* pTailOut = pOutput + frameIdx * tailFrameStride;
+        const int tailYPitch = nYPitch[frameIdx];
+        const int tailUVPitch = nUVPitch[frameIdx];
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                uint8_t yVal = *(pY[frameIdx] + yy * tailYPitch + xx);
+                const uint8_t* pUVpx =
+                    pUV[frameIdx] + (yy / 2) * tailUVPitch + (xx & ~1);
+                RGB24 rgb = YuvToRgbForPixel<uint8_t>(yVal, pUVpx[0], pUVpx[1],
+                                                      fullRange);
+                const int idx = yy * nWidth + xx;
+                pTailOut[0 * tailCStride + idx] = (rgb.r * invStd.x) - mean.x;
+                pTailOut[1 * tailCStride + idx] = (rgb.g * invStd.y) - mean.y;
+                pTailOut[2 * tailCStride + idx] = (rgb.b * invStd.z) - mean.z;
+            }
+        }
         return;
     }
     
@@ -1891,7 +2528,7 @@ void launchNv12BatchToBchw(
 {
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
         (nHeight + 3) / 4,
@@ -1964,7 +2601,23 @@ __global__ void Rgb24ToBchwKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail: scalar-convert the edge pixels from packed RGB24
+    // into normalized BCHW. Even dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailStride = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const uint8_t* px = pRgb + yy * nRgbPitch + xx * 3;
+                const int idx = yy * nWidth + xx;
+                pOutput[0 * tailStride + idx] = (px[0] * invStd.x) - mean.x;
+                pOutput[1 * tailStride + idx] = (px[1] * invStd.y) - mean.y;
+                pOutput[2 * tailStride + idx] = (px[2] * invStd.z) - mean.z;
+            }
+        }
         return;
     }
     
@@ -2030,7 +2683,26 @@ __global__ void Rgb24ToBchwFP16Kernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail: scalar-convert the edge pixels from packed RGB24
+    // into normalized FP16 BCHW. Even dimensions never take this branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailStride = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const uint8_t* px = pRgb + yy * nRgbPitch + xx * 3;
+                const int idx = yy * nWidth + xx;
+                pOutput[0 * tailStride + idx] =
+                    __float2half((px[0] * invStd.x) - mean.x);
+                pOutput[1 * tailStride + idx] =
+                    __float2half((px[1] * invStd.y) - mean.y);
+                pOutput[2 * tailStride + idx] =
+                    __float2half((px[2] * invStd.z) - mean.z);
+            }
+        }
         return;
     }
     
@@ -2084,7 +2756,24 @@ __global__ void Rgba32ToBchwKernel(
     int x = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
     int y = (threadIdx.y + blockIdx.y * blockDim.y) * 2;
     
+    if (x >= nWidth || y >= nHeight) {
+        return;
+    }
+
+    // Odd-dimension tail: scalar-convert the edge pixels from packed RGBA32
+    // (alpha ignored) into normalized BCHW. Even dimensions never take this
+    // branch.
     if (x + 1 >= nWidth || y + 1 >= nHeight) {
+        const int tailStride = nWidth * nHeight;
+        for (int yy = y; yy < y + 2 && yy < nHeight; ++yy) {
+            for (int xx = x; xx < x + 2 && xx < nWidth; ++xx) {
+                const uint8_t* px = pRgba + yy * nRgbaPitch + xx * 4;
+                const int idx = yy * nWidth + xx;
+                pOutput[0 * tailStride + idx] = (px[0] * invStd.x) - mean.x;
+                pOutput[1 * tailStride + idx] = (px[1] * invStd.y) - mean.y;
+                pOutput[2 * tailStride + idx] = (px[2] * invStd.z) - mean.z;
+            }
+        }
         return;
     }
     
@@ -2136,10 +2825,10 @@ void launchRgb24ToBchw(
     float3 invStd,
     cudaStream_t stream)
 {
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Rgb24ToBchwKernel<<<gridDim, blockDim, 0, stream>>>(
@@ -2160,10 +2849,10 @@ void launchRgb24ToBchwFP16(
     float3 invStd,
     cudaStream_t stream)
 {
-    dim3 blockDim(32, 2);
+    dim3 blockDim(32, 4);
     dim3 gridDim(
         (nWidth + 63) / 64,
-        (nHeight + 3) / 4
+        (nHeight + 7) / 8
     );
     
     Rgb24ToBchwFP16Kernel<<<gridDim, blockDim, 0, stream>>>(
@@ -2198,8 +2887,8 @@ void launchNv12ToRgba32Separate(
     // CRITICAL: Initialize the YUV->RGB color conversion matrix before kernel launch!
     SetMatYuv2Rgb(colorSpace, colorRange, stream);
     
-    dim3 blockDim(32, 2);
-    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 7) / 8);
     
     bool full = (colorRange == 1); // ColorRange_Full = 1
     
@@ -2218,13 +2907,99 @@ void launchRgba32ToBchw(
     float3 invStd,
     cudaStream_t stream)
 {
-    dim3 blockDim(32, 2);
-    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 7) / 8);
     
     Rgba32ToBchwKernel<<<gridDim, blockDim, 0, stream>>>(
         pRgba, nRgbaPitch, pOutput, nWidth, nHeight, mean, invStd
     );
 }
+
+
+void launchP016ToRgb24Separate(
+    const uint8_t* pY, const uint8_t* pUV,
+    int nYPitch, int nUVPitch,
+    uint8_t* pRgb, int nRgbPitch,
+    int nWidth, int nHeight,
+    int colorSpace, int colorRange, int bitDepth,
+    cudaStream_t stream)
+{
+    if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
+        bitDepth = 16;
+    SetMatYuv2RgbScaled(colorSpace, colorRange, bitDepth, stream);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 7) / 8);
+    bool full = (colorRange == ColorRange_Full);
+    if (bitDepth == 10)
+        P016SeparateToRgb24KernelBD<10><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else if (bitDepth == 12)
+        P016SeparateToRgb24KernelBD<12><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else
+        P016SeparateToRgb24KernelBD<16><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+}
+
+void launchP016ToRgb48Separate(
+    const uint8_t* pY, const uint8_t* pUV,
+    int nYPitch, int nUVPitch,
+    uint8_t* pRgb, int nRgbPitch,
+    int nWidth, int nHeight,
+    int colorSpace, int colorRange, int bitDepth,
+    cudaStream_t stream)
+{
+    if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
+        bitDepth = 16;
+    SetMatYuv2RgbScaled(colorSpace, colorRange, bitDepth, stream);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 7) / 8);
+    bool full = (colorRange == ColorRange_Full);
+    if (bitDepth == 10)
+        P016SeparateToRgb48KernelBD<10><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else if (bitDepth == 12)
+        P016SeparateToRgb48KernelBD<12><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else
+        P016SeparateToRgb48KernelBD<16><<<gridDim, blockDim, 0, stream>>>(pY, pUV, nYPitch, nUVPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+}
+
+void launchYuv444P16ToRgb24BD(
+    const uint8_t* pY, const uint8_t* pU, const uint8_t* pV,
+    int nYuvPitch, uint8_t* pRgb, int nRgbPitch,
+    int nWidth, int nHeight, int colorSpace, int colorRange, int bitDepth,
+    cudaStream_t stream)
+{
+    if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
+        bitDepth = 16;
+    SetMatYuv2RgbScaled(colorSpace, colorRange, bitDepth, stream);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    bool full = (colorRange == ColorRange_Full);
+    if (bitDepth == 10)
+        Yuv444P16ToRgb24KernelBD<10><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else if (bitDepth == 12)
+        Yuv444P16ToRgb24KernelBD<12><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else
+        Yuv444P16ToRgb24KernelBD<16><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+}
+
+void launchYuv444P16ToRgb48BD(
+    const uint8_t* pY, const uint8_t* pU, const uint8_t* pV,
+    int nYuvPitch, uint8_t* pRgb, int nRgbPitch,
+    int nWidth, int nHeight, int colorSpace, int colorRange, int bitDepth,
+    cudaStream_t stream)
+{
+    if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
+        bitDepth = 16;
+    SetMatYuv2RgbScaled(colorSpace, colorRange, bitDepth, stream);
+    dim3 blockDim(32, 4);
+    dim3 gridDim((nWidth + 63) / 64, (nHeight + 3) / 4);
+    bool full = (colorRange == ColorRange_Full);
+    if (bitDepth == 10)
+        Yuv444P16ToRgb48KernelBD<10><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else if (bitDepth == 12)
+        Yuv444P16ToRgb48KernelBD<12><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+    else
+        Yuv444P16ToRgb48KernelBD<16><<<gridDim, blockDim, 0, stream>>>(pY, pU, pV, nYuvPitch, pRgb, nRgbPitch, nWidth, nHeight, full);
+}
+
 
 } // namespace nelux::backends::cuda
 

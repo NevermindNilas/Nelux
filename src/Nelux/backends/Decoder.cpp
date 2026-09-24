@@ -1,45 +1,55 @@
+#include <spdlog/spdlog.h>
 // Decoder.cpp
 #include "Decoder.hpp"
 #include "BatchDecoder.hpp"
 #include "conversion/cpu/AutoToRGB.hpp"
+#include <cerrno>
+#include <cctype>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 using namespace nelux::error;
 
 namespace
 {
-// AVERROR_EOF is the only code that means "the file ended". Every other
-// failure leaves the stream unfinished, and none of the three read sites can
+// AVERROR_EOF is the only code that means "the file ended". Most other
+// failures leave the stream unfinished, and none of the read sites can
 // resume from one: each responds by flushing the decoder and draining, so a
 // code exempted here is not retried, it is reported as a complete video.
 //
-// That is why EAGAIN, AVERROR_EXIT and ETIMEDOUT are fatal too, despite
-// naming transient conditions. Nelux sets neither AVFMT_FLAG_NONBLOCK nor an
-// interrupt callback, so the first two cannot arrive; ETIMEDOUT can, from a
-// network source that stalled, and it means the frames after it were never
-// read. Raising is not a permanently poisoned reader either -- a successful
-// seek or reconfigure() clears the latch, so a caller who believes the stall
-// was transient can seek and carry on. Silently returning a short video is
-// the one outcome with no recovery, because nothing tells the caller it
-// happened.
+// Two classes of codes are NOT latched as fatal:
+//  * AVERROR(EAGAIN) and AVERROR_EXIT cannot arrive here at all (Nelux sets
+//    neither AVFMT_FLAG_NONBLOCK nor an interrupt callback; av_read_frame
+//    never returns EAGAIN), so treating them as stream corruption would turn
+//    an impossible/transient condition into a poisoned reader.
+//  * AVERROR(ETIMEDOUT) can arrive from a stalled network source. It means
+//    the read timed out, not that the container is damaged; latching it would
+//    permanently poison the reader for a transient stall. A successful seek
+//    or reconfigure() still clears any latched error, so a caller who
+//    believes the stall was transient can seek and carry on.
 bool isFatalReadError(int err)
 {
-    return err != AVERROR_EOF;
+    if (err == AVERROR_EOF || err == AVERROR(EAGAIN) || err == AVERROR_EXIT ||
+        err == AVERROR(ETIMEDOUT))
+        return false;
+    return true;
 }
 } // namespace
 
 
 namespace nelux
 {
-// Convert workers idle on cv.wait when queue empty so over-spawning is cheap;
-// the wins from extra parallelism on fast formats (nv12/yuv420p) outweigh
-// any cost of unused threads. Cap at hw_concurrency or 16, whichever is lower.
-// Users who want a different tradeoff (e.g. polite mode that matches
-// torchcodec's CPU footprint) should pass convert_workers=N on VideoReader,
-// or set NELUX_CONVERT_WORKERS=N.
-static int defaultConvertWorkers()
+// Convert workers idle on cv.wait when queue empty. Default leaves one
+// decode thread's worth of headroom: clamp(hw - decodeThreads, 1, 8).
+// Caps steady-state convert-pool RAM (4K RSS ~200MB, not ~800MB) with ~same
+// fps as the old min(hw,16) default. 0 = polite (no workers, no fanout,
+// torchcodec-like footprint). Explicit N (convert_workers=N) and
+// NELUX_CONVERT_WORKERS=N override, including 0.
+static int defaultConvertWorkers(int decodeThreads)
 {
     if (const char* env = std::getenv("NELUX_CONVERT_WORKERS"))
     {
@@ -50,7 +60,13 @@ static int defaultConvertWorkers()
     const int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw <= 0)
         return 4;
-    return std::min(hw, 16);
+    const int decode = (decodeThreads > 0) ? decodeThreads : (hw / 2);
+    int avail = hw - decode;
+    if (avail < 1)
+        avail = 1;
+    if (avail > 8)
+        avail = 8;
+    return avail;
 }
 
 // Override syncMaxInFlight_ via env var for tuning sweeps.
@@ -63,6 +79,58 @@ static size_t defaultMaxInFlight(size_t fallback)
             return static_cast<size_t>(v);
     }
     return fallback;
+}
+
+// In-flight cap from frame size: clamp(64MB / frameBytes, 4, 16).
+// 4K RGB (~25MB) -> 4; 1080p (~6MB) -> 10; 720p (~2.7MB) -> 16 (capped).
+// Env override wins (tuning sweeps). 0 frameBytes = geometry unknown yet.
+static size_t computeMaxInFlightForBytes(size_t frameBytes)
+{
+    if (const char* env = std::getenv("NELUX_MAX_INFLIGHT"))
+    {
+        const int v = std::atoi(env);
+        if (v > 0)
+            return static_cast<size_t>(v);
+    }
+    if (frameBytes == 0)
+        return 8;
+    size_t v = (64u * 1024u * 1024u) / frameBytes;
+    if (v < 4)
+        v = 4;
+    if (v > 16)
+        v = 16;
+    return v;
+}
+
+// 64B-aligned pool allocation with trailing slack for swscale SIMD over-read
+// on odd widths. Dst stride headroom is FFALIGN(W*C*elem,32); dstLineSize
+// passed to swscale stays tight (arbitrary) so tensors stay contiguous HWC.
+// Slack covers the final row; inter-row over-read lands in the next row
+// (still in-bounds since rows are contiguous) or in the trailing slack.
+static inline size_t ffAlign32(size_t x) { return (x + 31) & ~size_t(31); }
+static constexpr size_t kPoolSlack = 128;
+static uint8_t* alignedAlloc64(size_t nbytes)
+{
+    const size_t allocBytes = nbytes + kPoolSlack;
+#ifdef _WIN32
+    void* p = _aligned_malloc(allocBytes, 64);
+    return static_cast<uint8_t*>(p);
+#else
+    void* p = nullptr;
+    if (::posix_memalign(&p, 64, allocBytes) != 0)
+        return nullptr;
+    return static_cast<uint8_t*>(p);
+#endif
+}
+static void alignedFree64(uint8_t* p) noexcept
+{
+    if (!p)
+        return;
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    ::free(p);
+#endif
 }
 
 // Default behavior for the async (prefetch=True) path: route raw frames
@@ -78,15 +146,59 @@ static bool defaultAsyncFanout()
     return true;
 }
 
+// ── Demuxer probe opt-ins (flags only; full probe stays the default) ────────
+// NELUX_AVIO_KB=N caps the probe buffer to N KiB (fast path, opt-in).
+// NELUX_FULL_PROBE=1 forces the full find_stream_info pass even where the
+// fast path would apply (escape hatch). The fast path applies ONLY to
+// MP4/MOV with nb_frames > 0; TS / raw / VFR and anything without nb_frames
+// keeps the full probe. probeFile() and openFile() share this helper so
+// probe() and VideoReader.properties always agree.
+static int avioProbeKB()
+{
+    if (const char* env = std::getenv("NELUX_AVIO_KB"))
+    {
+        const int v = std::atoi(env);
+        if (v > 0)
+            return v;
+    }
+    return 0;
+}
+
+static bool forceFullProbe()
+{
+    if (const char* env = std::getenv("NELUX_FULL_PROBE"))
+        return std::atoi(env) != 0;
+    return false;
+}
+
+static bool isMp4MovPath(const std::string& path)
+{
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos)
+        return false;
+    std::string ext = path.substr(dot + 1);
+    for (auto& c : ext)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == "mp4" || ext == "mov" || ext == "m4v";
+}
+
+static void applyFastProbeBudget(AVFormatContext* fmt, int avioKB)
+{
+    // Cap both knobs libav sizes stream analysis with. 0.5 s analyzeduration
+    // is enough for MP4/MOV headers that already carry nb_frames; the full
+    // defaults stay for everything else.
+    fmt->probesize = static_cast<int64_t>(avioKB) * 1024;
+    fmt->max_analyze_duration = 500000;
+}
+
 Decoder::Decoder(int numThreads)
     : converter(nullptr), formatCtx(nullptr), codecCtx(nullptr), pkt(nullptr),
       videoStreamIndex(-1), numThreads(numThreads)
 {
-    syncConvertWorkerCount_ = defaultConvertWorkers();
-    // Bump default from 16 -> 32: convert sweep showed ~2-4% win at 4K
-    // resolution with no measurable cost at 720p/1080p, since the larger
-    // buffer just lets workers stay fed when their per-frame work is heavier.
-    syncMaxInFlight_ = defaultMaxInFlight(32);
+    syncConvertWorkerCount_ = defaultConvertWorkers(numThreads);
+    // Capped from frame size once geometry is known (see initialize/
+    // reconfigure); 8 is the pre-probe neutral value, not the old fixed 32.
+    syncMaxInFlight_ = defaultMaxInFlight(8);
     asyncFanoutEnabled_ = defaultAsyncFanout() && syncConvertWorkerCount_ > 0;
     outputBufferPool_ = std::make_shared<OutputBufferPool>();
     NELUX_DEBUG("BASE DECODER: Decoder constructed (sync_workers={}, max_inflight={})",
@@ -99,11 +211,10 @@ Decoder::Decoder(int numThreads, int resizeWidth, int resizeHeight)
 {
     resizeWidth_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeWidth : 0;
     resizeHeight_ = (resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0;
-    syncConvertWorkerCount_ = defaultConvertWorkers();
-    // Bump default from 16 -> 32: convert sweep showed ~2-4% win at 4K
-    // resolution with no measurable cost at 720p/1080p, since the larger
-    // buffer just lets workers stay fed when their per-frame work is heavier.
-    syncMaxInFlight_ = defaultMaxInFlight(32);
+    syncConvertWorkerCount_ = defaultConvertWorkers(numThreads);
+    // Capped from frame size once geometry is known (see initialize/
+    // reconfigure); 8 is the pre-probe neutral value, not the old fixed 32.
+    syncMaxInFlight_ = defaultMaxInFlight(8);
     asyncFanoutEnabled_ = defaultAsyncFanout() && syncConvertWorkerCount_ > 0;
     outputBufferPool_ = std::make_shared<OutputBufferPool>();
     NELUX_DEBUG("BASE DECODER: Decoder constructed with resize={}x{} (sync_workers={}, max_inflight={})",
@@ -460,32 +571,51 @@ void Decoder::setProperties()
 // scales with content, so this is cheaper but not constant-time.
 Decoder::VideoProperties probeFile(const std::string& filePath)
 {
-    AVFormatContext* raw = nullptr;
-    int ret = avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr);
-    if (ret < 0)
+    // Shared with the live decoder via extractVideoProperties: probe() and
+    // VideoReader.properties always agree field-for-field.
+    const int avioKB = avioProbeKB();
+    const bool wantFast = avioKB > 0 && !forceFullProbe() && isMp4MovPath(filePath);
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        throw CxException("Failed to open input file for probe: " + filePath +
-                          ": " + errorToString(ret));
-    }
-    std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
+        const bool fast = (wantFast && attempt == 0);
+        AVFormatContext* raw = nullptr;
+        int ret = avformat_open_input(&raw, filePath.c_str(), nullptr, nullptr);
+        if (ret < 0)
+        {
+            throw CxException("Failed to open input file for probe: " + filePath +
+                              ": " + errorToString(ret));
+        }
+        std::unique_ptr<AVFormatContext, AVFormatContextDeleter> fmt(raw);
+        if (fast)
+            applyFastProbeBudget(fmt.get(), avioKB);
 
-    ret = avformat_find_stream_info(fmt.get(), nullptr);
-    if (ret < 0)
-    {
-        throw CxException("Failed to find stream info for probe: " + filePath +
-                          ": " + errorToString(ret));
-    }
+        ret = avformat_find_stream_info(fmt.get(), nullptr);
+        if (ret < 0)
+        {
+            throw CxException("Failed to find stream info for probe: " + filePath +
+                              ": " + errorToString(ret));
+        }
 
-    int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
-                                   nullptr, 0);
-    if (vIdx < 0)
-    {
-        throw CxException("No video stream found for probe: " + filePath);
-    }
+        int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
+                                       nullptr, 0);
+        if (vIdx < 0)
+        {
+            throw CxException("No video stream found for probe: " + filePath);
+        }
 
-    Decoder::VideoProperties properties{};
-    Decoder::extractVideoProperties(fmt.get(), vIdx, properties);
-    return properties;
+        // Fast probe only counts when the container already carries nb_frames.
+        // Anything else (TS/raw/VFR, or an MP4/MOV without nb_frames) falls
+        // back to the full probe on the second attempt.
+        if (fast && fmt->streams[vIdx]->nb_frames <= 0)
+            continue;
+
+        Decoder::VideoProperties properties{};
+        Decoder::extractVideoProperties(fmt.get(), vIdx, properties);
+        return properties;
+    }
+    // Unreachable: the loop either returns or throws. Kept to satisfy
+    // -Wreturn-type on compilers that do not see the throw above.
+    throw CxException("Failed to probe input file: " + filePath);
 }
 
 void Decoder::initialize(const std::string& filePath)
@@ -518,6 +648,9 @@ void Decoder::initialize(const std::string& filePath)
     convertedFrameBytes = static_cast<size_t>(properties.width) *
                           static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
+    // Size the in-flight cap from the real frame footprint now that geometry
+    // is known (4K -> 4, 1080p -> ~10, 720p -> 16). Env override still wins.
+    syncMaxInFlight_ = computeMaxInFlightForBytes(convertedFrameBytes);
 
     const AVCodecParameters* params = formatCtx->streams[videoStreamIndex]->codecpar;
     AVColorSpace color_space = params->color_space;        // matrix_coefficients
@@ -546,19 +679,83 @@ void Decoder::openFile(const std::string& filePath)
     // Open input file
     frame = Frame(); // Fallback to CPU Frame
 
-    AVFormatContext* fmt_ctx = nullptr;
-    FF_CHECK_MSG(avformat_open_input(&fmt_ctx, filePath.c_str(), nullptr, nullptr),
-                 std::string("Failure Opening Input:"));
+    // Fast-probe opt-in (NELUX_AVIO_KB, MP4/MOV only, nb_frames > 0):
+    // try the capped budget first, verify nb_frames, else reopen full.
+    // NELUX_FULL_PROBE=1 skips the fast attempt entirely. TS/raw/VFR never
+    // take the fast path: full probe stays the default there.
+    const int avioKB = avioProbeKB();
+    const bool wantFast = avioKB > 0 && !forceFullProbe() && isMp4MovPath(filePath);
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        const bool fast = (wantFast && attempt == 0);
+        AVFormatContext* fmt_ctx = nullptr;
+        FF_CHECK_MSG(avformat_open_input(&fmt_ctx, filePath.c_str(), nullptr, nullptr),
+                     std::string("Failure Opening Input:"));
 
-    formatCtx.reset(fmt_ctx); // Wrap in unique_ptr
-    NELUX_DEBUG("BASE DECODER: Input file opened successfully");
+        formatCtx.reset(fmt_ctx); // Wrap in unique_ptr
+        if (fast)
+            applyFastProbeBudget(formatCtx.get(), avioKB);
+        NELUX_DEBUG("BASE DECODER: Input file opened successfully");
 
-    // Retrieve stream information
-    FF_CHECK_MSG(avformat_find_stream_info(formatCtx.get(), nullptr),
-                 std::string("Failure Finding Stream Info:"));
+        // Retrieve stream information
+        FF_CHECK_MSG(avformat_find_stream_info(formatCtx.get(), nullptr),
+                     std::string("Failure Finding Stream Info:"));
+
+        if (fast)
+        {
+            const int vIdx = av_find_best_stream(formatCtx.get(), AVMEDIA_TYPE_VIDEO,
+                                                 -1, -1, nullptr, 0);
+            if (vIdx < 0 || formatCtx->streams[vIdx]->nb_frames <= 0)
+            {
+                // Not a fast-probe candidate after all: drop this context
+                // and redo the loop as a full probe.
+                formatCtx.reset();
+                continue;
+            }
+        }
+        break;
+    }
 
     pkt.reset(av_packet_alloc()); // Allocate packet
     NELUX_DEBUG("BASE DECODER: Stream information retrieved successfully");
+}
+
+bool Decoder::rewindToStart()
+{
+    // Same-file rewind via seek + flush — no reopen, no reconfigure. The
+    // cached frame count and the batch codec context stay valid because the
+    // file did not change. Returns false when the container cannot seek, so
+    // the caller can fall back to reconfigure().
+    if (!formatCtx || videoStreamIndex < 0 || !codecCtx)
+        return false;
+    sharedStreamDirty_.store(true, std::memory_order_relaxed);
+    stopDecodingThread();
+    stopSyncConvertWorkers();
+    clearQueue();
+    resetTimestampState();
+    syncEofReached_ = false;
+    syncFlushSent_ = false;
+    syncDrained_ = false;
+    syncProduceSeq_ = 0;
+    syncConsumeSeq_ = 0;
+
+    int ret = av_seek_frame(formatCtx.get(), videoStreamIndex, 0,
+                            AVSEEK_FLAG_BACKWARD);
+    if (ret < 0)
+        ret = av_seek_frame(formatCtx.get(), -1, 0, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0)
+    {
+        if (!syncMode_)
+            startDecodingThread();
+        return false;
+    }
+    avcodec_flush_buffers(codecCtx.get());
+    isFinished = false;
+    seekRequested = false;
+    decodeError_.store(0, std::memory_order_relaxed);
+    if (!syncMode_)
+        startDecodingThread();
+    return true;
 }
 
 void Decoder::findVideoStream()
@@ -966,22 +1163,18 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
         }
 
         // Fallback: legacy buffer queued before tensorHandoff_ flipped on.
-        // Wrap or copy into a tensor.
-        auto dtype = (cf.buffer.size() ==
-                      static_cast<size_t>(properties.width) * properties.height *
-                          static_cast<size_t>(outChannels_))
-                         ? torch::kUInt8
-                         : torch::kUInt16;
-        torch::Tensor t = torch::empty(
-            {properties.height, properties.width, outChannels_},
-            torch::TensorOptions().dtype(dtype).device(torch::kCPU));
-        std::memcpy(t.data_ptr(), cf.buffer.data(), cf.buffer.size());
+        // Route through the pooled buffer (uninitialized, recycled) instead of
+        // torch::empty + memcpy: acquire + memcpy + from_blob wrap. Pixels
+        // identical, no zero-init, buffer recycles via deleter.
+        const size_t legacyBytes = cf.buffer.size();
+        auto pooledLegacy = acquireOutputBuffer(legacyBytes);
+        std::memcpy(pooledLegacy.get(), cf.buffer.data(), legacyBytes);
         {
             std::lock_guard<std::mutex> plock(convertedBufferPoolMutex);
             if (convertedBufferPool.size() < maxQueueSize + 2)
                 convertedBufferPool.push_back(std::move(cf.buffer));
         }
-        return t;
+        return tensorFromPooledBuffer(std::move(pooledLegacy));
     }
 
     // No-preconvert path: decoder hands raw AVFrame; convert here.
@@ -1004,13 +1197,24 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
     setLastFrameType(frame.get());
     const int elemSize =
         (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
-    const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
-    torch::Tensor t = torch::empty(
-        {properties.height, properties.width, outChannels_},
-        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+    const size_t nbytes = static_cast<size_t>(properties.width) *
+                          static_cast<size_t>(properties.height) *
+                          static_cast<size_t>(outChannels_) *
+                          static_cast<size_t>(elemSize);
+    auto pooledBuf = acquireOutputBuffer(nbytes);
     if (converter)
-        converter->convert(frame, t.data_ptr());
-    return t;
+    {
+        try
+        {
+            converter->convert(frame, pooledBuf.get());
+        }
+        catch (...)
+        {
+            std::memset(pooledBuf.get(), 0, nbytes);
+            throw;
+        }
+    }
+    return tensorFromPooledBuffer(std::move(pooledBuf));
 }
 
 void Decoder::setSyncMode(bool enabled)
@@ -1039,6 +1243,21 @@ void Decoder::setSyncConvertWorkers(int n)
     syncConvertWorkerCount_ = (n < 0) ? 0 : n;
 }
 
+void Decoder::AlignedDeleter::operator()(uint8_t* p) const noexcept
+{
+    alignedFree64(p);
+}
+
+size_t Decoder::currentFrameBytes() const
+{
+    if (properties.width <= 0 || properties.height <= 0)
+        return 0;
+    const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
+    return static_cast<size_t>(properties.width) *
+           static_cast<size_t>(properties.height) *
+           static_cast<size_t>(outChannels_) * static_cast<size_t>(elemSize);
+}
+
 void Decoder::syncConvertWorkerLoop()
 {
     auto local_converter = std::make_unique<nelux::conversion::cpu::AutoToRGBConverter>();
@@ -1061,13 +1280,15 @@ void Decoder::syncConvertWorkerLoop()
             syncConvertWorkQueue_.pop();
         }
 
-        // Convert into a pooled plain heap buffer on this worker thread. The
+        // Convert into a pooled 64B-aligned buffer on this worker thread. The
         // output torch::Tensor wraps this buffer on the consumer thread via
         // from_blob -- never allocated here -- so torch's CPU allocator never
         // sees an alloc-on-worker / free-on-main split, which leaks ~one frame
         // of host RAM per frame. Plain heap/pool ops are cross-thread safe.
         // Recycling through outputBufferPool_ avoids the per-frame 6+MB
         // alloc + zero-init that made the pooled path slower than cw=0.
+        // Uninitialized (no memset on the fast path); memset only on convert
+        // error so a failed frame never exposes stale bytes.
         const int elemSize =
             (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
         const size_t nbytes = static_cast<size_t>(properties.width) *
@@ -1083,7 +1304,18 @@ void Decoder::syncConvertWorkerLoop()
         if (motionVectorsEnabled_)
             entry.motionVectors = extractMotionVectors(w.frame.get());
         entry.frameType = av_get_picture_type_char(w.frame.get()->pict_type);
-        local_converter->convert(w.frame, entry.buffer.get());
+        try
+        {
+            local_converter->convert(w.frame, entry.buffer.get());
+        }
+        catch (...)
+        {
+            // Never hand a half-written pooled buffer to the consumer as-is:
+            // zero it so the failure (which the consumer rethrows via the
+            // latched decodeError_) cannot surface stale pixels on retry.
+            std::memset(entry.buffer.get(), 0, nbytes);
+            throw;
+        }
 
         {
             std::lock_guard<std::mutex> lk(syncConvertOutMu_);
@@ -1102,9 +1334,15 @@ void Decoder::startSyncConvertWorkers()
     if (!outputBufferPool_)
         outputBufferPool_ = std::make_shared<OutputBufferPool>();
     {
-        // Retain enough buffers to cover everything that can be in flight at
-        // once (work queue + out map + consumer-held) so steady state never
-        // hits the heap.
+        // Refresh the in-flight cap from live geometry (covers a resize that
+        // happened while workers were stopped), then retain enough buffers to
+        // cover everything in flight at once (work queue + out map +
+        // consumer-held) so steady state never hits the heap. Caps stay
+        // bounded: 64MB/frameBytes keeps 4K at ~16 retained (~400MB worst,
+        // ~200MB steady) instead of the old fixed-32 blowup.
+        const size_t liveBytes = currentFrameBytes();
+        if (liveBytes != 0)
+            syncMaxInFlight_ = computeMaxInFlightForBytes(liveBytes);
         std::lock_guard<std::mutex> lk(outputBufferPool_->mu);
         outputBufferPool_->maxRetained =
             syncMaxInFlight_ + static_cast<size_t>(syncConvertWorkerCount_) + 4;
@@ -1142,7 +1380,7 @@ void Decoder::stopSyncConvertWorkers()
     }
 }
 
-std::unique_ptr<uint8_t[]> Decoder::acquireOutputBuffer(size_t nbytes)
+Decoder::PooledBufferPtr Decoder::acquireOutputBuffer(size_t nbytes)
 {
     if (outputBufferPool_)
     {
@@ -1150,50 +1388,73 @@ std::unique_ptr<uint8_t[]> Decoder::acquireOutputBuffer(size_t nbytes)
         if (outputBufferPool_->bufferBytes != nbytes)
         {
             // Frame geometry changed (reconfigure / resize): stale buffers
-            // are the wrong size, drop them.
+            // are the wrong size, drop them and bump the generation so
+            // in-flight deleters holding the old gen free instead of recycle.
             outputBufferPool_->free_.clear();
             outputBufferPool_->bufferBytes = nbytes;
+            ++outputBufferPool_->generation;
         }
         if (!outputBufferPool_->free_.empty())
         {
-            std::unique_ptr<uint8_t[]> buf =
-                std::move(outputBufferPool_->free_.back());
+            PooledBufferPtr buf = std::move(outputBufferPool_->free_.back());
             outputBufferPool_->free_.pop_back();
             return buf;
         }
     }
-    // operator new[] does not zero-initialize: skips the full-frame memset
-    // that std::vector::resize paid on every frame.
-    return std::unique_ptr<uint8_t[]>(new uint8_t[nbytes]);
+    // 64B-aligned, uninitialized (skips the full-frame memset
+    // std::vector::resize paid per frame). +128B slack for swscale SIMD
+    // over-read on odd widths; base stays 64B-aligned.
+    uint8_t* raw = alignedAlloc64(nbytes);
+    if (!raw)
+        throw std::bad_alloc();
+    return PooledBufferPtr(raw);
 }
 
-torch::Tensor Decoder::tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf)
+torch::Tensor Decoder::tensorFromPooledBuffer(PooledBufferPtr buf)
 {
     const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
     const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
     const size_t nbytes = static_cast<size_t>(properties.width) *
                           static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
+    const int64_t numel = static_cast<int64_t>(properties.height) *
+                          static_cast<int64_t>(properties.width) *
+                          static_cast<int64_t>(outChannels_);
+    // (seq,nbytes,gen) stamp: validates the pooled buffer against live
+    // geometry. bufferBytes == nbytes == numel*elem must hold; a mismatch
+    // (resize raced a wrap, stale pool) frees instead of recycling, fixing
+    // the council OOB concern. Numel check catches channel/dtype drift.
+    const int64_t seq = pooledBufferSeq_.fetch_add(1, std::memory_order_relaxed);
+    (void)seq;
+    if (!buf || nbytes == 0 ||
+        nbytes != static_cast<size_t>(numel) * static_cast<size_t>(elemSize))
+    {
+        // Corrupt stamp: do not wrap; let the buffer free via its deleter.
+        // Caller treats empty tensor as fatal (latched via decodeError_).
+        return torch::Tensor();
+    }
     // The deleter captures the pool by shared_ptr so recycling works even if
     // the Decoder is destroyed while Python still holds frames. It runs on
     // whatever thread drops the last tensor reference; everything it touches
-    // (mutex, vector, delete[]) is cross-thread safe and torch-allocator-free.
+    // (mutex, vector, aligned free) is cross-thread safe, torch-allocator-free
+    // and GIL-free (never takes the GIL under pool->mu).
     std::shared_ptr<OutputBufferPool> pool = outputBufferPool_;
+    const uint64_t gen = pool ? pool->generation : 0;
     uint8_t* raw = buf.release();
-    auto deleter = [pool, nbytes](void* p)
+    auto deleter = [pool, nbytes, gen](void* p)
     {
         uint8_t* bytes = static_cast<uint8_t*>(p);
         if (pool)
         {
             std::lock_guard<std::mutex> lk(pool->mu);
-            if (pool->bufferBytes == nbytes &&
+            if (pool->generation == gen && pool->bufferBytes == nbytes &&
                 pool->free_.size() < pool->maxRetained)
             {
-                pool->free_.emplace_back(std::unique_ptr<uint8_t[]>(bytes));
+                pool->free_.emplace_back(PooledBufferPtr(bytes));
                 return;
             }
         }
-        delete[] bytes;
+        alignedFree64(bytes);
     };
     return torch::from_blob(
         raw, {properties.height, properties.width, outChannels_}, std::move(deleter),
@@ -1310,9 +1571,15 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             av_packet_unref(pkt.get());
             if (sent == AVERROR(EAGAIN))
             {
-                syncDrained_ = true;
-                decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
-                throwIfDecodeFailed();
+                // The packet was NOT accepted (decoder input full) — the
+                // send/receive contract requires draining via receive_frame
+                // before retrying, which the top of this loop does on the next
+                // turn. This is flow control, not stream corruption: warn and
+                // continue exactly like any other send error below instead of
+                // latching AVERROR_INVALIDDATA and aborting the whole decode.
+                NELUX_WARN("Decoder input full (EAGAIN on send_packet); "
+                           "draining before retry");
+                continue;
             }
             if (sent < 0)
                 NELUX_WARN("Error sending packet to decoder: {}", errorToString(sent));
@@ -1666,10 +1933,8 @@ AVCodecContext* Decoder::getCtx()
 
 int64_t Decoder::convertTimestamp(double timestamp) const
 {
-    NELUX_TRACE("Converting timestamp: {}", timestamp);
     AVRational time_base = formatCtx->streams[videoStreamIndex]->time_base;
     int64_t ts = static_cast<int64_t>(timestamp * time_base.den / time_base.num);
-    NELUX_TRACE("Converted timestamp: {}", ts);
     return ts;
 }
 
@@ -1894,6 +2159,12 @@ void Decoder::setOutputChannels(int channels)
                           static_cast<size_t>(properties.height) *
                           static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
+    syncMaxInFlight_ = computeMaxInFlightForBytes(convertedFrameBytes);
+    if (outputBufferPool_)
+    {
+        std::lock_guard<std::mutex> lk(outputBufferPool_->mu);
+        ++outputBufferPool_->generation;
+    }
 }
 
 void Decoder::setPrefetchSize(size_t size)
@@ -2045,6 +2316,14 @@ void Decoder::reconfigure(const std::string& filePath)
     convertedFrameBytes = static_cast<size_t>(properties.width) *
                           static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize_r);
+    // New geometry: refresh the in-flight cap and bump the pool generation so
+    // stale buffers (old nbytes/gen) are freed, never recycled (OOB fix).
+    syncMaxInFlight_ = computeMaxInFlightForBytes(convertedFrameBytes);
+    if (outputBufferPool_)
+    {
+        std::lock_guard<std::mutex> lk(outputBufferPool_->mu);
+        ++outputBufferPool_->generation;
+    }
 
     // Restart prefetch thread (skip in sync mode -- sync owns the ctx).
     if (!syncMode_)
@@ -2263,10 +2542,23 @@ void Decoder::decodingLoop()
                     // and hand it to the consumer. Saves one W*H*3 memcpy per
                     // frame (~2.7 MB for 720p RGB).
                     auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
-                    cf.tensor = torch::empty(
-                        {properties.height, properties.width, outChannels_},
-                        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
-                    converter->convert(localFrame, cf.tensor.data_ptr());
+                    cf.tensor = [&]() -> torch::Tensor {
+                        const size_t hb = static_cast<size_t>(properties.width) *
+                                          static_cast<size_t>(properties.height) *
+                                          static_cast<size_t>(outChannels_) *
+                                          static_cast<size_t>(elemSize);
+                        auto pb = acquireOutputBuffer(hb);
+                        try
+                        {
+                            converter->convert(localFrame, pb.get());
+                        }
+                        catch (...)
+                        {
+                            std::memset(pb.get(), 0, hb);
+                            throw;
+                        }
+                        return tensorFromPooledBuffer(std::move(pb));
+                    }();
                     std::unique_lock<std::mutex> lock(queueMutex);
                     convertedQueue.push(std::move(cf));
                     queueCond.notify_one();
@@ -2628,6 +2920,15 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
         ctx->thread_type = batch_thread_types;
         ctx->time_base = stream->time_base;
         ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+        // Mirror the streaming context's motion-vector export opt-in. Without
+        // this, a reader opened with motion_vectors=True silently gets a batch
+        // context that never populates AV_FRAME_DATA_MOTION_VECTORS side-data.
+        // Side-data only: never changes reconstructed pixels.
+        if (motionVectorsEnabled_)
+        {
+            ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
+            ctx->export_side_data |= AV_CODEC_EXPORT_DATA_MVS;
+        }
 
         FF_CHECK_MSG(avcodec_open2(ctx, codec, nullptr),
                      std::string("Failed to open batch codec context:"));

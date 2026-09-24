@@ -1,5 +1,6 @@
 #include "BatchDecoder.hpp"
 #include "Logger.hpp"
+#include <spdlog/spdlog.h>
 #include "error/CxException.hpp"
 #include <algorithm>
 #include <cmath>
@@ -798,14 +799,13 @@ torch::Tensor BatchDecoder::decode_batch(
     // packets again until a seek flushes it, so leave the position unknown.
     retainedFrame_ = decoderDrained_ ? -1 : current_frame;
 
-    // Move to target device if needed
-    if (config_.device.is_cuda()) {
-        output = output.to(config_.device);
-    }
-
-    // Convert dtype if needed
-    if (config_.dtype != torch::kUInt8) {
-        output = output.to(config_.dtype);
+    // Output was allocated directly with the final dtype/device when that is
+    // uint8/CPU (the common path: narrow+view over a uint8 slack buffer, no
+    // trailing .to()). Otherwise a single fused .to(device,dtype) replaces
+    // the old two-step .to(device).to(dtype) (two full-tensor copies).
+    if (config_.device.is_cuda() || config_.dtype != torch::kUInt8)
+    {
+        output = output.to(config_.device, config_.dtype);
     }
 
     NELUX_INFO("Batch decode completed successfully");

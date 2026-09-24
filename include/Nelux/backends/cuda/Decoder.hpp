@@ -166,6 +166,10 @@ public:
      */
     void reconfigure(const std::string& filePath) override;
 
+    // Same-file rewind via the NVDEC seek + flush path (no reopen).
+    // Falls back to reconfigure() through the caller on failure.
+    bool rewindToStart() override;
+
     /**
      * @brief Decode a batch of frames at specified indices directly on GPU
      * 
@@ -249,12 +253,29 @@ protected:
      * @brief (Re)allocate the intermediate device buffer to at least `bytes`.
      *
      * Grow-only and shared by every conversion path, which each need a different
-     * layout in it (RGB24/RGB48 aligned rows, or RGBA32).
+     * layout in it (RGB24/RGB48 aligned rows, or RGBA32). Uses stream-ordered
+     * cudaMallocAsync when available (no CPU sync), falling back to cudaMalloc.
+     * Never freed on reconfigure — retained across files to avoid re-alloc
+     * stalls. Freed only in close().
      *
-     * @param allocFailMessage Thrown verbatim if cudaMalloc fails, so each caller
+     * @param allocFailMessage Thrown verbatim if allocation fails, so each caller
      *        keeps naming its own layout.
      */
     void ensureRgbBuffer(size_t bytes, const char* allocFailMessage);
+
+    // Thread-local device selection: cudaSetDevice only when the cached device
+    // differs (verified against cudaGetDevice). Cheap per-frame entry.
+    void ensureCudaDevice() const;
+    // Event-based producer ordering: record producerDoneEvent_ on cuvid's
+    // stream, then cudaStreamWaitEvent(cudaStream_, producerDoneEvent_).
+    // No CPU sync. Skipped when NELUX_NVDEC_SKIP_ENTRY_SYNC=1.
+    void waitForProducer(AVFrame* frame);
+    // Order the torch consumer against our async chain: record
+    // decodeCompleteEvent_, make the current torch stream wait on it, and
+    // record the output pointer with the caching allocator. No CPU sync.
+    void orderTorchConsumer(void* torchPtr);
+    // Record decodeCompleteEvent_ on cudaStream_ (checked).
+    void recordDecodeComplete();
 
     // Static callback for FFmpeg hardware pixel format selection
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);
@@ -262,8 +283,9 @@ protected:
 private:
     int cudaDeviceIndex_;
     cudaStream_t cudaStream_;
-    cudaEvent_t decodeCompleteEvent_;  // Event to signal when decode is complete
-    cudaEvent_t consumerSyncEvent_;    // Cross-stream barrier: torch stream -> our stream
+    cudaEvent_t decodeCompleteEvent_; // Recorded after each async decode chain
+    cudaEvent_t producerDoneEvent_;   // cuvidDone: recorded on producer stream,
+                                      // waited on by cudaStream_
     AVBufferRef* hwDeviceCtx_;
     AVPixelFormat hwPixFmt_;
     

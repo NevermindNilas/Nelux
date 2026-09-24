@@ -303,6 +303,19 @@ exact frame rate and pixel format); `ffprobe` performs the same analysis.
 > demux-only packet pass (no decoding, cached) that matches
 > `ffprobe -count_packets`. Use `p["nb_frames"] > 0` to tell whether the
 > container-reported count is authoritative without triggering the pass.
+>
+> **Demuxer opt-ins (flags only, defaults unchanged).** Full probe stays the
+> default for TS / raw / VFR. Two env vars opt into a leaner path, and only
+> for MP4/MOV that already carry `nb_frames > 0`:
+>
+> - `NELUX_AVIO_KB=N` — cap the AVIO probe buffer to N KiB for the open.
+> - `NELUX_FULL_PROBE=1` — force the full `find_stream_info` pass even where
+>   the fast path would apply (escape hatch for odd files).
+>
+> Same-file re-iteration rewinds via seek + flush, not reconfigure; negative
+> range bounds resolve via the cached `get_frame_count()` demux pass, not a
+> full decode. `probe()` and `VideoReader.properties` share
+> `extractVideoProperties`, so metadata agrees either way.
 
 ---
 
@@ -622,6 +635,38 @@ reader.stop_prefetch()
 - 8-16: Typical ML pipelines
 - 32+: Variable processing times or slow storage
 
+#### Overlap pattern and Pareto report (no auto-tuner)
+
+`examples/inference_overlap.py` shows a reader created with `prefetch=True`,
+`start_prefetch(8-16)` into a bounded queue, and per-frame reads stacked into
+BHWC batches. Inference runs on a dedicated `torch.cuda.Stream` with `Event`
+handoff. Decoder-side `resize=` works with this streaming path; NVDEC frames
+are cloned before the reader reuses its output tensor. The hot path avoids
+`.numpy()`.
+
+Throughput vs memory is a report, never an auto-selection. Run the matrix:
+
+```bash
+python tests/comprehensive_bench.py --tag current --pareto --skip-quality
+# -> tests/output/comprehensive/current/pareto_1080p.csv (+ .png plot)
+# columns: fps_best/fps_median/fps_iqr, rss_peak_mb, cpu_median_pct,
+#          cpu_user/system_s, gpu_scope, MB_per_fps (= rss_peak_mb / fps_median)
+```
+
+`nelux.suggest_config(path)` returns `(workers, prefetch, expected)` as a
+report only — it never changes a reader default. Knee on 1080p-class content:
+`workers=4, prefetch=False` reaches ~60% of peak fps at ~30% of peak RSS;
+more workers buy diminishing fps for linear RSS, and prefetch only pays when
+per-frame consumer work outweighs the queue handoff cost.
+
+Bench harness notes (`tests/utils/bench_harness.py`, shared by
+`comprehensive_bench` and `bench_thread_modes`): warmup iter0 discarded,
+median ± IQR **and** best reported (best kept for history), 15 ms sampler
+(10–20 ms band), `cpu_times` user+system deltas, ≥20 samples per rep (else
+extend the clip), per-process NVML when `GetProcessUtilization` exists else
+explicitly `host-global`, each clip floored to ≥2 s wall. `--tag check`
+gates on `stdev/median < 5%`. No thermal sleeps, no auto-tuner.
+
 ---
 
 ### Decoder Reconfiguration
@@ -817,6 +862,40 @@ dropped, as `ffmpeg -pix_fmt rgba` does. A CUDA tensor that is deep or
 4-channel takes the CPU staging path rather than the zero-copy GPU convert,
 whose fused kernel is 8-bit RGB-only — so a p010 NVENC encode keeps its extra
 bits whichever device the tensor came from.
+
+### Encoder Tuning Knobs (opt-in; defaults unchanged)
+
+Defaults are kept: libx264/libx265 `medium`, NVENC `p4` (balanced), PNG stills
+`compression_level=1` + `pred=up`, JPEG standard Huffman tables. Each knob
+below is opt-in via `preset`/`options` and never flips a default:
+
+```python
+# x264 veryfast + lookahead for lower latency at a small quality cost.
+# Default medium is kept; pass this only when you want the trade.
+with VideoEncoder("out.mp4", codec="libx264", width=1920, height=1080,
+                  fps=30.0, preset="veryfast",
+                  options={"rc-lookahead": "20"}) as enc:
+    ...
+
+# NVENC: p4 is the default and stays. Pin another preset explicitly if needed:
+with VideoEncoder("out.mp4", codec="h264_nvenc", preset="p7", ...) as enc:
+    ...  # p1 fastest … p7 slowest/best; omit preset for p4
+
+# PNG stills default to level 1 + up (fast lossless). Smaller file, slower
+# encode — opt in per call:
+with VideoEncoder("still.png", codec="png", width=640, height=360,
+                  pixel_format="rgb24",
+                  options={"compression_level": "6"}) as enc:
+    enc.encode_frame(frame)
+
+# JPEG quality: q:v=2 opt-in (matches ffmpeg -q:v 2). The yuvj444p +
+# qmin/flags/global_quality recipe above stays the lossless-ish default path.
+with VideoEncoder("frames_%08d.jpg", codec="mjpeg", width=640, height=360,
+                  pixel_format="yuvj444p",
+                  options={"qmin": "2", "qmax": "2",
+                           "flags": "+qscale", "global_quality": "160"}) as enc:
+    ...
+```
 
 ### Image Sequences and Single Images
 

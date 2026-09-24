@@ -62,7 +62,7 @@ class VideoReader
      * "cpu".
      * @param cuda_device_index CUDA device index for NVDEC (default: 0).
      * @param convertWorkers Override convert-worker pool size. -1 = use default
-     * (min(hw_concurrency, 16)), 0 = single-thread fallback (no fanout, polite
+     * (clamp(hw - decodeThreads, 1, 8)), 0 = single-thread fallback (no fanout, polite
      * mode that matches torchcodec's CPU footprint), positive = pin to N workers.
      */
     VideoReader(const std::string& filePath,
@@ -472,6 +472,16 @@ class VideoReader
     torch::ScalarType findTypeFromBitDepth();
     int exactRangeFrameCount();
     torch::Tensor decodeRangeFrame();
+    // Internal decode assuming the GIL is released and lifecycleMu_ is held
+    // EXCLUSIVE by the caller. Used by seek/operator[]/range-discard loops to
+    // take one release+lock for N frames instead of N releases+locks.
+    // Returns undefined Tensor on EOF; throws on decode failure. Does NOT
+    // touch currentIndex/current_timestamp/streamTouched_ (caller updates
+    // those GIL-held after the locked section).
+    torch::Tensor decodeFrameNogilLocked(double* frame_timestamp);
+    // Range variant of the above (includes VP9 timing sidecar without
+    // re-locking). Assumes exclusive lock + released GIL like above.
+    torch::Tensor decodeRangeFrameNogilLocked();
 
     // ---- Multi-segment iteration ----
     // Load segments_[index] into the active start_frame/end_frame/start_time/
@@ -640,6 +650,18 @@ class VideoReader
      * @return torch::Tensor The decoded frame.
      */
     torch::Tensor decodeFrameAt(int frame_index);
+
+    // Origin (seconds) of the container's timestamp timeline: the video
+    // stream's start_time. Frame indices and `duration` count from the start
+    // of the stream, while getFrameTimestamp() reports RAW container stamps;
+    // the two agree only for zero-based files. decodeFrameAt() takes a
+    // zero-based presentation time (index / fps) and rebases it by this
+    // offset before seeking/comparing, so both overloads share one frame of
+    // reference. 0 for ordinary zero-based files (no behavior change).
+    double ptsOriginSeconds() const
+    {
+        return (properties.startTime > 0.0) ? properties.startTime : 0.0;
+    }
 
     // Member variables
     std::shared_ptr<nelux::Decoder> decoder;

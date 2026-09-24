@@ -14,5 +14,8 @@
 #include <cuda_runtime.h>
 namespace nelux {
 cudaStream_t currentCudaStream(int device);
-}  // namespace nelux
-#endif  // NELUX_ENABLE_CUDA
+// Make torch's current stream wait on `ev` (recorded on our decode stream).
+// No CPU sync. Delay-load-safe (routes through currentCudaStream).
+void torchStreamWaitEvent(cudaEvent_t ev, int device);
+} // namespace nelux
+#endif // NELUX_ENABLE_CUDA

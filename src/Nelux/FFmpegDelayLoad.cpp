@@ -5,6 +5,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <spdlog/spdlog.h>
 // Allow writable delay-load hook variables on MSVC
 #define DELAYIMP_INSECURE_WRITABLE_HOOKS
 #include <delayimp.h>
@@ -65,12 +66,18 @@ static const char** GetVersionList(const char* dllName) {
 }
 
 // Delay-load notification hook
-// Called when delay-load helper is about to load a DLL
+// Called when delay-load helper is about to load a DLL.
+// SEH -> runtime_error translation: the MSVC delay-load helper raises a Win32
+// SEH exception (VcppException) when a DLL/proc cannot be resolved, which
+// CPython does not translate — the interpreter dies with no traceback. Throw
+// std::runtime_error from the failure notifications instead so callers get a
+// catchable C++ exception with the DLL name attached. Pre-load notifications
+// keep returning HMODULE/nullptr (no throw) so normal fallback still applies.
 FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
     if (dliNotify == dliNotePreLoadLibrary) {
         // pdli->szDll contains the DLL name we're trying to load
         const char** versions = GetVersionList(pdli->szDll);
-        
+
         if (versions) {
             HMODULE hMod = LoadFFmpegDll(pdli->szDll);
             if (hMod != NULL)
@@ -90,7 +97,24 @@ FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
             }
         }
     }
-    
+
+    if (dliNotify == dliFailLoadLib) {
+        const char* name = (pdli && pdli->szDll) ? pdli->szDll : "<unknown>";
+        throw std::runtime_error(
+            std::string("Failed to load delay-loaded DLL: ") + name +
+            " (no bundled copy and none on the DLL search path; "
+            "see nelux.diagnose_runtime_dlls())");
+    }
+    if (dliNotify == dliFailGetProc) {
+        const char* dll = (pdli && pdli->szDll) ? pdli->szDll : "<unknown>";
+        const char* proc = "";
+        if (pdli && pdli->dlp.szProcName)
+            proc = pdli->dlp.szProcName;
+        throw std::runtime_error(
+            std::string("Failed to resolve proc '") + proc +
+            std::string("' in delay-loaded DLL: ") + dll);
+    }
+
     // Return nullptr to let default behavior handle it
     return nullptr;
 }

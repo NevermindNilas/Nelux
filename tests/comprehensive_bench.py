@@ -3,12 +3,25 @@
 Measures: throughput (fps), peak RSS, peak GPU mem, avg CPU%, avg GPU%,
 PSNR/SSIM/VMAF vs ffmpeg reference.
 
+Reporting (council-accepted): warmup iter0 discarded, then N reps;
+each config reports median +/- IQR AND best (the old "best" column is kept
+for history, never rewritten). Sampler runs at 15 ms (10-20 ms band),
+records cpu_times deltas, requires >= 20 samples per rep, floors each clip
+to >= 2 s wall, and marks GPU numbers per-process vs host-global.
+
+Pareto report (no auto-select): --pareto runs a workers {0,2,4,8,16} x
+prefetch {F,T} matrix recording fps/rss/gpu/cpu, emits MB_per_fps plus a
+Pareto CSV/plot. See nelux.suggest_config() for the report-only helper;
+nothing here ever auto-applies a config.
+
 Outputs json + markdown summary into tests/output/.
 Run with --tag <name> to label this run (e.g. 'baseline', 'current').
+--tag check enforces the stability gate (stdev/median < 5%).
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -16,12 +29,12 @@ import shutil
 import statistics
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 
 FFBIN = HERE.parent / "external" / "ffmpeg" / "bin"
 if FFBIN.exists():
@@ -38,6 +51,15 @@ except Exception:
     NVML_AVAILABLE = False
 
 import nelux  # noqa: E402
+
+from utils.bench_harness import (  # noqa: E402
+    ResourceSampler,
+    bench_repeated,
+    check_stability,
+    fps_stats,
+    mb_per_fps,
+    pareto_frontier,
+)
 
 try:
     from torchcodec.decoders import VideoDecoder as TCVideoDecoder
@@ -57,98 +79,20 @@ CLIPS = [
 OUT_DIR = HERE / "output" / "comprehensive"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-class ResourceSampler:
-    """Background thread sampling CPU%, RSS (process+children), GPU%/mem."""
-
-    def __init__(self, pid=None, gpu_index=0):
-        self.pid = pid or os.getpid()
-        self.proc = psutil.Process(self.pid)
-        self.gpu_index = gpu_index
-        self.cpu_samples = []
-        self.rss_samples = []
-        self.gpu_util_samples = []
-        self.gpu_mem_samples = []
-        self._stop = threading.Event()
-        self._thread = None
-        self._gpu_handle = None
-        if NVML_AVAILABLE:
-            try:
-                self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-            except Exception:
-                self._gpu_handle = None
-
-    def _loop(self):
-        # Prime cpu_percent for self + all current children (first call = 0).
-        try:
-            self.proc.cpu_percent(interval=None)
-        except Exception:
-            pass
-        primed = set()
-        while not self._stop.is_set():
-            total_cpu = 0.0
-            total_rss = 0
-            try:
-                total_cpu += self.proc.cpu_percent(interval=None)
-                total_rss += self.proc.memory_info().rss
-                for child in self.proc.children(recursive=True):
-                    try:
-                        if child.pid not in primed:
-                            child.cpu_percent(interval=None)
-                            primed.add(child.pid)
-                            continue
-                        total_cpu += child.cpu_percent(interval=None)
-                        total_rss += child.memory_info().rss
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            if total_cpu > 0:
-                self.cpu_samples.append(total_cpu)
-            if total_rss > 0:
-                self.rss_samples.append(total_rss)
-            if self._gpu_handle:
-                try:
-                    u = pynvml.nvmlDeviceGetUtilizationRates(self._gpu_handle)
-                    self.gpu_util_samples.append(u.gpu)
-                    m = pynvml.nvmlDeviceGetMemoryInfo(self._gpu_handle)
-                    self.gpu_mem_samples.append(m.used)
-                except Exception:
-                    pass
-            time.sleep(0.1)
-
-    def __enter__(self):
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_):
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-
-    def summary(self):
-        return {
-            "cpu_avg_pct": (statistics.mean(self.cpu_samples)
-                            if self.cpu_samples else 0.0),
-            "cpu_peak_pct": max(self.cpu_samples) if self.cpu_samples else 0.0,
-            "rss_peak_mb": (max(self.rss_samples) / (1024 * 1024)
-                            if self.rss_samples else 0.0),
-            "gpu_util_avg_pct": (statistics.mean(self.gpu_util_samples)
-                                 if self.gpu_util_samples else 0.0),
-            "gpu_util_peak_pct": (max(self.gpu_util_samples)
-                                  if self.gpu_util_samples else 0.0),
-            "gpu_mem_peak_mb": (max(self.gpu_mem_samples) / (1024 * 1024)
-                                if self.gpu_mem_samples else 0.0),
-            "samples": len(self.cpu_samples),
-        }
+# Re-exported for --tag check and for external callers that import this
+# module: the old in-file sampler is gone, the shared harness is canonical.
+__all__ = ["ResourceSampler", "bench_one", "run_nelux"]
 
 
 # -------- decoders --------
 
 def run_nelux(path: str, nframes: int, accelerator: str = "cpu",
-              prefetch: bool = False):
-    r = nelux.VideoReader(path, backend="pytorch", num_threads=0,
-                          decode_accelerator=accelerator, prefetch=prefetch)
+              prefetch: bool = False, convert_workers=None):
+    kwargs = dict(backend="pytorch", num_threads=0,
+                  decode_accelerator=accelerator, prefetch=prefetch)
+    if convert_workers is not None:
+        kwargs["convert_workers"] = convert_workers
+    r = nelux.VideoReader(path, **kwargs)
     n = 0
     t0 = time.perf_counter()
     for _ in r:
@@ -249,20 +193,6 @@ def _nelux(): pass
 def quality_metrics(ref_raw: Path, test_raw: Path, w: int, h: int,
                     nframes: int) -> dict:
     """Run ffmpeg lavfi to compute PSNR/SSIM/VMAF."""
-    cmd = [
-        FFMPEG, "-hide_banner", "-nostats", "-loglevel", "info",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", "30",
-        "-i", str(test_raw),
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", "30",
-        "-i", str(ref_raw),
-        "-frames:v", str(nframes),
-        "-lavfi",
-        "[0:v]format=yuv420p[t];[1:v]format=yuv420p[r];"
-        "[t][r]psnr=stats_file=-;[0:v][1:v]ssim=stats_file=-;"
-        "[0:v][1:v]libvmaf=log_fmt=json:log_path=-",
-        "-f", "null", "-",
-    ]
-    # Simpler: do three separate ffmpeg passes (psnr, ssim, vmaf)
     out = {}
 
     def parse_metric(args, pattern: str, key: str):
@@ -296,23 +226,136 @@ def quality_metrics(ref_raw: Path, test_raw: Path, w: int, h: int,
     return out
 
 
-# -------- main --------
+# -------- bench core (shared harness) --------
 
-def bench_one(label: str, decoder_fn, nframes: int, *args):
-    """Run decoder_fn 3 times under resource sampling; return best result."""
-    best = None
-    for _ in range(3):
-        with ResourceSampler() as rs:
-            n, dur = decoder_fn(*args)
-        rec = {
-            "label": label, "frames": n, "wall_s": dur,
-            "fps": n / dur if dur > 0 else 0.0,
-            **rs.summary(),
-        }
-        if best is None or rec["fps"] > best["fps"]:
-            best = rec
+def bench_one(label: str, decoder_fn, nframes: int, *args, reps: int = 4):
+    """Run decoder_fn with warmup+discard iter0; return best rep record.
+
+    The returned dict is the history-compatible "best" record (fps, wall_s,
+    rss_peak_mb, cpu_*, gpu_*, samples, ...). Full median/IQR/best detail is
+    available via bench_detail(); this wrapper keeps old call sites working
+    without rewriting history.
+    """
+    agg = bench_repeated(label, lambda: decoder_fn(*args), reps=reps)
+    best = agg["best"]
+    # Attach aggregate reporting alongside the best record.
+    best = dict(best)
+    best["fps_median"] = agg["median_fps"]
+    best["fps_iqr"] = agg["iqr_fps"]
+    best["fps_mean"] = agg["mean_fps"]
+    best["fps_stdev"] = agg["stdev_fps"]
+    best["reps"] = agg["n"]
     return best
 
+
+def bench_detail(label: str, decoder_fn, *args, reps: int = 4):
+    """Full aggregate: best + median +/- IQR over reps (warmup discarded)."""
+    return bench_repeated(label, lambda: decoder_fn(*args), reps=reps)
+
+
+# -------- Pareto matrix (report only, never auto-applied) --------
+
+PARETO_WORKERS = [0, 2, 4, 8, 16]
+PARETO_PREFETCH = [False, True]
+
+
+def run_pareto_matrix(clip_label="1080p", reps=3):
+    """Workers x prefetch sweep on one clip; returns row list with MB_per_fps."""
+    clip = next((c for c in CLIPS if c[0] == clip_label), CLIPS[1])
+    _, path, w, h, nf = clip
+    rows = []
+    for workers in PARETO_WORKERS:
+        for prefetch in PARETO_PREFETCH:
+            tag = f"w{workers}-{'pf' if prefetch else 'sync'}"
+            try:
+                agg = bench_repeated(
+                    tag,
+                    lambda p=path, n=nf, wv=workers, pf=prefetch: run_nelux(
+                        p, n, "cpu", pf, convert_workers=wv),
+                    reps=reps)
+            except Exception as e:
+                print(f"  pareto {tag}: ERROR {e}")
+                continue
+            best = agg["best"]
+            fps = best["fps"]
+            rss = best["rss_peak_mb"]
+            rows.append({
+                "clip": clip_label,
+                "workers": workers,
+                "prefetch": prefetch,
+                "label": tag,
+                "fps_best": fps,
+                "fps_median": agg["median_fps"],
+                "fps_iqr": agg["iqr_fps"],
+                "rss_peak_mb": rss,
+                "rss_median_mb": best.get("rss_median_mb", rss),
+                "cpu_median_pct": best.get("cpu_median_pct", best.get("cpu_avg_pct", 0)),
+                "cpu_avg_pct": best.get("cpu_avg_pct", 0),
+                "cpu_user_s": best.get("cpu_user_s", 0.0),
+                "cpu_system_s": best.get("cpu_system_s", 0.0),
+                "gpu_util_median_pct": best.get("gpu_util_median_pct", 0.0),
+                "gpu_scope": best.get("gpu_scope", "none"),
+                "mb_per_fps": mb_per_fps(rss, fps),
+                "samples": best.get("samples", 0),
+                "wall_s": best.get("wall_s", 0.0),
+            })
+            r = rows[-1]
+            print(f"  pareto {tag:<10} fps_best={r['fps_best']:7.1f} "
+                  f"fps_med={r['fps_median']:7.1f}±{r['fps_iqr']:.1f} "
+                  f"rss={r['rss_peak_mb']:6.0f} MB "
+                  f"MB/fps={r['mb_per_fps']:.3f} cpu_med={r['cpu_median_pct']:5.0f}% "
+                  f"gpu_scope={r['gpu_scope']}")
+    # Pareto flags (max fps, min RSS): report only.
+    frontier = pareto_frontier(rows, fps_key="fps_median",
+                               cost_key="rss_peak_mb")
+    fset = {(f["workers"], f["prefetch"]) for f in frontier}
+    for r in rows:
+        r["pareto"] = (r["workers"], r["prefetch"]) in fset
+    return rows
+
+
+def write_pareto_csv(rows, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["clip", "label", "workers", "prefetch", "fps_best", "fps_median",
+              "fps_iqr", "rss_peak_mb", "rss_median_mb", "cpu_median_pct",
+              "cpu_avg_pct", "cpu_user_s", "cpu_system_s",
+              "gpu_util_median_pct", "gpu_scope", "mb_per_fps", "pareto",
+              "samples", "wall_s"]
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k) for k in fields})
+    return out_path
+
+
+def write_pareto_plot(rows, out_path: Path):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"  pareto plot skipped (matplotlib unavailable: {e})")
+        return None
+    xs = [r["rss_peak_mb"] for r in rows]
+    ys = [r["fps_median"] for r in rows]
+    labels = [r["label"] for r in rows]
+    pareto = [r["pareto"] for r in rows]
+    fig, ax = plt.subplots()
+    for x, y, lab, is_p in zip(xs, ys, labels, pareto):
+        ax.scatter(x, y, s=80 if is_p else 30,
+                   marker="o" if is_p else "x")
+        ax.annotate(lab, (x, y))
+    ax.set_xlabel("Peak RSS (MB) — lower is leaner")
+    ax.set_ylabel("Median fps — higher is faster")
+    ax.set_title("NeLux workers x prefetch Pareto (report only; knee ~ w4)")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+# -------- main --------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -320,6 +363,12 @@ def main():
     ap.add_argument("--frames-quality", type=int, default=60,
                     help="Frames used for PSNR/SSIM/VMAF comparison")
     ap.add_argument("--skip-quality", action="store_true")
+    ap.add_argument("--reps", type=int, default=4,
+                    help="Timed reps per config after warmup iter0 discard")
+    ap.add_argument("--pareto", action="store_true",
+                    help="Run workers {0,2,4,8,16} x prefetch {F,T} Pareto matrix")
+    ap.add_argument("--pareto-clip", default="1080p")
+    ap.add_argument("--pareto-reps", type=int, default=3)
     args = ap.parse_args()
 
     tag_dir = OUT_DIR / args.tag
@@ -328,8 +377,12 @@ def main():
     print(f"=== Comprehensive bench [{args.tag}] ===")
     print(f"nelux={nelux.__version__} torchcodec={TORCHCODEC_AVAILABLE} "
           f"cuda={nelux.__cuda_support__}")
+    print(f"harness: warmup iter0 discarded, reps={args.reps}, "
+          f"sampler=15ms (10-20ms band), min_samples=20, floor=2.0s wall; "
+          f"report median+/-IQR AND best (best kept for history)")
 
     all_results = []
+    stability_flags = []
 
     # ---- Throughput + resource bench ----
     for label, path, w, h, nf in CLIPS:
@@ -353,19 +406,58 @@ def main():
         clip_results = []
         for name, fn in bench_set:
             try:
-                rec = bench_one(name, fn, nf)
+                agg = bench_repeated(name, fn, reps=args.reps)
             except Exception as e:
                 print(f"  {name}: ERROR {e}")
                 continue
+            best = agg["best"]
+            rec = dict(best)
             rec["clip"] = label
             rec["resolution"] = f"{w}x{h}"
+            # Aggregate reporting next to the history-compatible best column.
+            rec["fps_median"] = agg["median_fps"]
+            rec["fps_iqr"] = agg["iqr_fps"]
+            rec["fps_mean"] = agg["mean_fps"]
+            rec["fps_stdev"] = agg["stdev_fps"]
             clip_results.append(rec)
-            print(f"  {name:<20} fps={rec['fps']:7.1f}  "
+            ok, ratio = check_stability([r["fps"] for r in agg["reps"]])
+            stability_flags.append(ok)
+            print(f"  {name:<20} best={rec['fps']:7.1f}  "
+                  f"med={rec['fps_median']:7.1f}±{rec['fps_iqr']:.1f}  "
                   f"rss={rec['rss_peak_mb']:6.0f} MB  "
-                  f"cpu_avg={rec['cpu_avg_pct']:5.0f}%  "
-                  f"gpu_avg={rec['gpu_util_avg_pct']:4.0f}%  "
-                  f"gpu_mem={rec['gpu_mem_peak_mb']:.0f} MB")
+                  f"cpu_med={rec.get('cpu_median_pct', rec['cpu_avg_pct']):5.0f}%  "
+                  f"cpu_u={rec.get('cpu_user_s', 0):.1f}s+{rec.get('cpu_system_s', 0):.1f}s  "
+                  f"gpu_med={rec.get('gpu_util_median_pct', rec['gpu_util_avg_pct']):4.0f}%  "
+                  f"[{rec.get('gpu_scope', '?')}]  "
+                  f"gpu_mem={rec['gpu_mem_peak_mb']:.0f} MB  "
+                  f"n={rec['samples']} stab={'ok' if ok else f'UNSTABLE {ratio:.1%}'}")
         all_results.extend(clip_results)
+
+    # ---- Pareto matrix (report only) ----
+    pareto_rows = []
+    if args.pareto:
+        print(f"\n=== Pareto matrix [{args.pareto_clip}] "
+              f"workers {PARETO_WORKERS} x prefetch {PARETO_PREFETCH} ===")
+        print("Report only: nothing is auto-applied. "
+              "Knee heuristic: workers=4 reaches ~60% of peak fps at ~30% "
+              "of peak RSS; see nelux.suggest_config().")
+        pareto_rows = run_pareto_matrix(args.pareto_clip, reps=args.pareto_reps)
+        csv_path = tag_dir / f"pareto_{args.pareto_clip}.csv"
+        write_pareto_csv(pareto_rows, csv_path)
+        print(f"Wrote {csv_path} ({len(pareto_rows)} rows)")
+        plot_path = tag_dir / f"pareto_{args.pareto_clip}.png"
+        if write_pareto_plot(pareto_rows, plot_path):
+            print(f"Wrote {plot_path}")
+        # Document the knee in the console: first row >= 60% peak fps at
+        # minimal RSS, expected to be workers=4 on 1080p-class content.
+        if pareto_rows:
+            peak = max(r["fps_median"] for r in pareto_rows)
+            cands = [r for r in pareto_rows if r["fps_median"] >= 0.6 * peak]
+            knee = min(cands, key=lambda r: r["rss_peak_mb"])
+            print(f"Knee (report): {knee['label']} "
+                  f"fps_med={knee['fps_median']:.1f} "
+                  f"({knee['fps_median'] / peak:.0%} of peak {peak:.1f}) "
+                  f"rss={knee['rss_peak_mb']:.0f} MB MB/fps={knee['mb_per_fps']:.3f}")
 
     # ---- Quality (PSNR/SSIM/VMAF) ----
     if not args.skip_quality:
@@ -411,10 +503,29 @@ def main():
         "tag": args.tag,
         "nelux_version": nelux.__version__,
         "torchcodec_available": TORCHCODEC_AVAILABLE,
+        "harness": {
+            "warmup_discarded": True,
+            "reps": args.reps,
+            "sample_interval_s": 0.015,
+            "min_samples": 20,
+            "min_wall_s": 2.0,
+            "reporting": "median+/-IQR AND best (best kept for history)",
+        },
         "throughput": all_results,
+        "pareto": pareto_rows,
         "quality": quality_results,
     }, indent=2))
     print(f"\nWrote {out_json}")
+
+    if args.tag == "check":
+        # Stability gate: every config's stdev/median < 5%.
+        bad = sum(0 if f else 1 for f in stability_flags)
+        print(f"\n--tag check: stdev/median<5% on {len(stability_flags)} configs; "
+              f"unstable={bad}")
+        if bad:
+            print("CHECK FAILED: rerun on a quiet machine; do not publish.")
+            sys.exit(1)
+        print("CHECK PASSED")
 
 
 if __name__ == "__main__":

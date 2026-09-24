@@ -1,3 +1,4 @@
+#include <spdlog/spdlog.h>
 // Python/VideoReader.cpp
 #include "python/VideoReader.hpp"
 #include <cpu/ResizeFilter.hpp>
@@ -600,10 +601,16 @@ void VideoReader::rewindForFreshIteration()
     if (!streamTouched_)
         return;
 
-    // A timestamp seek to zero is not a physical rewind: raw streams may
-    // not seek at all, and containers with offsets/open GOPs can skip frames.
-    // Reopening restores the same decoding pre-roll as a newly opened reader.
-    underReaderLock([&](nelux::Decoder& d) { d.reconfigure(filePath); return 0; });
+    // Same-file rewind via seek + flush (no reconfigure/reopen). Falls back
+    // to reconfigure() only when the container cannot seek (raw streams) or
+    // the seek+flush reports failure. A timestamp seek to zero alone is not
+    // a physical rewind on such streams, which is why the fallback reopens
+    // and restores the same decoding pre-roll as a newly opened reader.
+    underReaderLock([&](nelux::Decoder& d) {
+        if (!d.rewindToStart())
+            d.reconfigure(filePath);
+        return 0;
+    });
     currentIndex = 0;
     current_timestamp = 0.0;
     streamTouched_ = false;
@@ -665,9 +672,11 @@ torch::Tensor VideoReader::decodeRangeFrame()
 
 int VideoReader::exactRangeFrameCount()
 {
-    // Negative bounds need decoded frames, not fps*duration or packet counts
-    // (one packet can contain multiple frames). An independent reader also
-    // leaves the caller's current position and buffered frames untouched.
+    // Negative bounds need a decoded frame count. Container nb_frames can
+    // survive truncation, and packet counts can differ from frame counts.
+    // Count through an independent reader so the live position and buffered
+    // frames remain untouched; decode errors must propagate before a range
+    // setter mutates the reader's state.
     const std::string path = filePath;
     const auto source = pinDecoder();
     if (!source)
@@ -688,6 +697,115 @@ int VideoReader::exactRangeFrameCount()
     if (pinDecoder() != source || filePath != path)
         throw std::runtime_error("VideoReader changed while resolving negative bounds");
     return static_cast<int>(count);
+}
+
+torch::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
+{
+    // Assumes the GIL is released and lifecycleMu_ is held EXCLUSIVE.
+    // Single-frame body shared by decodeFrame() and the batched
+    // seek/operator[]/range-discard loops (one release+lock for N frames).
+    std::shared_ptr<nelux::Decoder> dec = decoder;
+    if (!dec)
+        throw std::runtime_error("VideoReader is closed");
+    torch::Tensor outTensor;
+    double ts = 0.0;
+    try
+    {
+        if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
+        {
+            outTensor = prefetch
+                            ? dec->decodeNextFrameTensor(&ts)
+                            : dec->decodeNextFrameTensorSync(&ts);
+        }
+        else
+        {
+            const bool ok = dec->decodeNextFrame(tensor.data_ptr(), &ts);
+            if (ok)
+                outTensor = tensor;
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        NELUX_ERROR("decodeFrame(): decoder failed: {}. "
+                    "Set decode_accelerator='cpu' to use software decode.",
+                    ex.what());
+        throw;
+    }
+    if (frame_timestamp)
+        *frame_timestamp = ts;
+    return outTensor;
+}
+
+torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
+{
+    // Assumes exclusive lock + released GIL (see above). Mirrors
+    // decodeRangeFrame() without re-locking: the NVDEC VP9 timing sidecar is
+    // driven directly since the lock is already held (underReaderLock would
+    // deadlock: lifecycleMu_ is not recursive).
+    if (rangeTimestampError_)
+        throw std::runtime_error("Time range requires finite, nondecreasing frame "
+                                 "timestamps; use frame-index ranges for this input.");
+    double ts = 0.0;
+    torch::Tensor frame = decodeFrameNogilLocked(&ts);
+    // Caller updates current_timestamp/currentIndex/streamTouched_ GIL-held.
+    // Range timestamp bookkeeping needs the raw ts + NVDEC VP9 sidecar:
+    if (!segments_.empty() && !segments_.front().byFrames)
+    {
+        double timestamp = ts;
+        if (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
+        {
+            // Direct (no underReaderLock): lock already held.
+            if (decoder && decoder->getCtx() &&
+                decoder->getCtx()->codec_id == AV_CODEC_ID_VP9)
+            {
+                const bool haveFrame = frame.defined() && frame.numel() > 0;
+                if (haveFrame || rangeTimingDecoder_)
+                {
+                    if (!rangeTimingDecoder_)
+                    {
+                        rangeTimingDecoder_ = nelux::createDecoder(
+                            filePath, 2, nelux::DecodeAccelerator::CPU, 0, 32, 32,
+                            true, 1, SWS_BILINEAR, false, true, 1);
+                    }
+                    double stamp = 0.0;
+                    auto timingFrame = rangeTimingDecoder_->decodeNextFrameTensorSync(&stamp);
+                    if (timingFrame.defined() != haveFrame)
+                        throw std::runtime_error("VP9 hardware/software frame counts disagree; "
+                                                 "cannot establish accurate time range timestamps.");
+                    timestamp = stamp;
+                }
+            }
+        }
+        if (!frame.defined() || frame.numel() == 0)
+            return frame;
+        // Stash raw timestamp in rangeTimestamp_ via a side channel: the caller
+        // (decodeRangeFrame wrapper / batched loops) finishes the bookkeeping
+        // GIL-held. Here we only validate finiteness/monotonicity against
+        // stored state (relaxed atomics not needed: lock held).
+        if (!std::isfinite(timestamp) ||
+            (rangeLastTimestamp_ && timestamp < *rangeLastTimestamp_))
+        {
+            rangeTimestampError_ = true;
+            throw std::runtime_error("Time range requires finite, nondecreasing frame "
+                                     "timestamps; use frame-index ranges for this input.");
+        }
+        if (!rangeTimeOrigin_)
+            rangeTimeOrigin_ = timestamp;
+        rangeLastTimestamp_ = timestamp;
+        rangeTimestamp_ = timestamp - *rangeTimeOrigin_;
+        // NOTE: current_timestamp update is the caller's job (GIL-held).
+        // Store raw ts in a member the caller reads? Use current_timestamp as
+        // scratch while lock held is unsafe (GIL discipline). Instead return
+        // frame and let the wrapper set current_timestamp=ts GIL-held; the
+        // rangeTimestamp_ above is already final.
+        // To keep decodeRangeFrame() compatible, also stash ts for the wrapper:
+        current_timestamp = timestamp; // lock-held write; wrapper re-sets GIL-held (same value)
+    }
+    else
+    {
+        current_timestamp = ts; // same note as above
+    }
+    return frame;
 }
 
 torch::Tensor VideoReader::decodeFrame()
@@ -724,37 +842,8 @@ torch::Tensor VideoReader::decodeFrame()
         py::gil_scoped_release release;
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
 
-        std::shared_ptr<nelux::Decoder> dec = decoder;
-        if (!dec)
-            throw std::runtime_error("VideoReader is closed");
-
-        // No silent NVDEC->CPU fallback: if hardware decode fails mid-stream we
-        // surface the error to the caller. Silent fallback was removed because
-        // it masked configuration errors and silently switched output
-        // devices/tensor layouts under the caller's feet. Use
-        // decode_accelerator='cpu' to opt in to software decode explicitly.
-        try
-        {
-            if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
-            {
-                outTensor = prefetch
-                                ? dec->decodeNextFrameTensor(&frame_timestamp)
-                                : dec->decodeNextFrameTensorSync(&frame_timestamp);
-                success = outTensor.defined();
-            }
-            else
-            {
-                // NVDEC / hardware path: in-place write into shared CUDA tensor.
-                success = dec->decodeNextFrame(tensor.data_ptr(), &frame_timestamp);
-            }
-        }
-        catch (const std::exception& ex)
-        {
-            NELUX_ERROR("decodeFrame(): decoder failed: {}. "
-                        "Set decode_accelerator='cpu' to use software decode.",
-                        ex.what());
-            throw;
-        }
+        outTensor = decodeFrameNogilLocked(&frame_timestamp);
+        success = outTensor.defined();
     }
     // Scope ends here deliberately: the reader-level counters below are updated
     // with the GIL HELD and the lock released, which is where iter(), next() and
@@ -789,22 +878,34 @@ py::object VideoReader::readFrame()
 py::tuple VideoReader::readFrameWithMotionVectors()
 {
     requireMotionVectors();
-    torch::Tensor frame = decodeFrame();
-    py::list vectors;
-    // Read the vectors under the lock rather than off the member: decodeFrame()
-    // above has already released it, so close() can tear the decoder down
-    // between the two. An empty result covers both the closed reader and the
-    // no-frame case, so the loop below needs no further guard.
+    // Single locked nogil section for Tensor+MVs: decode and fetch vectors
+    // under one release+exclusive lock so close() cannot tear the decoder
+    // down between the two (the old two-lock version had that window).
+    torch::Tensor frame;
     std::vector<nelux::Decoder::MotionVector> mvs;
-    if (frame.defined() && frame.numel() != 0)
     {
-        mvs = underReaderLockRead(
-            [](nelux::Decoder* d)
-            {
-                return d ? d->getLastMotionVectors()
-                         : std::vector<nelux::Decoder::MotionVector>{};
-            });
+        py::gil_scoped_release release;
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        if (!decoder)
+            throw std::runtime_error("VideoReader is closed");
+        double ts = 0.0;
+        frame = decodeFrameNogilLocked(&ts);
+        // Reader counters GIL-held below (decodeFrame discipline).
+        if (frame.defined() && frame.numel() != 0)
+            mvs = decoder->getLastMotionVectors();
+        // Stash ts for the GIL-held update below.
+        if (frame.defined() && frame.numel() != 0)
+            current_timestamp = ts; // lock-held; re-set GIL-held below (same value)
+        // currentIndex/streamTouched_ updated GIL-held below.
+        frame = frame; // keep for GIL section
+        // Remember success for counter update.
+        if (frame.defined() && frame.numel() != 0)
+        {
+            // Defer counter bump to GIL section to keep the GIL discipline:
+            // mark via a local; actual bump below.
+        }
     }
+    py::list vectors;
 
     for (const auto& mv : mvs)
     {
@@ -823,6 +924,12 @@ py::tuple VideoReader::readFrameWithMotionVectors()
         vectors.append(item);
     }
 
+    if (frame.defined() && frame.numel() != 0)
+    {
+        // GIL-held counter update (matches decodeFrame() discipline).
+        currentIndex++;
+        streamTouched_ = true;
+    }
     return py::make_tuple(tensorToOutput(frame), vectors);
 }
 
@@ -873,13 +980,16 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         // exists for the case the enum grows a CPU-resident in-place backend
         // (the shape a QSV/xpu decode path would take), where `t` really would
         // be the shared member on the host and a view would alias it.
-        // Fast path: CPU-contiguous tensors skip the redundant .cpu().contiguous()
-        // round-trip (one refcount bump + contiguity check instead of a dispatch).
+        // Split: D2H + contiguous under release (torch-only, no Python),
+        // capsule/array under GIL. Only the capsule/array needs the GIL.
         torch::Tensor cpu_tensor;
-        if (t.device().is_cpu() && t.is_contiguous())
-            cpu_tensor = t;
-        else
-            cpu_tensor = t.cpu().contiguous();
+        {
+            py::gil_scoped_release release;
+            if (t.device().is_cpu() && t.is_contiguous())
+                cpu_tensor = t;
+            else
+                cpu_tensor = t.cpu().contiguous();
+        }
         if (tensor.defined() && cpu_tensor.data_ptr() == tensor.data_ptr())
             cpu_tensor = cpu_tensor.clone();
 
@@ -965,13 +1075,41 @@ bool VideoReader::seek(double timestamp)
         return false;
     }
 
-    bool success =
-        underReaderLock([&](nelux::Decoder& d) { return d.seekToNearestKeyframe(timestamp); });
-
-    // Mark the stream moved HERE, not after the decode loop below. That loop is
-    // skipped whenever current_timestamp already satisfies the target, and then
-    // nothing would record that the demuxer had been repositioned — a later
-    // iter() would skip its rewind and start mid-stream while reporting index 0.
+    // Single release+exclusive lock for the seek + the discard loop that
+    // follows it (was 1 lock for the seek + N locks for N decoded frames).
+    // Counters (current_timestamp/currentIndex/streamTouched_) are updated
+    // GIL-held after the locked section (decodeFrame discipline).
+    bool success = false;
+    int64_t discarded = 0;
+    double lastTs = 0.0;
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+        if (!decoder)
+            throw std::runtime_error("VideoReader is closed");
+        success = decoder->seekToNearestKeyframe(timestamp);
+        if (success)
+        {
+            // Decode forward under the same lock until the target.
+            // Timestamps come from the decoder directly; current_timestamp
+            // (GIL discipline) is only the loop condition snapshot taken
+            // before the lock. Re-check against live decoded ts.
+            double liveTs = current_timestamp;
+            // If already satisfied, no discard needed.
+            while (liveTs < timestamp)
+            {
+                double ts = 0.0;
+                torch::Tensor f = decodeFrameNogilLocked(&ts);
+                if (!f.defined() || f.numel() == 0)
+                    break;
+                liveTs = ts;
+                ++discarded;
+            }
+            lastTs = liveTs;
+        }
+    }
+    // Mark the stream moved HERE (see old comment): even when the discard
+    // loop above runs zero iterations, the demuxer was repositioned.
     streamTouched_ = true;
 
     if (!success)
@@ -980,10 +1118,10 @@ bool VideoReader::seek(double timestamp)
         return false;
     }
 
-    // Decode frames until reaching the exact timestamp
-    while (current_timestamp < timestamp)
+    if (discarded > 0)
     {
-        readFrame();
+        current_timestamp = lastTs;
+        currentIndex += static_cast<int>(discarded);
     }
 
     NELUX_TRACE("Exact seek to timestamp {} successful", timestamp);
@@ -1155,18 +1293,32 @@ py::object VideoReader::operator[](py::object key)
         // forward jump).
         if (diff_frames >= 0 && diff_sec <= smart_seek_threshold_sec)
         {
+            // Single release+exclusive lock for the whole forward walk
+            // (was N releases+locks for N frames).
             torch::Tensor f;
-            for (long long i = 0; i <= diff_frames; ++i)
+            double lastTs = 0.0;
             {
-                f = decodeFrame();
-                if (!f.defined() || f.numel() == 0)
+                py::gil_scoped_release release;
+                std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+                if (!decoder)
+                    throw std::runtime_error("VideoReader is closed");
+                for (long long i = 0; i <= diff_frames; ++i)
                 {
-                    throw std::runtime_error(
-                        "Failed to decode frame near index " + std::to_string(req) +
-                        " (last successful index: " + std::to_string(currentIndex - 1) +
-                        ")");
+                    double ts = 0.0;
+                    f = decodeFrameNogilLocked(&ts);
+                    if (!f.defined() || f.numel() == 0)
+                    {
+                        throw std::runtime_error(
+                            "Failed to decode frame near index " + std::to_string(req) +
+                            " (last successful index: " + std::to_string(currentIndex - 1) +
+                            ")");
+                    }
+                    lastTs = ts;
                 }
             }
+            current_timestamp = lastTs;
+            currentIndex += static_cast<int>(diff_frames + 1);
+            streamTouched_ = true;
             return tensorToOutput(f);
         }
 
@@ -1196,24 +1348,38 @@ py::object VideoReader::operator[](py::object key)
                     ? static_cast<int>(properties.fps * smart_seek_threshold_sec) + 8
                     : 150;
 
+            // Single release+exclusive lock for the whole timestamp walk.
             torch::Tensor f;
-            for (int i = 0; i < cap; ++i)
+            double liveTs = current_timestamp;
+            int64_t steps = 0;
+            bool hit = false;
             {
-                // If we are already close enough, we might need a frame?
-                // But wait, if diff is very small positive, we still need to decode at
-                // least once if we want to BE SURE we have the frame at/after ts.
-
-                // If we are already >= ts - half, should we return the "current" frame?
-                // The VideoReader doesn't store it. So we must have decoded it earlier.
-                // This is why operator[] is tricky with stateful main decoder.
-
-                // For now, let's keep it simple: if we are close, just decode.
-                f = decodeFrame();
-                if (!f.defined() || f.numel() == 0)
-                    break;
-
-                if (current_timestamp + 1e-9 >= ts - half)
-                    return tensorToOutput(f);
+                py::gil_scoped_release release;
+                std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+                if (!decoder)
+                    throw std::runtime_error("VideoReader is closed");
+                for (int i = 0; i < cap; ++i)
+                {
+                    double dts = 0.0;
+                    torch::Tensor cur = decodeFrameNogilLocked(&dts);
+                    if (!cur.defined() || cur.numel() == 0)
+                        break;
+                    liveTs = dts;
+                    ++steps;
+                    f = cur;
+                    if (liveTs + 1e-9 >= ts - half)
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (hit)
+            {
+                current_timestamp = liveTs;
+                currentIndex += static_cast<int>(steps);
+                streamTouched_ = true;
+                return tensorToOutput(f);
             }
             // If loop fails, fall back
         }
@@ -1359,6 +1525,26 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 
     const double half = 0.5 * ((properties.fps > 0) ? 1.0 / properties.fps : 0.0);
 
+    // Rebase the zero-based presentation time onto the container's raw
+    // timeline. Frame indices (and decodeFrameAt(int)'s t = idx/fps) count
+    // from the start of the stream, but seeks and frame PTSs live in raw
+    // container stamps; on a container that starts at a non-zero timestamp
+    // (MPEG-TS, raw captures, open-GOP cuts) the two disagree by start_time.
+    // 0 for ordinary zero-based files, i.e. no behavior change there.
+    const double ptsOrigin = ptsOriginSeconds();
+    const double seekTs = timestamp_seconds + ptsOrigin;
+
+    // The decoder bounds-checks seek targets against `duration`, which is a
+    // span, not a raw-timeline end: an in-range rebased target can exceed it
+    // by up to the origin offset. Clamp such a target back into bounds — a
+    // BACKWARD seek plus decode-forward still lands on the right frame.
+    // Gated on ptsOrigin > 0 so zero-based files (and genuinely out-of-range
+    // requests) keep their exact historical seek/error behavior.
+    double seekTarget = seekTs;
+    if (ptsOrigin > 0.0 && seekTarget > properties.duration &&
+        timestamp_seconds <= properties.duration && properties.duration > 0.0)
+        seekTarget = properties.duration;
+
     // 1. Seek to nearest keyframe before/at target — unless the decoder is
     //    already parked just behind the target. Walking indices forward
     //    (reader[i] in a loop, frame_at over an increasing schedule) otherwise
@@ -1374,10 +1560,12 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     //        on a container that starts at a non-zero timestamp the seeking
     //        path and this one disagree about which frame a request names, and
     //        frame_at() must stay a pure function of its argument.
+    //    randLastTs_ is stored in the RAW container domain (hit_ts below), so
+    //    the forward window compares the rebased target against it.
     const double lastTs = randLastTs_.load(std::memory_order_relaxed);
     const bool decodeForward = lastTs >= 0.0 &&
-                               timestamp_seconds > lastTs + half &&
-                               (timestamp_seconds - lastTs) <= 1.0 &&
+                               seekTs > lastTs + half &&
+                               (seekTs - lastTs) <= 1.0 &&
                                rdec->hasZeroBasedTimeline();
     // Position is unknown until this call re-establishes it: any throw or
     // partial decode below must leave the next call re-seeking.
@@ -1385,14 +1573,26 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 
     if (!decodeForward)
     {
-        if (!rdec->seekToNearestKeyframe(timestamp_seconds))
+        if (!rdec->seekToNearestKeyframe(seekTarget))
         {
-            double backoff = std::max(0.0, timestamp_seconds - 2.0);
+            double backoff = std::max(0.0, seekTarget - 2.0);
             NELUX_WARN("seekToNearestKeyframe({}) failed; retrying with {}",
-                       timestamp_seconds, backoff);
+                       seekTarget, backoff);
             if (!rdec->seekToNearestKeyframe(backoff))
             {
-                throw std::runtime_error("Failed to seek in random decoder");
+                // Raw inputs, MPEG-TS and open-GOP cuts can all refuse
+                // keyframe seeks on a demuxer that has already errored or
+                // drifted. Reopen the file once (full demuxer/decoder reset)
+                // and retry the original target before giving up — this
+                // recovers positions a bare re-seek cannot reach.
+                NELUX_WARN("seekToNearestKeyframe({}) failed twice; "
+                           "reopening '{}' and retrying",
+                           seekTarget, filePath);
+                rdec->reconfigure(filePath);
+                if (!rdec->seekToNearestKeyframe(seekTarget))
+                {
+                    throw std::runtime_error("Failed to seek in random decoder");
+                }
             }
         }
     }
@@ -1412,7 +1612,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         if (!ok)
             break;
 
-        if (ts + 1e-9 >= timestamp_seconds - half)
+        if (ts + 1e-9 >= seekTs - half)
         {
             out_frame = buf;
             hit_ts = ts;
@@ -1421,7 +1621,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
         if (++safety > cap)
         {
             NELUX_WARN("decodeFrameAt(): safety cap hit while advancing to ts={}",
-                       timestamp_seconds);
+                       seekTs);
             break;
         }
     }
@@ -1444,8 +1644,10 @@ torch::Tensor VideoReader::decodeFrameAt(int frame_index)
         (frame_index >= properties.totalFrames && frame_index >= getFrameCount()))
         throw std::out_of_range("Frame index out of range");
 
-    // Random access uses the raw container timeline: decodeFrameAt(double)
-    // both seeks with this value and compares it against frame PTSs.
+    // Random access takes a zero-based presentation time (index / fps);
+    // decodeFrameAt(double) rebases it onto the raw container timeline via
+    // ptsOriginSeconds(), so both overloads share one frame of reference even
+    // when the container starts at a non-zero timestamp.
     double t = static_cast<double>(frame_index) / std::max(1.0, properties.fps);
     return decodeFrameAt(t);
 }

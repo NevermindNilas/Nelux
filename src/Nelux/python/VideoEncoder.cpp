@@ -1,5 +1,6 @@
 ﻿#include "python/VideoEncoder.hpp"
 #include <array>
+#include <spdlog/spdlog.h>
 #include <cassert>
 #include <cctype>
 #include <cmath>

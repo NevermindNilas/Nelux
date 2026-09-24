@@ -7,6 +7,10 @@ import torch
 from typing import Union, List
 
 
+class _SliceList(list):
+    __slots__ = ("_n",)
+
+
 class BatchMixin:
     """
     Mixin class that adds batch frame reading capabilities to VideoReader.
@@ -81,7 +85,14 @@ class BatchMixin:
             if stop < 0:
                 stop = max(stop + n, floor)
 
-        return list(range(start, stop, step))
+        lst = _SliceList(range(start, stop, step))
+        lst._n = n
+        return lst
+
+    def _slice_to_indices_and_n(self, s: slice):
+        """Return ``(indices, n)`` so get_batch reuses the count (1 fetch)."""
+        lst = self._slice_to_index_list(s)
+        return lst, lst._n
 
     def _to_index_list(self, indices) -> List[int]:
         """
@@ -116,7 +127,7 @@ class BatchMixin:
 
         # Handle list/tuple
         if isinstance(indices, (list, tuple)):
-            return [int(idx) for idx in indices]
+            return [operator.index(idx) for idx in indices]
 
         # Single index - should not reach here as __getitem__ handles this
         raise TypeError(f"Unsupported index type: {type(indices)}")
@@ -146,45 +157,91 @@ class BatchMixin:
             >>> batch = vr.get_batch([0, 10, 20])  # [3, H, W, C]
             >>> batch = vr.get_batch(range(0, 100, 10))  # [10, H, W, C]
         """
+        # Slice: already absolute — resolver handled negatives. Reuse its
+        # frame_count (1 fetch total, not 2) and check only the max in O(1):
+        # the list is monotonic so max(first,last) covers all; min>=0 holds.
         if isinstance(indices, slice):
-            # Already absolute — _slice_to_index_list resolved the negatives
-            # against frame_count, and adding it again would move them twice.
-            normalized = self._slice_to_index_list(indices)
-            n = None
-        else:
-            normalized = self._to_index_list(indices)
-            n = None
-            if normalized:
-                # Only pay for frame_count when a negative index needs it: on
-                # a container without nb_frames the first call demuxes the
-                # whole file.
-                if any(idx < 0 for idx in normalized):
-                    n = self.frame_count
-                    normalized = [idx + n if idx < 0 else idx for idx in normalized]
+            normalized, n = self._slice_to_indices_and_n(indices)
+            if not normalized:
+                return self.decode_batch([])
+            frame_count = n if n is not None else self.frame_count
+            m = normalized[0] if normalized[0] > normalized[-1] else normalized[-1]
+            if m >= frame_count:
+                raise IndexError(f"Frame index {m} out of bounds [0, {frame_count})")
+            return self.decode_batch(normalized)
 
-        if not normalized:
-            # Let the C++ path build the empty batch: it matches the shape,
-            # dtype and device a populated batch would have had (channel
-            # count, uint8 vs uint16, CPU vs CUDA), which a hardcoded
-            # torch.empty here cannot. decodeBatch skips its capability gates
-            # for an empty request, so this works on gray/rgba/resize readers
-            # too.
+        # Tensor fast-path: int dtype check first, min/max on-device, single
+        # tolist after validation.
+        if isinstance(indices, torch.Tensor):
+            if indices.numel() == 0:
+                return self.decode_batch([])
+            if indices.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool):
+                raise TypeError(f"Unsupported index type: {indices.dtype}")
+            mn = int(indices.min())
+            mx = int(indices.max())
+            if mn >= 0:
+                frame_count = self.frame_count
+                if mx >= frame_count:
+                    raise IndexError(f"Frame index {mx} out of bounds [0, {frame_count})")
+                return self.decode_batch(indices.cpu().tolist())
+            frame_count = self.frame_count
+            if mn + frame_count < 0:
+                raise IndexError(f"Frame index {mn + frame_count} out of bounds [0, {frame_count})")
+            if mx >= frame_count:
+                raise IndexError(f"Frame index {mx} out of bounds [0, {frame_count})")
+            i64 = indices.to(torch.int64)
+            fixed = torch.where(i64 < 0, i64 + frame_count, i64)
+            return self.decode_batch(fixed.cpu().tolist())
+
+        # Range with no negatives: O(1) endpoint check, single list() materialization.
+        if isinstance(indices, range):
+            if len(indices) == 0:
+                return self.decode_batch([])
+            lo = indices[0]
+            hi = indices[-1]
+            mn, mx = (lo, hi) if lo <= hi else (hi, lo)
+            if mn >= 0:
+                frame_count = self.frame_count
+                if mx >= frame_count:
+                    raise IndexError(f"Frame index {mx} out of bounds [0, {frame_count})")
+                return self.decode_batch(list(indices))
+            # negatives fall through to vectorized path below
+
+        if not isinstance(indices, (list, tuple, np.ndarray, range)):
+            raise TypeError(f"Unsupported index type: {type(indices)}")
+        arr0 = np.asarray(indices)
+        if arr0.size == 0:
+            # Empty request is inert and matches a populated batch via C++.
             return self.decode_batch([])
-
-        # Validate bounds. Reuse the frame_count already fetched for negative
-        # normalisation when available (one fewer Python->C++ round-trip).
-        # frame_count is immutable per file and cached in C++, so reuse is
-        # exact. Note: the slice path resolves negatives inside
-        # _slice_to_index_list (which fetches its own count), so slices still
-        # fetch once there and once here — both cache hits, not extra demux
-        # passes.
-        frame_count = n if n is not None else self.frame_count
-        for idx in normalized:
-            if not (0 <= idx < frame_count):
-                raise IndexError(f"Frame index {idx} out of bounds [0, {frame_count})")
-
-        # Call C++ decode_batch method
-        return self.decode_batch(normalized)
+        if arr0.dtype.kind not in "iub":
+            if arr0.dtype.kind == "O":
+                try:
+                    pylist = [operator.index(x) for x in indices]
+                except TypeError:
+                    raise TypeError(f"Unsupported index type: {arr0.dtype}") from None
+                frame_count = self.frame_count
+                norm = [x + frame_count if x < 0 else x for x in pylist] if any(x < 0 for x in pylist) else pylist
+                for x in norm:
+                    if not (0 <= x < frame_count):
+                        raise IndexError(f"Frame index {x} out of bounds [0, {frame_count})")
+                return self.decode_batch(norm)
+            raise TypeError(f"Unsupported index type: {arr0.dtype}")
+        mn = int(arr0.min())
+        mx = int(arr0.max())
+        if mn >= 0:
+            frame_count = self.frame_count
+            if mx >= frame_count:
+                raise IndexError(f"Frame index {mx} out of bounds [0, {frame_count})")
+            arr = arr0 if arr0.dtype == np.int64 else arr0.astype(np.int64, copy=False)
+            return self.decode_batch(arr.tolist())
+        frame_count = self.frame_count
+        if mn + frame_count < 0:
+            raise IndexError(f"Frame index {mn + frame_count} out of bounds [0, {frame_count})")
+        if mx >= frame_count:
+            raise IndexError(f"Frame index {mx} out of bounds [0, {frame_count})")
+        arr = arr0.astype(np.int64, copy=True)
+        arr[arr < 0] += frame_count
+        return self.decode_batch(arr.tolist())
 
     def get_batch_range(
         self, start: int = 0, end: int = None, step: int = 1

@@ -235,6 +235,12 @@ class Decoder
      */
     virtual void reconfigure(const std::string& filePath);
 
+    // Same-file rewind via seek + flush (no reopen). Returns false when the
+    // container cannot seek (e.g. raw streams); the caller then falls back
+    // to reconfigure(). Preserves cached_frame_count_ and the batch codec
+    // context, both still valid for the same file.
+    virtual bool rewindToStart();
+
     virtual std::vector<std::string> listSupportedDecoders() const;
 
     /**
@@ -319,14 +325,30 @@ class Decoder
 
     // Shared pool for consumer-convert path. Held via shared_ptr so the
     // torch::Tensor deleter can recycle the buffer even if Decoder is gone.
+    // 64B-aligned + trailing slack so swscale SIMD over-read on odd widths
+    // stays in-bounds. Deleter is GIL-free (plain heap/mutex only) and never
+    // takes the GIL under pool->mu. pool->mu is a plain fair std::mutex.
+    struct AlignedDeleter
+    {
+        void operator()(uint8_t* p) const noexcept;
+    };
+    using PooledBufferPtr = std::unique_ptr<uint8_t[], AlignedDeleter>;
     struct OutputBufferPool
     {
         std::mutex mu;
-        std::vector<std::unique_ptr<uint8_t[]>> free_;
-        size_t bufferBytes = 0;
+        std::vector<PooledBufferPtr> free_;
+        size_t bufferBytes = 0; // tight nbytes (W*H*C*elem) for live geometry
         size_t maxRetained = 8;
+        // Bumped on every geometry change (reconfigure / resize / channels).
+        // Deleter captures the gen at wrap time and only recycles when it
+        // still matches; stale buffers are freed. Fixes the council OOB
+        // concern where a resized frame could recycle a wrong-sized buffer.
+        uint64_t generation = 0;
     };
     std::shared_ptr<OutputBufferPool> outputBufferPool_;
+    // Monotonic seq for pooled-buffer stamps (seq,nbytes,gen). Debug/validation
+    // only; never used for ordering (ordering is syncProduceSeq_/syncConsumeSeq_).
+    std::atomic<int64_t> pooledBufferSeq_{0};
     // When true, producer fills a fresh torch::Tensor each frame instead of
     // a pooled byte buffer. Consumer receives the tensor directly.
     std::atomic<bool> tensorHandoff_{false};
@@ -462,7 +484,7 @@ class Decoder
         // never reclaims it. The consumer wraps this buffer zero-copy with
         // torch::from_blob; the tensor deleter only does plain heap/pool ops,
         // never touching the torch CPU allocator, so the leak cannot recur.
-        std::unique_ptr<uint8_t[]> buffer;
+        PooledBufferPtr buffer;
         double timestamp = 0.0;
         std::vector<MotionVector> motionVectors;
         char frameType = '?';
@@ -481,15 +503,22 @@ class Decoder
     void startSyncConvertWorkers();
     void stopSyncConvertWorkers();
     void syncConvertWorkerLoop();
-    // Pop a recycled output buffer from outputBufferPool_, or heap-allocate a
-    // fresh one (operator new[] -- NOT zero-initialized, unlike the old
-    // std::vector::resize which paid a full-frame memset per frame).
-    std::unique_ptr<uint8_t[]> acquireOutputBuffer(size_t nbytes);
+    // Pop a recycled output buffer from outputBufferPool_, or 64B-aligned
+    // heap-allocate a fresh one (uninitialized -- skips the full-frame memset
+    // std::vector::resize paid per frame). Allocation is nbytes + 64B slack
+    // with dst stride FFALIGN(W*C*elem,32) worth of headroom; dstLineSize
+    // passed to swscale stays tight (arbitrary) so tensors stay contiguous.
+    PooledBufferPtr acquireOutputBuffer(size_t nbytes);
     // Wrap a worker-filled pooled buffer zero-copy via torch::from_blob. The
-    // tensor's deleter returns the buffer to outputBufferPool_ (or delete[]s
-    // it) -- plain heap/mutex ops only, safe on any thread, no torch CPU
-    // allocator involvement (see SyncConvertOutEntry leak note).
-    torch::Tensor tensorFromPooledBuffer(std::unique_ptr<uint8_t[]> buf);
+    // tensor's deleter returns the buffer to outputBufferPool_ (or frees it)
+    // -- plain heap/mutex ops only, GIL-free, safe on any thread, no torch
+    // CPU allocator involvement (see SyncConvertOutEntry leak note).
+    // Validates bufferBytes == nbytes == numel*elem with the (seq,nbytes,gen)
+    // stamp; mismatches are freed, never recycled. Memsets on convert error.
+    torch::Tensor tensorFromPooledBuffer(PooledBufferPtr buf);
+    // Tight frame bytes for the live geometry (W*H*C*elem). Used to size
+    // maxInFlight (64MB/frameBytes) and to validate pooled buffers.
+    size_t currentFrameBytes() const;
 
   public:
     /**

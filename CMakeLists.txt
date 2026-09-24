@@ -55,6 +55,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD        20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Visibility hygiene: hide all C++ symbols by default (smaller binary, no
+# accidental ABI surface). The pybind11 extension entry point keeps its
+# default visibility via PYBIND11_EXPORT/PyMODINIT_FUNC, so `import nelux`
+# is unaffected. No change to AVX2 (OFF) / LTO (ON) / fast-math (ON) policy.
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 option(NELUX_ENABLE_CUDA   "Enable CUDA support in Nelux" OFF)
 option(NELUX_BUILD_PYTHON "Build Python bindings"     ON)

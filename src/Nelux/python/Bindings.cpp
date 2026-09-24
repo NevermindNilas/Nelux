@@ -1,5 +1,6 @@
 ﻿#include "VideoEncoder.hpp"
 #include "VideoReader.hpp"
+#include <spdlog/spdlog.h>
 #include "StreamMuxer.hpp"
 #include <optional>
 #include <utility>

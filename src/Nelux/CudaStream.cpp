@@ -2,7 +2,7 @@
 
 #ifdef NELUX_ENABLE_CUDA
 
-#include <c10/cuda/CUDAStream.h>  // c10::cuda::getCurrentCUDAStream, CUDAStream
+#include <c10/cuda/CUDAStream.h> // c10::cuda::getCurrentCUDAStream, CUDAStream
 #include <stdexcept>
 
 #ifndef _WIN32
@@ -56,6 +56,15 @@ cudaStream_t currentCudaStream(int device)
 #endif
 }
 
-}  // namespace nelux
+void torchStreamWaitEvent(cudaEvent_t ev, int device)
+{
+    if (!ev)
+        return;
+    cudaStream_t torchStream = currentCudaStream(device);
+    // No CPU sync: GPU-side ordering only.
+    cudaStreamWaitEvent(torchStream, ev, 0);
+}
 
-#endif  // NELUX_ENABLE_CUDA
+} // namespace nelux
+
+#endif // NELUX_ENABLE_CUDA

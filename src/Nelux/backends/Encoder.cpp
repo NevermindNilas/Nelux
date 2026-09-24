@@ -1,4 +1,5 @@
-﻿#include "Encoder.hpp"
+#include "Encoder.hpp"
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cctype>
@@ -1401,6 +1402,37 @@ void Encoder::initVideoStream()
             {
                 av_dict_set_int(&opts, "crf", properties.cq, 0);
                 videoCodecCtx->bit_rate = 0;
+            }
+        }
+        else if (properties.cq >= 0)
+        {
+            // Any other software codec (mjpeg, png, mpeg4, prores, ffv1,
+            // ...): there is no crf/cqp knob here, so a caller-passed cq must
+            // not vanish silently. mjpeg honors a JPEG q-scale: map cq 0..51
+            // onto q 2..31 (lower is better on both scales) via
+            // global_quality + QSCALE, the same mechanism `ffmpeg -q:v` uses.
+            // Every other codec in this branch is either lossless or has no
+            // quality dial, so warn instead of pretending to comply.
+            // Default (cq < 0) is untouched: no option, no warning, no
+            // byte change.
+            if (videoCodecCtx->codec_id == AV_CODEC_ID_MJPEG ||
+                videoCodecCtx->codec_id == AV_CODEC_ID_MJPEGB)
+            {
+                const int q = std::clamp(
+                    2 + (properties.cq * 29 + 25) / 51, 2, 31);
+                videoCodecCtx->flags |= AV_CODEC_FLAG_QSCALE;
+                videoCodecCtx->global_quality = FF_QP2LAMBDA * q;
+                NELUX_INFO("mjpeg: mapped cq={} to qscale q={}", properties.cq,
+                           q);
+            }
+            else
+            {
+                NELUX_WARN("cq={} has no effect for codec '{}': it honours "
+                           "neither crf nor a q-scale; the value is ignored "
+                           "(png and other still-image codecs are lossless — "
+                           "tune them via extraOptions, e.g. "
+                           "compression_level).",
+                           properties.cq, codecName);
             }
         }
     }

@@ -15,6 +15,7 @@
 #include <Nelux/backends/cuda/RGBToNV12.cuh>
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <new>
 #include <cstring>
 
 extern "C" {
@@ -55,6 +56,16 @@ private:
     int nv12Pitch = 0;
     int surfaceHeight = 0;
     int rgbPitch = 0;  // For RGB packed formats
+    // Pinned host staging (2x rgbBytes, WriteCombined, cap 2-3 buffers).
+    // H2D via Async on encoderStream; D2H via Async into pinned bounce +
+    // memcpy to AVFrame; Event ordering for overlap. Falls back to pageable
+    // when cudaHostAlloc fails.
+    static constexpr int kPinnedCount = 2;
+    uint8_t* pinnedBounce_[3] = {nullptr, nullptr, nullptr};
+    bool pinnedIsHostAlloc_[3] = {false, false, false};
+    cudaEvent_t bounceDone_[3] = {nullptr, nullptr, nullptr};
+    size_t pinnedBytes_ = 0;
+    int pinnedNext_ = 0;
 
 public:
     RGBToAutoGPUConverter(int w, int h, AVPixelFormat format, cudaStream_t cudaStream = nullptr)
@@ -343,8 +354,32 @@ private:
     void copyPlane2DToHost(uint8_t* dst, int dstPitch, const uint8_t* src, int srcPitch,
                            size_t widthBytes, size_t copyHeight)
     {
-        cudaError_t err = cudaMemcpy2D(dst, dstPitch, src, srcPitch,
-                                       widthBytes, copyHeight, cudaMemcpyDeviceToHost);
+        // Pinned-bounce D2H: Async into WriteCombined bounce on encoderStream,
+        // Event ordering for overlap, then CPU memcpy to AVFrame. Falls back
+        // to blocking copy when no stream or bounce unavailable.
+        size_t rowBytes = widthBytes;
+        size_t total = rowBytes * copyHeight;
+        // Fast path when stream is available and bounce can be used (contiguous rows assumed for bounce; pitch handled per-row via 2D async).
+        if (stream) {
+            try { ensurePinnedBounce(total); } catch (...) { ensurePinnedBounce(0); }
+            if (pinnedBounce_[0] && pinnedBytes_ >= total) {
+                uint8_t* bounce = pinnedBounce_[pinnedNext_];
+                cudaEvent_t ev = bounceDone_[pinnedNext_];
+                pinnedNext_ = (pinnedNext_ + 1) % kPinnedCount;
+                cudaError_t aerr = cudaMemcpy2DAsync(bounce, rowBytes, src, srcPitch, widthBytes, copyHeight, cudaMemcpyDeviceToHost, stream);
+                if (aerr == cudaSuccess) {
+                    if (ev) cudaEventRecord(ev, stream);
+                    // Single sync for CPU visibility (one stall, not two). Event ordering lets prior GPU work overlap with CPU memcpy of previous frame via double-buffering.
+                    cudaError_t serr = ev ? cudaEventSynchronize(ev) : cudaStreamSynchronize(stream);
+                    if (serr != cudaSuccess) throw std::runtime_error(std::string("RGBToAutoGPUConverter: D2H event sync failed: ") + cudaGetErrorString(serr));
+                    // Bounce is contiguous (rowBytes pitch); dst may be pitched.
+                    for (size_t r = 0; r < copyHeight; ++r) std::memcpy(dst + r * dstPitch, bounce + r * rowBytes, widthBytes);
+                    return;
+                }
+                cudaGetLastError();
+            }
+        }
+        cudaError_t err = cudaMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, copyHeight, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw std::runtime_error("RGBToAutoGPUConverter: CUDA D2H copy failed: " +
                                      std::string(cudaGetErrorString(err)));
@@ -353,6 +388,23 @@ private:
 
     void copyPlaneToHost(uint8_t* dst, const uint8_t* src, size_t bytes)
     {
+        if (stream) {
+            try { ensurePinnedBounce(bytes); } catch (...) {}
+            if (pinnedBounce_[0] && pinnedBytes_ >= bytes) {
+                uint8_t* bounce = pinnedBounce_[pinnedNext_];
+                cudaEvent_t ev = bounceDone_[pinnedNext_];
+                pinnedNext_ = (pinnedNext_ + 1) % kPinnedCount;
+                cudaError_t aerr = cudaMemcpyAsync(bounce, src, bytes, cudaMemcpyDeviceToHost, stream);
+                if (aerr == cudaSuccess) {
+                    if (ev) cudaEventRecord(ev, stream);
+                    cudaError_t serr = ev ? cudaEventSynchronize(ev) : cudaStreamSynchronize(stream);
+                    if (serr != cudaSuccess) throw std::runtime_error(std::string("RGBToAutoGPUConverter: D2H sync failed: ") + cudaGetErrorString(serr));
+                    std::memcpy(dst, bounce, bytes);
+                    return;
+                }
+                cudaGetLastError();
+            }
+        }
         cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw std::runtime_error("RGBToAutoGPUConverter: CUDA D2H copy failed: " +
@@ -529,8 +581,48 @@ private:
         if (err != cudaSuccess) throw std::runtime_error("Failed to allocate R16 buffer");
     }
     
+    void freePinned()
+    {
+        for (int i = 0; i < kPinnedCount; ++i) {
+            if (bounceDone_[i]) { cudaEventDestroy(bounceDone_[i]); bounceDone_[i] = nullptr; }
+            if (pinnedBounce_[i]) {
+                if (pinnedIsHostAlloc_[i]) cudaFreeHost(pinnedBounce_[i]);
+                else delete[] pinnedBounce_[i];
+                pinnedBounce_[i] = nullptr; pinnedIsHostAlloc_[i] = false;
+            }
+        }
+        pinnedBytes_ = 0;
+    }
+    void ensurePinnedBounce(size_t bytes)
+    {
+        if (pinnedBounce_[0] && pinnedBytes_ >= bytes) return;
+        freePinned();
+        for (int i = 0; i < kPinnedCount; ++i) {
+            uint8_t* ptr = nullptr;
+            cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocWriteCombined | cudaHostAllocPortable);
+            if (err == cudaSuccess && ptr) { pinnedBounce_[i] = ptr; pinnedIsHostAlloc_[i] = true; }
+            else { cudaGetLastError(); ptr = new (std::nothrow) uint8_t[bytes]; pinnedBounce_[i] = ptr; pinnedIsHostAlloc_[i] = false; if (!ptr) throw std::runtime_error("RGBToAutoGPUConverter: pinned bounce alloc failed"); }
+            if (cudaEventCreateWithFlags(&bounceDone_[i], cudaEventDisableTiming) != cudaSuccess) bounceDone_[i] = nullptr;
+        }
+        pinnedBytes_ = bytes;
+        pinnedNext_ = 0;
+    }
+    // Async H2D host->device via pinned bounce on encoderStream (overlap). Caller must ensure stream ordering via synchronize() or events.
+    void uploadHostToDeviceAsync(const uint8_t* hostSrc, uint8_t* devDst, size_t bytes)
+    {
+        if (!hostSrc || !devDst) throw std::runtime_error("RGBToAutoGPUConverter::uploadHostToDeviceAsync: null pointer");
+        ensurePinnedBounce(bytes);
+        uint8_t* bounce = pinnedBounce_[pinnedNext_];
+        cudaEvent_t ev = bounceDone_[pinnedNext_];
+        pinnedNext_ = (pinnedNext_ + 1) % kPinnedCount;
+        std::memcpy(bounce, hostSrc, bytes);
+        cudaError_t err = stream ? cudaMemcpyAsync(devDst, bounce, bytes, cudaMemcpyHostToDevice, stream) : cudaMemcpy(devDst, bounce, bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) throw std::runtime_error(std::string("RGBToAutoGPUConverter: H2D async failed: ") + cudaGetErrorString(err));
+        if (stream && ev) cudaEventRecord(ev, stream);
+    }
     void freeBuffers()
     {
+        freePinned();
         if (cudaNv12Buffer) { cudaFree(cudaNv12Buffer); cudaNv12Buffer = nullptr; }
         if (cudaYBuffer) { cudaFree(cudaYBuffer); cudaYBuffer = nullptr; }
         if (cudaUBuffer) { cudaFree(cudaUBuffer); cudaUBuffer = nullptr; }
