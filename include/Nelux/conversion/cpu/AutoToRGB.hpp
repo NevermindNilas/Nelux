@@ -362,7 +362,7 @@ class AutoToRGBConverter
                                     if (be) v = (static_cast<uint16_t>(row[2*x]) << 8) | row[2*x+1];
                                     else v = static_cast<uint16_t>(row[2*x]) | (static_cast<uint16_t>(row[2*x+1]) << 8);
                                     v &= 0x3FF;
-                                    dd[x] = static_cast<uint8_t>((v + 2) >> 2);
+                                    dd[x] = static_cast<uint8_t>(std::min(255, (v + 2) >> 2));
                                 }
                             }
                             return;

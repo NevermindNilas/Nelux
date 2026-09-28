@@ -8,6 +8,10 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+extern "C"
+{
+#include <libavutil/avstring.h>
+}
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -720,13 +724,22 @@ void Decoder::openFile(const std::string& filePath)
     NELUX_DEBUG("BASE DECODER: Stream information retrieved successfully");
 }
 
+bool Decoder::canRewindViaSeek() const
+{
+    // Matroska can report a zero start_time while exposing negative-PTS
+    // frames before its zero keyframe. A successful seek would skip them.
+    return formatCtx && formatCtx->iformat &&
+           av_match_name("mov", formatCtx->iformat->name) &&
+           hasZeroBasedTimeline();
+}
+
 bool Decoder::rewindToStart()
 {
     // Same-file rewind via seek + flush — no reopen, no reconfigure. The
     // cached frame count and the batch codec context stay valid because the
-    // file did not change. Returns false when the container cannot seek, so
-    // the caller can fall back to reconfigure().
-    if (!formatCtx || videoStreamIndex < 0 || !codecCtx)
+    // file did not change. Reopen inputs whose timestamp-zero keyframe is
+    // not guaranteed to be their physical start, even if seeking succeeds.
+    if (!canRewindViaSeek() || videoStreamIndex < 0 || !codecCtx)
         return false;
     sharedStreamDirty_.store(true, std::memory_order_relaxed);
     stopDecodingThread();
@@ -1961,7 +1974,7 @@ int Decoder::getBitDepth() const
     return bitDepth;
 }
 
-bool Decoder::seekToNearestKeyframe(double timestamp)
+bool Decoder::seekToNearestKeyframe(double timestamp, double timelineOrigin)
 {
     // Seeking moves the shared demuxer position.
     sharedStreamDirty_.store(true, std::memory_order_relaxed);
@@ -1976,7 +1989,7 @@ bool Decoder::seekToNearestKeyframe(double timestamp)
     syncConsumeSeq_ = 0;
 
     NELUX_TRACE("Seeking to the nearest keyframe for timestamp: {}", timestamp);
-    if (timestamp < 0 || timestamp > properties.duration)
+    if (timestamp < timelineOrigin || timestamp > timelineOrigin + properties.duration)
     {
         NELUX_WARN("Timestamp out of bounds: {}", timestamp);
         // Sync mode owns formatCtx/codecCtx on the caller thread; spawning

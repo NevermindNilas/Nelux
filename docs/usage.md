@@ -312,7 +312,8 @@ exact frame rate and pixel format); `ffprobe` performs the same analysis.
 > - `NELUX_FULL_PROBE=1` — force the full `find_stream_info` pass even where
 >   the fast path would apply (escape hatch for odd files).
 >
-> Same-file re-iteration rewinds via seek + flush, not reconfigure; negative
+> Same-file re-iteration uses seek + flush for zero-based MP4/MOV; other
+> inputs reopen to preserve their initial frames and decoder pre-roll. Negative
 > range bounds resolve via the cached `get_frame_count()` demux pass, not a
 > full decode. `probe()` and `VideoReader.properties` share
 > `extractVideoProperties`, so metadata agrees either way.
@@ -340,6 +341,11 @@ while True:
     except StopIteration:
         break
 ```
+
+NVDEC sequential frames share output storage; use `frame.clone()` to retain a
+frame across reads. Copies queued on the read's Torch stream finish before that
+storage is reused, including when the next read uses a different stream. Work
+queued on another stream needs an explicit stream handoff before the next read.
 
 #### Context Manager
 
@@ -577,8 +583,9 @@ reader.clear_ranges()  # back to iterating the whole file
   Output frames remain on the GPU. This adds CPU decode work to VP9 time cuts;
   integer frame ranges do not need that timing decoder.
 - Skipped portions are decoded forward on CPU and NVDEC to preserve frame
-  identity. **Large inpoints and gaps cost linear decode time.** Replaying a
-  reader reopens the input to restore its real beginning and decoder pre-roll.
+  identity. **Large inpoints and gaps cost linear decode time.** Replaying
+  restores the input's real beginning and decoder pre-roll: zero-based
+  MP4/MOV uses seek + flush, and other inputs reopen.
 - Negative frame indices count back from the real decoded EOF. Resolving them
   requires a separate full decode, without changing the main reader's position.
   Prefer non-negative bounds when startup latency matters.

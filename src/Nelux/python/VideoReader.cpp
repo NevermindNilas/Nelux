@@ -4,6 +4,7 @@
 #include <cpu/ResizeFilter.hpp>
 #include <algorithm> // For std::transform
 #include <cstring> // For std::memcpy
+#include <exception>
 #include <iostream>
 #include <cmath>
 #include <cctype>
@@ -601,11 +602,8 @@ void VideoReader::rewindForFreshIteration()
     if (!streamTouched_)
         return;
 
-    // Same-file rewind via seek + flush (no reconfigure/reopen). Falls back
-    // to reconfigure() only when the container cannot seek (raw streams) or
-    // the seek+flush reports failure. A timestamp seek to zero alone is not
-    // a physical rewind on such streams, which is why the fallback reopens
-    // and restores the same decoding pre-roll as a newly opened reader.
+    // Seek + flush for zero-based MP4/MOV; reopen other inputs to restore
+    // their real beginning and decoder pre-roll, including negative PTSs.
     underReaderLock([&](nelux::Decoder& d) {
         if (!d.rewindToStart())
             d.reconfigure(filePath);
@@ -1297,28 +1295,43 @@ py::object VideoReader::operator[](py::object key)
             // (was N releases+locks for N frames).
             torch::Tensor f;
             double lastTs = 0.0;
+            int64_t steps = 0;
+            std::exception_ptr decodeFailure;
             {
                 py::gil_scoped_release release;
                 std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-                if (!decoder)
-                    throw std::runtime_error("VideoReader is closed");
-                for (long long i = 0; i <= diff_frames; ++i)
+                try
                 {
-                    double ts = 0.0;
-                    f = decodeFrameNogilLocked(&ts);
-                    if (!f.defined() || f.numel() == 0)
+                    if (!decoder)
+                        throw std::runtime_error("VideoReader is closed");
+                    for (long long i = 0; i <= diff_frames; ++i)
                     {
-                        throw std::runtime_error(
-                            "Failed to decode frame near index " + std::to_string(req) +
-                            " (last successful index: " + std::to_string(currentIndex - 1) +
-                            ")");
+                        double ts = 0.0;
+                        f = decodeFrameNogilLocked(&ts);
+                        if (!f.defined() || f.numel() == 0)
+                        {
+                            throw std::runtime_error(
+                                "Failed to decode frame near index " + std::to_string(req) +
+                                " (last successful index: " + std::to_string(currentIndex + steps - 1) +
+                                ")");
+                        }
+                        lastTs = ts;
+                        ++steps;
                     }
-                    lastTs = ts;
+                }
+                catch (...)
+                {
+                    decodeFailure = std::current_exception();
                 }
             }
-            current_timestamp = lastTs;
-            currentIndex += static_cast<int>(diff_frames + 1);
+            // The decoder can advance before EOF or an exception. Publish
+            // that progress with the GIL held, then propagate the failure.
+            if (steps > 0)
+                current_timestamp = lastTs;
+            currentIndex += static_cast<int>(steps);
             streamTouched_ = true;
+            if (decodeFailure)
+                std::rethrow_exception(decodeFailure);
             return tensorToOutput(f);
         }
 
@@ -1353,34 +1366,43 @@ py::object VideoReader::operator[](py::object key)
             double liveTs = current_timestamp;
             int64_t steps = 0;
             bool hit = false;
+            std::exception_ptr decodeFailure;
             {
                 py::gil_scoped_release release;
                 std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
-                if (!decoder)
-                    throw std::runtime_error("VideoReader is closed");
-                for (int i = 0; i < cap; ++i)
+                try
                 {
-                    double dts = 0.0;
-                    torch::Tensor cur = decodeFrameNogilLocked(&dts);
-                    if (!cur.defined() || cur.numel() == 0)
-                        break;
-                    liveTs = dts;
-                    ++steps;
-                    f = cur;
-                    if (liveTs + 1e-9 >= ts - half)
+                    if (!decoder)
+                        throw std::runtime_error("VideoReader is closed");
+                    for (int i = 0; i < cap; ++i)
                     {
-                        hit = true;
-                        break;
+                        double dts = 0.0;
+                        torch::Tensor cur = decodeFrameNogilLocked(&dts);
+                        if (!cur.defined() || cur.numel() == 0)
+                            break;
+                        liveTs = dts;
+                        ++steps;
+                        f = cur;
+                        if (liveTs + 1e-9 >= ts - half)
+                        {
+                            hit = true;
+                            break;
+                        }
                     }
                 }
+                catch (...)
+                {
+                    decodeFailure = std::current_exception();
+                }
             }
-            if (hit)
-            {
+            if (steps > 0)
                 current_timestamp = liveTs;
-                currentIndex += static_cast<int>(steps);
-                streamTouched_ = true;
+            currentIndex += static_cast<int>(steps);
+            streamTouched_ = true;
+            if (decodeFailure)
+                std::rethrow_exception(decodeFailure);
+            if (hit)
                 return tensorToOutput(f);
-            }
             // If loop fails, fall back
         }
         return frameAt(ts);
@@ -1534,17 +1556,6 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     const double ptsOrigin = ptsOriginSeconds();
     const double seekTs = timestamp_seconds + ptsOrigin;
 
-    // The decoder bounds-checks seek targets against `duration`, which is a
-    // span, not a raw-timeline end: an in-range rebased target can exceed it
-    // by up to the origin offset. Clamp such a target back into bounds — a
-    // BACKWARD seek plus decode-forward still lands on the right frame.
-    // Gated on ptsOrigin > 0 so zero-based files (and genuinely out-of-range
-    // requests) keep their exact historical seek/error behavior.
-    double seekTarget = seekTs;
-    if (ptsOrigin > 0.0 && seekTarget > properties.duration &&
-        timestamp_seconds <= properties.duration && properties.duration > 0.0)
-        seekTarget = properties.duration;
-
     // 1. Seek to nearest keyframe before/at target — unless the decoder is
     //    already parked just behind the target. Walking indices forward
     //    (reader[i] in a loop, frame_at over an increasing schedule) otherwise
@@ -1573,12 +1584,12 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 
     if (!decodeForward)
     {
-        if (!rdec->seekToNearestKeyframe(seekTarget))
+        if (!rdec->seekToNearestKeyframe(seekTs, ptsOrigin))
         {
-            double backoff = std::max(0.0, seekTarget - 2.0);
+            double backoff = std::max(ptsOrigin, seekTs - 2.0);
             NELUX_WARN("seekToNearestKeyframe({}) failed; retrying with {}",
-                       seekTarget, backoff);
-            if (!rdec->seekToNearestKeyframe(backoff))
+                       seekTs, backoff);
+            if (!rdec->seekToNearestKeyframe(backoff, ptsOrigin))
             {
                 // Raw inputs, MPEG-TS and open-GOP cuts can all refuse
                 // keyframe seeks on a demuxer that has already errored or
@@ -1587,9 +1598,9 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
                 // recovers positions a bare re-seek cannot reach.
                 NELUX_WARN("seekToNearestKeyframe({}) failed twice; "
                            "reopening '{}' and retrying",
-                           seekTarget, filePath);
+                           seekTs, filePath);
                 rdec->reconfigure(filePath);
-                if (!rdec->seekToNearestKeyframe(seekTarget))
+                if (!rdec->seekToNearestKeyframe(seekTs, ptsOrigin))
                 {
                     throw std::runtime_error("Failed to seek in random decoder");
                 }

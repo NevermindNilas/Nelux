@@ -175,6 +175,10 @@ class BatchMixin:
         if isinstance(indices, torch.Tensor):
             if indices.numel() == 0:
                 return self.decode_batch([])
+            if indices.dtype in (torch.uint16, torch.uint32, torch.uint64):
+                # These unsigned dtypes lack min/max kernels. Convert to
+                # Python ints without narrowing uint64 before bounds checks.
+                return self.get_batch(indices.cpu().tolist())
             if indices.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool):
                 raise TypeError(f"Unsupported index type: {indices.dtype}")
             mn = int(indices.min())
@@ -214,7 +218,9 @@ class BatchMixin:
             # Empty request is inert and matches a populated batch via C++.
             return self.decode_batch([])
         if arr0.dtype.kind not in "iub":
-            if arr0.dtype.kind == "O":
+            if arr0.dtype.kind == "O" or isinstance(indices, (list, tuple)):
+                # NumPy can promote mixed signed/unsigned integer lists to
+                # float64; validate the original elements without that loss.
                 try:
                     pylist = [operator.index(x) for x in indices]
                 except TypeError:

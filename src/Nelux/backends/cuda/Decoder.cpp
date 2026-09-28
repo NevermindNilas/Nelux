@@ -376,27 +376,47 @@ void Decoder::recordDecodeComplete()
                           cudaGetErrorString(err));
     }
 }
-void Decoder::orderTorchConsumer(void* torchPtr)
+void Decoder::waitForTorchConsumer(bool synchronize)
 {
-    // Record our async chain, then make torch's stream wait on it (GPU-side
-    // only, no CPU sync) and record the pointer with the caching allocator
-    // so it is not reused while our stream is still writing.
-    recordDecodeComplete();
-    try
+    if (!hasTorchConsumer_)
+        return;
+    ensureCudaDeviceOnThread(cudaDeviceIndex_);
+    const cudaStream_t current = nelux::currentCudaStream(cudaDeviceIndex_);
+    const auto fence = [this](cudaStream_t consumer)
     {
-        nelux::torchStreamWaitEvent(decodeCompleteEvent_, cudaDeviceIndex_);
+        cudaError_t err = cudaEventRecord(consumerDoneEvent_, consumer);
+        if (err != cudaSuccess)
+            throw CxException(std::string("CUDA DECODER: consumer event record failed: ") +
+                              cudaGetErrorString(err));
+        err = cudaStreamWaitEvent(cudaStream_, consumerDoneEvent_, 0);
+        if (err != cudaSuccess)
+            throw CxException(std::string("CUDA DECODER: consumer event wait failed: ") +
+                              cudaGetErrorString(err));
+    };
+    // The return stream may differ from the next call's stream. Protect both
+    // before a conversion or device copy overwrites the shared output tensor.
+    fence(torchConsumerStream_);
+    if (current != torchConsumerStream_)
+        fence(current);
+    if (synchronize)
+    {
+        const cudaError_t err = cudaStreamSynchronize(cudaStream_);
+        if (err != cudaSuccess)
+            throw CxException(std::string("CUDA DECODER: consumer completion wait failed: ") +
+                              cudaGetErrorString(err));
+        hasTorchConsumer_ = false;
     }
-    catch (const std::exception& ex)
-    {
+}
+
+void Decoder::orderTorchConsumer()
+{
+    const cudaStream_t consumer = nelux::currentCudaStream(cudaDeviceIndex_);
+    const cudaError_t err = cudaStreamWaitEvent(consumer, decodeCompleteEvent_, 0);
+    if (err != cudaSuccess)
         throw CxException(std::string("CUDA DECODER: torch stream wait failed: ") +
-                          ex.what());
-    }
-    if (torchPtr)
-    {
-        // For raw void* (streaming path) the VideoReader-held tensor outlives
-        // the async chain, and the event wait above is the ordering guarantee.
-        (void)torchPtr;
-    }
+                          cudaGetErrorString(err));
+    torchConsumerStream_ = consumer;
+    hasTorchConsumer_ = true;
 }
 
 Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex,
@@ -404,7 +424,7 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
     : nelux::Decoder(numThreads, resizeWidth, resizeHeight),
       cudaDeviceIndex_(cudaDeviceIndex),
       cudaStream_(nullptr), decodeCompleteEvent_(nullptr),
-      producerDoneEvent_(nullptr), hwDeviceCtx_(nullptr),
+      producerDoneEvent_(nullptr), consumerDoneEvent_(nullptr), hwDeviceCtx_(nullptr),
       hwPixFmt_(AV_PIX_FMT_CUDA),
       rgb24Buffer_(nullptr), rgb24BufferSize_(0), hwInitialized_(false),
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
@@ -464,6 +484,13 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
                           cudaGetErrorString(err));
     }
 
+    err = cudaEventCreateWithFlags(&consumerDoneEvent_, cudaEventDisableTiming);
+    if (err != cudaSuccess)
+    {
+        throw CxException(std::string("Failed to create CUDA consumer event: ") +
+                          cudaGetErrorString(err));
+    }
+
     initialize(filePath);
     cachedFilePath_ = filePath;
 
@@ -488,6 +515,9 @@ Decoder::Decoder(Decoder&& other) noexcept
     : nelux::Decoder(std::move(other)), cudaDeviceIndex_(other.cudaDeviceIndex_),
       cudaStream_(other.cudaStream_), decodeCompleteEvent_(other.decodeCompleteEvent_),
       producerDoneEvent_(other.producerDoneEvent_),
+      consumerDoneEvent_(other.consumerDoneEvent_),
+      torchConsumerStream_(other.torchConsumerStream_),
+      hasTorchConsumer_(other.hasTorchConsumer_),
       hwDeviceCtx_(other.hwDeviceCtx_), hwPixFmt_(other.hwPixFmt_),
       rgb24Buffer_(other.rgb24Buffer_), rgb24BufferSize_(other.rgb24BufferSize_),
       hwInitialized_(other.hwInitialized_),
@@ -497,6 +527,9 @@ Decoder::Decoder(Decoder&& other) noexcept
     other.cudaStream_ = nullptr;
     other.decodeCompleteEvent_ = nullptr;
     other.producerDoneEvent_ = nullptr;
+    other.consumerDoneEvent_ = nullptr;
+    other.torchConsumerStream_ = nullptr;
+    other.hasTorchConsumer_ = false;
     other.hwDeviceCtx_ = nullptr;
     other.rgb24Buffer_ = nullptr;
     other.hwInitialized_ = false;
@@ -517,6 +550,9 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         cudaStream_ = other.cudaStream_;
         decodeCompleteEvent_ = other.decodeCompleteEvent_;
         producerDoneEvent_ = other.producerDoneEvent_;
+        consumerDoneEvent_ = other.consumerDoneEvent_;
+        torchConsumerStream_ = other.torchConsumerStream_;
+        hasTorchConsumer_ = other.hasTorchConsumer_;
         hwDeviceCtx_ = other.hwDeviceCtx_;
         hwPixFmt_ = other.hwPixFmt_;
         rgb24Buffer_ = other.rgb24Buffer_;
@@ -529,6 +565,9 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         other.cudaStream_ = nullptr;
         other.decodeCompleteEvent_ = nullptr;
         other.producerDoneEvent_ = nullptr;
+        other.consumerDoneEvent_ = nullptr;
+        other.torchConsumerStream_ = nullptr;
+        other.hasTorchConsumer_ = false;
         other.hwDeviceCtx_ = nullptr;
         other.rgb24Buffer_ = nullptr;
         other.hwInitialized_ = false;
@@ -1085,6 +1124,7 @@ std::optional<Frame> Decoder::acquireDecodedFrame(double* frame_timestamp,
     (void)logTag;
     // Thread-local device: cudaSetDevice only on change.
     ensureCudaDeviceOnThread(cudaDeviceIndex_);
+    waitForTorchConsumer();
 
     // Use the base class decoding thread infrastructure, but with our conversion
     if (!decodingThread.joinable())
@@ -1242,15 +1282,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
             // Keep the surface alive through conversion; releaseDecodedFrame
             // waits on the completion event before returning it to CUVID.
             releaseDecodedFrame(frame);
-            try
-            {
-                nelux::torchStreamWaitEvent(decodeCompleteEvent_, cudaDeviceIndex_);
-            }
-            catch (const std::exception& ex)
-            {
-                throw CxException(std::string("CUDA DECODER: torch stream wait failed: ") +
-                                  ex.what());
-            }
+            orderTorchConsumer();
             return true;
         }
         int alignedPitch = (rowBytes + 255) & ~255;
@@ -1281,15 +1313,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
                                   cudaGetErrorString(copy_err));
             }
             releaseDecodedFrame(frame);
-            try
-            {
-                nelux::torchStreamWaitEvent(decodeCompleteEvent_, cudaDeviceIndex_);
-            }
-            catch (const std::exception& ex)
-            {
-                throw CxException(std::string("CUDA DECODER: torch stream wait failed: ") +
-                                  ex.what());
-            }
+            orderTorchConsumer();
             return true;
         }
         else
@@ -1382,6 +1406,17 @@ void Decoder::close()
     // Stop decoding thread first
     stopDecodingThread();
 
+    // The reader may drop its output tensor immediately after close returns.
+    // Finish queued consumer reads before that storage can be recycled.
+    try
+    {
+        waitForTorchConsumer(true);
+    }
+    catch (const std::exception& ex)
+    {
+        NELUX_WARN("CUDA DECODER: consumer drain during close failed: {}", ex.what());
+    }
+
     // Release RGB24 buffer (grow-only cache; freed only here, not on reconfigure)
     if (rgb24Buffer_)
     {
@@ -1433,6 +1468,14 @@ void Decoder::close()
         cudaEventDestroy(producerDoneEvent_);
         producerDoneEvent_ = nullptr;
     }
+
+    if (consumerDoneEvent_)
+    {
+        cudaEventDestroy(consumerDoneEvent_);
+        consumerDoneEvent_ = nullptr;
+    }
+    torchConsumerStream_ = nullptr;
+    hasTorchConsumer_ = false;
 
     // Destroy CUDA stream
     if (cudaStream_)
@@ -1665,14 +1708,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
         // Complete the two-kernel chain before releasing the NVDEC surface.
         // Staging remains for the ML two-step by design.
         releaseDecodedFrame(frame);
-        try
-        {
-            nelux::torchStreamWaitEvent(decodeCompleteEvent_, cudaDeviceIndex_);
-        }
-        catch (const std::exception& ex)
-        {
-            throw CxException(std::string("CUDA DECODER: torch stream wait failed: ") + ex.what());
-        }
+        orderTorchConsumer();
         return true;
     }
     else
@@ -1693,6 +1729,9 @@ void Decoder::reconfigure(const std::string& filePath)
 
     // Stop decoding thread first
     stopDecodingThread();
+    // Reconfigure may replace the reader's shared tensor. Drain its consumers
+    // before returning control to that allocation change.
+    waitForTorchConsumer(true);
     clearQueue();
     resetTimestampState();
 
@@ -1763,6 +1802,8 @@ void Decoder::reconfigure(const std::string& filePath)
 
 bool Decoder::rewindToStart()
 {
+    if (!canRewindViaSeek())
+        return false;
     return seek(0.0);
 }
 

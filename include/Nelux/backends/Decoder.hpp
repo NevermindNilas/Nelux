@@ -116,7 +116,9 @@ class Decoder
     Decoder() = default;
     Decoder(int numThreads);
     Decoder(int numThreads, int resizeWidth, int resizeHeight);
-    bool seekToNearestKeyframe(double timestamp);
+    // timestamp is a raw container stamp; timelineOrigin supplies the start
+    // of the valid span when a caller rebases a presentation-time request.
+    bool seekToNearestKeyframe(double timestamp, double timelineOrigin = 0.0);
     virtual ~Decoder();
 
     // Deleted copy constructor and assignment operator
@@ -235,10 +237,10 @@ class Decoder
      */
     virtual void reconfigure(const std::string& filePath);
 
-    // Same-file rewind via seek + flush (no reopen). Returns false when the
-    // container cannot seek (e.g. raw streams); the caller then falls back
-    // to reconfigure(). Preserves cached_frame_count_ and the batch codec
-    // context, both still valid for the same file.
+    // Same-file rewind via seek + flush for zero-based MP4/MOV. Other
+    // containers can have frames before the keyframe at timestamp zero, so
+    // return false and let the caller reopen to restore the physical start.
+    // A successful rewind preserves cached_frame_count_ and the batch context.
     virtual bool rewindToStart();
 
     virtual std::vector<std::string> listSupportedDecoders() const;
@@ -272,6 +274,7 @@ class Decoder
     char getLastFrameType() const;
 
   protected:
+    bool canRewindViaSeek() const;
     void initialize(const std::string& filePath);
     void setProperties();
     virtual void openFile(const std::string& filePath);

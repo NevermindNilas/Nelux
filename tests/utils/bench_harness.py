@@ -226,6 +226,15 @@ class ResourceSampler:
         except Exception:
             pass
 
+    def merge(self, other):
+        """Include another completed sample window in this work total."""
+        self.cpu_samples.extend(other.cpu_samples)
+        self.rss_samples.extend(other.rss_samples)
+        self.gpu_util_samples.extend(other.gpu_util_samples)
+        self.gpu_mem_samples.extend(other.gpu_mem_samples)
+        self.cpu_user_delta_s += other.cpu_user_delta_s
+        self.cpu_system_delta_s += other.cpu_system_delta_s
+
     def summary(self):
         n = len(self.cpu_samples)
         return {
@@ -285,10 +294,7 @@ def bench_repeated(label, fn, reps=4, warmup=True, gpu_index=0,
             with ResourceSampler(gpu_index=gpu_index) as rs2:
                 n2, d2 = fn()
             # merge sampler streams for the sample-count gate
-            rs.cpu_samples.extend(rs2.cpu_samples)
-            rs.rss_samples.extend(rs2.rss_samples)
-            rs.gpu_util_samples.extend(rs2.gpu_util_samples)
-            rs.gpu_mem_samples.extend(rs2.gpu_mem_samples)
+            rs.merge(rs2)
             total_n += n2
             total_dur += d2
             if total_dur >= min_wall_s:

@@ -270,10 +270,12 @@ protected:
     // stream, then cudaStreamWaitEvent(cudaStream_, producerDoneEvent_).
     // No CPU sync. Skipped when NELUX_NVDEC_SKIP_ENTRY_SYNC=1.
     void waitForProducer(AVFrame* frame);
-    // Order the torch consumer against our async chain: record
-    // decodeCompleteEvent_, make the current torch stream wait on it, and
-    // record the output pointer with the caching allocator. No CPU sync.
-    void orderTorchConsumer(void* torchPtr);
+    // Fence queued reads on the previous/current Torch streams before reusing
+    // output storage. Cold lifecycle changes also drain those reads on the CPU.
+    void waitForTorchConsumer(bool synchronize = false);
+    // Make the current Torch stream wait on decodeCompleteEvent_ and remember
+    // that stream so the next decode can protect its queued reads. No CPU sync.
+    void orderTorchConsumer();
     // Record decodeCompleteEvent_ on cudaStream_ (checked).
     void recordDecodeComplete();
 
@@ -286,6 +288,9 @@ private:
     cudaEvent_t decodeCompleteEvent_; // Recorded after each async decode chain
     cudaEvent_t producerDoneEvent_;   // cuvidDone: recorded on producer stream,
                                       // waited on by cudaStream_
+    cudaEvent_t consumerDoneEvent_;
+    cudaStream_t torchConsumerStream_ = nullptr;
+    bool hasTorchConsumer_ = false; // nullptr is a valid default CUDA stream
     AVBufferRef* hwDeviceCtx_;
     AVPixelFormat hwPixFmt_;
     

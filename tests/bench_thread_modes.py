@@ -99,10 +99,7 @@ for _ in range({reps}):
     while total_dur < 2.0:
         with ResourceSampler(gpu_index=gpu_index) as rs2:
             n2, d2 = decode_once()
-        rs.cpu_samples.extend(rs2.cpu_samples)
-        rs.rss_samples.extend(rs2.rss_samples)
-        rs.gpu_util_samples.extend(rs2.gpu_util_samples)
-        rs.gpu_mem_samples.extend(rs2.gpu_mem_samples)
+        rs.merge(rs2)
         total_n += n2; total_dur += d2
     s = rs.summary()
     rec = {{
