@@ -22,6 +22,22 @@ REPO = Path(__file__).resolve().parents[1]
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def validate_probe_artifact(wheel: Path, record: dict, *, ownership: bool = False) -> Path:
+    label = "Ownership fault probe" if ownership else "Boundary probe"
+    if not isinstance(record, dict):
+        raise RuntimeError(f"{label} has an invalid artifact record")
+    filename = record.get("file")
+    if not isinstance(filename, str) or Path(filename).name != filename or "\\" in filename:
+        raise RuntimeError(f"{label} has an invalid artifact filename")
+    if ownership and filename not in ("ownership_fault_probe", "ownership_fault_probe.exe"):
+        raise RuntimeError("Ownership fault probe has an invalid artifact filename")
+    if record.get("errors") or (ownership and (record.get("passed") is not True or record.get("errors") != [])):
+        raise RuntimeError(f"{label} does not have a passing binary audit")
+    path = wheel.parent / filename
+    if not path.is_file() or sha256(path) != record.get("sha256"):
+        raise RuntimeError(f"{label} differs from audited artifact")
+    return path
+
 def validate_manifest(wheel: Path, manifest: Path) -> dict:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     if data.get("passed") is not True or data.get("floor") != "2.12" or data.get("errors"):
@@ -29,10 +45,9 @@ def validate_manifest(wheel: Path, manifest: Path) -> dict:
     if data.get("sha256") != sha256(wheel) or data.get("wheel") != wheel.name:
         raise RuntimeError("Wheel differs from audited artifact; refusing runtime validation")
     if "probe" in data:
-        probe = data["probe"]
-        path = wheel.parent / probe["file"]
-        if not path.is_file() or sha256(path) != probe["sha256"]:
-            raise RuntimeError("Boundary probe differs from audited artifact")
+        validate_probe_artifact(wheel, data["probe"])
+    if "ownership_probe" in data:
+        validate_probe_artifact(wheel, data["ownership_probe"], ownership=True)
     return data
 
 def run(args) -> int:
@@ -46,6 +61,8 @@ def run(args) -> int:
     report = {"wheel": wheel.name, "sha256": audit["sha256"], "floor": "2.12",
               "requested_torch": args.torch_version, "index": args.index_url,
               "require_gpu": args.require_gpu, "passed": False, "commands": []}
+    if "ownership_probe" in audit:
+        report["ownership_probe"] = {key: audit["ownership_probe"][key] for key in ("file", "sha256")}
     env = dict(os.environ)
     # Build-tree search paths would invalidate installed-artifact validation.
     for key in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
@@ -129,9 +146,14 @@ def pytest_runtest_makereport(item, call):
             report.longrepr = "Unexpected skip in stable ABI runtime gate: " + reason
 ''', encoding="utf-8")
             if "probe" in audit:
+                validate_probe_artifact(wheel, audit["probe"])
                 checked([str(python), "tests/stable_abi/check_boundary.py", str(wheel.parent)])
+                checked([str(python), "tests/stable_abi/check_tensor_type.py", str(wheel.parent)])
                 if args.require_gpu:
                     checked([str(python), "tests/stable_abi/check_cuda.py", str(wheel.parent)])
+            if "ownership_probe" in audit:
+                validate_probe_artifact(wheel, audit["ownership_probe"], ownership=True)
+                checked([str(python), "tests/stable_abi/check_ownership_faults.py", str(wheel.parent)])
             checked([str(python), "tests/wheel_smoke_test.py"])
             # Maintained parity regressions, including all newly added ABI tests.
             test_files = sorted((stage / "tests").glob("test_stable_abi*.py"))
@@ -163,6 +185,10 @@ def pytest_runtest_makereport(item, call):
                     raise RuntimeError("Mandatory NVDEC/NVENC FIFO gate skipped hardware tests")
             if sha256(wheel) != audit["sha256"]:
                 raise RuntimeError("Wheel changed during runtime validation")
+            if "probe" in audit:
+                validate_probe_artifact(wheel, audit["probe"])
+            if "ownership_probe" in audit:
+                validate_probe_artifact(wheel, audit["ownership_probe"], ownership=True)
             report["passed"] = True
     except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         report["error"] = str(exc)

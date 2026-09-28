@@ -83,6 +83,59 @@ def check_exchange():
         else:
             raise AssertionError("Conversion failed to restore the function mode")
 
+    # A function mode may become active inside the Python operator call, after
+    # any earlier predicate checked the thread. Keep conversion guarded across
+    # both operator directions, including reentrant wrappers and profiler hooks.
+    for name in ("_capture", "_export"):
+        packet = getattr(torch.ops.nelux_abi, name)
+        original = packet._op
+
+        def entered_mode(*args, **kwargs):
+            with HostileFunctionMode():
+                return original(*args, **kwargs)
+
+        packet._op = entered_mode
+        try:
+            result = probe.identity(value)
+        finally:
+            packet._op = original
+        assert result.data_ptr() == value.data_ptr()
+        # The wrapper's mode was removed and conversion restored its guard.
+        assert value.clone().data_ptr() != value.data_ptr()
+
+    for name in ("_capture", "_export"):
+        packet = getattr(torch.ops.nelux_abi, name)
+        mode = HostileFunctionMode()
+        entered = False
+        previous_profile = sys.getprofile()
+
+        def enter_mode_from_profile(frame, event, arg):
+            nonlocal entered
+            if (not entered and event == "call" and frame.f_code.co_name == "__call__"
+                    and frame.f_locals.get("self") is packet):
+                sys.setprofile(None)
+                mode.__enter__()
+                entered = True
+
+        sys.setprofile(enter_mode_from_profile)
+        try:
+            result = probe.identity(value)
+            assert entered, "The profiler did not reach the operator call"
+            # Conversion must restore the newly installed mode on return.
+            try:
+                value.clone()
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("Conversion lost the profiler's function mode")
+        finally:
+            sys.setprofile(None)
+            if entered:
+                mode.__exit__(None, None, None)
+            sys.setprofile(previous_profile)
+        assert result.data_ptr() == value.data_ptr()
+        assert value.clone().data_ptr() != value.data_ptr()
+
     requires_grad = value.clone().requires_grad_()
     assert probe.identity(requires_grad).requires_grad
     with torch.inference_mode():

@@ -707,21 +707,24 @@ torch::stable::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestam
     std::shared_ptr<nelux::Decoder> dec = decoder;
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
-    torch::stable::Tensor outTensor;
     double ts = 0.0;
     try
     {
         if (decodeAccelerator == nelux::DecodeAccelerator::CPU)
         {
-            outTensor = prefetch
+            auto outTensor = prefetch
                             ? dec->decodeNextFrameTensor(&ts)
                             : dec->decodeNextFrameTensorSync(&ts);
+            if (frame_timestamp)
+                *frame_timestamp = ts;
+            return outTensor;
         }
         else
         {
             const bool ok = dec->decodeNextFrame(tensor.data_ptr(), &ts);
-            if (ok)
-                outTensor = tensor;
+            if (frame_timestamp)
+                *frame_timestamp = ts;
+            return ok ? tensor : torch::stable::Tensor();
         }
     }
     catch (const std::exception& ex)
@@ -731,9 +734,6 @@ torch::stable::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestam
                     ex.what());
         throw;
     }
-    if (frame_timestamp)
-        *frame_timestamp = ts;
-    return outTensor;
 }
 
 torch::stable::Tensor VideoReader::decodeRangeFrameNogilLocked()
@@ -836,15 +836,15 @@ torch::stable::Tensor VideoReader::decodeFrame()
     // it.
     double frame_timestamp = 0.0;
     bool success = false;
-    torch::stable::Tensor outTensor;  // populated by zero-copy CPU path
-
+    auto outTensor = [&]
     {
         py::gil_scoped_release release;
         std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
 
-        outTensor = decodeFrameNogilLocked(&frame_timestamp);
-        success = outTensor.defined();
-    }
+        auto decoded = decodeFrameNogilLocked(&frame_timestamp);
+        success = decoded.defined();
+        return decoded;
+    }();
     // Scope ends here deliberately: the reader-level counters below are updated
     // with the GIL HELD and the lock released, which is where iter(), next() and
     // reset() also read and write them. Updating them inside the GIL-free region
@@ -865,7 +865,7 @@ torch::stable::Tensor VideoReader::decodeFrame()
                 current_timestamp);
     // CPU path returns a per-frame tensor (zero-copy from decoder pool).
     // GPU path still returns the shared `tensor` member.
-    return outTensor.defined() ? outTensor : tensor;
+    return outTensor;
 }
 
 py::object VideoReader::readFrame()
@@ -982,14 +982,13 @@ py::object VideoReader::tensorToOutput(const torch::stable::Tensor& t) const
         // be the shared member on the host and a view would alias it.
         // Split: D2H + contiguous under release (torch-only, no Python),
         // capsule/array under GIL. Only the capsule/array needs the GIL.
-        torch::stable::Tensor cpu_tensor;
+        auto cpu_tensor = [&]() -> torch::stable::Tensor
         {
             py::gil_scoped_release release;
-            if (t.device().is_cpu() && t.is_contiguous())
-                cpu_tensor = t;
-            else
-                cpu_tensor = nelux::tensor::contiguous(nelux::tensor::to(t, nelux::tensor::Device(nelux::tensor::kCPU)));
-        }
+            if (t.is_cpu() && t.is_contiguous())
+                return t;
+            return nelux::tensor::contiguous(nelux::tensor::to(t, nelux::tensor::Device(nelux::tensor::kCPU)));
+        }();
         if (tensor.defined() && cpu_tensor.data_ptr() == tensor.data_ptr())
             cpu_tensor = nelux::tensor::clone(cpu_tensor);
 
@@ -1761,17 +1760,16 @@ py::object VideoReader::next()
             continue;
         }
         // If we have a buffered frame from the discard loop, consume it first.
-        torch::stable::Tensor frame;
-        if (hasBufferedFrame)
+        const bool useBuffered = hasBufferedFrame;
+        auto frame = useBuffered ? bufferedFrame : decodeRangeFrame();
+        if (useBuffered)
         {
-            frame = bufferedFrame;
             hasBufferedFrame = false;
             // current_timestamp is already set by decodeFrame() earlier.
         }
         else
         {
             // Otherwise decode the next frame
-            frame = decodeRangeFrame();
             if (!frame.defined() || frame.numel() == 0)
             {
                 NELUX_INFO("No more frames available (decode returned empty).");

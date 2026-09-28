@@ -46,20 +46,7 @@ struct PythonBoundary {
     pybind11::object disable_dispatch;
     pybind11::object enter_dispatch;
     pybind11::object exit_dispatch;
-    PythonBoundary() {
-        auto torch = pybind11::module_::import("torch");
-        tensor_type = torch.attr("Tensor");
-        auto operators = torch.attr("ops").attr("nelux_abi");
-        capture_op = operators.attr("_capture");
-        export_op = operators.attr("_export");
-        auto core = torch.attr("_C");
-        disable_function = core.attr("DisableTorchFunction");
-        enter_function = disable_function.attr("__enter__");
-        exit_function = disable_function.attr("__exit__");
-        disable_dispatch = core.attr("_DisableTorchDispatch");
-        enter_dispatch = disable_dispatch.attr("__enter__");
-        exit_dispatch = disable_dispatch.attr("__exit__");
-    }
+    PythonBoundary();
 };
 PythonBoundary& pythonBoundary() {
     // Interpreter-owned Python references survive sys.modules eviction and
@@ -113,6 +100,34 @@ public:
         }
     }
 };
+
+PythonBoundary::PythonBoundary() {
+    auto torch = pybind11::module_::import("torch");
+    auto operators = torch.attr("ops").attr("nelux_abi");
+    capture_op = operators.attr("_capture");
+    export_op = operators.attr("_export");
+    auto core = torch.attr("_C");
+    disable_function = core.attr("DisableTorchFunction");
+    enter_function = disable_function.attr("__enter__");
+    exit_function = disable_function.attr("__exit__");
+    disable_dispatch = core.attr("_DisableTorchDispatch");
+    enter_dispatch = disable_dispatch.attr("__enter__");
+    exit_dispatch = disable_dispatch.attr("__exit__");
+
+    // torch.Tensor is a mutable module attribute. Derive the canonical Python
+    // type from an actual stable export, so rebinding that attribute cannot
+    // reject genuine tensors or admit unrelated objects to the unpacker.
+    // This one-time exchange uses the same guards and native wrapping as later
+    // conversions, without private Tensor layouts or Python class symbols.
+    Exchange exchange(Direction::Export);
+    DisablePythonTensorOverrides overrides(*this);
+    exchange.tensor.emplace(nelux::tensor::empty({0}, nelux::tensor::kUInt8));
+    auto exemplar = export_op();
+    if (!exchange.used)
+        throw std::runtime_error("PyTorch did not initialize Nelux's tensor conversion");
+    tensor_type = pybind11::reinterpret_borrow<pybind11::object>(
+        reinterpret_cast<PyObject*>(Py_TYPE(exemplar.ptr())));
+}
 } // namespace
 
 void initializeTensorInterop() { requireGil(); (void)pythonBoundary(); }

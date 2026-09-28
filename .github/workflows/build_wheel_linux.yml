@@ -204,7 +204,8 @@ jobs:
         run: |
           cmake -S tests/stable_abi -B out/stable-boundary -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
           cmake --build out/stable-boundary --config Release
-          python -c "import pathlib,shutil; p=pathlib.Path('out/stable-boundary'); modules=list(p.rglob('abi_probe*.pyd'))+list(p.rglob('abi_probe*.so')); assert len(modules)==1, modules; shutil.copy2(modules[0], 'dist')"
+          python tests/stable_abi/check_ownership_faults.py out/stable-boundary
+          python -c "import pathlib,shutil; p=pathlib.Path('out/stable-boundary'); modules=list(p.rglob('abi_probe*.pyd'))+list(p.rglob('abi_probe*.so')); assert len(modules)==1, modules; shutil.copy2(modules[0], 'dist'); faults=list(p.rglob('ownership_fault_probe'))+list(p.rglob('ownership_fault_probe.exe')); assert len(faults)==1, faults; shutil.copy2(faults[0], 'dist')"
 
       - name: Audit the exact repaired wheel against floor C shims
         shell: bash
@@ -220,6 +221,7 @@ jobs:
             dist/*.whl
             dist/*.stable-abi.json
             dist/abi_probe*
+            dist/ownership_fault_probe*
 
   stable-runtime:
     needs: build-linux

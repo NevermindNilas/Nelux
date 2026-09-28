@@ -48,6 +48,17 @@ def test_async_nvenc_retains_delayed_nondefault_stream_inputs(tmp_path):
     device = torch.cuda.current_device()
     producer = torch.cuda.Stream(device=device)
     assert producer.cuda_stream != torch.cuda.default_stream(device).cuda_stream
+    # Lazy host-side CUDA kernel/event initialization can outlast the queued
+    # delay. Warm it first so the pending-work assertion tests the producer.
+    produced = torch.cuda.Event()
+    with torch.cuda.stream(producer):
+        warm = torch.empty((HEIGHT, WIDTH, 3), dtype=torch.float32, device=device)
+        torch.cuda._sleep(1)
+        warm.fill_(0.0)
+        produced.record(producer)
+        produced.query()
+    producer.synchronize()
+    del warm
     encoder = VideoEncoder(str(output), codec="h264_nvenc", width=WIDTH,
                            height=HEIGHT, fps=30.0, pixel_format="nv12", cq=1,
                            options={"bf": "0"})
@@ -61,7 +72,6 @@ def test_async_nvenc_retains_delayed_nondefault_stream_inputs(tmp_path):
                 torch.cuda._sleep(100_000_000 if index == 0 else 2_000_000)
                 frame.fill_(value / 255.0)
                 if index == 0:
-                    produced = torch.cuda.Event()
                     produced.record(producer)
                     assert not produced.query(), "producer delay did not leave queued work"
                 encoder.encode_frame(frame)

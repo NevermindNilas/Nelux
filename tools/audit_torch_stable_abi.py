@@ -124,6 +124,18 @@ def audit(wheel: Path, output: Path, probe_directory: Path | None = None) -> dic
             report["probe"] = {"file": probe.name, "sha256": sha256(probe),
                                "imports": records, "dependencies": dependencies}
             report["errors"].extend(f"boundary probe: {error}" for error in errors)
+        ownership_probes = [path for name in ("ownership_fault_probe", "ownership_fault_probe.exe")
+                            if (path := probe_directory / name).is_file()]
+        if len(ownership_probes) > 1:
+            report["errors"].append("Expected at most one independently built ownership fault probe")
+        elif ownership_probes:
+            probe = ownership_probes[0]
+            records, dependencies = imports(probe)
+            errors = violations(records, dependencies, allowed)
+            report["ownership_probe"] = {"file": probe.name, "sha256": sha256(probe),
+                                         "imports": records, "dependencies": dependencies,
+                                         "passed": not errors, "errors": errors}
+            report["errors"].extend(f"ownership fault probe: {error}" for error in errors)
     report["passed"] = not report["errors"]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

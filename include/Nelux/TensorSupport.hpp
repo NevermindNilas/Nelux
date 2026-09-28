@@ -4,6 +4,7 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <limits>
@@ -89,22 +90,48 @@ Tensor div(const Tensor& t, S value) { return div_floating(t, static_cast<double
 // pool lease is released once whether validation fails or storage dies later.
 template<class F>
 Tensor from_blob(void* data, Shape shape, F deleter, Dtype dtype, Device device = Device(kCPU)) {
-    struct State { F deleter; std::atomic<bool> released{false}; explicit State(F f) : deleter(std::move(f)) {} };
-    struct Context { std::shared_ptr<State> state; };
-    std::shared_ptr<State> state;
+    struct Context {
+        F deleter;
+        std::atomic<bool> released{false};
+        // Construction and the pending storage callback each own one reference.
+        std::atomic<unsigned> references{2};
+        explicit Context(const F& f) : deleter(f) {}
+        void releaseReference() {
+            if (references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
+        }
+    };
+    struct ReleaseReference {
+        Context* context;
+        ~ReleaseReference() { context->releaseReference(); }
+    };
+    Context* context = nullptr;
     bool committed = false;
     struct ReleaseOnFailure {
         F& deleter;
         void* data;
-        std::shared_ptr<State>& state;
+        Context*& context;
         bool& committed;
         ~ReleaseOnFailure() {
-            if (!committed && (!state || !state->released.load())) deleter(data);
+            if (!context) {
+                deleter(data);
+                return;
+            }
+            ReleaseReference construction{context};
+            if ((!committed || !data) && !context->released.exchange(true, std::memory_order_acq_rel)) {
+                ReleaseReference native{context};
+                deleter(data);
+            }
         }
-    } release{deleter, data, state, committed};
+    } release{deleter, data, context, committed};
     // Keep the original callable valid through every preliminary allocation.
-    state = std::make_shared<State>(deleter);
-    std::vector<int64_t> strides(shape.size());
+    context = new Context(deleter);
+    std::array<int64_t, 8> inline_strides;
+    std::vector<int64_t> large_strides;
+    int64_t* strides = inline_strides.data();
+    if (shape.size() > inline_strides.size()) {
+        large_strides.resize(shape.size());
+        strides = large_strides.data();
+    }
     int64_t stride = 1;
     for (size_t i = shape.size(); i > 0; --i) {
         if (shape[i - 1] < 0 || (shape[i - 1] > 0 && stride > std::numeric_limits<int64_t>::max() / shape[i - 1])) {
@@ -113,28 +140,35 @@ Tensor from_blob(void* data, Shape shape, F deleter, Dtype dtype, Device device 
         strides[i - 1] = stride;
         stride *= std::max<int64_t>(shape[i - 1], 1);
     }
-    auto context_owner = std::make_unique<Context>(Context{state});
     const auto shim_dtype = torch::stable::detail::to<int32_t>(torch::stable::detail::from(dtype));
     const auto shim_device = torch::stable::detail::to<int32_t>(torch::stable::detail::from(device.type()));
     const auto shim_layout = torch::stable::detail::to<int32_t>(
         torch::stable::detail::from(torch::headeronly::Layout::Strided));
-    auto* context = context_owner.release();
     AtenTensorHandle handle = nullptr;
-    const auto error = torch_from_blob(data, shape.size(), shape.data(), strides.data(), 0,
+    const auto error = torch_from_blob(data, shape.size(), shape.data(), strides, 0,
         shim_dtype, shim_device,
         device.index(), &handle,
         shim_layout,
         nullptr, 0,
         [](void* pointer, void* opaque) {
-            std::unique_ptr<Context> owner(static_cast<Context*>(opaque));
-            owner->state->released.store(true);
-            owner->state->deleter(pointer);
+            auto* owner = static_cast<Context*>(opaque);
+            if (!owner->released.exchange(true, std::memory_order_acq_rel)) {
+                ReleaseReference native{owner};
+                owner->deleter(pointer);
+            }
         }, context);
-    if (error != AOTI_TORCH_SUCCESS && !state->released.load()) {
-        delete context;
-    }
     TORCH_ERROR_CODE_CHECK(error);
+    // shared_ptr construction inside Tensor(handle) deletes the native handle
+    // if its control-block allocation fails, invoking the callback itself.
     committed = true;
-    return Tensor(handle);
+    Tensor result(handle);
+    // For null data the floor shim creates empty_strided storage and does not
+    // install the callback. Own its native handle before invoking the original
+    // lease, so a throwing deleter cannot leak that newly allocated storage.
+    if (!data && !context->released.exchange(true, std::memory_order_acq_rel)) {
+        ReleaseReference native{context};
+        deleter(data);
+    }
+    return result;
 }
 } // namespace nelux::tensor

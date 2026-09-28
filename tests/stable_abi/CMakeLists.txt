@@ -20,3 +20,13 @@ target_include_directories(abi_probe BEFORE PRIVATE ${pybind11_INCLUDE_DIRS})
 target_include_directories(abi_probe SYSTEM PRIVATE "${PROBE_TORCH_ROOT}/include")
 target_compile_definitions(abi_probe PRIVATE TORCH_TARGET_VERSION=0x020c000000000000)
 target_link_libraries(abi_probe PRIVATE "${PROBE_TORCH_CPU}")
+
+# Fault injection is confined to a standalone executable and never enters the
+# production module. Successful paths still use real stable Tensor/storage.
+add_executable(ownership_fault_probe ownership_fault_probe.cpp)
+find_package(Threads REQUIRED)
+target_include_directories(ownership_fault_probe PRIVATE "${PROBE_REPO_ROOT}/include/Nelux")
+target_include_directories(ownership_fault_probe SYSTEM PRIVATE "${PROBE_TORCH_ROOT}/include")
+target_compile_definitions(ownership_fault_probe PRIVATE TORCH_TARGET_VERSION=0x020c000000000000)
+target_link_libraries(ownership_fault_probe PRIVATE "${PROBE_TORCH_CPU}" Threads::Threads)
+set_target_properties(ownership_fault_probe PROPERTIES BUILD_RPATH "${PROBE_TORCH_ROOT}/lib")
