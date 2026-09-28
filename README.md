@@ -85,6 +85,11 @@ for frame in reader:
 
 ### Batch Frame Reading
 
+Frame indices follow decoded presentation order, including VFR. Batches support
+resize and CPU gray/RGBA output. [Presentation-aware video APIs](docs/indexed-video.md)
+cover exact/approximate startup tradeoffs, timing, clip samplers, CHW views,
+input adapters, stream selection, and owned CUDA frames.
+
 ```python
 import torch
 from nelux import VideoReader

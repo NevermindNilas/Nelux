@@ -263,14 +263,11 @@ class TestAbsentOrdinalsDoNotPoisonTheBatch:
         class stops testing what it says it does.
         """
         path = gappy_clips["vfr"]
-        # Consecutive ordinals must collide, because they resolve to the same
-        # surviving frame. Dense ordinals would make every one distinct.
+        # Exact ordinals count surviving frames, even when PTS has gaps.
         with VideoReader(path) as r:
             batch = r.decode_batch([100, 101])
-        assert _hash(batch[0]) == _hash(batch[1]), (
-            "consecutive ordinals resolve to different frames; the vfr fixture "
-            "no longer has absent ordinals"
-        )
+        expected = _sequential_hashes(path)
+        assert [_hash(frame) for frame in batch] == [expected[100], expected[101]]
 
     @pytest.mark.parametrize("index", [43, 200, 600, 900])
     def test_absent_ordinal_first_does_not_change_a_later_index(

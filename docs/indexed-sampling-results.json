@@ -1,0 +1,128 @@
+{
+  "method": "Same CFR 600-frame 1080p clip, four decode threads, zero CPU convert workers, one cold batch plus 12 warm calls; CUDA synchronized at timer boundaries. Exact index construction measured separately. Approximate mode uses the prior native batch planner.",
+  "indices": [
+    480,
+    481,
+    495,
+    495
+  ],
+  "python": "3.14.6 (tags/v3.14.6:c63aec6, Jun 10 2026, 10:26:10) [MSC v.1944 64 bit (AMD64)]",
+  "torch": "2.13.0+cu132",
+  "nelux": "0.20.0",
+  "ffmpeg": "8.1.2-tas",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "binary_sha256": "5a223df1d6d987af514797b09483ab44960fc9fea7066ec4d4d4216d1c526820",
+  "clip_sha256": "1849aac848825a6a92eaed7f8358c0d1eb1cc248adf01f77d11426e37739e532",
+  "rows": [
+    {
+      "accelerator": "cpu",
+      "mode": "approximate",
+      "frames": 600,
+      "constructor_ms": 9.042499994393438,
+      "index_or_count_ms": 0.008500006515532732,
+      "first_batch_ms": 185.6209000106901,
+      "warm_median_ms": 184.1374499927042,
+      "warm_trials_ms": [
+        185.81299998913892,
+        182.7560999954585,
+        184.02519999654032,
+        183.46770000061952,
+        183.5785000002943,
+        184.25530000240542,
+        185.5566999875009,
+        184.2496999888681,
+        184.53080000472255,
+        183.59629999031313,
+        185.19279998145066,
+        183.06410001241602
+      ],
+      "pixel_sha256": "841110100bc7a62c03bcea9f7e99355961652d27108256a532774d9a58978155"
+    },
+    {
+      "accelerator": "cpu",
+      "mode": "exact",
+      "frames": 600,
+      "constructor_ms": 5.243200022960082,
+      "index_or_count_ms": 440.4303000192158,
+      "first_batch_ms": 186.32189999334514,
+      "warm_median_ms": 183.7239999877056,
+      "warm_trials_ms": [
+        183.58399998396635,
+        184.174099995289,
+        183.71209999895655,
+        184.9903000111226,
+        182.56720001227222,
+        183.73589997645468,
+        184.2319999996107,
+        182.9145000083372,
+        183.29750001430511,
+        183.90670002554543,
+        184.00999999721535,
+        183.64659999497235
+      ],
+      "pixel_sha256": "841110100bc7a62c03bcea9f7e99355961652d27108256a532774d9a58978155",
+      "sampling_stats": {
+        "indexed_frames": 600,
+        "decoded_frames": 3198,
+        "converted_frames": 39,
+        "decoder_opens": 1,
+        "seeks": 13
+      }
+    },
+    {
+      "accelerator": "nvdec",
+      "mode": "approximate",
+      "frames": 600,
+      "constructor_ms": 81.33879999513738,
+      "index_or_count_ms": 0.005099980626255274,
+      "first_batch_ms": 755.8648000122048,
+      "warm_median_ms": 731.4409999962663,
+      "warm_trials_ms": [
+        725.2313999924809,
+        726.9950000045355,
+        725.8470999950077,
+        732.2763999982271,
+        732.3624000127893,
+        731.0409000201616,
+        730.1946000079624,
+        731.8191999802366,
+        731.0628000122961,
+        731.8384999816772,
+        732.285200007027,
+        731.8737999885343
+      ],
+      "pixel_sha256": "b415cb839976eb448dc47a6cc23e76387fc72bf41c13e8aebb0629c211dd47ce"
+    },
+    {
+      "accelerator": "nvdec",
+      "mode": "exact",
+      "frames": 600,
+      "constructor_ms": 8.548499987227842,
+      "index_or_count_ms": 445.5057999875862,
+      "first_batch_ms": 367.74200000218116,
+      "warm_median_ms": 370.66349998349324,
+      "warm_trials_ms": [
+        375.5732999998145,
+        370.2977000211831,
+        370.26980001246557,
+        370.98340000375174,
+        369.9059000064153,
+        370.68880000151694,
+        370.81429999670945,
+        370.842200005427,
+        370.679099985864,
+        369.5263999979943,
+        370.64789998112246,
+        369.25950000295416
+      ],
+      "pixel_sha256": "b415cb839976eb448dc47a6cc23e76387fc72bf41c13e8aebb0629c211dd47ce",
+      "sampling_stats": {
+        "indexed_frames": 600,
+        "decoded_frames": 3198,
+        "converted_frames": 39,
+        "decoder_opens": 1,
+        "seeks": 13
+      }
+    }
+  ]
+}

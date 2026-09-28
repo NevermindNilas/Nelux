@@ -159,7 +159,8 @@ def test_get_batch_rows_are_independent(tmp_path):
 # Contract 2: full 3-thread decode -> upscale -> encode FIFO keeps integrity.
 # --------------------------------------------------------------------------- #
 @cuda_nvenc
-def test_fifo_decode_upscale_encode_integrity(tmp_path):
+@pytest.mark.parametrize("async_frames", [False, True])
+def test_fifo_decode_upscale_encode_integrity(tmp_path, async_frames):
     src = tmp_path / "src.mp4"
     out = OUT_DIR / "fifo_out.mp4"
     _make_source(src)
@@ -170,7 +171,7 @@ def test_fifo_decode_upscale_encode_integrity(tmp_path):
 
     def decode_thread():
         try:
-            vr = VideoReader(str(src), decode_accelerator="nvdec")
+            vr = VideoReader(str(src), decode_accelerator="nvdec", async_frames=async_frames)
             for frame in vr:
                 # MUST clone: the reader overwrites this buffer on the next
                 # iteration while the downstream stages still hold it.

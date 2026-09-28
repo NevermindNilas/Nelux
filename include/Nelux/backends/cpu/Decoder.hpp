@@ -10,9 +10,10 @@ class Decoder : public nelux::Decoder
   public:
     Decoder(const std::string& filePath, int numThreads, bool syncMode = false,
             int outChannels = 3, bool motionVectors = false, bool force8Bit = false,
-            int convertWorkers = -1)
+            int convertWorkers = -1, int streamIndex = -1)
         : nelux::Decoder( numThreads)
     {
+        requestedVideoStreamIndex_ = streamIndex;
         // Set the output channel count BEFORE initialize() so the converter and
         // convertedFrameBytes are sized correctly and the producer thread (which
         // initialize() may start) never observes a mid-flight change. Rejecting
@@ -34,9 +35,10 @@ class Decoder : public nelux::Decoder
     Decoder(const std::string& filePath, int numThreads, int resizeWidth,
             int resizeHeight, bool syncMode = false, int outChannels = 3,
             int resizeFilter = SWS_BILINEAR, bool motionVectors = false,
-            bool force8Bit = false, int convertWorkers = -1)
+            bool force8Bit = false, int convertWorkers = -1, int streamIndex = -1)
         : nelux::Decoder(numThreads, resizeWidth, resizeHeight)
     {
+        requestedVideoStreamIndex_ = streamIndex;
         requireOutputChannels(outChannels);
         outChannels_ = outChannels;
         // Set the scaling kernel BEFORE initialize() so the converter and the

@@ -106,7 +106,7 @@ VideoReader(
 | `resize` | `tuple[int, int] \| None` | `None` | Decoder-side resize to `(width, height)`. See [Decoder-Side Resize](#decoder-side-resize) |
 | `prefetch` | `bool` | `False` | Decode on a background thread. Off by default: the queue handoff costs ~2.5× more than the parallelism saves at typical decode speeds |
 | `convert_workers` | `int \| None` | `None` | YUV→RGB libswscale pool size. `None` = `min(hw_concurrency, 16)`; `0` disables the pool (single-threaded convert, lowest CPU); a positive int pins the count |
-| `color_format` | `str` | `"rgb"` | Output color: `"rgb"` → `[H, W, 3]`; `"gray"` (aliases `"grayscale"`, `"l"`) → `[H, W, 1]` luma; `"rgba"` → `[H, W, 4]` with the source alpha plane. `"gray"` and `"rgba"` are CPU-decode only and not supported by `decode_batch()` |
+| `color_format` | `str` | `"rgb"` | Output color: `"rgb"` → `[H, W, 3]`; `"gray"` (aliases `"grayscale"`, `"l"`) → `[H, W, 1]` luma; `"rgba"` → `[H, W, 4]` with the source alpha plane. `"gray"` and `"rgba"` are CPU-decode only including `decode_batch()` |
 | `resize_filter` | `str` | `"bilinear"` | libswscale kernel for the decoder-side resize; only used when `resize` is set. CPU-decode only |
 | `motion_vectors` | `bool` | `False` | Enable per-frame motion-vector export. See [Motion Vectors](#motion-vectors) |
 
@@ -151,7 +151,7 @@ reader.width, reader.height          # 1920, 1080
 affects spatial rescaling only, never color conversion. It is CPU-decode only —
 the NVDEC path uses cuvid's hardware scaler and rejects a non-default value.
 
-`decode_batch()` is not supported while `resize` is active.
+`decode_batch()` uses the same resize settings.
 
 #### Alpha and Grayscale Output
 
@@ -169,7 +169,7 @@ reader.channels                      # 1
 ProRes alpha is straight, not premultiplied, and a source without an alpha
 plane yields a fully opaque one — matching `ffmpeg -pix_fmt rgba`. Sources with
 alpha include ProRes 4444 / 4444 XQ, VP9 and PNG. Both `"gray"` and `"rgba"`
-require `decode_accelerator="cpu"` and are rejected by `decode_batch()`.
+require `decode_accelerator="cpu"` and work with `decode_batch()`.
 
 ---
 
@@ -406,15 +406,15 @@ reader = VideoReader("video.mp4")
 len(reader)              # Exact whole-file frame count (same as get_frame_count())
 reader.total_frames      # Fast count: nb_frames, else an fps × duration estimate
 reader.get_frame_count() # Exact count, cached. Reads nb_frames when present;
-                         #   otherwise pays one demux-only pass over the file
+                         #   exact mode lazily scans decoded frames without RGB conversion
 reader.shape             # (frame_count, height, width, channels)
 ```
 
 > `total_frames` and `get_frame_count()` are **not** interchangeable: on
 > containers that omit `nb_frames` (MKV/WebM, most VFR files) `total_frames` is
 > an estimate, while `get_frame_count()` / `len(reader)` match
-> `ffprobe -count_packets`. Check `reader.properties["nb_frames"] > 0` to see
-> which case you are in without triggering the pass.
+> decoded presentation frame order. Exact mode lazily scans decoded frames
+> without RGB conversion; `seek_mode="approximate"` keeps the header/packet estimate.
 >
 > None of the three is range-aware: `len(reader)` counts the whole file whether
 > or not `set_range`/`set_ranges` is active. Size a bounded loop from the range
@@ -423,6 +423,10 @@ reader.shape             # (frame_count, height, width, channels)
 ---
 
 ### Batch Frame Reading
+
+See [Exact indexing, timing, clip sampling, and owned CUDA outputs](indexed-video.md)
+for the presentation-aware APIs and startup tradeoffs. Resize and gray/RGBA
+settings apply to populated batches as well as streaming reads.
 
 Efficiently decode multiple frames at once with automatic optimization.
 
@@ -476,9 +480,8 @@ reader[0:len(reader) + 1]  # IndexError — a bound past the end raises, it does
 
 A batch always comes back as a `torch.Tensor`, including under
 `backend="numpy"`. An empty request returns a `[0, H, W, C]` tensor with the
-dtype and device a populated batch would have had, and is the one request
-accepted on readers where batch decoding is otherwise rejected (`resize=`,
-`color_format="gray"` / `"rgba"`).
+dtype and device a populated batch would have had, without building the index.
+Populated batches support resize and CPU gray/RGBA output.
 
 ---
 

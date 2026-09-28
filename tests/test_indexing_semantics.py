@@ -213,8 +213,7 @@ class TestEmptyBatchMatchesPopulated:
 
     def test_empty_is_allowed_on_a_resize_reader(self):
         vr = VideoReader(_default_video(), resize=(64, 48))
-        with pytest.raises(RuntimeError):
-            vr.get_batch([0])  # non-empty is still rejected
+        assert vr.get_batch([0]).shape == (1, 48, 64, 3)
         assert vr.get_batch([]).shape == (0, 48, 64, 3)
         assert vr[3:3].shape == (0, 48, 64, 3)
 
@@ -223,8 +222,7 @@ class TestEmptyBatchMatchesPopulated:
     )
     def test_empty_is_allowed_on_gray_and_rgba_readers(self, color_format, channels):
         vr = VideoReader(_default_video(), color_format=color_format)
-        with pytest.raises(RuntimeError):
-            vr.get_batch([0])
+        assert vr.get_batch([0]).shape == (1, vr.height, vr.width, channels)
         empty = vr.get_batch([])
         assert empty.shape == (0, vr.height, vr.width, channels)
         assert vr.channels == channels

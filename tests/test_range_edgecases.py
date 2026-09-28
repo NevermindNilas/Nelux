@@ -258,3 +258,12 @@ def test_truncated_ranges_raise_and_negative_setter_is_atomic(mode, tmp_path):
         assert len(list(reader)) == 240
         reader.set_range(17, 20)
         assert len(list(reader)) == 3
+
+
+def test_exact_random_and_batch_identity(clip, mode, baseline):
+    with reader_for(clip, mode) as reader:
+        indices = [len(baseline) - 1, len(baseline) // 2, 0, len(baseline) // 2, 5]
+        assert reader.frame_count == len(baseline)
+        assert [digest(frame) for frame in reader.get_batch(indices)] == [baseline[i] for i in indices]
+        for index in (len(baseline) - 1, 0, len(baseline) // 2):
+            assert digest(reader.frame_at(index)) == baseline[index]

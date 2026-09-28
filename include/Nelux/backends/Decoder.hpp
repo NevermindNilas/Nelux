@@ -182,6 +182,7 @@ class Decoder
 
     // Number of output channels (1 gray / 3 RGB / 4 RGBA) currently configured.
     int getOutputChannels() const { return outChannels_; }
+    int getVideoStreamIndex() const { return videoStreamIndex; }
 
     // Prefetch control API
     /**
@@ -274,6 +275,7 @@ class Decoder
     char getLastFrameType() const;
 
   protected:
+    int requestedVideoStreamIndex_ = -1;
     bool canRewindViaSeek() const;
     void initialize(const std::string& filePath);
     void setProperties();

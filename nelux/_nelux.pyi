@@ -1,5 +1,5 @@
 from types import TracebackType
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 import torch
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +40,12 @@ def set_log_level(level: LogLevel) -> None:
     """
     ...
 
+class FrameIndex:
+    @property
+    def num_frames(self) -> int: ...
+    @property
+    def duration_seconds(self) -> float: ...
+
 class VideoReader:
     """
     Read video frames from a file.
@@ -69,6 +75,7 @@ class VideoReader:
             "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
         ] = "bilinear",
         motion_vectors: bool = False,
+        stream_index: Optional[int] = None,
     ) -> None:
         """
         Open a video file for reading.
@@ -87,8 +94,7 @@ class VideoReader:
             resize (tuple[int, int] | None, optional): Decoder-side resize target as (width, height).
                 CPU path uses libswscale; NVDEC path uses the cuvid ``resize=WxH`` option for
                 GPU-side scaling. All reported properties and frame shapes reflect the resize
-                target. ``None`` (default) disables resize. ``decode_batch`` is not supported
-                while resize is active.
+                target. ``None`` (default) disables resize. Batch decoding uses the same target.
             prefetch (bool, optional): If True, decode frames in a background thread.
                 Default False: producer/consumer queue handoff costs ~2.5x more than the
                 parallelism saves at typical decode speeds.
@@ -106,7 +112,7 @@ class VideoReader:
                 with alpha). ProRes alpha is straight, not premultiplied; a source
                 without alpha yields a fully opaque plane, matching
                 ``ffmpeg -pix_fmt rgba``. Both "gray" and "rgba" are CPU-decode only
-                (decode_accelerator="cpu") and are not supported by decode_batch().
+                (decode_accelerator="cpu"), including batch decoding.
             resize_filter (str, optional): libswscale scaling kernel for the decoder-side
                 resize. Only takes effect when ``resize`` is set. Same scaler names as
                 ffmpeg's ``-sws_flags``: "fast_bilinear", "bilinear" (default), "bicubic",
@@ -422,11 +428,23 @@ class VideoReader:
         """
         Total frame count, cached after the first call.
 
-        Read from container metadata (``nb_frames``) when it is present. For
-        containers that omit it — MKV/WebM and most VFR files — the first call
-        pays one demux-only pass over the whole file.
+        Lazily decodes a presentation index without pixel conversion. Counts
+        actual decoded frames, including VFR and packets containing multiple frames.
         """
         ...
+
+    def _decode_timed_batch(self, indices: Sequence[int]) -> tuple[torch.Tensor, list[tuple[float, float]]]: ...
+    def _decode_batch_played_at(self, seconds: Sequence[float]) -> tuple[torch.Tensor, list[tuple[float, float]]]: ...
+    def _decode_clips_played_at(self, starts: Sequence[float], length: int, stride: float, policy: str) -> tuple[torch.Tensor, list[tuple[float, float]]]: ...
+    def _get_frame_indices_played_at(self, seconds: Sequence[float]) -> list[int]: ...
+    def _get_metadata_snapshot(self, exact: bool) -> dict[str, Any]: ...
+    def _get_frame_timing(self) -> list[tuple[float, float]]: ...
+    def _get_frame_index(self) -> FrameIndex: ...
+    def _set_frame_index(self, index: FrameIndex) -> None: ...
+    def _get_approximate_frame_count(self) -> int: ...
+    def _decode_batch_approximate(self, indices: Sequence[int]) -> torch.Tensor: ...
+    def _enable_async_frames(self) -> None: ...
+    def _get_sampling_stats(self) -> tuple[int, int, int, int, int]: ...
 
     def decode_batch(self, indices: Sequence[int]) -> torch.Tensor:
         """
@@ -435,9 +453,8 @@ class VideoReader:
         Always a ``torch.Tensor``, including under ``backend="numpy"``. Indices
         must already be non-negative and in bounds — ``VideoReader.get_batch``
         is the checked wrapper. An empty list returns a ``[0, H, W, C]`` tensor
-        with the dtype and device a populated batch would have had, and is the
-        one request accepted on readers batch decoding otherwise rejects
-        (``resize=``, ``color_format="gray"``/``"rgba"``).
+        with the dtype and device a populated batch would have had. Resize and
+        gray/RGBA settings match streaming output.
         """
         ...
 
@@ -472,6 +489,8 @@ class VideoReader:
     def prefetch_size(self) -> int:
         """Maximum number of frames the prefetch buffer holds."""
         ...
+
+    def close(self) -> None: ...
 
     def reconfigure(self, file_path: str) -> None:
         """

@@ -239,6 +239,7 @@ Decoder::Decoder(Decoder&& other) noexcept
 {
     NELUX_DEBUG("BASE DECODER: Decoder move constructor called");
     inputTimestampOrigin_.store(other.inputTimestampOrigin_.load());
+    requestedVideoStreamIndex_ = other.requestedVideoStreamIndex_;
     resizeWidth_ = other.resizeWidth_;
     resizeHeight_ = other.resizeHeight_;
     other.videoStreamIndex = -1;
@@ -257,6 +258,7 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
         codecCtx = std::move(other.codecCtx);
         pkt = std::move(other.pkt);
         videoStreamIndex = other.videoStreamIndex;
+        requestedVideoStreamIndex_ = other.requestedVideoStreamIndex_;
         properties = std::move(other.properties);
         inputTimestampOrigin_.store(other.inputTimestampOrigin_.load());
         frame = std::move(other.frame);
@@ -775,8 +777,14 @@ void Decoder::findVideoStream()
 {
     NELUX_DEBUG("BASE DECODER: Finding best video stream");
 
-    int ret =
-        av_find_best_stream(formatCtx.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    int ret = requestedVideoStreamIndex_;
+    if (ret >= 0) {
+        if (ret >= static_cast<int>(formatCtx->nb_streams) ||
+            formatCtx->streams[ret]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            throw std::invalid_argument("stream_index must identify a video stream");
+    } else {
+        ret = av_find_best_stream(formatCtx.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    }
     if (ret < 0)
     {
         NELUX_DEBUG("No video stream found");
@@ -2183,21 +2191,15 @@ void Decoder::setOutputChannels(int channels)
 void Decoder::setPrefetchSize(size_t size)
 {
     NELUX_DEBUG("Setting prefetch buffer size to {}", size);
-
-    // If we're changing the size while prefetching, we need to restart
-    bool wasRunning = decodingThread.joinable() && !stopDecoding;
-    if (wasRunning)
-    {
+    // Resizing must retain already decoded frames. Restarting and clearing the
+    // queue loses them, particularly when a short clip has already reached EOF.
+    if (size == 0)
         stopDecodingThread();
-        clearQueue();
-    }
-
-    maxQueueSize = size > 0 ? size : 1; // Minimum of 1 for queue-based operation
-
-    if (wasRunning && size > 0)
     {
-        startDecodingThread();
+        std::lock_guard<std::mutex> lock(queueMutex);
+        maxQueueSize = size > 0 ? size : 1;
     }
+    producerCond.notify_all();
 }
 
 size_t Decoder::getPrefetchBufferedCount() const
@@ -2807,8 +2809,7 @@ int64_t Decoder::countVideoPacketsExact()
         return -1;
     }
 
-    int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
-                                   nullptr, 0);
+    int vIdx = videoStreamIndex;
     if (vIdx < 0)
     {
         return -1;

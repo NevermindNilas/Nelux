@@ -89,7 +89,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
                          int cuda_device_index, int resizeWidth, int resizeHeight,
                          bool prefetch, int convertWorkers,
                          const std::string& color_format,
-                         const std::string& resize_filter, bool motion_vectors)
+                         const std::string& resize_filter, bool motion_vectors, int stream_index)
         : decoder(nullptr), rand_decoder(nullptr), currentIndex(0), current_timestamp(0.0),
             nvdecTimestampOffset_(0.0), nvdecTimestampOffsetInitialized_(false),
       start_frame(0), end_frame(-1), start_time(-1.0), end_time(-1.0),
@@ -101,6 +101,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
       resizeHeight_((resizeWidth > 0 && resizeHeight > 0) ? resizeHeight : 0),
       prefetch(prefetch)
 {
+    streamIndex_ = stream_index;
     motionVectorsEnabled_ = motion_vectors;
     NELUX_INFO(
         "VideoReader constructor called with filePath: {}, decode_accelerator: {}, resize={}x{}",
@@ -188,7 +189,7 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         decoder = nelux::createDecoder(
             filePath, numThreads, decodeAccelerator, cuda_device_index,
             resizeWidth_, resizeHeight_, syncMode, outChannels_, resizeFilter_,
-            motionVectorsEnabled_, force_8bit, convertWorkers);
+            motionVectorsEnabled_, force_8bit, convertWorkers, streamIndex_);
         NELUX_INFO("Main decoder created successfully with accelerator: {}",
                    decode_accelerator);
 
@@ -247,6 +248,7 @@ void VideoReader::close()
         std::shared_ptr<nelux::Decoder> dec, randDec, timingDec;
         dec.swap(decoder);
         randDec.swap(rand_decoder);
+        indexed_decoder_.reset();
         timingDec.swap(rangeTimingDecoder_);
         randLastTs_.store(-1.0, std::memory_order_relaxed);
         if (dec)
@@ -641,7 +643,7 @@ torch::Tensor VideoReader::decodeRangeFrame()
                     // timestamps, missing timing, and superframe display order.
                     rangeTimingDecoder_ = nelux::createDecoder(
                         filePath, 2, nelux::DecodeAccelerator::CPU, 0, 32, 32,
-                        true, 1, SWS_BILINEAR, false, true, 1);
+                        true, 1, SWS_BILINEAR, false, true, 1, streamIndex_);
                 }
                 double stamp = 0.0;
                 auto timingFrame = rangeTimingDecoder_->decodeNextFrameTensorSync(&stamp);
@@ -682,7 +684,8 @@ int VideoReader::exactRangeFrameCount()
     VideoReader counter(path, numThreads, true, Backend::PyTorch,
                         decodeAccelerator == nelux::DecodeAccelerator::NVDEC
                             ? "nvdec" : "cpu",
-                        cudaDeviceIndex, 0, 0, false, 0);
+                        cudaDeviceIndex, 0, 0, false, 0, "rgb", "bilinear", false,
+                        streamIndex_);
     int64_t count = 0;
     for (;;)
     {
@@ -763,7 +766,7 @@ torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
                     {
                         rangeTimingDecoder_ = nelux::createDecoder(
                             filePath, 2, nelux::DecodeAccelerator::CPU, 0, 32, 32,
-                            true, 1, SWS_BILINEAR, false, true, 1);
+                            true, 1, SWS_BILINEAR, false, true, 1, streamIndex_);
                     }
                     double stamp = 0.0;
                     auto timingFrame = rangeTimingDecoder_->decodeNextFrameTensorSync(&stamp);
@@ -1248,11 +1251,9 @@ py::object VideoReader::operator[](py::object key)
 
     auto check_idx_range = [&](long long idx)
     {
-        // Header-derived totalFrames can be zero for a still image or an
-        // undercount for a container without nb_frames. Only pay for the
-        // exact demux count when the requested index needs it.
-        if (idx < 0 ||
-            (idx >= properties.totalFrames && idx >= getFrameCount()))
+        // Exact ordinals must reject an overestimated header count before the
+        // forward optimization can consume the streaming iterator.
+        if (idx < 0 || idx >= getFrameCount())
         {
             throw py::index_error("Frame index out of range: " + std::to_string(idx));
         }
@@ -1489,7 +1490,7 @@ void VideoReader::ensureRandDecoder()
             fresh = nelux::createDecoder(
                 path, numThreads, decodeAccelerator, cudaDeviceIndex,
                 resizeWidth_, resizeHeight_, /*syncMode=*/true, outChannels_,
-                resizeFilter_, motionVectorsEnabled_, force_8bit);
+                resizeFilter_, motionVectorsEnabled_, force_8bit, -1, streamIndex_);
         }
 
         {
@@ -1649,18 +1650,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 
 torch::Tensor VideoReader::decodeFrameAt(int frame_index)
 {
-    NELUX_TRACE("decodeFrameAt(index={}) using rand_decoder", frame_index);
-
-    if (frame_index < 0 ||
-        (frame_index >= properties.totalFrames && frame_index >= getFrameCount()))
-        throw std::out_of_range("Frame index out of range");
-
-    // Random access takes a zero-based presentation time (index / fps);
-    // decodeFrameAt(double) rebases it onto the raw container timeline via
-    // ptsOriginSeconds(), so both overloads share one frame of reference even
-    // when the container starts at a non-zero timestamp.
-    double t = static_cast<double>(frame_index) / std::max(1.0, properties.fps);
-    return decodeFrameAt(t);
+    return decodeBatch({frame_index})[0];
 }
 
 py::object VideoReader::frameAt(double timestamp_seconds)
@@ -1839,8 +1829,7 @@ void VideoReader::exit(const py::object& exc_type, const py::object& exc_value,
 
 int VideoReader::length() const
 {
-    NELUX_TRACE("length() called: Returning totalFrames = {}", properties.totalFrames);
-    return properties.totalFrames;
+    return static_cast<int>(getFrameCount());
 }
 
 // The bit-depth -> dtype rule on its own, with no locking and no reader state,
@@ -1932,88 +1921,153 @@ std::string VideoReader::getPixelFormat() const
     return name ? std::string(name) : "Unknown";
 }
 
+nelux::IndexedDecoder& VideoReader::indexedDecoderLocked() const
+{
+    if (!decoder) throw std::runtime_error("VideoReader is closed");
+    if (!indexed_decoder_) {
+        auto device = decodeAccelerator == nelux::DecodeAccelerator::CPU
+            ? torch::Device(torch::kCPU) : torch::Device(torch::kCUDA, cudaDeviceIndex);
+        indexed_decoder_ = std::make_unique<nelux::IndexedDecoder>(
+            nelux::IndexedDecoder::Config{filePath, numThreads, properties.width,
+                properties.height, outChannels_, force_8bit, resizeFilter_,
+                scalarTypeFromBitDepth(force_8bit ? 8 : properties.bitDepth), device,
+                decoder->getVideoStreamIndex(), asyncFrames_});
+    }
+    return *indexed_decoder_;
+}
+
 int64_t VideoReader::getFrameCount() const
 {
-    // Locked, not pinned: get_frame_count() walks formatCtx/streams, which a
-    // concurrent close()/reconfigure() can reset.
-    return underReaderLockRead(
-        [](nelux::Decoder* d) -> int64_t
-        {
-            if (!d)
-                throw std::runtime_error("VideoReader is closed");
-            return d->get_frame_count();
-        });
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().size();
+}
+
+int64_t VideoReader::getApproximateFrameCount() const
+{
+    return underReaderLockRead([](nelux::Decoder* decoder) -> int64_t {
+        if (!decoder) throw std::runtime_error("VideoReader is closed");
+        return decoder->get_frame_count();
+    });
+}
+
+py::dict VideoReader::getMetadataSnapshot(bool exact) const
+{
+    nelux::Decoder::VideoProperties snapshot;
+    int64_t count;
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+        if (!decoder) throw std::runtime_error("VideoReader is closed");
+        snapshot = properties;
+        count = exact ? indexedDecoderLocked().size() : decoder->get_frame_count();
+    }
+    py::dict result;
+    result["width"] = snapshot.width;
+    result["height"] = snapshot.height;
+    result["fps"] = snapshot.fps;
+    result["duration"] = snapshot.duration;
+    result["num_frames"] = count;
+    result["bit_depth"] = snapshot.bitDepth;
+    result["codec"] = snapshot.codec;
+    result["is_vfr"] = snapshot.isVfr;
+    return result;
+}
+
+std::vector<std::pair<double, double>> VideoReader::getFrameTiming() const
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().timing();
+}
+
+std::shared_ptr<nelux::IndexedDecoder::Index> VideoReader::getFrameIndex() const
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().getIndex();
+}
+
+void VideoReader::setFrameIndex(std::shared_ptr<nelux::IndexedDecoder::Index> index)
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    indexedDecoderLocked().setIndex(std::move(index));
+}
+
+void VideoReader::enableAsyncFrames()
+{
+    underReaderLock([&](nelux::Decoder& decoder) {
+#ifdef NELUX_ENABLE_CUDA
+        auto* cudaDecoder = dynamic_cast<nelux::backends::cuda::Decoder*>(&decoder);
+        if (!cudaDecoder) throw std::invalid_argument("async_frames requires NVDEC");
+        cudaDecoder->enableAsyncFrameRelease();
+        asyncFrames_ = true;
+        indexed_decoder_.reset();
+#else
+        throw std::invalid_argument("async_frames requires a CUDA build");
+#endif
+    });
+}
+
+std::array<int64_t, 5> VideoReader::getSamplingStats() const
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().stats();
 }
 
 torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 {
-    NELUX_DEBUG("VideoReader::decodeBatch called with {} indices", indices.size());
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().decode(indices);
+}
 
-    // Both capability gates are skipped for an empty batch. Decoding nothing
-    // is decoding nothing whatever the reader is configured for, and Python's
-    // `reader[i:i]` lands here — refusing it would make an empty slice raise
-    // on exactly the readers where an empty slice is the safest thing to ask
-    // for. The empty tensor still reports this reader's own geometry, so it
-    // concatenates with whatever read_frame() produces.
-    if (!indices.empty())
-    {
-        if (resizeWidth_ > 0 && resizeHeight_ > 0)
-        {
-            throw std::runtime_error(
-                "decode_batch is not supported when resize is configured on the "
-                "VideoReader. Create a reader without the resize argument for batch "
-                "decoding, or call frame_at() in a loop.");
-        }
+VideoReader::TimedBatch VideoReader::decodeTimedBatch(const std::vector<int64_t>& indices)
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    auto& sampling = indexedDecoderLocked();
+    auto data = sampling.decode(indices);
+    return {data, sampling.timingFor(indices)};
+}
 
-        if (outChannels_ != 3)
-        {
-            throw std::runtime_error(
-                "decode_batch is not supported with color_format='" +
-                std::string(outChannels_ == 1 ? "gray" : "rgba") +
-                "'. Use read_frame()/frame_at() for gray/rgba decoding, or create "
-                "the reader with the default color_format='rgb' for batch "
-                "decoding.");
-        }
-    }
+VideoReader::TimedBatch VideoReader::decodeBatchPlayedAt(const std::vector<double>& seconds)
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    auto& sampling = indexedDecoderLocked();
+    auto indices = sampling.indicesPlayedAt(seconds);
+    auto data = sampling.decode(indices);
+    return {data, sampling.timingFor(indices)};
+}
 
-    // Set BEFORE the call, not after: decode_batch seeks and demuxes on the
-    // SHARED format context, so the reader stops being parked at frame 0 as
-    // soon as it starts — including on the paths that throw part way through.
-    // Without this, iter() saw streamTouched_ == false, skipped the rewind, and
-    // a following `for frame in reader` started from wherever the batch left
-    // the stream while reporting index 0.
-    //
-    // Set here rather than inside the locked region below, because the reader's
-    // own counters are serialised by the GIL, not by lifecycleMu_ — iter() and
-    // next() read them holding nothing else. Writing this one with the GIL
-    // dropped would be the single site that mixes the two disciplines.
-    //
-    // An empty batch is exempt: both decode_batch overrides return before they
-    // touch the demuxer, so the stream really has not moved and a rewind would
-    // be pure waste — a full reconfigure on NVDEC.
-    if (!indices.empty())
-        streamTouched_ = true;
+std::vector<int64_t> VideoReader::getFrameIndicesPlayedAt(const std::vector<double>& seconds) const
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    return indexedDecoderLocked().indicesPlayedAt(seconds);
+}
 
-    torch::Tensor batch;
-    {
-        // EXCLUSIVE, not shared. decode_batch drives the shared AVFormatContext
-        // directly — it stops the producer, seeks and demuxes on it — so two
-        // concurrent batches, or a batch racing a streaming decode, corrupt the
-        // demuxer state (two threads also double-join the producer thread). The
-        // GIL used to serialise this for free; now that it is dropped, the lock
-        // has to. Ordering as in decodeFrame(): GIL first, so the lock is
-        // released before the GIL is taken back.
-        py::gil_scoped_release release;
-        std::unique_lock<std::shared_mutex> lk(lifecycleMu_);
+VideoReader::TimedBatch VideoReader::decodeClipsPlayedAt(const std::vector<double>& starts,
+                                                       int64_t length, double stride,
+                                                       const std::string& policy)
+{
+    py::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
+    auto& sampling = indexedDecoderLocked();
+    auto indices = sampling.clipIndicesPlayedAt(starts, length, stride, policy);
+    auto data = sampling.decode(indices);
+    return {data, sampling.timingFor(indices)};
+}
 
-        std::shared_ptr<nelux::Decoder> dec = decoder;
-        if (!dec)
-            throw std::runtime_error("VideoReader is closed");
-
-        batch = dec->decode_batch(indices);
-    }
-
-    return batch;
+torch::Tensor VideoReader::decodeBatchApproximate(const std::vector<int64_t>& indices)
+{
+    if (!indices.empty()) streamTouched_ = true;
+    return underReaderLock([&](nelux::Decoder& decoder) {
+        return decoder.decode_batch(indices);
+    });
 }
 
 // ----------------------------------
@@ -2124,38 +2178,39 @@ void VideoReader::reconfigure(const std::string& newFilePath)
         [&](nelux::Decoder& d)
         {
             oldRand.swap(rand_decoder);
+            indexed_decoder_.reset();
             rangeTimingDecoder_.reset();
             randLastTs_.store(-1.0, std::memory_order_relaxed);
 
-            d.reconfigure(newFilePath);
-
-            // Read back from the decoder we just reconfigured, not through a
-            // pointer pinned before the lock.
-            properties = d.getVideoProperties();
-            filePath = newFilePath;
-
-            // Reallocate the output tensor if the geometry, layout or dtype
-            // changed. The layout has to follow the reader's mode, not be
-            // assumed: only an ML reader emits {1, 3, H, W} float32, everyone
-            // else emits native-depth HWC, which is what decodeFrame() fills.
-            // Hardcoding BCHW float32 here handed ordinary readers a tensor of
-            // the wrong shape and dtype with RGB24/RGB48 rows written into it.
-            //
-            // The dtype is re-derived from the NEW file rather than carried
-            // over: reconfiguring from an 8-bit file to a 10-bit one has to move
-            // uint8 -> uint16. scalarTypeFromBitDepth() is used instead of
-            // findTypeFromBitDepth() because the latter takes the lifecycle
-            // lock, which this critical section already holds and which is not
-            // recursive. It also re-applies the constructor's depth validation,
-            // closing reconfigure() as a second way in for depths the
-            // constructor would have rejected.
-            //
-            // ML mode stays float32 whatever mlUseFP16_ says. The NV12 ML kernel
-            // (launchRgba32ToBchw) writes float32 unconditionally and documents
-            // that it ignores the flag, so honouring it here would hand a
-            // 4-byte-per-element kernel a 2-byte-per-element tensor.
             try
             {
+                d.reconfigure(newFilePath);
+
+                // Read back from the decoder we just reconfigured, not through a
+                // pointer pinned before the lock.
+                properties = d.getVideoProperties();
+                filePath = newFilePath;
+
+                // Reallocate the output tensor if the geometry, layout or dtype
+                // changed. The layout has to follow the reader's mode, not be
+                // assumed: only an ML reader emits {1, 3, H, W} float32, everyone
+                // else emits native-depth HWC, which is what decodeFrame() fills.
+                // Hardcoding BCHW float32 here handed ordinary readers a tensor of
+                // the wrong shape and dtype with RGB24/RGB48 rows written into it.
+                //
+                // The dtype is re-derived from the NEW file rather than carried
+                // over: reconfiguring from an 8-bit file to a 10-bit one has to move
+                // uint8 -> uint16. scalarTypeFromBitDepth() is used instead of
+                // findTypeFromBitDepth() because the latter takes the lifecycle
+                // lock, which this critical section already holds and which is not
+                // recursive. It also re-applies the constructor's depth validation,
+                // closing reconfigure() as a second way in for depths the
+                // constructor would have rejected.
+                //
+                // ML mode stays float32 whatever mlUseFP16_ says. The NV12 ML kernel
+                // (launchRgba32ToBchw) writes float32 unconditionally and documents
+                // that it ignores the flag, so honouring it here would hand a
+                // 4-byte-per-element kernel a 2-byte-per-element tensor.
                 const torch::Device torchDevice = tensor.device();
                 const torch::Dtype torchDataType =
                     mlOutputMode_ ? torch::kFloat32 // FP16 disabled

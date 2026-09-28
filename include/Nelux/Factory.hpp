@@ -40,7 +40,7 @@ createDecoder(const std::string& filename, int numThreads,
               int cudaDeviceIndex = 0, int resizeWidth = 0, int resizeHeight = 0,
               bool syncMode = false, int outChannels = 3,
               int resizeFilter = SWS_BILINEAR, bool motionVectors = false,
-              bool force8Bit = false, int convertWorkers = -1)
+              bool force8Bit = false, int convertWorkers = -1, int streamIndex = -1)
 {
     switch (accelerator)
     {
@@ -56,10 +56,10 @@ createDecoder(const std::string& filename, int numThreads,
             if (resizeWidth > 0 && resizeHeight > 0)
                 return std::make_shared<nelux::backends::cpu::Decoder>(
                     filename, numThreads, resizeWidth, resizeHeight, syncMode,
-                    outChannels, resizeFilter, motionVectors, force8Bit, convertWorkers);
+                    outChannels, resizeFilter, motionVectors, force8Bit, convertWorkers, streamIndex);
             return std::make_shared<nelux::backends::cpu::Decoder>(
                 filename, numThreads, syncMode, outChannels, motionVectors,
-                force8Bit, convertWorkers);
+                force8Bit, convertWorkers, streamIndex);
 
         case DecodeAccelerator::NVDEC:
 #ifdef NELUX_ENABLE_CUDA
@@ -69,7 +69,7 @@ createDecoder(const std::string& filename, int numThreads,
             // reached with a filter the caller expects to take effect.
             {
                 auto decoder = std::make_shared<nelux::backends::cuda::Decoder>(
-                    filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight);
+                    filename, numThreads, cudaDeviceIndex, resizeWidth, resizeHeight, streamIndex);
                 // Hardware production queues unconverted surfaces. Its pixel
                 // conversion starts on the consumer only after factory return.
                 decoder->setForce8Bit(force8Bit);

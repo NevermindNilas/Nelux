@@ -3,6 +3,7 @@
 
 #include "Decoder.hpp"
 #include "Factory.hpp"
+#include <IndexedDecoder.hpp>
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -75,12 +76,13 @@ class VideoReader
                 int convertWorkers = -1,
                 const std::string& color_format = "rgb",
                 const std::string& resize_filter = "bilinear",
-                bool motion_vectors = false);
+                bool motion_vectors = false, int stream_index = -1);
 
     /**
      * @brief Destructor for VideoReader.
      */
     ~VideoReader();
+    void close();
 
     /**
      * @brief Create a VideoEncoder configured to this reader's video properties.
@@ -149,6 +151,7 @@ class VideoReader
      * @return py::dict Dictionary containing video properties.
      */
     py::dict getProperties() const;
+    py::dict getMetadataSnapshot(bool exact) const;
 
     /**
      * @brief Read a frame from the video.
@@ -345,6 +348,20 @@ class VideoReader
      * @return int64_t Total number of frames in the video.
      */
     int64_t getFrameCount() const;
+    int64_t getApproximateFrameCount() const;
+    std::vector<std::pair<double, double>> getFrameTiming() const;
+    std::shared_ptr<nelux::IndexedDecoder::Index> getFrameIndex() const;
+    void setFrameIndex(std::shared_ptr<nelux::IndexedDecoder::Index> index);
+    void enableAsyncFrames();
+    std::array<int64_t, 5> getSamplingStats() const;
+    torch::Tensor decodeBatchApproximate(const std::vector<int64_t>& indices);
+    using TimedBatch = std::pair<torch::Tensor, std::vector<std::pair<double, double>>>;
+    TimedBatch decodeTimedBatch(const std::vector<int64_t>& indices);
+    TimedBatch decodeBatchPlayedAt(const std::vector<double>& seconds);
+    TimedBatch decodeClipsPlayedAt(const std::vector<double>& starts,
+                                   int64_t length, double stride,
+                                   const std::string& policy);
+    std::vector<int64_t> getFrameIndicesPlayedAt(const std::vector<double>& seconds) const;
 
     /**
      * @brief Decode a batch of frames at specified indices.
@@ -579,6 +596,8 @@ class VideoReader
         return (properties.fps > 0.0) ? 1.0 / properties.fps : 0.0;
     }
     std::shared_ptr<nelux::Decoder> rand_decoder;
+    mutable std::unique_ptr<nelux::IndexedDecoder> indexed_decoder_;
+    nelux::IndexedDecoder& indexedDecoderLocked() const;
 
     // Serialises everything a reader does to its FFmpeg contexts, and the
     // decoder ownership handoff along with it.
@@ -625,7 +644,6 @@ class VideoReader
     /**
      * @brief Close the video reader and release resources.
      */
-    void close();
 
     /**
      * @brief Convert a torch::Tensor to a py::object based on the backend setting.
@@ -716,6 +734,8 @@ class VideoReader
     Backend backend = Backend::PyTorch; // Output backend selection
     nelux::DecodeAccelerator decodeAccelerator = nelux::DecodeAccelerator::CPU;
     int cudaDeviceIndex = 0;
+    int streamIndex_ = -1;
+    bool asyncFrames_ = false;
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;
     // libswscale scaling kernel (SWS_* flag) selected via the resize_filter

@@ -420,7 +420,7 @@ void Decoder::orderTorchConsumer()
 }
 
 Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex,
-                 int resizeWidth, int resizeHeight)
+                 int resizeWidth, int resizeHeight, int streamIndex)
     : nelux::Decoder(numThreads, resizeWidth, resizeHeight),
       cudaDeviceIndex_(cudaDeviceIndex),
       cudaStream_(nullptr), decodeCompleteEvent_(nullptr),
@@ -430,6 +430,7 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlOutputMode_(false), mlUseFP16_(false), mlMean_{0.0f, 0.0f, 0.0f},
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
+    requestedVideoStreamIndex_ = streamIndex;
     // c10_cuda.dll is delay-loaded on Windows so the module imports on a
     // CPU-only PyTorch; fail clearly here if NVDEC is reached without it.
     nelux::requireCudaRuntime();
@@ -524,6 +525,7 @@ Decoder::Decoder(Decoder&& other) noexcept
       rawPassthroughMode_(other.rawPassthroughMode_),
       rawSwsCtx_(other.rawSwsCtx_), rawSwsFrame_(other.rawSwsFrame_)
 {
+    other.stopFrameReleaseWorker();
     other.cudaStream_ = nullptr;
     other.decodeCompleteEvent_ = nullptr;
     other.producerDoneEvent_ = nullptr;
@@ -544,6 +546,7 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept
     {
         close();
 
+        other.stopFrameReleaseWorker();
         nelux::Decoder::operator=(std::move(other));
 
         cudaDeviceIndex_ = other.cudaDeviceIndex_;
@@ -1163,6 +1166,15 @@ std::optional<Frame> Decoder::acquireDecodedFrame(double* frame_timestamp,
 
 void Decoder::releaseDecodedFrame(Frame& frame)
 {
+    if (retireWorker_.joinable()) {
+        recordDecodeComplete();
+        {
+            std::lock_guard<std::mutex> lock(retireMutex_);
+            retiredFrame_.emplace(std::move(frame));
+        }
+        retireCond_.notify_one();
+        return;
+    }
     // Record the completion event so waitForDecodeComplete() remains functional
     // for external consumers. Unref-before-notify is preserved: the AVFrame
     // reference is dropped before the producer is released, otherwise a small
@@ -1194,6 +1206,61 @@ void Decoder::releaseDecodedFrame(Frame& frame)
     av_frame_unref(frame.get());
     producerBlocked_.store(false, std::memory_order_release);
     producerCond.notify_one();
+}
+
+void Decoder::enableAsyncFrameRelease()
+{
+    if (retireWorker_.joinable()) return;
+    retireStop_ = false;
+    retireError_ = nullptr;
+    retireWorker_ = std::thread([this] {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(retireMutex_);
+            retireCond_.wait(lock, [this] { return retireStop_ || retiredFrame_.has_value(); });
+            if (retireStop_ && !retiredFrame_) return;
+            Frame frame = std::move(*retiredFrame_);
+            retiredFrame_.reset();
+            retireBusy_ = true;
+            lock.unlock();
+            std::exception_ptr failure;
+            try {
+                ensureCudaDeviceOnThread(cudaDeviceIndex_);
+                cudaError_t error = cudaEventSynchronize(decodeCompleteEvent_);
+                if (error != cudaSuccess)
+                    throw CxException(std::string("CUDA surface retirement failed: ") + cudaGetErrorString(error));
+            } catch (...) { failure = std::current_exception(); }
+            // The sole in-flight AVFrame owns the surface until conversion has
+            // completed. Retirement happens off the Python calling thread.
+            av_frame_unref(frame.get());
+            producerBlocked_.store(false, std::memory_order_release);
+            producerCond.notify_one();
+            lock.lock();
+            retireError_ = failure;
+            retireBusy_ = false;
+            lock.unlock();
+            retireCond_.notify_all();
+        }
+    });
+}
+
+void Decoder::waitForRetiredFrame()
+{
+    if (!retireWorker_.joinable()) return;
+    std::unique_lock<std::mutex> lock(retireMutex_);
+    retireCond_.wait(lock, [this] { return !retiredFrame_ && !retireBusy_; });
+    if (retireError_) std::rethrow_exception(retireError_);
+}
+
+void Decoder::stopFrameReleaseWorker()
+{
+    if (!retireWorker_.joinable()) return;
+    {
+        std::unique_lock<std::mutex> lock(retireMutex_);
+        retireCond_.wait(lock, [this] { return !retiredFrame_ && !retireBusy_; });
+        retireStop_ = true;
+    }
+    retireCond_.notify_one();
+    retireWorker_.join();
 }
 
 void Decoder::ensureRgbBuffer(size_t bytes, const char* allocFailMessage)
@@ -1242,6 +1309,14 @@ void Decoder::ensureRgbBuffer(size_t bytes, const char* allocFailMessage)
 
 bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 {
+    return decodeNextFrameSelective(buffer, {}, frame_timestamp);
+}
+
+bool Decoder::decodeNextFrameSelective(void* buffer,
+                                      const std::function<bool(int64_t)>& select,
+                                      double* frame_timestamp)
+{
+    waitForRetiredFrame();
     if (!hwInitialized_)
     {
         NELUX_WARN("CUDA DECODER: Hardware not initialized");
@@ -1254,6 +1329,27 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
         return false;
     }
     Frame& frame = *frameOpt;
+    if (select)
+    {
+        const auto* raw = frame.get();
+        int64_t pts = raw->best_effort_timestamp != AV_NOPTS_VALUE
+            ? raw->best_effort_timestamp : raw->pts;
+        bool selected = false;
+        try { selected = select(pts); }
+        catch (...) {
+            av_frame_unref(frame.get());
+            producerBlocked_.store(false, std::memory_order_release);
+            producerCond.notify_one();
+            throw;
+        }
+        if (!selected)
+        {
+            av_frame_unref(frame.get());
+            producerBlocked_.store(false, std::memory_order_release);
+            producerCond.notify_one();
+            return true;
+        }
+    }
     ensureCudaDeviceOnThread(cudaDeviceIndex_);
     // Convert and transfer the frame
     // For hardware frames, we use our GPU-side conversion
@@ -1357,6 +1453,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
 
 bool Decoder::seek(double timestamp)
 {
+    waitForRetiredFrame();
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
     // Stop decoding thread, clear queue, and seek
@@ -1399,6 +1496,7 @@ bool Decoder::seek(double timestamp)
 
 void Decoder::close()
 {
+    stopFrameReleaseWorker();
     NELUX_DEBUG("CUDA DECODER: Closing");
 
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
@@ -1572,6 +1670,7 @@ void Decoder::setMLOutputMode(bool enable, const float meanRGB[3],
 
 bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
 {
+    waitForRetiredFrame();
     if (!hwInitialized_)
     {
         NELUX_WARN("CUDA DECODER: Hardware not initialized");
@@ -1723,6 +1822,7 @@ bool Decoder::decodeNextFrameML(void* buffer, double* frame_timestamp)
 
 void Decoder::reconfigure(const std::string& filePath)
 {
+    waitForRetiredFrame();
     std::lock_guard<std::mutex> guard(cudaDecodeMutex_);
 
     NELUX_INFO("CUDA DECODER: Reconfiguring for new file: {}", filePath);

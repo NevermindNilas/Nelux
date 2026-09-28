@@ -408,12 +408,34 @@ def probe_cache_clear() -> None:
 
 # Import batch mixin
 from .batch import BatchMixin
+from .temporal import TemporalMixin, Frame, FrameBatch, VideoMetadata
+from . import samplers
+from .sources import prepare_source
+from ._nelux import FrameIndex
 
 
-class VideoReader(BatchMixin, _VideoReaderBase):
+class VideoReader(TemporalMixin, BatchMixin, _VideoReaderBase):
     """VideoReader with batch frame reading support."""
 
     def __init__(self, *args, **kwargs):
+        self.dimension_order = kwargs.pop("dimension_order", "HWC")
+        self.copy_frames = kwargs.pop("copy_frames", False)
+        self.seek_mode = kwargs.pop("seek_mode", "exact")
+        frame_index = kwargs.pop("frame_index", None)
+        async_frames = kwargs.pop("async_frames", False)
+        if self.dimension_order not in ("HWC", "CHW"):
+            raise ValueError("dimension_order must be 'HWC' or 'CHW'")
+        if self.seek_mode not in ("exact", "approximate"):
+            raise ValueError("seek_mode must be 'exact' or 'approximate'")
+        self._numpy_backend = kwargs.get("backend", args[3] if len(args) > 3 else "pytorch") == "numpy"
+        self._legacy_batch_output = (kwargs.get("resize", args[6] if len(args) > 6 else None) is None
+                                     and kwargs.get("color_format", args[9] if len(args) > 9 else "rgb") == "rgb")
+        self._source_owner = None
+        if args:
+            path, self._source_owner = prepare_source(args[0])
+            args = (path, *args[1:])
+        elif "input_path" in kwargs:
+            kwargs["input_path"], self._source_owner = prepare_source(kwargs["input_path"])
         # NVDEC needs a CUDA-capable, *active* PyTorch. The CUDA runtime is
         # delay-loaded so the module imports on CPU-only torch; guard here so
         # requesting nvdec on a CPU/GPU-less torch raises a clear error up front
@@ -432,7 +454,52 @@ class VideoReader(BatchMixin, _VideoReaderBase):
                     "(CPU-only PyTorch or no NVIDIA GPU). Use "
                     "decode_accelerator='cpu', or install a CUDA build of PyTorch."
                 )
-        super().__init__(*args, **kwargs)
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            if self._source_owner is not None:
+                self._source_owner.cleanup()
+            raise
+        if async_frames:
+            self._enable_async_frames()
+        if frame_index is not None:
+            self._set_frame_index(frame_index)
+
+    def close(self):
+        super().close()
+        if self._source_owner is not None:
+            self._source_owner.cleanup()
+            self._source_owner = None
+
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            if self._source_owner is not None:
+                self._source_owner.cleanup()
+                self._source_owner = None
+
+    def reconfigure(self, source):
+        path, owner = prepare_source(source)
+        old_owner = self._source_owner
+        try:
+            super().reconfigure(path)
+        except BaseException:
+            if owner is not None:
+                owner.cleanup()
+            raise
+        finally:
+            if old_owner is not None:
+                old_owner.cleanup()
+        self._source_owner = owner
+
+    def __del__(self):
+        # FFmpeg must close its file handle before Windows can remove the spool.
+        if getattr(self, "_source_owner", None) is not None:
+            try:
+                self.close()
+            except Exception:
+                pass
 
     def iter_segments(self):
         """Iterate the configured segments as ``(segment_index, frame)`` tuples.
@@ -513,6 +580,11 @@ __all__ = [
     "__cuda_support__",
     "__ffmpeg_version__",
     "VideoReader",
+    "Frame",
+    "FrameBatch",
+    "FrameIndex",
+    "VideoMetadata",
+    "samplers",
     "VideoEncoder",
     "set_log_level",
     "LogLevel",

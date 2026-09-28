@@ -305,8 +305,17 @@ class BatchMixin:
         raise TypeError(f"Unsupported index type: {type(key)}")
 
     def __len__(self) -> int:
-        """Return total number of frames."""
-        return self.frame_count
+        """Return exact length when the entire stream can be decoded."""
+        try:
+            return self.frame_count
+        except RuntimeError as exc:
+            if not str(exc).startswith("Decoding failed part way through"):
+                raise
+            # list(reader) asks for a length hint before consuming a bounded
+            # range. Its readable prefix remains usable even if the tail is
+            # damaged. TypeError tells Python that no length hint is available;
+            # explicit frame_count still reports the underlying decode error.
+            raise TypeError("Exact length unavailable for a damaged stream") from exc
 
     @property
     def frame_count(self) -> int:
