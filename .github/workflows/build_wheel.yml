@@ -36,7 +36,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install scikit-build-core pybind11 numpy ninja
-          python -m pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu132
+          python -m pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu132
 
       - name: Cache vcpkg
         uses: actions/cache@v4
@@ -251,7 +251,6 @@ jobs:
           Remove-Item dist/*.whl -Force
           Move-Item dist_repaired/*.whl dist/
           Remove-Item dist_repaired -Recurse -Force
-          python tools/tag_wheel_torch.py (Get-ChildItem dist/*.whl).FullName
           Write-Host "=== Wheel repair complete ==="
 
       - name: List wheel contents
@@ -271,7 +270,7 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Installing wheel ==="
-          pip install (Get-ChildItem dist/*.whl) --force-reinstall
+          pip install (Get-ChildItem dist/*.whl) --force-reinstall --no-deps
 
           # external/ffmpeg is deliberately NOT put on PATH: the wheel has to
           # stand on its own bundled DLLs, and prepending the build tree would
@@ -285,18 +284,11 @@ jobs:
           # GPU-less runner) into a terminating NativeCommandError. Relax it so
           # stderr is captured as text and our exit-code/marker logic can run.
           $ErrorActionPreference = 'Continue'
-          # The CUDA-linked extension cannot initialize on a GPU-less CI runner.
-          # The smoke test prints a "[smoke] SKIP:" marker in that case, but the
-          # process can still exit non-zero during interpreter shutdown after the
-          # failed CUDA DLL load. Treat a SKIP as success; fail on any real error.
           $output = python tests/wheel_smoke_test.py 2>&1 | Out-String
+          $code = $LASTEXITCODE
           Write-Host $output
-          if ($output -match '\[smoke\] SKIP:') {
-            Write-Host "Smoke test skipped on GPU-less runner - wheel build + DLL bundling validated."
-            exit 0  # override any lingering non-zero LASTEXITCODE from the skip
-          } elseif ($LASTEXITCODE -ne 0) {
-            Write-Error "Smoke test failed (exit $LASTEXITCODE)"
-            exit 1
+          if ($code -ne 0 -or $output -notmatch '\[smoke\] ALL CHECKS PASSED') {
+            throw "CPU wheel smoke test failed or crashed (exit $code)"
           }
 
       - name: Mandatory installed-wheel range gate
@@ -304,8 +296,41 @@ jobs:
         with:
           artifact-name: range-gate-windows-${{ matrix.python-version }}
 
+      - name: Build standalone boundary probe once with floor headers
+        shell: bash
+        run: |
+          cmake -S tests/stable_abi -B out/stable-boundary -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
+          cmake --build out/stable-boundary --config Release
+          python -c "import pathlib,shutil; p=pathlib.Path('out/stable-boundary'); modules=list(p.rglob('abi_probe*.pyd'))+list(p.rglob('abi_probe*.so')); assert len(modules)==1, modules; shutil.copy2(modules[0], 'dist')"
+
+      - name: Audit the exact repaired wheel against floor C shims
+        shell: bash
+        run: |
+          python -m pip install pefile
+          python tools/audit_torch_stable_abi.py dist/*.whl --probe-directory dist
+
       - name: Upload Windows wheel
         uses: actions/upload-artifact@v4
         with:
           name: windows-wheel-py${{ matrix.python-version }}
-          path: "dist/*.whl"
+          path: |
+            dist/*.whl
+            dist/*.stable-abi.json
+            dist/abi_probe*
+
+  stable-runtime:
+    needs: build-windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.13'
+            python_tag: '313'
+          - python: '3.14'
+            python_tag: '314'
+    uses: ./.github/workflows/stable-abi-runtime.yml
+    with:
+      artifact_name: windows-wheel-py${{ matrix.python }}
+      runner: windows-2022
+      python_version: ${{ matrix.python }}
+      profiles: '["cpu", "cu132"]'

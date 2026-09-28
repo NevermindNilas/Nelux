@@ -1,70 +1,55 @@
 #include <CudaStream.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
-
-#include <c10/cuda/CUDAStream.h> // c10::cuda::getCurrentCUDAStream, CUDAStream
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/util/shim_utils.h>
 #include <stdexcept>
-
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #endif
 
 namespace nelux {
-
-cudaStream_t currentCudaStream(int device)
-{
-    const auto idx = static_cast<c10::DeviceIndex>(device);
+namespace {
+using GetCurrentStream = AOTITorchError (*)(int32_t, void**);
+GetCurrentStream resolveCurrentStream() {
+    // Importing CUDA PyTorch loads its CUDA libraries. Resolve only the stable
+    // C shim, without c10/ATen C++ symbols or a private stream-object layout.
 #ifdef _WIN32
-    // c10_cuda.dll is delay-loaded (CMake /DELAYLOAD); the symbol resolves on
-    // first GPU op. Direct call is fine — it never runs on CPU-only torch.
-    return c10::cuda::getCurrentCUDAStream(idx).stream();
+    auto library = GetModuleHandleW(L"torch_cuda.dll");
+    auto function = library ? reinterpret_cast<GetCurrentStream>(
+        GetProcAddress(library, "aoti_torch_get_current_cuda_stream")) : nullptr;
 #else
-    // Linux has no delay-load, and CPython dlopen's extensions with RTLD_NOW, so
-    // referencing the symbol directly would make libc10_cuda.so an eager
-    // DT_NEEDED and break `import nelux` on CPU-only torch. Resolve the two
-    // symbols we need at runtime instead. libc10_cuda.so is already loaded into
-    // the process (RTLD_GLOBAL) by CUDA torch before any GPU op can run.
-    //
-    // Mangled (Itanium) symbols, stable across torch versions:
-    //   c10::cuda::getCurrentCUDAStream(c10::DeviceIndex)  [DeviceIndex=int8_t]
-    //   c10::cuda::CUDAStream::stream() const
-    using GetStreamFn = c10::cuda::CUDAStream (*)(c10::DeviceIndex);
-    using ToCudaFn = cudaStream_t (*)(const c10::cuda::CUDAStream*);
-    static GetStreamFn getCurrent = nullptr;
-    static ToCudaFn toCuda = nullptr;
-    if (getCurrent == nullptr || toCuda == nullptr)
-    {
-        void* h = ::dlopen("libc10_cuda.so", RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
-        if (h == nullptr)
-            h = ::dlopen("libc10_cuda.so", RTLD_NOW | RTLD_GLOBAL);
-        if (h != nullptr)
-        {
-            getCurrent = reinterpret_cast<GetStreamFn>(
-                ::dlsym(h, "_ZN3c104cuda20getCurrentCUDAStreamEa"));
-            toCuda = reinterpret_cast<ToCudaFn>(
-                ::dlsym(h, "_ZNK3c104cuda10CUDAStream6streamEv"));
+    auto function = reinterpret_cast<GetCurrentStream>(
+        dlsym(RTLD_DEFAULT, "aoti_torch_get_current_cuda_stream"));
+    if (!function) {
+        void* library = dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_NOLOAD);
+        if (library) {
+            function = reinterpret_cast<GetCurrentStream>(
+                dlsym(library, "aoti_torch_get_current_cuda_stream"));
+            dlclose(library);
         }
     }
-    if (getCurrent == nullptr || toCuda == nullptr)
-        throw std::runtime_error(
-            "GPU operation requires a CUDA build of PyTorch, but libc10_cuda.so "
-            "(or its getCurrentCUDAStream symbol) could not be resolved — your "
-            "PyTorch is CPU-only. Install a CUDA build of PyTorch for NVDEC/NVENC, "
-            "or use CPU decoding and software encoders.");
-    c10::cuda::CUDAStream s = getCurrent(idx);
-    return toCuda(&s);
 #endif
+    if (!function)
+        throw std::runtime_error(
+            "NVDEC/NVENC requires a CUDA build of PyTorch with the stable CUDA stream shim. "
+            "Install CUDA PyTorch, or use CPU decoding and software encoders.");
+    return function;
 }
-
-void torchStreamWaitEvent(cudaEvent_t ev, int device)
-{
-    if (!ev)
-        return;
-    cudaStream_t torchStream = currentCudaStream(device);
-    // No CPU sync: GPU-side ordering only.
-    cudaStreamWaitEvent(torchStream, ev, 0);
+} // namespace
+cudaStream_t currentCudaStream(int device) {
+    static const auto getStream = resolveCurrentStream();
+    void* stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(getStream(device, &stream));
+    return static_cast<cudaStream_t>(stream);
 }
-
+void torchStreamWaitEvent(cudaEvent_t event, int device) {
+    if (!event) return;
+    const auto status = cudaStreamWaitEvent(currentCudaStream(device), event, 0);
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("Failed to order PyTorch's CUDA stream: ") + cudaGetErrorString(status));
+}
 } // namespace nelux
-
-#endif // NELUX_ENABLE_CUDA
+#endif

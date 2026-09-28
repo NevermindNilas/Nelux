@@ -6,7 +6,7 @@
 #include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/extension.h>
+#include <TensorInterop.hpp>
 
 extern "C"
 {
@@ -21,6 +21,9 @@ namespace py = pybind11;
 #define PYBIND11_DETAILED_ERROR_MESSAGES
 #ifndef NELUX_TORCH_ABI
 #define NELUX_TORCH_ABI "unknown"
+#endif
+#ifndef NELUX_TORCH_BUILD_VERSION
+#define NELUX_TORCH_BUILD_VERSION "unknown"
 #endif
 
 // Helper function to convert string to Backend enum
@@ -177,9 +180,13 @@ const char* loadedFFmpegVersion()
 
 PYBIND11_MODULE(_nelux, m)
 {
+    nelux::python::initializeTensorInterop();
     m.doc() = "nelux – lightspeed video decoding into tensors";
     m.attr("__version__") = "0.20.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
+    m.attr("__torch_abi_kind__") = "stable";
+    m.attr("__torch_abi_floor__") = "2.12";
+    m.attr("__torch_build_version__") = NELUX_TORCH_BUILD_VERSION;
 
     // Identity of the FFmpeg actually loaded into this process, not the one we
     // compiled against. Wheels bundle the TAS-FFMPEG build, which is tagged
@@ -198,7 +205,8 @@ PYBIND11_MODULE(_nelux, m)
 #endif
 
     m.attr("__all__") =
-        py::make_tuple("__version__", "__torch_abi__", "__cuda_support__",
+        py::make_tuple("__version__", "__torch_abi__", "__torch_abi_kind__",
+                       "__torch_abi_floor__", "__torch_build_version__", "__cuda_support__",
                        "__ffmpeg_version__", "VideoReader", "VideoEncoder",
                        "set_log_level", "LogLevel");
     py::enum_<spdlog::level::level_enum>(m, "LogLevel")
@@ -214,6 +222,11 @@ PYBIND11_MODULE(_nelux, m)
     m.def("set_log_level", &nelux::Logger::set_level, "Set the logging level for Nelux",
           py::arg("level"));
     // ---------- VideoReader -----------
+    py::class_<nelux::IndexedDecoder::Index, std::shared_ptr<nelux::IndexedDecoder::Index>>(m, "FrameIndex")
+        .def_property_readonly("num_frames", [](const nelux::IndexedDecoder::Index& index) {
+            return index.pts.size();
+        });
+
     py::class_<VideoReader, std::shared_ptr<VideoReader>>(m, "VideoReader")
         .def(py::init(
                  [](const std::string& input_path, int num_threads, bool force_8bit,
@@ -222,8 +235,10 @@ PYBIND11_MODULE(_nelux, m)
                     std::optional<std::pair<int, int>> resize, bool prefetch,
                     std::optional<int> convert_workers,
                     const std::string& color_format,
-                    const std::string& resize_filter, bool motion_vectors)
+                    const std::string& resize_filter, bool motion_vectors, std::optional<int> stream_index)
                  {
+                     if (stream_index.has_value() && *stream_index < 0)
+                         throw std::invalid_argument("stream_index must be non-negative or None");
                      int rw = 0, rh = 0;
                      if (resize.has_value())
                      {
@@ -260,7 +275,7 @@ PYBIND11_MODULE(_nelux, m)
                          input_path, num_threads, force_8bit,
                          backendFromString(backend), decode_accelerator,
                          cuda_device_index, rw, rh, prefetch, cw, color_format,
-                         resize_filter, motion_vectors);
+                         resize_filter, motion_vectors, stream_index.value_or(-1));
                  }),
              py::arg("input_path"),
              py::arg("num_threads") = 0,
@@ -270,7 +285,7 @@ PYBIND11_MODULE(_nelux, m)
              py::arg("convert_workers") = py::none(),
              py::arg("color_format") = "rgb",
              py::arg("resize_filter") = "bilinear",
-             py::arg("motion_vectors") = false,
+             py::arg("motion_vectors") = false, py::arg("stream_index") = py::none(),
              R"doc(Open a video file for reading.
 
 Args:
@@ -291,7 +306,7 @@ Args:
         - NVDEC path: the cuvid decoder's "resize=WxH" option scales on the GPU.
         properties.width/height, width/height, and returned frame shapes all reflect
         the resized dimensions. Pass None (default) to disable.
-        Note: decode_batch() is not supported while resize is active.
+        Batch decoding uses the same resize configuration.
     prefetch (bool, optional): If True, decode frames in a background thread.
         Default False: producer/consumer queue handoff costs ~2.5x more than the
         parallelism saves at typical decode speeds. Enable only for workloads where
@@ -311,7 +326,7 @@ Args:
         straight, not premultiplied, and is passed through unchanged; a source
         without an alpha plane yields a fully opaque one, matching
         ``ffmpeg -pix_fmt rgba``. Both "gray" and "rgba" are CPU-decode only
-        (decode_accelerator="cpu") and are not supported by decode_batch().
+        (decode_accelerator="cpu"), including batch decoding.
     resize_filter (str, optional): libswscale scaling kernel used for the
         decoder-side resize. Only takes effect when resize is set. Accepts the
         same scaler names as ffmpeg's -sws_flags: "fast_bilinear", "bilinear"
@@ -387,9 +402,15 @@ Args:
              R"doc(Return a frame by integer index or floating timestamp (seconds).
 Uses the secondary decoder; does not disturb iteration.)doc")
         .def("get_frame_count", &VideoReader::getFrameCount,
-             "Total frame count, cached after the first call. Read from container "
-             "metadata (nb_frames) when present; containers that omit it (MKV/WebM, "
-             "most VFR) pay one demux-only pass over the file on the first call.")
+             "Exact decoded frame count. Lazily builds a cached presentation index.")
+        .def("_get_approximate_frame_count", &VideoReader::getApproximateFrameCount)
+        .def("_get_frame_index", &VideoReader::getFrameIndex)
+        .def("_set_frame_index", &VideoReader::setFrameIndex)
+        .def("_enable_async_frames", &VideoReader::enableAsyncFrames)
+        .def("_get_sampling_stats", &VideoReader::getSamplingStats)
+        .def("_decode_batch_approximate", &VideoReader::decodeBatchApproximate)
+        .def("_get_frame_timing", &VideoReader::getFrameTiming,
+             "Raw presentation timestamps and durations in decoded frame order.")
         .def(
             "decode_batch", &VideoReader::decodeBatch, py::arg("indices"),
             "Decode a batch of frames at specified indices, returning [B,H,W,C] tensor")
@@ -404,6 +425,7 @@ Uses the secondary decoder; does not disturb iteration.)doc")
             py::return_value_policy::reference_internal)
         .def("__exit__", &VideoReader::exit)
         .def("reset", &VideoReader::reset)
+        .def("close", &VideoReader::close)
         .def("set_range", &VideoReader::setRange, py::arg("start"), py::arg("end"),
              "Set the range using either frame numbers (int) or timestamps (float).")
         .def(

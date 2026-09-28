@@ -43,9 +43,10 @@ pip install ./nelux-*.whl
 
 **Requirements:**
 - Python 3.13+
-- PyTorch 2.14.x — each wheel is built against a single torch minor, is
-  build-tagged (`214torch`) and raises `ImportError` under a different one.
-  `import torch` must precede `import nelux`.
+- PyTorch >=2.12, <3 through the 2.12 stable ABI. Wheels retain platform and
+  CPython tags, with identical artifacts validated on torch 2.12/2.13/2.14.
+  Nelux loads torch before the extension and rejects older/prerelease runtimes early.
+  Install your chosen CPU/CUDA/ROCm torch first; ROCm acceleration is deferred.
 
 FFmpeg is **bundled in the wheel** — nothing to install, nothing to put on
 `PATH`. `nelux.__ffmpeg_version__` reports which build is actually loaded.
@@ -1095,7 +1096,10 @@ import nelux
 
 nelux.__version__        # str:  Library version (e.g., "0.20.0")
 nelux.__cuda_support__   # bool: True if CUDA/NVDEC support is compiled in
-nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.14"
+nelux.__torch_abi__      # str:  Stable ABI floor, "2.12"
+nelux.__torch_abi_kind__ # str:  "stable"
+nelux.__torch_abi_floor__ # str: "2.12"
+nelux.__torch_build_version__ # str: Exact build headers, e.g. "2.12.0+cu132"
 nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "8.1.2-tas"
 ```
 

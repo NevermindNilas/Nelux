@@ -1,3 +1,10 @@
+### Unreleased — PyTorch 2.12 stable ABI migration
+
+- Preserve pybind reader/encoder classes using stable dispatcher tensor exchange. CPU pool leases, borrowed CUDA output, batch ownership, existing temporal/layout/async-retirement features and encoder storage lifetime remain the compatibility contract.
+- Build against controlled torch 2.12.0 headers and require `torch>=2.12,<3`. Load torch before the native module; reject older/prerelease runtimes early. No ROCm acceleration is added.
+- Retire torch-minor wheel tags. Expose stable ABI floor/kind separately from the exact build-header version. Add SHA256-bound binary audits and unchanged-artifact 2.12/2.13/2.14 runtime gates, with separate required validation on provisioned GPU runners.
+- Historical test/benchmark results below describe prior releases. Full migration parity requires current matched-baseline evidence; hosted CPU compatibility jobs do not establish GPU coverage.
+
 
 ### **Version 0.19.0 (2026-09-14)**
 

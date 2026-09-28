@@ -7,7 +7,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
   if(EXISTS "${_local_vcpkg_toolchain}")
     set(CMAKE_TOOLCHAIN_FILE "${_local_vcpkg_toolchain}" CACHE FILEPATH "vcpkg toolchain file")
     message(STATUS "Auto-detected local vcpkg: ${CMAKE_TOOLCHAIN_FILE}")
-    
+
     # Also set default triplet if not set
     if(NOT DEFINED VCPKG_TARGET_TRIPLET AND NOT DEFINED ENV{VCPKG_TARGET_TRIPLET})
       if(WIN32)
@@ -28,7 +28,7 @@ endif()
 
 project(Nelux VERSION 0.20.0 LANGUAGES CXX)
 
-# ─── Compiler options ─── 
+# ─── Compiler options ───
 # Note: These apply to CXX compiler only. CUDA compiler options are set separately.
 if (MSVC)
   add_compile_options(
@@ -47,11 +47,7 @@ endif()
 set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-# C++20 is required by the PyTorch 2.13 headers: c10/util/StringUtil.h uses
-# designated initializers and c10/core/AutogradState.h uses default member
-# initializers for bit-fields. GCC/Clang accept both as C++17 extensions, so
-# only MSVC rejects them (C7555 / C7582), and C++17 additionally leaves
-# HeaderOnlyArrayRef's operator== ambiguous there (C2666).
+# Stable/header-only utilities use C++20 features on MSVC as well as GCC/Clang.
 set(CMAKE_CXX_STANDARD        20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -265,7 +261,7 @@ if(NELUX_ENABLE_CUDA)
     message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER}")
     message(STATUS "CUDA Toolkit: ${CUDAToolkit_VERSION}")
   else()
-    message(FATAL_ERROR 
+    message(FATAL_ERROR
       "NELUX_ENABLE_CUDA is ON but no CUDA compiler found!\n"
       "The build cannot continue without CUDA when explicitly requested.\n"
       "Ensure CUDA Toolkit is installed and CUDA_PATH is set correctly.\n"
@@ -457,7 +453,7 @@ if(NELUX_BUILD_PYTHON)
   message(STATUS "Python3: ${Python3_EXECUTABLE}")
   message(STATUS "Python3 includes: ${Python3_INCLUDE_DIRS}")
 
-  # Determine site-packages path (needed for PyTorch and fallback pybind11)
+  # Determine site-packages path for native dependencies.
   execute_process(
     COMMAND ${Python3_EXECUTABLE}
             -c "import site; print(site.getsitepackages()[0])"
@@ -474,14 +470,10 @@ if(NELUX_BUILD_PYTHON)
     set(NELUX_PYBIND11_LIBS pybind11::module)
   else()
     message(STATUS "pybind11 not found via CMake; falling back to pip headers")
-    
-    if(WIN32)
-      set(NELUX_PYBIND11_INCS
-          "${Python3_SITE_PACKAGES}/Lib/site-packages/pybind11/include")
-    else()
-      set(NELUX_PYBIND11_INCS
-          "${Python3_SITE_PACKAGES}/pybind11/include")
-    endif()
+
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+      OUTPUT_VARIABLE NELUX_PYBIND11_INCS OUTPUT_STRIP_TRAILING_WHITESPACE
+      COMMAND_ERROR_IS_FATAL ANY)
     set(NELUX_PYBIND11_LIBS "")
     if(NOT EXISTS "${NELUX_PYBIND11_INCS}/pybind11/pybind11.h")
       message(FATAL_ERROR "pybind11 headers missing; run: pip install pybind11")
@@ -496,28 +488,37 @@ if(NELUX_BUILD_PYTHON)
     OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE _torch_result
   )
-  
+
   if(_torch_result EQUAL 0 AND EXISTS "${TORCH_PACKAGE_DIR}")
     set(NELUX_PYTORCH_LIBDIR "${TORCH_PACKAGE_DIR}/lib")
     set(NELUX_PYTORCH_INCLUDEDIR "${TORCH_PACKAGE_DIR}/include")
     execute_process(
       COMMAND ${Python3_EXECUTABLE}
               -c "import torch; v=torch.__version__.split('+', 1)[0].split('.')[:2]; print('.'.join(v))"
-      OUTPUT_VARIABLE NELUX_TORCH_ABI
+      OUTPUT_VARIABLE NELUX_TORCH_BUILD_MINOR
       OUTPUT_STRIP_TRAILING_WHITESPACE
     )
-    
-    # Main headers: torch/include and torch/include/torch/csrc/api/include
-    include_directories(
+
+    if(NELUX_TORCH_BUILD_MINOR VERSION_LESS "2.12")
+      message(FATAL_ERROR "The stable ABI build requires PyTorch headers >=2.12")
+    endif()
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} -c "import torch; print(torch.__version__)"
+      OUTPUT_VARIABLE NELUX_TORCH_BUILD_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      COMMAND_ERROR_IS_FATAL ANY
+    )
+    set(NELUX_TORCH_ABI "2.12")
+    # Stable/header-only headers live in torch/include.
+    include_directories(SYSTEM
       ${NELUX_PYTORCH_INCLUDEDIR}
-      ${NELUX_PYTORCH_INCLUDEDIR}/torch/csrc/api/include
     )
     # Add the lib directory to the linker
     link_directories(${NELUX_PYTORCH_LIBDIR})
-    
+
     message(STATUS "Using torch headers: ${NELUX_PYTORCH_INCLUDEDIR}")
     message(STATUS "Using torch libs:    ${NELUX_PYTORCH_LIBDIR}")
-    message(STATUS "Building Nelux against PyTorch ABI: ${NELUX_TORCH_ABI}")
+    message(STATUS "Torch stable ABI floor: ${NELUX_TORCH_ABI}; build runtime: ${NELUX_TORCH_BUILD_VERSION}")
   else()
     message(FATAL_ERROR "PyTorch not found. Run: pip install torch")
   endif()
@@ -528,21 +529,23 @@ file(GLOB_RECURSE NELUX_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/conversion/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/*.cpp
 )
-list(REMOVE_ITEM NELUX_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/FFmpegDelayLoad.cpp)
+list(REMOVE_ITEM NELUX_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/FFmpegDelayLoad.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/python/TensorInterop.cpp)
 
-# Add CUDA sources if CUDA is enabled  
+# Add CUDA sources if CUDA is enabled
 if(NELUX_ENABLE_CUDA)
   # Add only the CUDA cpp files to main sources, but NOT the .cu files
   file(GLOB NELUX_CUDA_CPP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cpp
   )
   list(APPEND NELUX_SOURCES ${NELUX_CUDA_CPP_SOURCES})
-  
+
   # Create a separate CUDA library for .cu files
   file(GLOB NELUX_CUDA_CU_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Nelux/backends/cuda/*.cu
   )
-  
+
   if(NELUX_CUDA_CU_SOURCES)
     add_library(NeluxCuda STATIC ${NELUX_CUDA_CU_SOURCES})
     # Static-link the CUDA runtime on every platform so cudart is not an eager
@@ -565,7 +568,7 @@ if(NELUX_ENABLE_CUDA)
       ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion
       ${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/gpu
     )
-    target_compile_definitions(NeluxCuda PUBLIC NELUX_ENABLE_CUDA)
+    target_compile_definitions(NeluxCuda PUBLIC NELUX_ENABLE_CUDA TORCH_TARGET_VERSION=0x020c000000000000)
 
     nelux_apply_perf_flags(NeluxCuda)
 
@@ -578,11 +581,14 @@ if(NELUX_ENABLE_CUDA)
     # Do NOT link CUDA::cudart here - let the runtime be resolved at link time
     message(STATUS "CUDA .cu sources: ${NELUX_CUDA_CU_SOURCES}")
   endif()
-  
+
   message(STATUS "CUDA .cpp sources: ${NELUX_CUDA_CPP_SOURCES}")
 endif()
 
 add_library(NeluxLib STATIC ${NELUX_SOURCES})
+# Prefer the project fmt/spdlog headers to Torch bundled non-stable copies.
+set_target_properties(NeluxLib PROPERTIES NO_SYSTEM_FROM_IMPORTED TRUE)
+target_compile_definitions(NeluxLib PUBLIC TORCH_TARGET_VERSION=0x020c000000000000)
 
 nelux_apply_perf_flags(NeluxLib)
 
@@ -614,6 +620,7 @@ target_include_directories(NeluxLib
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/Nelux/conversion/gpu>
     $<INSTALL_INTERFACE:include>
     ${NELUX_FFMPEG_INCS}
+    ${NELUX_PYBIND11_INCS}
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:${Python3_INCLUDE_DIRS}>
     $<$<BOOL:${NELUX_ENABLE_CUDA}>:${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}>
 )
@@ -623,16 +630,7 @@ target_link_libraries(NeluxLib PUBLIC
   spdlog::spdlog_header_only
   ${FMT_HO_TARGET}
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-  # Windows ONLY: c10_cuda/torch_cuda are delay-loaded (see /DELAYLOAD) so they
-  # stay out of the eager import table while the import lib is present for the
-  # delay-load thunk. On Linux a plain -lc10_cuda becomes a DT_NEEDED even when
-  # unused (no --as-needed), which would break import on CPU-only torch; there
-  # the symbol is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
+
 )
 if(WIN32)
   target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
@@ -643,11 +641,14 @@ elseif(UNIX)
 endif()
 
 if(NELUX_BUILD_PYTHON)
-  set(NELUX_PYTHON_SOURCES src/Nelux/python/Bindings.cpp)
+  set(NELUX_PYTHON_SOURCES
+    src/Nelux/python/Bindings.cpp
+    src/Nelux/python/TensorInterop.cpp)
   if(WIN32)
     list(APPEND NELUX_PYTHON_SOURCES src/Nelux/FFmpegDelayLoad.cpp)
   endif()
   add_library(nelux MODULE ${NELUX_PYTHON_SOURCES})
+  set_target_properties(nelux PROPERTIES NO_SYSTEM_FROM_IMPORTED TRUE)
 
   nelux_apply_perf_flags(nelux)
 
@@ -662,22 +663,14 @@ if(NELUX_BUILD_PYTHON)
     Python3::Module
     ${NELUX_PYBIND11_LIBS}
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-    # Windows ONLY (mirrors NeluxLib above): linked so the /DELAYLOAD thunk has
-    # its import lib. On Linux a plain -lc10_cuda/-ltorch_cuda becomes a
-    # DT_NEEDED even when unused and breaks import on CPU-only torch; the symbol
-    # is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
+
   )
 
   # Delay-load FFmpeg DLLs on Windows for version flexibility
   if(WIN32 AND MSVC)
     # Link delayimp.lib for delay-load support
     target_link_libraries(nelux PRIVATE delayimp)
-    
+
     file(GLOB _nelux_ffmpeg_delay_dlls "${NELUX_FFMPEG_DIR}/bin/av*.dll" "${NELUX_FFMPEG_DIR}/bin/sw*.dll")
     foreach(_dll ${_nelux_ffmpeg_delay_dlls})
       get_filename_component(_dll_name "${_dll}" NAME)
@@ -698,42 +691,31 @@ if(NELUX_BUILD_PYTHON)
       message(STATUS "MSVC: Using /WHOLEARCHIVE for NeluxCuda to include all CUDA kernels in nelux")
     endif()
 
-    if(WIN32 AND MSVC)
-      # Delay-load the CUDA PyTorch runtime so the module still IMPORTS on a
-      # CPU-only PyTorch (where c10_cuda.dll is absent). Every c10::cuda / CUDA
-      # code path is runtime-gated (frame.is_cuda(), NVDEC accelerator), so
-      # c10_cuda is only resolved when a GPU op actually runs. cudart is
-      # static-linked and the NVDEC driver DLLs are LoadLibrary'd at runtime, so
-      # neither appears in the import table. Without this, the eager c10_cuda
-      # import makes `import nelux` fail with WinError 126 on CPU-only torch.
-      # (torch_cuda.dll is listed defensively; if a build doesn't import it the
-      #  linker emits a benign LNK4199 and ignores the directive.)
-      # delayimp.lib is already linked above (FFmpeg delay-load block).
-      target_link_options(nelux PRIVATE
-        "/DELAYLOAD:c10_cuda.dll"
-        "/DELAYLOAD:torch_cuda.dll"
-      )
-      message(STATUS "MSVC: c10_cuda.dll/torch_cuda.dll delay-loaded — import works on CPU-only PyTorch")
-    endif()
+
   endif()
 
   if(NELUX_TORCH_ABI)
-    target_compile_definitions(nelux PRIVATE NELUX_TORCH_ABI="${NELUX_TORCH_ABI}")
+    target_compile_definitions(nelux PRIVATE
+      TORCH_TARGET_VERSION=0x020c000000000000
+      NELUX_TORCH_ABI="${NELUX_TORCH_ABI}"
+      NELUX_TORCH_BUILD_VERSION="${NELUX_TORCH_BUILD_VERSION}")
   endif()
 
+  set(NELUX_PYTHON_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/nelux" CACHE PATH
+      "Native module output directory; separate it when building multiple Python ABIs")
   set_target_properties(nelux PROPERTIES
     PREFIX ""
     OUTPUT_NAME "_nelux"
 
     # single-config fallback
-    LIBRARY_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/nelux
-    RUNTIME_OUTPUT_DIRECTORY        ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    LIBRARY_OUTPUT_DIRECTORY        "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
+    RUNTIME_OUTPUT_DIRECTORY        "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
 
     # multi-config overrides:
-    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/nelux
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/nelux
-    LIBRARY_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/nelux
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_CURRENT_SOURCE_DIR}/nelux
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG   "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${NELUX_PYTHON_OUTPUT_DIRECTORY}"
   )
   if(WIN32)
     set_target_properties(nelux PROPERTIES SUFFIX ".pyd")
@@ -766,14 +748,14 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   # DLL copy logic for Windows only
   # Bundle runtime DLLs into the wheel so self-built wheels import cleanly.
   set(NELUX_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
-  
+
   # vcpkg provides spdlog, fmt
   if(DEFINED ENV{VCPKG_TARGET_TRIPLET})
     set(_vcpkg_triplet "$ENV{VCPKG_TARGET_TRIPLET}")
   else()
     set(_vcpkg_triplet "x64-windows")
   endif()
-  
+
   # vcpkg can put DLLs in different locations depending on mode:
   # - Classic mode: vcpkg/installed/<triplet>/bin/
   # - Manifest mode: vcpkg/packages/<package>_<triplet>/bin/
@@ -785,7 +767,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     set(VCPKG_INSTALLED_BIN "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_vcpkg_triplet}/bin")
     set(VCPKG_PACKAGES_DIR "${CMAKE_SOURCE_DIR}/vcpkg/packages")
   endif()
-  
+
   # Try installed directory first (classic mode)
   file(GLOB NELUX_DLLS
     "${VCPKG_INSTALLED_BIN}/spdlog*.dll"
@@ -927,6 +909,9 @@ install(TARGETS nelux
 install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/nelux/__init__.py
   ${CMAKE_CURRENT_SOURCE_DIR}/nelux/batch.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/temporal.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/_build_info.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/nelux/_torch_compat.py
   ${CMAKE_CURRENT_SOURCE_DIR}/nelux/py.typed
   ${CMAKE_CURRENT_SOURCE_DIR}/nelux/_nelux.pyi
   DESTINATION nelux

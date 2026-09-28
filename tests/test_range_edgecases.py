@@ -237,7 +237,12 @@ def test_truncated_ranges_raise_and_negative_setter_is_atomic(mode, tmp_path):
     broken.write_bytes(data[:len(data) * 7 // 10])
     with VideoReader(str(broken), decode_accelerator=mode[0], prefetch=mode[1]) as reader:
         reader.set_range(0, 2)
-        assert len(list(reader)) == 2
+        # list(reader) asks for a length hint, which builds the exact full-file
+        # index and detects this later corruption before streaming the prefix.
+        # Exercise streaming independently, then pin that indexing error too.
+        assert len([frame for frame in reader]) == 2
+        with pytest.raises(RuntimeError, match="receive indexed frame: Invalid data"):
+            len(reader)
         for _ in range(3):
             with pytest.raises(StopIteration):
                 next(reader)
@@ -250,7 +255,7 @@ def test_truncated_ranges_raise_and_negative_setter_is_atomic(mode, tmp_path):
         with pytest.raises(RuntimeError, match="Decoding failed"):
             next(reader)
         before = reader.ranges
-        with pytest.raises(RuntimeError, match="Decoding failed"):
+        with pytest.raises(RuntimeError, match="Decoding failed|receive indexed frame: Invalid data"):
             reader.set_range(-5, -1)
         assert reader.ranges == before
         # Recover through the existing reconfigure API, then cut the clean file.
@@ -258,3 +263,41 @@ def test_truncated_ranges_raise_and_negative_setter_is_atomic(mode, tmp_path):
         assert len(list(reader)) == 240
         reader.set_range(17, 20)
         assert len(list(reader)) == 3
+
+
+def test_sync_workers_latch_corrupt_tail_after_last_converted_frame(tmp_path):
+    if not available(FFMPEG):
+        pytest.skip("ffmpeg required")
+    clean = tmp_path / "worker-drain-clean.mp4"
+    run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+         "testsrc2=size=320x192:rate=24:duration=10", "-c:v", "libx264",
+         "-g", "24", "-bf", "3", "-movflags", "+faststart", str(clean)])
+    data = clean.read_bytes()
+    broken = tmp_path / "worker-drain-truncated.mp4"
+    broken.write_bytes(data[:len(data) * 7 // 10])
+    # All runs share one exact input. Stable tensor wrapping changes the time
+    # at which workers finish, exposing the terminal receive branch where no
+    # converted frames remain. That branch must not disguise a corrupt tail
+    # as EOF when the refill branch would have reported the same codec error.
+    for _ in range(20):
+        with VideoReader(str(broken), decode_accelerator="cpu", prefetch=False) as reader:
+            reader.set_range(0, 2)
+            assert len([frame for frame in reader]) == 2
+            reader.set_range(0, 10000)
+            seen = 0
+            with pytest.raises(RuntimeError, match="Decoding failed"):
+                for frame in reader:
+                    seen += 1
+            assert seen > 0
+            for _ in range(3):
+                with pytest.raises(RuntimeError, match="Decoding failed"):
+                    next(reader)
+
+
+def test_exact_random_and_batch_identity(clip, mode, baseline):
+    with reader_for(clip, mode) as reader:
+        indices = [len(baseline) - 1, len(baseline) // 2, 0, len(baseline) // 2, 5]
+        assert reader.frame_count == len(baseline)
+        assert [digest(frame) for frame in reader.get_batch(indices)] == [baseline[i] for i in indices]
+        for index in (len(baseline) - 1, 0, len(baseline) // 2):
+            assert digest(reader.frame_at(index)) == baseline[index]

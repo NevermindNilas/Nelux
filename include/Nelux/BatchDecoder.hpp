@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <TensorSupport.hpp>
 #include <algorithm>
 #include <utility>
 #include <vector>
@@ -28,8 +28,8 @@ public:
         int height;
         int width;
         int channels = 3;
-        torch::ScalarType dtype;
-        torch::Device device;
+        nelux::tensor::Dtype dtype;
+        nelux::tensor::Device device;
         bool normalize = false;
     };
 
@@ -62,10 +62,10 @@ public:
      *        since the previous decode_batch call, so the remembered position
      *        may be reused instead of seeking. The caller owns this decision
      *        because fmt_ctx is shared with the streaming decode path.
-     * @return torch::Tensor Output tensor of shape [B, H, W, C] where B = indices.size()
+     * @return torch::stable::Tensor Output tensor of shape [B, H, W, C] where B = indices.size()
      * @throws std::runtime_error on decode failures or invalid indices
      */
-    torch::Tensor decode_batch(
+    torch::stable::Tensor decode_batch(
         const std::vector<int64_t>& indices,
         AVFormatContext* fmt_ctx,
         AVCodecContext* codec_ctx,
@@ -255,7 +255,7 @@ private:
      */
     void copyFrameToOutput(
         AVFrame* frame,
-        torch::Tensor& output,
+        torch::stable::Tensor& output,
         const std::vector<size_t>& positions,
         SwsContext* sws_ctx);
     // Zero-alloc fan-out: scatter one decoded frame to `count` batch
@@ -263,7 +263,7 @@ private:
     // per-target std::vector alloc on the hot path.
     void copyFrameToOutput(
         AVFrame* frame,
-        torch::Tensor& output,
+        torch::stable::Tensor& output,
         const size_t* positions,
         size_t count,
         SwsContext* sws_ctx);

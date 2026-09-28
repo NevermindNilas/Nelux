@@ -7,6 +7,9 @@ from enum import Enum
 
 __version__: str
 __torch_abi__: str
+__torch_abi_kind__: str
+__torch_abi_floor__: str
+__torch_build_version__: str
 __cuda_support__: bool
 # av_version_info() of the FFmpeg loaded at runtime, e.g. "8.1.2-tas" for the
 # TAS-FFMPEG build bundled in the wheel.
@@ -39,6 +42,10 @@ def set_log_level(level: LogLevel) -> None:
         level (LogLevel): The logging level to set.
     """
     ...
+
+class FrameIndex:
+    @property
+    def num_frames(self) -> int: ...
 
 class VideoReader:
     """
@@ -417,6 +424,15 @@ class VideoReader:
             Union[torch.Tensor, numpy.ndarray]: The decoded video frame based on backend setting.
         """
         ...
+
+    def close(self) -> None: ...
+    def _get_approximate_frame_count(self) -> int: ...
+    def _get_frame_index(self) -> FrameIndex: ...
+    def _set_frame_index(self, index: FrameIndex) -> None: ...
+    def _enable_async_frames(self) -> None: ...
+    def _get_sampling_stats(self) -> Tuple[int, int, int, int, int]: ...
+    def _decode_batch_approximate(self, indices: Sequence[int]) -> torch.Tensor: ...
+    def _get_frame_timing(self) -> List[Tuple[float, float]]: ...
 
     def get_frame_count(self) -> int:
         """

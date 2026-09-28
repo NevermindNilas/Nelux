@@ -3,6 +3,7 @@
 #define VIDEO_ENCODER_HPP
 
 #include "Encoder.hpp"
+#include <TensorSupport.hpp>
 #include <cpu/RGBToAuto.hpp>
 #include <condition_variable>
 #include <deque>
@@ -59,7 +60,7 @@ class VideoEncoder
 
     ~VideoEncoder();
 
-    void encodeFrame(torch::Tensor frame);
+    void encodeFrame(torch::stable::Tensor frame);
     void close();
 
     // Check if using hardware encoder. Takes the lifecycle lock: it reads the
@@ -151,8 +152,8 @@ class VideoEncoder
     // The locked bodies of the public entry points. Called through
     // underEncoderLock() so the lock/GIL dance lives in exactly one place.
     // Both run with lifecycleMu_ held exclusively and the GIL dropped.
-    void encodeFrameLocked(torch::Tensor& frame);
-    void encodeStillImageDirect(torch::Tensor& frame, AVPixelFormat srcFmt,
+    void encodeFrameLocked(torch::stable::Tensor& frame);
+    void encodeStillImageDirect(torch::stable::Tensor& frame, AVPixelFormat srcFmt,
                                 int inW, int inH, int srcChannels, bool deep);
     void closeLocked();
     void convertWorkerLoop(int workerId);
@@ -169,11 +170,11 @@ class VideoEncoder
     // is enabled); grayInput says whether the caller passed a single-channel
     // frame (decided from the shape by encodeFrameLocked, which knows the
     // resize mode).
-    void encodeGrayVerbatim(torch::Tensor frame, int inW, int inH, bool grayInput);
+    void encodeGrayVerbatim(torch::stable::Tensor frame, int inW, int inH, bool grayInput);
     std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter> grayRgbConverter_;
 #ifdef NELUX_ENABLE_CUDA
     // GPU: wait input-ready, RGB->NV12 on stream, copy into CUDA AVFrame, send.
-    void submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent);
+    void submitGpuToEncoder(torch::stable::Tensor& gpuTensor, cudaEvent_t readyEvent);
 #endif
 
     // RGB frame awaiting conversion (CPU path), assigned a target YUV frame.
@@ -192,7 +193,7 @@ class VideoEncoder
     {
         nelux::Frame* yuv = nullptr;   // CPU path: already converted, ready to send
 #ifdef NELUX_ENABLE_CUDA
-        torch::Tensor gpuTensor;       // GPU path: converted on the submit thread
+        torch::stable::Tensor gpuTensor;       // GPU path: converted on the submit thread
         cudaEvent_t readyEvent = nullptr;
         bool isGpu = false;
 #endif
@@ -216,7 +217,7 @@ class VideoEncoder
     // them here (no refcount op, no GIL); the caller frees them at encode_frame
     // entry while it still holds the GIL. This avoids the submit thread taking
     // the GIL per frame, which stalled it behind the GIL-heavy host pipeline.
-    std::deque<torch::Tensor> retiredTensors;
+    std::deque<torch::stable::Tensor> retiredTensors;
 #endif
     int64_t enqueueSeq = 0;     // caller-assigned, monotonic
     int64_t nextSubmitSeq = 0;  // submit thread cursor

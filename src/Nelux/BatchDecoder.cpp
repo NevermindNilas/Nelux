@@ -32,7 +32,8 @@ BatchDecoder::BatchDecoder(const Config& config)
     NELUX_DEBUG("BatchDecoder created: {}x{}x{}, dtype={}, device={}",
                 config_.width, config_.height, config_.channels,
                 static_cast<int>(config_.dtype),
-                config_.device.str());
+                std::string(config_.device.is_cuda() ? "cuda" : "cpu") +
+                    (config_.device.index() < 0 ? "" : ":" + std::to_string(config_.device.index())));
 }
 
 BatchDecoder::~BatchDecoder()
@@ -344,7 +345,7 @@ bool BatchDecoder::decodeUntilFrame(
 
 void BatchDecoder::copyFrameToOutput(
     AVFrame* frame,
-    torch::Tensor& output,
+    torch::stable::Tensor& output,
     const std::vector<size_t>& positions,
     SwsContext* sws_ctx)
 {
@@ -353,7 +354,7 @@ void BatchDecoder::copyFrameToOutput(
 
 void BatchDecoder::copyFrameToOutput(
     AVFrame* frame,
-    torch::Tensor& output,
+    torch::stable::Tensor& output,
     const size_t* positions,
     size_t count,
     SwsContext* sws_ctx)
@@ -455,7 +456,7 @@ void BatchDecoder::copyFrameToOutput(
     // destination above are hard-coded, so the two cannot drift apart.
     const int rowBytes = config_.width * 3;
     const size_t frameBytes = static_cast<size_t>(config_.height) * rowBytes;
-    uint8_t* out_base = output.data_ptr<uint8_t>();
+    uint8_t* out_base = output.mutable_data_ptr<uint8_t>();
 
     uint8_t* first = out_base + positions[0] * frameBytes;
     uint8_t* dstData[4] = {first, nullptr, nullptr, nullptr};
@@ -471,7 +472,7 @@ void BatchDecoder::copyFrameToOutput(
         std::memcpy(out_base + positions[i] * frameBytes, first, frameBytes);
 }
 
-torch::Tensor BatchDecoder::decode_batch(
+torch::stable::Tensor BatchDecoder::decode_batch(
     const std::vector<int64_t>& indices,
     AVFormatContext* fmt_ctx,
     AVCodecContext* codec_ctx,
@@ -483,8 +484,8 @@ torch::Tensor BatchDecoder::decode_batch(
     NELUX_INFO("Decoding batch of {} frames", indices.size());
     
     if (indices.empty()) {
-        return torch::empty({0, config_.height, config_.width, config_.channels},
-                           torch::TensorOptions().dtype(config_.dtype).device(config_.device));
+        return nelux::tensor::empty({0, config_.height, config_.width, config_.channels},
+                           config_.dtype, nelux::tensor::Device(config_.device));
     }
 
     // Validate all indices
@@ -551,12 +552,11 @@ torch::Tensor BatchDecoder::decode_batch(
     // [N,H,W,C] uint8 tensor with the usual strides.
     const int64_t visible = static_cast<int64_t>(indices.size()) *
                             config_.height * config_.width * config_.channels;
-    torch::Tensor output =
-        torch::empty({visible + SWS_DST_SLACK},
-                     torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
-            .narrow(0, 0, visible)
-            .view({static_cast<int64_t>(indices.size()), config_.height,
-                   config_.width, config_.channels});
+    auto storage = nelux::tensor::empty({visible + SWS_DST_SLACK},
+                                         nelux::tensor::kUInt8);
+    auto output = nelux::tensor::view(nelux::tensor::narrow(storage, 0, 0, visible),
+                                     {static_cast<int64_t>(indices.size()), config_.height,
+                                      config_.width, config_.channels});
 
     AVStream* stream = fmt_ctx->streams[stream_idx];
     double fps = av_q2d(stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate);
@@ -803,9 +803,9 @@ torch::Tensor BatchDecoder::decode_batch(
     // uint8/CPU (the common path: narrow+view over a uint8 slack buffer, no
     // trailing .to()). Otherwise a single fused .to(device,dtype) replaces
     // the old two-step .to(device).to(dtype) (two full-tensor copies).
-    if (config_.device.is_cuda() || config_.dtype != torch::kUInt8)
+    if (config_.device.is_cuda() || config_.dtype != nelux::tensor::kUInt8)
     {
-        output = output.to(config_.device, config_.dtype);
+        output = nelux::tensor::to(output, config_.device, config_.dtype);
     }
 
     NELUX_INFO("Batch decode completed successfully");

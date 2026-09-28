@@ -89,7 +89,7 @@ namespace
 
     void releaseCpuTensor(void* opaque, uint8_t*)
     {
-        delete static_cast<torch::Tensor*>(opaque);
+        delete static_cast<torch::stable::Tensor*>(opaque);
     }
 
     // Turn a frame rate given as a double into the exact rational the muxer
@@ -136,14 +136,20 @@ namespace
     // Float [0,1] scales to 0-255; a 16-bit source is downscaled uniformly
     // (v*255/65535). Shared by the direct-fill and resized gray paths, which
     // must agree on this mapping exactly.
-    torch::Tensor normalizeGrayTo8(torch::Tensor g)
+    torch::stable::Tensor normalizeGrayTo8(torch::stable::Tensor g)
     {
-        if (g.is_floating_point())
-            return (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
-        if (g.scalar_type() == torch::ScalarType::UInt16)
-            return (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
-        if (g.dtype() != torch::kUInt8)
-            return g.clamp(0, 255).to(torch::kUInt8);
+        if (tensor::is_floating_point(g))
+            return tensor::to(
+                tensor::clamp(tensor::round(tensor::mul(
+                    tensor::to(g, tensor::kFloat32), 255.0f)), 0, 255),
+                tensor::kUInt8);
+        if (g.scalar_type() == tensor::kUInt16)
+            return tensor::to(
+                tensor::clamp(tensor::div(tensor::mul(
+                    tensor::to(g, tensor::kInt32), 255), 65535), 0, 255),
+                tensor::kUInt8);
+        if (g.scalar_type() != tensor::kUInt8)
+            return tensor::to(tensor::clamp(g, 0, 255), tensor::kUInt8);
         return g;
     }
 
@@ -151,13 +157,16 @@ namespace
     // (the direct-fill path writes bytes from int32; the resized path narrows
     // to uint16 for swscale). Float [0,1] -> 0-65535; an 8-bit source is
     // promoted exactly (v*257); a 16-bit source passes through verbatim.
-    torch::Tensor normalizeGrayTo16(torch::Tensor g)
+    torch::stable::Tensor normalizeGrayTo16(torch::stable::Tensor g)
     {
-        if (g.is_floating_point())
-            return (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
-        if (g.dtype() == torch::kUInt8)
-            return g.to(torch::kInt32) * 257;
-        return g.to(torch::kInt32).clamp(0, 65535);
+        if (tensor::is_floating_point(g))
+            return tensor::to(
+                tensor::clamp(tensor::round(tensor::mul(
+                    tensor::to(g, tensor::kFloat32), 65535.0f)), 0, 65535),
+                tensor::kInt32);
+        if (g.scalar_type() == tensor::kUInt8)
+            return tensor::mul(tensor::to(g, tensor::kInt32), 257);
+        return tensor::clamp(tensor::to(g, tensor::kInt32), 0, 65535);
     }
 } // namespace
 
@@ -375,7 +384,7 @@ void VideoEncoder::addPassthrough(const std::string& source, bool audio,
         });
 }
 
-void VideoEncoder::encodeFrame(torch::Tensor frame)
+void VideoEncoder::encodeFrame(torch::stable::Tensor frame)
 {
     // Validate input shape up front, while the GIL is still held so this raises
     // as a clean Python exception.
@@ -471,7 +480,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     // inner lock, and doing it here keeps the "free under the GIL" property
     // without holding the GIL for the whole encode.
     {
-        std::deque<torch::Tensor> toFree;
+        std::deque<torch::stable::Tensor> toFree;
         {
             std::lock_guard<std::mutex> lk(mu);
             toFree.swap(retiredTensors);
@@ -486,7 +495,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
     underEncoderLock([&] { encodeFrameLocked(frame); });
 }
 
-void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
+void VideoEncoder::encodeFrameLocked(torch::stable::Tensor& frame)
 {
     // Re-checked (not merely checked) under the lock: a concurrent close() can
     // have swapped `encoder` out and destroyed it at any point before we got
@@ -546,34 +555,38 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
 
     // Grayscale input: replicate the single luma channel into a fresh 3-channel
     // RGB tensor so the rest of the pipeline is unchanged (R==G==B). Uses only
-    // .to()/.contiguous()/torch::empty plus a raw byte fill (no torch reshape/
+    // Stable cast/layout/allocation plus a raw byte fill (no tensor reshape/
     // expand/repeat) to keep the interleave explicit and cheap. The result is a
     // CPU tensor, so a grayscale frame handed to an NVENC encoder takes the
     // CPU-stage -> hwupload path instead of the zero-copy GPU path; RGB input
     // keeps the fast path.
     if (grayInput)
     {
-        torch::Tensor g = frame;
+        torch::stable::Tensor g = frame;
         if (g.device().is_cuda())
-            g = g.to(torch::kCPU);
+            g = tensor::to(g, tensor::Device(tensor::kCPU));
         // is_floating_point(), for the same reason as the colour path below:
         // a kFloat16/kFloat32 list sends float64 and bfloat16 to the truncating
         // .to(kUInt8) catch-all, which turns a [0,1] tensor into an all-black
         // frame.
-        if (g.is_floating_point())
-            g = (g.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (g.scalar_type() == torch::ScalarType::UInt16)
-            g = (g.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (g.dtype() != torch::kUInt8)
-            g = g.to(torch::kUInt8);
+        if (tensor::is_floating_point(g))
+            g = tensor::to(
+                tensor::clamp(tensor::mul(tensor::to(g, tensor::kFloat32),
+                                          255.0f), 0, 255),
+                tensor::kUInt8);
+        else if (g.scalar_type() == tensor::kUInt16)
+            g = tensor::to(
+                tensor::clamp(tensor::div(tensor::to(g, tensor::kFloat32),
+                                          257.0f), 0, 255),
+                tensor::kUInt8);
+        else if (g.scalar_type() != tensor::kUInt8)
+            g = tensor::to(g, tensor::kUInt8);
         if (!g.is_contiguous())
-            g = g.contiguous();
+            g = tensor::contiguous(g);
 
-        torch::Tensor rgb = torch::empty(
-            {inH, inW, 3},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
-        const uint8_t* src = g.data_ptr<uint8_t>();
-        uint8_t* dst = rgb.data_ptr<uint8_t>();
+        torch::stable::Tensor rgb = tensor::empty({inH, inW, 3}, tensor::kUInt8);
+        const uint8_t* src = tensor::data_ptr<uint8_t>(g);
+        uint8_t* dst = tensor::data_ptr<uint8_t>(rgb);
         const int64_t n = static_cast<int64_t>(inW) * inH;
         for (int64_t i = 0; i < n; ++i)
         {
@@ -596,8 +609,8 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // so reading them as 0-65535 would silently reinterpret existing data.
     const AVPixFmtDescriptor* outDesc = av_pix_fmt_desc_get(outputPixelFormat);
     const bool deepDest = outDesc && outDesc->comp[0].depth > 8;
-    const bool deepSource = frame.is_floating_point() ||
-                            frame.scalar_type() == torch::ScalarType::UInt16;
+    const bool deepSource = tensor::is_floating_point(frame) ||
+                            frame.scalar_type() == tensor::kUInt16;
     const bool deep = deepDest && deepSource;
 
     // A 4-channel [H,W,4] input carries alpha. It is what makes ProRes 4444 /
@@ -641,20 +654,26 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         }
 
         // Convert tensor dtype to uint8 if needed (on GPU, on torch's stream).
-        if (frame.dtype() == torch::kFloat16 || frame.dtype() == torch::kFloat32)
+        if (frame.scalar_type() == tensor::kFloat16 || frame.scalar_type() == tensor::kFloat32)
         {
-            frame = (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+            frame = tensor::to(
+                tensor::clamp(tensor::mul(tensor::to(frame, tensor::kFloat32),
+                                          255.0f), 0, 255),
+                tensor::kUInt8);
         }
-        else if (frame.scalar_type() == torch::ScalarType::UInt16)
+        else if (frame.scalar_type() == tensor::kUInt16)
         {
-            frame = (frame.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
+            frame = tensor::to(
+                tensor::clamp(tensor::div(tensor::to(frame, tensor::kFloat32),
+                                          257.0f), 0, 255),
+                tensor::kUInt8);
         }
-        else if (frame.dtype() != torch::kUInt8)
+        else if (frame.scalar_type() != tensor::kUInt8)
         {
-            frame = frame.to(torch::kUInt8);
+            frame = tensor::to(frame, tensor::kUInt8);
         }
         if (!frame.is_contiguous())
-            frame = frame.contiguous();
+            frame = tensor::contiguous(frame);
 
         // Record an event on the tensor's producer stream (torch current stream,
         // which is where the decode + the dtype ops above ran). The worker makes
@@ -712,43 +731,49 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         // Float is normalized [0,1] and scales to the FULL 16-bit range (the
         // same convention encodeGrayVerbatim uses for 16-bit gray output);
         // uint16 is already the target representation and passes through.
-        if (frame.is_floating_point())
+        if (tensor::is_floating_point(frame))
         {
-            frame = (frame.to(torch::kFloat32) * 65535.0f)
-                        .round()
-                        .clamp(0, 65535)
-                        .to(torch::kUInt16);
+            frame = tensor::to(
+                tensor::clamp(tensor::round(tensor::mul(
+                    tensor::to(frame, tensor::kFloat32), 65535.0f)), 0, 65535),
+                tensor::kUInt16);
         }
     }
-    else if (frame.is_floating_point())
+    else if (tensor::is_floating_point(frame))
     {
         // is_floating_point(), not a kFloat16/kFloat32 list: float64 and
         // bfloat16 used to fall through to the bare .to(kUInt8) catch-all
         // below, which truncates a [0,1] tensor to an all-black frame. The deep
         // branch above uses the same predicate, so changing only pixel_format
         // can no longer flip a caller between correct and black.
-        frame = (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+        frame = tensor::to(
+            tensor::clamp(tensor::mul(tensor::to(frame, tensor::kFloat32),
+                                      255.0f), 0, 255),
+            tensor::kUInt8);
     }
-    else if (frame.scalar_type() == torch::ScalarType::UInt16)
+    else if (frame.scalar_type() == tensor::kUInt16)
     {
-        frame = (frame.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
+        frame = tensor::to(
+            tensor::clamp(tensor::div(tensor::to(frame, tensor::kFloat32),
+                                      257.0f), 0, 255),
+            tensor::kUInt8);
     }
-    else if (frame.dtype() == torch::kInt16 || frame.dtype() == torch::kInt32)
+    else if (frame.scalar_type() == tensor::kInt16 || frame.scalar_type() == tensor::kInt32)
     {
-        frame = frame.to(torch::kFloat32).clamp(0, 255).to(torch::kUInt8);
+        frame = tensor::to(tensor::clamp(tensor::to(frame, tensor::kFloat32), 0, 255), tensor::kUInt8);
     }
-    else if (frame.dtype() == torch::kInt64)
+    else if (frame.scalar_type() == tensor::kInt64)
     {
-        frame = frame.clamp(0, 255).to(torch::kUInt8);
+        frame = tensor::to(tensor::clamp(frame, 0, 255), tensor::kUInt8);
     }
-    else if (frame.dtype() != torch::kUInt8)
+    else if (frame.scalar_type() != tensor::kUInt8)
     {
-        frame = frame.to(torch::kUInt8);
+        frame = tensor::to(frame, tensor::kUInt8);
     }
 
     if (!frame.is_contiguous())
     {
-        frame = frame.contiguous();
+        frame = tensor::contiguous(frame);
     }
 
     if (directStillImage_)
@@ -820,7 +845,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
                                      std::string(cudaGetErrorString(cerr)));
         }
 #else
-        frame = frame.to(torch::kCPU);
+        frame = tensor::to(frame, tensor::Device(tensor::kCPU));
         std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
 #endif
     }
@@ -836,19 +861,19 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     cvConvert.notify_one();
 }
 
-void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
+void VideoEncoder::encodeStillImageDirect(torch::stable::Tensor& frame,
                                           AVPixelFormat srcFmt, int inW, int inH,
                                           int srcChannels, bool deep)
 {
     directStillImageEncoded_ = true;
     if (frame.device().is_cuda())
-        frame = frame.to(torch::kCPU);
+        frame = tensor::to(frame, tensor::Device(tensor::kCPU));
     if (!frame.is_contiguous())
-        frame = frame.contiguous();
+        frame = tensor::contiguous(frame);
 
     if (adaptivePngStill_ &&
         (srcFmt == AV_PIX_FMT_RGB24 || srcFmt == AV_PIX_FMT_RGBA) &&
-        highEntropyPackedImage(frame.data_ptr<uint8_t>(), inW, inH, srcChannels))
+        highEntropyPackedImage(tensor::data_ptr<uint8_t>(frame), inW, inH, srcChannels))
     {
         // A high-entropy image has little to deflate. The PNG codec chooses
         // its zlib level when opened, so replace the still-unfed encoder with
@@ -882,7 +907,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         // staging copy or swscale context is needed for this identity path.
         const size_t rowBytes = static_cast<size_t>(width) * srcChannels *
                                 (deep ? 2 : 1);
-        auto holder = std::make_unique<torch::Tensor>(frame);
+        auto holder = std::make_unique<torch::stable::Tensor>(frame);
         auto* data = static_cast<uint8_t*>(frame.data_ptr());
         AVBufferRef* buffer = av_buffer_create(
             data, rowBytes * height, releaseCpuTensor, holder.get(),
@@ -921,7 +946,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         throw std::runtime_error("Failed to encode still image");
 }
 
-void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
+void VideoEncoder::encodeGrayVerbatim(torch::stable::Tensor frame, int inW, int inH,
                                       bool grayInput)
 {
     const AVPixelFormat pf = outputPixelFormat;
@@ -940,7 +965,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
     workersStarted = true;
 
     if (frame.device().is_cuda())
-        frame = frame.to(torch::kCPU);
+        frame = tensor::to(frame, tensor::Device(tensor::kCPU));
 
     // Build the output gray frame, tagged full range so the stored samples are
     // read back verbatim (no 16-235 expansion) by a range-aware decoder.
@@ -964,7 +989,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         // the same one-pass swscale the RGB paths use, at the output depth so
         // 16-bit data is resampled at 16-bit precision, never through 8-bit
         // RGB. Same-size input keeps the exact direct-fill path below.
-        torch::Tensor g = frame.reshape({inH, inW});
+        torch::stable::Tensor g = tensor::reshape(frame, {inH, inW});
         AVPixelFormat srcGrayFmt;
         if (!is16)
         {
@@ -975,10 +1000,10 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         {
             // Feed swscale little-endian 16-bit; a GRAY16BE destination is
             // byte-swapped by swscale itself.
-            g = normalizeGrayTo16(g).to(torch::kUInt16);
+            g = tensor::to(normalizeGrayTo16(g), tensor::kUInt16);
             srcGrayFmt = AV_PIX_FMT_GRAY16LE;
         }
-        g = g.contiguous();
+        g = tensor::contiguous(g);
 
         if (!grayRgbConverter_)
             grayRgbConverter_ =
@@ -992,12 +1017,12 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
 
     if (grayInput)
     {
-        torch::Tensor g = frame.reshape({height, width});
+        torch::stable::Tensor g = tensor::reshape(frame, {height, width});
         if (!is16)
         {
             // 8-bit output: keep 8-bit samples verbatim.
-            g = normalizeGrayTo8(g).contiguous();
-            const uint8_t* src = g.data_ptr<uint8_t>();
+            g = tensor::contiguous(normalizeGrayTo8(g));
+            const uint8_t* src = tensor::data_ptr<uint8_t>(g);
             // Contiguous fast path: stride == width is the common
             // allocateBuffer(32) case; one memcpy instead of H calls.
             // Identical bytes, fewer call/branch overheads per frame.
@@ -1011,8 +1036,8 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         else
         {
             // 16-bit output: preserve full precision.
-            g = normalizeGrayTo16(g).contiguous();
-            const int32_t* src = g.data_ptr<int32_t>();
+            g = tensor::contiguous(normalizeGrayTo16(g));
+            const int32_t* src = tensor::data_ptr<int32_t>(g);
             for (int r = 0; r < height; ++r)
             {
                 uint8_t* row = dst + static_cast<size_t>(r) * stride;
@@ -1034,14 +1059,17 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         // for full precision. The channel count has to be honoured here -- a
         // hardcoded 3 turned a documented "alpha is dropped" case into an
         // internal reshape error that also left the encoder half-started.
-        torch::Tensor rgb = frame;
-        if (rgb.is_floating_point())
-            rgb = (rgb.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (rgb.dtype() != torch::kUInt8)
-            rgb = rgb.clamp(0, 255).to(torch::kUInt8);
+        torch::stable::Tensor rgb = frame;
+        if (tensor::is_floating_point(rgb))
+            rgb = tensor::to(
+                tensor::clamp(tensor::mul(tensor::to(rgb, tensor::kFloat32),
+                                          255.0f), 0, 255),
+                tensor::kUInt8);
+        else if (rgb.scalar_type() != tensor::kUInt8)
+            rgb = tensor::to(tensor::clamp(rgb, 0, 255), tensor::kUInt8);
         const int64_t ch =
             (rgb.numel() == static_cast<int64_t>(inW) * inH * 4) ? 4 : 3;
-        rgb = rgb.reshape({inH, inW, ch}).contiguous();
+        rgb = tensor::contiguous(tensor::reshape(rgb, {inH, inW, ch}));
         // Built with the (locked) input size; when resize is off inW/inH equal
         // width/height and this is the converter it always was. Shared with
         // the resized single-channel path above — convert() rebuilds its
@@ -1053,7 +1081,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
                     inW, inH, resizeFlags_);
         // convert() rebuilds its cached context when the source format changes,
         // so a session mixing 3- and 4-channel frames stays correct.
-        grayRgbConverter_->convert(f, rgb.data_ptr<uint8_t>(),
+        grayRgbConverter_->convert(f, tensor::data_ptr<uint8_t>(rgb),
                                    ch == 4 ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24);
     }
 
@@ -1303,7 +1331,7 @@ void VideoEncoder::encodeSubmitLoop()
 }
 
 #ifdef NELUX_ENABLE_CUDA
-void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent)
+void VideoEncoder::submitGpuToEncoder(torch::stable::Tensor& gpuTensor, cudaEvent_t readyEvent)
 {
     // Destroy the producer-ready event on every exit path (any call below can
     // throw). Declared first so it also covers a cudaSetDevice failure; the
@@ -1366,7 +1394,7 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
 
     // RGB24 -> NV12/YUV on the GPU (writes into the converter's CUDA buffer).
     gpuConverter->convert(
-        reinterpret_cast<const uint8_t*>(gpuTensor.data_ptr<uint8_t>()),
+        reinterpret_cast<const uint8_t*>(tensor::data_ptr<uint8_t>(gpuTensor)),
         width * 3);  // RGB24 pitch
 
     AVBufferRef* hwFramesCtx = encoder->getHwFramesCtx();
@@ -1560,7 +1588,7 @@ void VideoEncoder::closeLocked()
     // header: encode_frame's prologue blocks on `mu` while holding the GIL, so a
     // "hold `mu`, want GIL" edge here would close that into a real deadlock.
     {
-        std::deque<torch::Tensor> toFree;
+        std::deque<torch::stable::Tensor> toFree;
         {
             std::lock_guard<std::mutex> lk(mu);
             toFree.swap(retiredTensors);

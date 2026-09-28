@@ -153,13 +153,13 @@ def test_decode_rgba_opaque_when_source_has_no_alpha():
     assert np.unique(got[..., 3]).tolist() == [65535]
 
 
-def test_rgba_rejected_by_decode_batch():
+def test_rgba_batch_matches_streaming():
     clip = CORPUS / "p1080_prores_ks_hq.mov"
     if not clip.exists():
         pytest.skip("missing fixture")
-    reader = nelux.VideoReader(str(clip), backend="numpy", color_format="rgba")
-    with pytest.raises(RuntimeError, match="color_format='rgba'"):
-        reader.decode_batch([0, 1])
+    with nelux.VideoReader(str(clip), color_format="rgba") as reader:
+        expected = torch.stack([reader.read_frame().clone() for _ in range(2)])
+        assert torch.equal(reader.decode_batch([0, 1]), expected)
 
 
 def test_encode_rgba_reaches_the_alpha_plane(tmp_path):

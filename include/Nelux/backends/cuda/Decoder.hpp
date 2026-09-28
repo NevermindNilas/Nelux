@@ -28,7 +28,7 @@ namespace nelux::backends::cuda
  * This decoder uses FFmpeg's hwaccel API with NVDEC to decode video
  * frames directly on the GPU. The decoded NV12 frames are converted
  * to RGB using a custom CUDA kernel, and the output remains on the GPU
- * as a torch::Tensor with device='cuda'.
+ * as a torch::stable::Tensor with device='cuda'.
  * 
  * Thread safety:
  * - C++ side: Uses mutex for frame queue access
@@ -54,7 +54,7 @@ public:
      * reflect the resize target.
      */
     Decoder(const std::string& filePath, int numThreads, int cudaDeviceIndex,
-            int resizeWidth, int resizeHeight);
+            int resizeWidth, int resizeHeight, int streamIndex = -1);
 
     ~Decoder() override;
     
@@ -73,6 +73,12 @@ public:
      * @return true if frame was decoded, false if EOF or error
      */
     bool decodeNextFrame(void* buffer, double* frame_timestamp = nullptr) override;
+    // Inspect presentation identity before conversion. Discarded preroll keeps
+    // no GPU output and performs no color conversion or output synchronization.
+    bool decodeNextFrameSelective(void* buffer,
+                                  const std::function<bool(int64_t)>& select,
+                                  double* frame_timestamp = nullptr);
+    void enableAsyncFrameRelease();
     
     /**
      * @brief Seek to a specific timestamp
@@ -176,9 +182,9 @@ public:
      * Overrides the base implementation to keep frames on the GPU.
      * 
      * @param indices Frame indices to decode
-     * @return torch::Tensor Output tensor of shape [B, H, W, C] on CUDA device
+     * @return torch::stable::Tensor Output tensor of shape [B, H, W, C] on CUDA device
      */
-    torch::Tensor decode_batch(const std::vector<int64_t>& indices) override;
+    torch::stable::Tensor decode_batch(const std::vector<int64_t>& indices) override;
 
 protected:
     void initialize(const std::string& filePath);
@@ -283,6 +289,15 @@ protected:
     static AVPixelFormat getHwFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts);
 
 private:
+    void waitForRetiredFrame();
+    void stopFrameReleaseWorker();
+    std::mutex retireMutex_;
+    std::condition_variable retireCond_;
+    std::optional<Frame> retiredFrame_;
+    std::thread retireWorker_;
+    bool retireBusy_ = false;
+    bool retireStop_ = false;
+    std::exception_ptr retireError_;
     int cudaDeviceIndex_;
     cudaStream_t cudaStream_;
     cudaEvent_t decodeCompleteEvent_; // Recorded after each async decode chain

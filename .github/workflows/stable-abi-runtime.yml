@@ -1,0 +1,68 @@
+name: Validate identical stable ABI wheel across torch runtimes
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      python_version:
+        required: true
+        type: string
+      profiles:
+        required: true
+        type: string
+      require_gpu:
+        description: Require real CUDA, NVDEC and NVENC execution without hardware skips
+        required: false
+        default: false
+        type: boolean
+jobs:
+  runtime:
+    # Hosted callers use a runner name; trusted GPU callers pass a JSON label list.
+    runs-on: ${{ startsWith(inputs.runner, '[') && fromJSON(inputs.runner) || inputs.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ['2.12.0', '2.13.0', '2.14.0']
+        profile: ${{ fromJSON(inputs.profiles) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python_version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: dist
+      - name: Fetch pinned reference tools (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tools/download_ffmpeg.ps1 -Force
+      - name: Fetch pinned reference tools (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash tools/download_ffmpeg.sh
+      - name: Validate installed artifact outside checkout
+        shell: bash
+        env:
+          RUNTIME_TORCH: ${{ matrix.torch }}
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          INDEX="https://download.pytorch.org/whl/$PROFILE"
+          if [ "$PROFILE" = "macos" ]; then INDEX="https://pypi.org/simple"; fi
+          GPU_ARGS=()
+          if [ '${{ inputs.require_gpu }}' = 'true' ]; then GPU_ARGS+=(--require-gpu); fi
+          python tools/stable_abi_runtime_gate.py --wheel-dir dist \
+            --torch-version "$RUNTIME_TORCH" --index-url "$INDEX" \
+            --ffmpeg-bin external/ffmpeg/bin --output stable-runtime-results "${GPU_ARGS[@]}"
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-${{ inputs.artifact_name }}-torch${{ matrix.torch }}-${{ matrix.profile }}-gpu${{ inputs.require_gpu }}
+          path: stable-runtime-results/
+          if-no-files-found: error

@@ -11,7 +11,7 @@
 #include <queue>
 #include <thread>
 #include <vector>
-#include <torch/torch.h>
+#include <TensorSupport.hpp>
 
 
 namespace nelux
@@ -145,18 +145,18 @@ class Decoder
     virtual bool decodeNextFrame(void* buffer, double* frame_timestamp = nullptr);
 
     // Zero-copy variant: returns the next decoded frame as a fresh
-    // torch::Tensor (HWC, native dtype) whose storage was filled directly by
+    // torch::stable::Tensor (HWC, native dtype) whose storage was filled directly by
     // the converter on the producer thread. Skips the producer->consumer
     // memcpy that decodeNextFrame() performs. Returns an undefined Tensor
     // when no more frames are available.
-    virtual torch::Tensor decodeNextFrameTensor(double* frame_timestamp = nullptr);
+    virtual torch::stable::Tensor decodeNextFrameTensor(double* frame_timestamp = nullptr);
 
     // Synchronous, single-threaded decode path: bypasses the producer thread,
     // queue, and mutex entirely. Returns the next decoded frame as a fresh
-    // torch::Tensor. Intended for raw single-stream throughput where pipeline
+    // torch::stable::Tensor. Intended for raw single-stream throughput where pipeline
     // coordination overhead dominates. Caller must have set sync mode on the
     // decoder before any decode call.
-    virtual torch::Tensor decodeNextFrameTensorSync(double* frame_timestamp = nullptr);
+    virtual torch::stable::Tensor decodeNextFrameTensorSync(double* frame_timestamp = nullptr);
 
     // Toggle synchronous decode mode. When true, the producer thread is never
     // started; callers must use decodeNextFrameTensorSync(). Must be set
@@ -182,6 +182,7 @@ class Decoder
 
     // Number of output channels (1 gray / 3 RGB / 4 RGBA) currently configured.
     int getOutputChannels() const { return outChannels_; }
+    int getVideoStreamIndex() const { return videoStreamIndex; }
 
     // Prefetch control API
     /**
@@ -269,11 +270,12 @@ class Decoder
     // failure. Used as the get_frame_count() fallback when the container omits
     // nb_frames. See ffprobe -count_packets.
     int64_t countVideoPacketsExact();
-    virtual torch::Tensor decode_batch(const std::vector<int64_t>& indices);
+    virtual torch::stable::Tensor decode_batch(const std::vector<int64_t>& indices);
     std::vector<MotionVector> getLastMotionVectors() const;
     char getLastFrameType() const;
 
   protected:
+    int requestedVideoStreamIndex_ = -1;
     bool canRewindViaSeek() const;
     void initialize(const std::string& filePath);
     void setProperties();
@@ -315,7 +317,7 @@ class Decoder
     struct ConvertedFrame
     {
         std::vector<uint8_t> buffer;        // legacy memcpy path
-        torch::Tensor tensor;               // zero-copy path
+        torch::stable::Tensor tensor;               // zero-copy path
         double timestamp = 0.0;
         std::vector<MotionVector> motionVectors;
         char frameType = '?';
@@ -327,7 +329,7 @@ class Decoder
     std::mutex convertedBufferPoolMutex;
 
     // Shared pool for consumer-convert path. Held via shared_ptr so the
-    // torch::Tensor deleter can recycle the buffer even if Decoder is gone.
+    // torch::stable::Tensor deleter can recycle the buffer even if Decoder is gone.
     // 64B-aligned + trailing slack so swscale SIMD over-read on odd widths
     // stays in-bounds. Deleter is GIL-free (plain heap/mutex only) and never
     // takes the GIL under pool->mu. pool->mu is a plain fair std::mutex.
@@ -352,7 +354,7 @@ class Decoder
     // Monotonic seq for pooled-buffer stamps (seq,nbytes,gen). Debug/validation
     // only; never used for ordering (ordering is syncProduceSeq_/syncConsumeSeq_).
     std::atomic<int64_t> pooledBufferSeq_{0};
-    // When true, producer fills a fresh torch::Tensor each frame instead of
+    // When true, producer fills a fresh torch::stable::Tensor each frame instead of
     // a pooled byte buffer. Consumer receives the tensor directly.
     std::atomic<bool> tensorHandoff_{false};
     std::mutex queueMutex;
@@ -406,6 +408,7 @@ class Decoder
     virtual void decodingLoop();
     void startDecodingThread();
     void stopDecodingThread();
+    void releaseProducer();
     void clearQueue();
 
     // Wake every consumer and mark the stream finished. `err` is 0 for a
@@ -480,7 +483,7 @@ class Decoder
     {
         // Converted RGB bytes, filled by a worker thread into a raw buffer
         // recycled via outputBufferPool_. We deliberately do NOT store a
-        // torch::Tensor here: allocating a CPU tensor on a convert worker and
+        // torch::stable::Tensor here: allocating a CPU tensor on a convert worker and
         // freeing it on the consumer (main) thread leaks ~one frame of host
         // RAM per frame, because torch's CPU allocator retains the freed block
         // on the main thread's pool while the worker that owned the allocation
@@ -518,7 +521,7 @@ class Decoder
     // CPU allocator involvement (see SyncConvertOutEntry leak note).
     // Validates bufferBytes == nbytes == numel*elem with the (seq,nbytes,gen)
     // stamp; mismatches are freed, never recycled. Memsets on convert error.
-    torch::Tensor tensorFromPooledBuffer(PooledBufferPtr buf);
+    torch::stable::Tensor tensorFromPooledBuffer(PooledBufferPtr buf);
     // Tight frame bytes for the live geometry (W*H*C*elem). Used to size
     // maxInFlight (64MB/frameBytes) and to validate pooled buffers.
     size_t currentFrameBytes() const;

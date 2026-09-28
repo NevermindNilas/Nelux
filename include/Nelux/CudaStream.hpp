@@ -1,12 +1,12 @@
 #pragma once
-// torch's current CUDA stream, obtained WITHOUT an eager link against c10_cuda.
+// torch's current CUDA stream through the PyTorch 2.12 stable C shim.
 //
-// c10_cuda (the PyTorch CUDA layer that exports getCurrentCUDAStream) ships only
+// torch_cuda (the PyTorch CUDA layer that exports the stable shim) ships only
 // with CUDA torch. Linking it eagerly makes the module fail to load on a
 // CPU-only PyTorch (WinError 126 / "cannot open shared object libc10_cuda.so").
 // We defer that dependency:
-//   - Windows: the symbol is delay-loaded (see /DELAYLOAD in CMakeLists.txt).
-//   - Linux:   resolved at runtime via dlsym (no DT_NEEDED on libc10_cuda.so).
+//   - Windows: the C shim is resolved from the already-loaded torch_cuda.dll.
+//   - Linux:   resolved at runtime via dlsym (no DT_NEEDED on libtorch_cuda.so).
 // Either way it is only touched on a real GPU code path, which cannot run on
 // CPU-only torch. Call this only on a confirmed-CUDA path; it throws if the
 // CUDA PyTorch runtime is unavailable.

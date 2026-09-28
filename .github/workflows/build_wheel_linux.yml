@@ -47,7 +47,7 @@ jobs:
 
       - name: Install PyTorch (CUDA)
         run: |
-          python -m pip install torch==2.14.0 torchvision==0.29.0 \
+          python -m pip install torch==2.12.0 \
             --index-url https://download.pytorch.org/whl/cu132
 
       - name: Install CUDA toolkit (RHEL8)
@@ -167,7 +167,6 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
-          python tools/tag_wheel_torch.py dist/*.whl
           echo "=== Repaired wheel ==="
           ls -la dist/
 
@@ -185,7 +184,7 @@ jobs:
 
       - name: Test wheel (import + real decode smoke test)
         run: |
-          pip install dist/*.whl --force-reinstall
+          pip install dist/*.whl --force-reinstall --no-deps
 
           # external/ffmpeg is deliberately NOT on LD_LIBRARY_PATH: the wheel
           # has to stand on its own vendored libraries, and pointing the loader
@@ -200,8 +199,41 @@ jobs:
         with:
           artifact-name: range-gate-linux-${{ matrix.python }}
 
+      - name: Build standalone boundary probe once with floor headers
+        shell: bash
+        run: |
+          cmake -S tests/stable_abi -B out/stable-boundary -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
+          cmake --build out/stable-boundary --config Release
+          python -c "import pathlib,shutil; p=pathlib.Path('out/stable-boundary'); modules=list(p.rglob('abi_probe*.pyd'))+list(p.rglob('abi_probe*.so')); assert len(modules)==1, modules; shutil.copy2(modules[0], 'dist')"
+
+      - name: Audit the exact repaired wheel against floor C shims
+        shell: bash
+        run: |
+          python -m pip install pefile
+          python tools/audit_torch_stable_abi.py dist/*.whl --probe-directory dist
+
       - name: Upload Linux wheel
         uses: actions/upload-artifact@v4
         with:
           name: linux-wheel-${{ matrix.python }}
-          path: dist/*.whl
+          path: |
+            dist/*.whl
+            dist/*.stable-abi.json
+            dist/abi_probe*
+
+  stable-runtime:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.13'
+            python_tag: '313'
+          - python: '3.14'
+            python_tag: '314'
+    uses: ./.github/workflows/stable-abi-runtime.yml
+    with:
+      artifact_name: linux-wheel-cp${{ matrix.python_tag }}
+      runner: ubuntu-22.04
+      python_version: ${{ matrix.python }}
+      profiles: '["cpu", "cu132"]'

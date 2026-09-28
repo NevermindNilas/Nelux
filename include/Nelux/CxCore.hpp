@@ -14,7 +14,9 @@
 #include <thread>
 #include <Logger.hpp>
 
-#include <torch/extension.h>
+#include <TensorSupport.hpp>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <vector>
 #include <optional>
 #include <type_traits>

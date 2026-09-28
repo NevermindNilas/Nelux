@@ -219,10 +219,10 @@ def test_invalid_color_format_raises():
         VideoReader(VIDEO_PATH, color_format="bogus")
 
 
-def test_gray_rejects_decode_batch():
-    vr = VideoReader(VIDEO_PATH, color_format="gray")
-    with pytest.raises(RuntimeError, match="color_format='gray'"):
-        vr.decode_batch([0, 1, 2])
+def test_gray_batch_matches_streaming():
+    with VideoReader(VIDEO_PATH, color_format="gray") as vr:
+        expected = torch.stack([vr.read_frame().clone() for _ in range(3)])
+        assert torch.equal(vr.decode_batch([0, 1, 2]), expected)
 
 
 def test_gray_rejects_nvdec():
