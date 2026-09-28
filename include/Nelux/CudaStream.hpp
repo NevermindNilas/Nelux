@@ -3,7 +3,7 @@
 //
 // torch_cuda (the PyTorch CUDA layer that exports the stable shim) ships only
 // with CUDA torch. Linking it eagerly makes the module fail to load on a
-// CPU-only PyTorch (WinError 126 / "cannot open shared object libc10_cuda.so").
+// CPU-only PyTorch (WinError 126 / "cannot open shared object libtorch_cuda.so").
 // We defer that dependency:
 //   - Windows: the C shim is resolved from the already-loaded torch_cuda.dll.
 //   - Linux:   resolved at runtime via dlsym (no DT_NEEDED on libtorch_cuda.so).

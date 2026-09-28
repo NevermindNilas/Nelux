@@ -303,7 +303,7 @@ Add focused assertions for stable dispatcher exchange, the same-artifact runtime
 
 ### Performance budget and the 3000 FPS question
 
-These local boundary measurements provide scale, not a production prediction:
+These historical prototype boundary measurements provide scale, not a production prediction. They predate the selected 2.12 dispatcher exchange for Nelux's class interface and do not measure its Python-call and override-scope costs. Use the matched production benchmark results for migration acceptance:
 
 | Isolated operation | Extra time relative to ordinary LibTorch | Arithmetic projection from 3000 FPS if paid once per frame |
 |---|---:|---:|

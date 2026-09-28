@@ -45,6 +45,8 @@ continue`` would otherwise keep reading the file that was just rejected.
 """
 
 import os
+from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -169,6 +171,23 @@ def test_reconfigure_onto_a_larger_file(accelerator):
     assert torch.equal(got, reference)
 
 
+def _ffmpeg_cli():
+    """Resolve the reference CLI without changing native library search paths."""
+    executable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for variable in ("FFMPEG_BIN", "NELUX_FFMPEG_BIN"):
+        override = os.environ.get(variable)
+        if override:
+            candidate = Path(override)
+            if candidate.is_dir():
+                candidate /= executable
+            if candidate.is_file():
+                return str(candidate.resolve())
+    found = shutil.which(executable)
+    if found:
+        return found
+    pytest.skip("FFmpeg CLI unavailable; set FFMPEG_BIN to its directory or executable")
+
+
 def _nine_bit_clip(tmp_path):
     """A 9-bit clip: a depth the CONSTRUCTOR rejects, so reconfigure must too.
 
@@ -176,14 +195,12 @@ def _nine_bit_clip(tmp_path):
     profile; it is generated rather than committed because it exists only to be
     refused.
     """
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
-        pytest.skip("ffmpeg not on PATH")
+    ffmpeg = _ffmpeg_cli()
+    subprocess.run([ffmpeg, "-version"], capture_output=True, check=True)
 
     out = str(tmp_path / "nine_bit.mkv")
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi",
          "-i", "testsrc2=size=320x240:rate=30:duration=1",
          "-c:v", "ffv1", "-pix_fmt", "yuv420p9le", out],
         capture_output=True, check=True)

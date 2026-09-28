@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(nelux_stable_boundary_probe LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
-find_package(Python COMPONENTS Interpreter Development REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
     OUTPUT_VARIABLE PYBIND11_CMAKE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
 list(PREPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_DIR}")

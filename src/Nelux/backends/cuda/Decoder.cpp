@@ -5,7 +5,7 @@
 
 #include <cuda_fp16.h>
 
-// (c10_cuda resolved delay-load-safe via CudaStream.hpp; no direct include)
+// (the stable stream shim is resolved lazily via CudaStream.hpp)
 
 #include <CudaStream.hpp>
 #include <CudaRuntimeGuard.hpp>
@@ -431,8 +431,8 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
     requestedVideoStreamIndex_ = streamIndex;
-    // c10_cuda.dll is delay-loaded on Windows so the module imports on a
-    // CPU-only PyTorch; fail clearly here if NVDEC is reached without it.
+    // Torch CUDA is loaded only on GPU paths so CPU-only PyTorch can import
+    // the module; fail clearly here if NVDEC is reached without CUDA Torch.
     nelux::requireCudaRuntime();
 
     // Async fanout uses CPU libswscale convert workers; CUDA decoder produces
