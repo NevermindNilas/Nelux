@@ -111,6 +111,72 @@ def test_runtime_gate_refuses_failed_audit(tmp_path):
         gate.validate_manifest(wheel, manifest)
 
 
+def test_nightly_install_is_separate_from_supported_release_selection():
+    gate = tool("stable_abi_runtime_gate")
+    assert gate.torch_install_arguments("2.12.0") == ["torch==2.12.0"]
+    assert gate.torch_install_arguments(None, nightly=True) == ["--pre", "torch"]
+    with pytest.raises(ValueError, match="declared released"):
+        gate.torch_install_arguments("2.15.0.dev20260929")
+
+
+def test_nightly_cannot_satisfy_gpu_release_gate():
+    from types import SimpleNamespace
+    gate = tool("stable_abi_runtime_gate")
+    with pytest.raises(ValueError, match="cannot satisfy"):
+        gate.run(SimpleNamespace(nightly=True, require_gpu=True))
+
+
+def test_nightly_override_does_not_leak_into_supported_runtime(tmp_path, monkeypatch):
+    gate = tool("stable_abi_runtime_gate")
+    monkeypatch.setenv("NELUX_ALLOW_TORCH_PRERELEASE", "1")
+    monkeypatch.setenv("PYTHONPATH", "unvalidated-build-tree")
+    released = gate.runtime_environment(tmp_path)
+    assert "NELUX_ALLOW_TORCH_PRERELEASE" not in released
+    assert "PYTHONPATH" not in released
+    nightly = gate.runtime_environment(tmp_path, nightly=True)
+    assert nightly["NELUX_ALLOW_TORCH_PRERELEASE"] == "1"
+    assert "PYTHONPATH" not in nightly
+
+
+def test_nightly_import_failure_retains_resolved_runtime(tmp_path, monkeypatch):
+    import builtins
+    from types import SimpleNamespace
+    gate = tool("stable_abi_runtime_gate")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    wheel = dist / "nelux.whl"
+    wheel.write_bytes(b"audited fixture")
+    wheel.with_suffix(".stable-abi.json").write_text(json.dumps({
+        "passed": True, "floor": "2.12", "errors": [],
+        "wheel": wheel.name, "sha256": gate.sha256(wheel),
+    }))
+    monkeypatch.setattr(gate.venv, "create", lambda *args, **kwargs: None)
+    torch = SimpleNamespace(__version__="2.15.0.dev20260929+cpu",
+                            version=SimpleNamespace(cuda=None),
+                            cuda=SimpleNamespace(is_available=lambda: False))
+    def imports(name, *args, **kwargs):
+        if name == "torch":
+            return torch
+        if name == "nelux":
+            raise ImportError("Injected nightly native import regression")
+        return builtins.__import__(name, *args, **kwargs)
+    def command_result(command, **kwargs):
+        if "-c" in command:
+            namespace = {"__builtins__": {**vars(builtins), "__import__": imports}}
+            with pytest.raises(ImportError, match="nightly native"):
+                exec(command[command.index("-c") + 1], namespace)
+            return SimpleNamespace(returncode=1, stdout="Injected nightly native import regression")
+        return SimpleNamespace(returncode=0, stdout="mock install succeeded")
+    monkeypatch.setattr(gate.subprocess, "run", command_result)
+    args = SimpleNamespace(nightly=True, require_gpu=False, torch_version=None,
+                           wheel_dir=dist, output=tmp_path / "result", timeout=30,
+                           index_url="https://download.pytorch.org/whl/nightly/cpu", ffmpeg_bin=tmp_path)
+    assert gate.run(args) == 1
+    report = json.loads((args.output / "summary.json").read_text())
+    assert report["passed"] is False and report["supported_release"] is False
+    assert report["runtime"]["torch"] == torch.__version__
+
+
 def ownership_audit_fixture(tmp_path, monkeypatch):
     audit = tool("audit_torch_stable_abi")
     wheel = tmp_path / "nelux.whl"

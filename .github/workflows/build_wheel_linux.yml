@@ -239,3 +239,21 @@ jobs:
       runner: ubuntu-22.04
       python_version: ${{ matrix.python }}
       profiles: '["cpu", "cu132"]'
+
+  nightly-early-warning:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.13'
+            python_tag: '313'
+          - python: '3.14'
+            python_tag: '314'
+    uses: ./.github/workflows/stable-abi-runtime.yml
+    with:
+      artifact_name: linux-wheel-cp${{ matrix.python_tag }}
+      runner: ubuntu-22.04
+      python_version: ${{ matrix.python }}
+      profiles: '["cpu"]'
+      nightly: true

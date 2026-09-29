@@ -19,15 +19,21 @@ on:
         required: false
         default: false
         type: boolean
+      nightly:
+        description: Test an actual torch nightly as nonblocking early warning
+        required: false
+        default: false
+        type: boolean
 jobs:
   runtime:
+    continue-on-error: ${{ inputs.nightly }}
     # Hosted callers use a runner name; trusted GPU callers pass a JSON label list.
     runs-on: ${{ startsWith(inputs.runner, '[') && fromJSON(inputs.runner) || inputs.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        torch: ['2.12.0', '2.13.0', '2.14.0']
+        torch: ${{ inputs.nightly && fromJSON('["nightly"]') || fromJSON('["2.12.0", "2.13.0", "2.14.0"]') }}
         profile: ${{ fromJSON(inputs.profiles) }}
     steps:
       - uses: actions/checkout@v4
@@ -56,8 +62,17 @@ jobs:
           if [ "$PROFILE" = "macos" ]; then INDEX="https://pypi.org/simple"; fi
           GPU_ARGS=()
           if [ '${{ inputs.require_gpu }}' = 'true' ]; then GPU_ARGS+=(--require-gpu); fi
+          TORCH_ARGS=(--torch-version "$RUNTIME_TORCH")
+          if [ '${{ inputs.nightly }}' = 'true' ]; then
+            if [ "$PROFILE" = "macos" ]; then
+              INDEX="https://download.pytorch.org/whl/nightly/cpu"
+            else
+              INDEX="https://download.pytorch.org/whl/nightly/$PROFILE"
+            fi
+            TORCH_ARGS=(--nightly)
+          fi
           python tools/stable_abi_runtime_gate.py --wheel-dir dist \
-            --torch-version "$RUNTIME_TORCH" --index-url "$INDEX" \
+            "${TORCH_ARGS[@]}" --index-url "$INDEX" \
             --ffmpeg-bin external/ffmpeg/bin --output stable-runtime-results "${GPU_ARGS[@]}"
       - name: Upload runtime evidence
         if: always()

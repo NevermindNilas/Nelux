@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate an audited, unchanged wheel in a fresh released-torch environment.
+"""Validate an audited, unchanged wheel in a fresh torch environment.
 
 This never rebuilds Nelux. Tests and media are staged outside the checkout;
 failure/crash/timeout always fails. CPU runs do not establish GPU parity.
@@ -18,6 +18,27 @@ import venv
 import xml.etree.ElementTree as ET
 
 REPO = Path(__file__).resolve().parents[1]
+
+def torch_install_arguments(version: str | None, *, nightly: bool = False) -> list[str]:
+    if nightly:
+        return ["--pre", "torch"]
+    if version not in ("2.12.0", "2.13.0", "2.14.0"):
+        raise ValueError("Supported validation requires a declared released torch version")
+    return [f"torch=={version}"]
+
+def runtime_environment(ffmpeg_bin: Path, *, nightly: bool = False) -> dict[str, str]:
+    env = dict(os.environ)
+    # Build-tree search paths would invalidate installed-artifact validation.
+    for key in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
+        env.pop(key, None)
+    env["PYTHONNOUSERSITE"] = "1"
+    # A caller's development override must never weaken a supported-release run.
+    env.pop("NELUX_ALLOW_TORCH_PRERELEASE", None)
+    if nightly:
+        env["NELUX_ALLOW_TORCH_PRERELEASE"] = "1"
+    env["FFMPEG_BIN"] = str(ffmpeg_bin.resolve())
+    env["NELUX_FFMPEG_BIN"] = env["FFMPEG_BIN"]
+    return env
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -51,6 +72,9 @@ def validate_manifest(wheel: Path, manifest: Path) -> dict:
     return data
 
 def run(args) -> int:
+    nightly = getattr(args, "nightly", False)
+    if nightly and args.require_gpu:
+        raise ValueError("Nightly early warning cannot satisfy the supported GPU release gate")
     wheels = sorted(args.wheel_dir.glob("*.whl"))
     if len(wheels) != 1:
         raise RuntimeError(f"Expected exactly one wheel, found {len(wheels)}")
@@ -58,18 +82,16 @@ def run(args) -> int:
     audit = validate_manifest(wheel, wheel.with_suffix(".stable-abi.json"))
     args.output.mkdir(parents=True, exist_ok=True)
     output = args.output.resolve()
+    metadata_path = output / "runtime-metadata.json"
+    # Do not attribute metadata from an earlier invocation to a failed install.
+    metadata_path.unlink(missing_ok=True)
     report = {"wheel": wheel.name, "sha256": audit["sha256"], "floor": "2.12",
-              "requested_torch": args.torch_version, "index": args.index_url,
-              "require_gpu": args.require_gpu, "passed": False, "commands": []}
+              "requested_torch": "nightly" if nightly else args.torch_version, "index": args.index_url,
+              "require_gpu": args.require_gpu, "validation_kind": "nightly_early_warning" if nightly else "supported_release",
+              "supported_release": not nightly, "passed": False, "commands": []}
     if "ownership_probe" in audit:
         report["ownership_probe"] = {key: audit["ownership_probe"][key] for key in ("file", "sha256")}
-    env = dict(os.environ)
-    # Build-tree search paths would invalidate installed-artifact validation.
-    for key in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
-        env.pop(key, None)
-    env["PYTHONNOUSERSITE"] = "1"
-    env["FFMPEG_BIN"] = str(args.ffmpeg_bin.resolve())
-    env["NELUX_FFMPEG_BIN"] = env["FFMPEG_BIN"]
+    env = runtime_environment(args.ffmpeg_bin, nightly=nightly)
     try:
         with tempfile.TemporaryDirectory(prefix="nelux-stable-runtime-", ignore_cleanup_errors=True) as temporary:
             stage = Path(temporary)
@@ -87,23 +109,33 @@ def run(args) -> int:
                 if result.returncode:
                     raise RuntimeError(f"Runtime command failed/crashed with exit {result.returncode}: {command}")
             checked([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-            checked([str(python), "-m", "pip", "install", f"torch=={args.torch_version}", "--index-url", args.index_url])
+            checked([str(python), "-m", "pip", "install", *torch_install_arguments(args.torch_version, nightly=nightly), "--index-url", args.index_url])
             checked([str(python), "-m", "pip", "install", "pytest", "numpy", "packaging"])
             checked([str(python), "-m", "pip", "install", "--no-deps", str(wheel)])
             verification = '''
-import json, pathlib, torch, nelux
+import json, pathlib, torch
+from packaging.version import Version
+metadata = {"torch": torch.__version__, "cuda": torch.version.cuda, "gpu_available": torch.cuda.is_available()}
+pathlib.Path(RUNTIME_METADATA).write_text(json.dumps(metadata))
+import nelux
 assert pathlib.Path(nelux.__file__).resolve().is_relative_to(pathlib.Path("environment").resolve()), nelux.__file__
-assert torch.__version__.split("+", 1)[0] == EXPECTED
+if NIGHTLY:
+    assert Version(torch.__version__).is_prerelease, "Nightly validation requires an actual prerelease torch artifact"
+else:
+    assert torch.__version__.split("+", 1)[0] == EXPECTED
 assert nelux.__torch_abi_kind__ == "stable"
 assert nelux.__torch_abi_floor__ == "2.12"
 assert nelux.__torch_abi__ == "2.12"
 assert nelux.__torch_build_version__.split("+", 1)[0] == "2.12.0"
 if REQUIRE_GPU:
     assert torch.version.cuda and torch.cuda.is_available(), "Provisioned CUDA/NVDEC/NVENC runner is required"
-print(json.dumps({"torch": torch.__version__, "cuda": torch.version.cuda, "gpu_available": torch.cuda.is_available(), "nelux": nelux.__file__}))
+metadata["nelux"] = nelux.__file__
+pathlib.Path(RUNTIME_METADATA).write_text(json.dumps(metadata))
+print(json.dumps(metadata))
 '''
-            verification = "EXPECTED=" + repr(args.torch_version) + "\nREQUIRE_GPU=" + repr(args.require_gpu) + "\n" + verification
+            verification = "EXPECTED=" + repr(args.torch_version) + "\nREQUIRE_GPU=" + repr(args.require_gpu) + "\nNIGHTLY=" + repr(nightly) + "\nRUNTIME_METADATA=" + repr(str(output / "runtime-metadata.json")) + "\n" + verification
             checked([str(python), "-I", "-c", verification])
+            report["runtime"] = json.loads((output / "runtime-metadata.json").read_text())
             shutil.copytree(REPO / "tests", stage / "tests", ignore=shutil.ignore_patterns("__pycache__", "output", "conftest.py"))
             shutil.copytree(REPO / "tools", stage / "tools", ignore=shutil.ignore_patterns("__pycache__"))
             # Ignored developer media cannot be assumed present in a checkout.
@@ -194,13 +226,17 @@ def pytest_runtest_makereport(item, call):
         report["error"] = str(exc)
         print(str(exc), file=sys.stderr)
     finally:
+        if metadata_path.is_file():
+            report["runtime"] = json.loads(metadata_path.read_text())
         (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0 if report["passed"] else 1
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel-dir", type=Path, required=True)
-    parser.add_argument("--torch-version", required=True, choices=("2.12.0", "2.13.0", "2.14.0"))
+    runtime = parser.add_mutually_exclusive_group(required=True)
+    runtime.add_argument("--torch-version", choices=("2.12.0", "2.13.0", "2.14.0"))
+    runtime.add_argument("--nightly", action="store_true", help="Separate prerelease early warning; never release acceptance")
     parser.add_argument("--index-url", required=True)
     parser.add_argument("--ffmpeg-bin", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

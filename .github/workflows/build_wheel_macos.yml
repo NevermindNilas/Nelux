@@ -214,3 +214,17 @@ jobs:
       runner: macos-14
       python_version: ${{ matrix.python }}
       profiles: '["macos"]'
+
+  nightly-early-warning:
+    needs: build-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.13', '3.14']
+    uses: ./.github/workflows/stable-abi-runtime.yml
+    with:
+      artifact_name: macos-wheel-arm64-py${{ matrix.python }}
+      runner: macos-14
+      python_version: ${{ matrix.python }}
+      profiles: '["macos"]'
+      nightly: true

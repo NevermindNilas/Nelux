@@ -336,3 +336,17 @@ jobs:
       runner: windows-2022
       python_version: ${{ matrix.python }}
       profiles: '["cpu", "cu132"]'
+
+  nightly-early-warning:
+    needs: build-windows
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.13', '3.14']
+    uses: ./.github/workflows/stable-abi-runtime.yml
+    with:
+      artifact_name: windows-wheel-py${{ matrix.python }}
+      runner: windows-2022
+      python_version: ${{ matrix.python }}
+      profiles: '["cpu"]'
+      nightly: true
