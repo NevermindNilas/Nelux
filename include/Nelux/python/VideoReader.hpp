@@ -95,11 +95,11 @@ class VideoReader
     // Direct property getters for performance
     int getWidth() const
     {
-        return properties.width;
+        return rotationQuarterTurns() % 2 ? properties.height : properties.width;
     }
     int getHeight() const
     {
-        return properties.height;
+        return rotationQuarterTurns() % 2 ? properties.width : properties.height;
     }
     /// Channels in a decoded frame, following color_format: 3 "rgb",
     /// 4 "rgba", 1 "gray". Fixed at construction, so no lock is needed.
@@ -152,6 +152,7 @@ class VideoReader
      */
     py::dict getProperties() const;
     py::dict getMetadataSnapshot(bool exact) const;
+    void setApplyRotation(bool enable);
 
     /**
      * @brief Read a frame from the video.
@@ -735,6 +736,9 @@ class VideoReader
     nelux::DecodeAccelerator decodeAccelerator = nelux::DecodeAccelerator::CPU;
     int cudaDeviceIndex = 0;
     int streamIndex_ = -1;
+    bool applyRotation_ = true;
+    int rotationQuarterTurns() const;
+    torch::Tensor orientFrameLocked(torch::Tensor frame, bool batch = false) const;
     bool asyncFrames_ = false;
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;

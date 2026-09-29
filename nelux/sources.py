@@ -8,11 +8,28 @@ from typing import BinaryIO, cast
 import numpy as np
 import torch
 
+type EncodedSource = str | os.PathLike[str] | bytes | bytearray | memoryview | BinaryIO | torch.Tensor | np.ndarray
+
 
 def prepare_source(source):
     """Return (path, owner). Encoded memory inputs are spooled once to a temp file."""
     if isinstance(source, (str, os.PathLike)):
         return os.fspath(source), None
+    payload = read_encoded_source(source)
+    owner = tempfile.TemporaryDirectory(prefix="nelux-source-")
+    path = Path(owner.name) / "input.bin"
+    try:
+        path.write_bytes(payload)
+    except BaseException:
+        owner.cleanup()
+        raise
+    return str(path), owner
+
+
+def read_encoded_source(source) -> bytes:
+    """Read encoded data without spooling; restore a seekable stream's position."""
+    if isinstance(source, (str, os.PathLike)):
+        return Path(source).read_bytes()
     if isinstance(source, torch.Tensor):
         if source.dtype != torch.uint8 or source.ndim != 1 or source.device.type != "cpu":
             raise TypeError("Encoded tensor input must be a one-dimensional CPU uint8 tensor")
@@ -35,11 +52,4 @@ def prepare_source(source):
         source = data
     if not isinstance(source, (bytes, bytearray, memoryview)):
         raise TypeError("input_path must be a path/URL, encoded bytes, uint8 tensor/array, or binary file-like source")
-    owner = tempfile.TemporaryDirectory(prefix="nelux-source-")
-    path = Path(owner.name) / "input.bin"
-    try:
-        path.write_bytes(bytes(source))
-    except BaseException:
-        owner.cleanup()
-        raise
-    return str(path), owner
+    return bytes(source)

@@ -3,7 +3,7 @@ from typing import BinaryIO, Literal, Sequence
 import numpy as np
 import torch
 
-from ._nelux import (VideoEncoder as VideoEncoder, FrameIndex as FrameIndex,
+from ._nelux import (FrameIndex as FrameIndex,
     LogLevel as LogLevel, set_log_level as set_log_level, probe as probe,
     get_available_encoders as get_available_encoders, get_nvenc_encoders as get_nvenc_encoders,
     merge_streams as merge_streams, __version__ as __version__, __torch_abi__ as __torch_abi__,
@@ -11,6 +11,9 @@ from ._nelux import (VideoEncoder as VideoEncoder, FrameIndex as FrameIndex,
 from ._nelux import VideoReader as _NativeVideoReader
 from .temporal import Frame as Frame, FrameBatch as FrameBatch, VideoMetadata as VideoMetadata
 from . import samplers as samplers
+from .audio import AudioReader as AudioReader, AudioSamples as AudioSamples, AudioMetadata as AudioMetadata
+from .encoding import VideoEncoder as VideoEncoder, encode_video as encode_video
+from .images import decode_image as decode_image, decode_images as decode_images, encode_image as encode_image
 
 class VideoReader(_NativeVideoReader):
     def __init__(self, input_path: str | PathLike[str] | bytes | bytearray | memoryview | BinaryIO | torch.Tensor | np.ndarray,
@@ -22,7 +25,7 @@ class VideoReader(_NativeVideoReader):
                  resize_filter: str = "bilinear", motion_vectors: bool = False, stream_index: int | None = None,
                  *, dimension_order: Literal["HWC", "CHW"] = "HWC", copy_frames: bool = False,
                  seek_mode: Literal["exact", "approximate"] = "exact", frame_index: FrameIndex | None = None,
-                 async_frames: bool = False) -> None: ...
+                 async_frames: bool = False, apply_rotation: bool = True) -> None: ...
     @property
     def frame_index(self) -> FrameIndex: ...
     @property
@@ -38,6 +41,7 @@ class VideoReader(_NativeVideoReader):
     def get_batch(self, indices: Sequence[int] | slice | torch.Tensor | np.ndarray) -> torch.Tensor: ...
     def get_batch_range(self, start: int = 0, end: int | None = None, step: int = 1) -> torch.Tensor: ...
     def iter_segments(self): ...
+    def create_encoder(self, output_path=None, *, format: str = "mp4") -> VideoEncoder: ...
 
 def probe_cache_clear() -> None: ...
 def diagnose_runtime_dlls() -> dict: ...

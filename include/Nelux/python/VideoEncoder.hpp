@@ -55,12 +55,14 @@ class VideoEncoder
                  std::optional<std::string> presetStr = std::nullopt,
                  std::map<std::string, std::string> extraOptions = {},
                  bool resize = false,
-                 const std::string& resizeFilter = "bilinear");
+                 const std::string& resizeFilter = "bilinear",
+                 bool memoryOutput = false);
 
     ~VideoEncoder();
 
     void encodeFrame(torch::Tensor frame);
     void close();
+    torch::Tensor getEncodedData();
 
     // Check if using hardware encoder. Takes the lifecycle lock: it reads the
     // `encoder` member, which close() swaps out and destroys.
@@ -99,6 +101,8 @@ class VideoEncoder
     int width, height;
     AVPixelFormat outputPixelFormat;  // Actual pixel format used
     std::string outputPath_;
+    bool memoryOutput_ = false;
+    std::vector<uint8_t> encodedOutput_;
     bool directStillImage_ = false;   // one image2 file, no numbered pattern
     bool directStillImageEncoded_ = false;
     bool borrowStillImageInput_ = false; // safe only when codec has one thread

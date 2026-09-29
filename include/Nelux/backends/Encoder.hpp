@@ -144,7 +144,8 @@ class Encoder
     };
 
     Encoder() = default;
-    Encoder(const std::string& filename, const EncodingProperties& properties);
+    Encoder(const std::string& filename, const EncodingProperties& properties,
+            bool memoryOutput = false);
     ~Encoder();
 
     void initialize();
@@ -155,6 +156,7 @@ class Encoder
     // loss this prevents.
     void stampPacketDuration();
     void close();
+    std::vector<uint8_t> takeOutputBytes() { return std::move(outputBytes_); }
 
     // Copy (remux) audio and/or subtitle streams from `source` into the output
     // container, equivalent to ffmpeg `-c:a copy -c:s copy`. Must be called
@@ -188,6 +190,8 @@ class Encoder
         return properties;
     }
   private:
+    bool memoryOutput_ = false;
+    std::vector<uint8_t> outputBytes_;
     void initVideoStream();
     void initHardwareContext();  // NEW: Initialize CUDA device context for NVENC
     void openOutputFile();

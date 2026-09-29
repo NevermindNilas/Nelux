@@ -69,6 +69,8 @@ class Decoder
         int rFrameRateNum = 0;
         int rFrameRateDen = 0;
         bool isVfr = false;          // r_frame_rate != avg_frame_rate
+        double rotationDegrees = 0.0; // counterclockwise display orientation
+        bool displayHFlip = false;    // reflection after rotation
 
         // Raw container frame count (0 if the container does not carry it);
         // distinct from totalFrames, which falls back to fps*duration.

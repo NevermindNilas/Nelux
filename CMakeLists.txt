@@ -961,6 +961,26 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
 endif()
 
 # --- GPL paper trail --------------------------------------------------------
+if(NELUX_ENABLE_CUDA)
+  # Optional JPEG runtime is resolved lazily, preserving CPU-only imports.
+  if(WIN32)
+    file(GLOB _nelux_nvjpeg_dlls "${CUDAToolkit_BIN_DIR}/nvjpeg64_*.dll"
+                               "${CUDAToolkit_BIN_DIR}/x64/nvjpeg64_*.dll")
+    if(_nelux_nvjpeg_dlls)
+      install(FILES ${_nelux_nvjpeg_dlls} DESTINATION nelux)
+    endif()
+  elseif(TARGET CUDA::nvjpeg)
+    get_target_property(_nelux_nvjpeg_shared CUDA::nvjpeg IMPORTED_LOCATION)
+    if(EXISTS "${_nelux_nvjpeg_shared}")
+      file(REAL_PATH "${_nelux_nvjpeg_shared}" _nelux_nvjpeg_real)
+      install(FILES "${_nelux_nvjpeg_real}" DESTINATION nelux RENAME libnvjpeg.so)
+    endif()
+  endif()
+  if(EXISTS "${CUDAToolkit_LIBRARY_ROOT}/EULA.txt")
+    install(FILES "${CUDAToolkit_LIBRARY_ROOT}/EULA.txt" DESTINATION nelux/licenses/cuda)
+  endif()
+endif()
+
 # The FFmpeg binaries we ship are GPL-2.0-or-later (libx264 and libx265 are
 # linked in), so the wheel is a combined work and the corresponding source has
 # to stay offer-able. Ship the licence texts the archive came with plus a NOTICE

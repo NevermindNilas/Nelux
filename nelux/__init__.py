@@ -412,6 +412,9 @@ from .temporal import TemporalMixin, Frame, FrameBatch, VideoMetadata
 from . import samplers
 from .sources import prepare_source
 from ._nelux import FrameIndex
+from .audio import AudioReader, AudioSamples, AudioMetadata
+from .encoding import VideoEncoder, encode_video
+from .images import decode_image, decode_images, encode_image
 
 
 class VideoReader(TemporalMixin, BatchMixin, _VideoReaderBase):
@@ -423,6 +426,7 @@ class VideoReader(TemporalMixin, BatchMixin, _VideoReaderBase):
         self.seek_mode = kwargs.pop("seek_mode", "exact")
         frame_index = kwargs.pop("frame_index", None)
         async_frames = kwargs.pop("async_frames", False)
+        apply_rotation = kwargs.pop("apply_rotation", True)
         if self.dimension_order not in ("HWC", "CHW"):
             raise ValueError("dimension_order must be 'HWC' or 'CHW'")
         if self.seek_mode not in ("exact", "approximate"):
@@ -456,20 +460,37 @@ class VideoReader(TemporalMixin, BatchMixin, _VideoReaderBase):
                 )
         try:
             super().__init__(*args, **kwargs)
+            try:
+                self._set_apply_rotation(apply_rotation)
+                if async_frames:
+                    self._enable_async_frames()
+                if frame_index is not None:
+                    self._set_frame_index(frame_index)
+            except BaseException:
+                super().close()
+                raise
         except BaseException:
             if self._source_owner is not None:
                 self._source_owner.cleanup()
+                self._source_owner = None
             raise
-        if async_frames:
-            self._enable_async_frames()
-        if frame_index is not None:
-            self._set_frame_index(frame_index)
 
     def close(self):
         super().close()
         if self._source_owner is not None:
             self._source_owner.cleanup()
             self._source_owner = None
+
+    def create_encoder(self, output_path=None, *, format="mp4"):
+        props = self.get_properties()
+        fps = props["fps"]
+        for prefix in ("avg_frame_rate", "r_frame_rate"):
+            num, den = props[prefix + "_num"], props[prefix + "_den"]
+            if num > 0 and den > 0:
+                fps = num / den
+                break
+        return VideoEncoder(output_path, format=format, width=props["width"],
+                            height=props["height"], fps=fps)
 
     def __exit__(self, *args):
         try:
@@ -585,6 +606,13 @@ __all__ = [
     "FrameIndex",
     "VideoMetadata",
     "samplers",
+    "AudioReader",
+    "AudioSamples",
+    "AudioMetadata",
+    "encode_video",
+    "decode_image",
+    "decode_images",
+    "encode_image",
     "VideoEncoder",
     "set_log_level",
     "LogLevel",

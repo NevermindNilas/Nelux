@@ -179,8 +179,9 @@ bool movRejectsAudioCopy(const AVOutputFormat* ofmt, int codecId)
             codec == AV_CODEC_ID_FLAC || codec == AV_CODEC_ID_TRUEHD);
 }
 
-Encoder::Encoder(const std::string& filename, const EncodingProperties& properties)
-    : properties(properties), filename(filename) // Store filename
+Encoder::Encoder(const std::string& filename, const EncodingProperties& properties,
+                 bool memoryOutput)
+    : properties(properties), filename(filename), memoryOutput_(memoryOutput)
 {
     initialize();
     openOutputFile();
@@ -211,6 +212,7 @@ void Encoder::initialize()
 
     // Infer container format from filename extension
     std::string containerFormat = inferContainerFormat(filename);
+    if (memoryOutput_ && containerFormat == "image2") containerFormat = "image2pipe";
 
     // Allocate format context
     avformat_alloc_output_context2(&fmt_ctx, nullptr, containerFormat.c_str(),
@@ -230,6 +232,11 @@ void Encoder::initialize()
 }
 void Encoder::openOutputFile()
 {
+    if (memoryOutput_) {
+        int result = avio_open_dyn_buf(&formatCtx->pb);
+        if (result < 0) throw std::runtime_error("Could not open memory output: " + errorToString(result));
+        return;
+    }
     // Ensure the parent directory exists, if needed
     filename = normalizePath(filename);
     std::filesystem::path filePath(filename);
@@ -1697,7 +1704,8 @@ void Encoder::close()
     }
 
     // Trailer finalizes moov box in .mp4
-    av_write_trailer(formatCtx.get());
+    const int trailerResult = av_write_trailer(formatCtx.get());
+    int memoryError = trailerResult;
 
     // Release per-stream transcode resources (swresample / FIFO are not owned
     // by the codec context, so free them explicitly; the codec contexts
@@ -1714,7 +1722,14 @@ void Encoder::close()
     inputFormatCtx.reset();
 
     // If not NOFILE, close I/O
-    if (!(formatCtx->oformat->flags & AVFMT_NOFILE) && formatCtx->pb)
+    if (memoryOutput_ && formatCtx->pb) {
+        uint8_t* bytes = nullptr;
+        const int size = avio_close_dyn_buf(formatCtx->pb, &bytes);
+        formatCtx->pb = nullptr;
+        if (size >= 0 && trailerResult >= 0) outputBytes_.assign(bytes, bytes + size);
+        av_free(bytes);
+        if (size < 0) memoryError = size;
+    } else if (!(formatCtx->oformat->flags & AVFMT_NOFILE) && formatCtx->pb)
         avio_closep(&formatCtx->pb);
 
     // Clean up hardware contexts
@@ -1737,6 +1752,8 @@ void Encoder::close()
         videoCodecCtx.reset();
     }
     formatCtx.reset();
+    if (memoryOutput_ && memoryError < 0)
+        throw std::runtime_error("Could not finalize memory output: " + errorToString(memoryError));
 }
 
 

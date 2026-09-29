@@ -33,6 +33,8 @@ class VideoMetadata:
     bit_depth: int
     codec: str
     is_vfr: bool
+    rotation_degrees: float = 0.0
+    display_hflip: bool = False
 
 
 class TemporalMixin(_NativeReader):
@@ -123,7 +125,8 @@ class TemporalMixin(_NativeReader):
         props = super()._get_metadata_snapshot(self.seek_mode == "exact")
         return VideoMetadata(props["width"], props["height"], props["fps"] or None,
                              props["duration"] or None, props["num_frames"],
-                             props["bit_depth"], props["codec"], props["is_vfr"])
+                             props["bit_depth"], props["codec"], props["is_vfr"],
+                             props["rotation_degrees"], props["display_hflip"])
 
     def _frame_result(self, batch):
         data = batch.data[0]

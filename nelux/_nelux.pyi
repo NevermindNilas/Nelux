@@ -11,6 +11,17 @@ __cuda_support__: bool
 # av_version_info() of the FFmpeg loaded at runtime, e.g. "8.1.2-tas" for the
 # TAS-FFMPEG build bundled in the wheel.
 __ffmpeg_version__: str
+class _ImageCodecCache:
+    def __init__(self) -> None: ...
+    def clear(self) -> None: ...
+def _decode_jpegs_cuda(encoded: Sequence[bytes], device: int, cache: _ImageCodecCache) -> list[torch.Tensor]: ...
+def _encode_jpeg_cuda(image: torch.Tensor, quality: int, cache: _ImageCodecCache) -> torch.Tensor: ...
+
+class _AudioDecoder:
+    def __init__(self, path: str, stream_index: int, sample_rate: int, channels: int, threads: int) -> None: ...
+    def samples(self, start: float, end: float | None) -> tuple[torch.Tensor, float, int]: ...
+    def metadata(self) -> tuple[int, int, int, float, str, int]: ...
+    def close(self) -> None: ...
 
 class LogLevel(Enum):
     trace = 0
@@ -166,8 +177,8 @@ class VideoReader:
 
     @property
     def aspect_ratio(self) -> float:
-        """Storage aspect ratio, width / height. NOT the display aspect ratio
-        on anamorphic sources — see ``properties['display_aspect_ratio']``."""
+        """Coded storage aspect ratio, before display rotation. For anamorphic
+        sources see ``properties['display_aspect_ratio']`` (also coded)."""
         ...
 
     @property
@@ -221,7 +232,7 @@ class VideoReader:
             pixel_format (str)
             bit_depth (int)
             color_primaries, color_transfer, color_space, color_range (str)
-            aspect_ratio (float)                   - width/height
+            aspect_ratio (float)                   - coded width/height, before rotation
             sample_aspect_ratio, display_aspect_ratio (str) - "1:1"-style rationals
             bit_rate, format_bit_rate (int, bits/s)
             field_order (str)                      - progressive/tt/bb/tb/bt/unknown
@@ -438,6 +449,7 @@ class VideoReader:
     def _decode_clips_played_at(self, starts: Sequence[float], length: int, stride: float, policy: str) -> tuple[torch.Tensor, list[tuple[float, float]]]: ...
     def _get_frame_indices_played_at(self, seconds: Sequence[float]) -> list[int]: ...
     def _get_metadata_snapshot(self, exact: bool) -> dict[str, Any]: ...
+    def _set_apply_rotation(self, enable: bool) -> None: ...
     def _get_frame_timing(self) -> list[tuple[float, float]]: ...
     def _get_frame_index(self) -> FrameIndex: ...
     def _set_frame_index(self, index: FrameIndex) -> None: ...
@@ -503,6 +515,7 @@ class VideoReader:
         ...
 
 class VideoEncoder:
+    def get_encoded_data(self) -> torch.Tensor: ...
     """
     Encode video frames into a file.
     """
@@ -523,6 +536,7 @@ class VideoEncoder:
             "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor",
             "area", "bicublin", "gauss", "sinc", "lanczos", "spline",
         ] = "bilinear",
+        _memory_output: bool = False,
     ) -> None:
         """
         Create a VideoEncoder; pass None for defaults.

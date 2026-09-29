@@ -686,6 +686,7 @@ int VideoReader::exactRangeFrameCount()
                             ? "nvdec" : "cpu",
                         cudaDeviceIndex, 0, 0, false, 0, "rgb", "bilinear", false,
                         streamIndex_);
+    counter.setApplyRotation(false);
     int64_t count = 0;
     for (;;)
     {
@@ -734,7 +735,7 @@ torch::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
     }
     if (frame_timestamp)
         *frame_timestamp = ts;
-    return outTensor;
+    return orientFrameLocked(outTensor);
 }
 
 torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
@@ -1188,6 +1189,8 @@ py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties
     props["r_frame_rate_num"] = properties.rFrameRateNum;
     props["r_frame_rate_den"] = properties.rFrameRateDen;
     props["is_vfr"] = properties.isVfr;
+    props["rotation_degrees"] = properties.rotationDegrees;
+    props["display_hflip"] = properties.displayHFlip;
     props["nb_frames"] = properties.nbFrames;
 
     // Color metadata
@@ -1223,7 +1226,13 @@ py::dict videoPropertiesToDict(const nelux::Decoder::VideoProperties& properties
 py::dict VideoReader::getProperties() const
 {
     NELUX_TRACE("getProperties() called");
-    return videoPropertiesToDict(properties);
+    auto snapshot = underReaderLockRead([&](nelux::Decoder*) {
+        auto value = properties;
+        value.width = getWidth();
+        value.height = getHeight();
+        return value;
+    });
+    return videoPropertiesToDict(snapshot);
 }
 
 py::object VideoReader::operator[](py::object key)
@@ -1645,7 +1654,7 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     randLastTs_.store(hit_ts, std::memory_order_relaxed);
 
     NELUX_DEBUG("decodeFrameAt(): hit ts={}", hit_ts);
-    return out_frame;
+    return orientFrameLocked(out_frame);
 }
 
 torch::Tensor VideoReader::decodeFrameAt(int frame_index)
@@ -1936,6 +1945,33 @@ nelux::IndexedDecoder& VideoReader::indexedDecoderLocked() const
     return *indexed_decoder_;
 }
 
+int VideoReader::rotationQuarterTurns() const
+{
+    if (!applyRotation_) return 0;
+    const double angle = properties.rotationDegrees;
+    if (!std::isfinite(angle) || std::abs(angle / 90.0 - std::round(angle / 90.0)) > 1e-4)
+        throw std::invalid_argument("Only right-angle display rotations are supported; use apply_rotation=False for coded pixels");
+    return (static_cast<int>(std::llround(angle / 90.0)) % 4 + 4) % 4;
+}
+
+void VideoReader::setApplyRotation(bool enable)
+{
+    underReaderLock([&](nelux::Decoder&) {
+        applyRotation_ = enable;
+        rotationQuarterTurns();
+    });
+}
+
+torch::Tensor VideoReader::orientFrameLocked(torch::Tensor frame, bool batch) const
+{
+    if (!frame.defined() || !applyRotation_) return frame;
+    const int first = batch ? 1 : (frame.dim() == 4 ? 2 : 0);
+    const int turns = rotationQuarterTurns();
+    if (turns) frame = torch::rot90(frame, turns, {first, first + 1});
+    if (properties.displayHFlip) frame = frame.flip({first + 1});
+    return frame;
+}
+
 int64_t VideoReader::getFrameCount() const
 {
     py::gil_scoped_release release;
@@ -1960,6 +1996,8 @@ py::dict VideoReader::getMetadataSnapshot(bool exact) const
         std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
         if (!decoder) throw std::runtime_error("VideoReader is closed");
         snapshot = properties;
+        snapshot.width = getWidth();
+        snapshot.height = getHeight();
         count = exact ? indexedDecoderLocked().size() : decoder->get_frame_count();
     }
     py::dict result;
@@ -1971,6 +2009,8 @@ py::dict VideoReader::getMetadataSnapshot(bool exact) const
     result["bit_depth"] = snapshot.bitDepth;
     result["codec"] = snapshot.codec;
     result["is_vfr"] = snapshot.isVfr;
+    result["rotation_degrees"] = snapshot.rotationDegrees;
+    result["display_hflip"] = snapshot.displayHFlip;
     return result;
 }
 
@@ -2021,7 +2061,7 @@ torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 {
     py::gil_scoped_release release;
     std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
-    return indexedDecoderLocked().decode(indices);
+    return orientFrameLocked(indexedDecoderLocked().decode(indices), true);
 }
 
 VideoReader::TimedBatch VideoReader::decodeTimedBatch(const std::vector<int64_t>& indices)
@@ -2030,7 +2070,7 @@ VideoReader::TimedBatch VideoReader::decodeTimedBatch(const std::vector<int64_t>
     std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
     auto& sampling = indexedDecoderLocked();
     auto data = sampling.decode(indices);
-    return {data, sampling.timingFor(indices)};
+    return {orientFrameLocked(data, true), sampling.timingFor(indices)};
 }
 
 VideoReader::TimedBatch VideoReader::decodeBatchPlayedAt(const std::vector<double>& seconds)
@@ -2040,7 +2080,7 @@ VideoReader::TimedBatch VideoReader::decodeBatchPlayedAt(const std::vector<doubl
     auto& sampling = indexedDecoderLocked();
     auto indices = sampling.indicesPlayedAt(seconds);
     auto data = sampling.decode(indices);
-    return {data, sampling.timingFor(indices)};
+    return {orientFrameLocked(data, true), sampling.timingFor(indices)};
 }
 
 std::vector<int64_t> VideoReader::getFrameIndicesPlayedAt(const std::vector<double>& seconds) const
@@ -2059,14 +2099,14 @@ VideoReader::TimedBatch VideoReader::decodeClipsPlayedAt(const std::vector<doubl
     auto& sampling = indexedDecoderLocked();
     auto indices = sampling.clipIndicesPlayedAt(starts, length, stride, policy);
     auto data = sampling.decode(indices);
-    return {data, sampling.timingFor(indices)};
+    return {orientFrameLocked(data, true), sampling.timingFor(indices)};
 }
 
 torch::Tensor VideoReader::decodeBatchApproximate(const std::vector<int64_t>& indices)
 {
     if (!indices.empty()) streamTouched_ = true;
     return underReaderLock([&](nelux::Decoder& decoder) {
-        return decoder.decode_batch(indices);
+        return orientFrameLocked(decoder.decode_batch(indices), true);
     });
 }
 
@@ -2189,6 +2229,7 @@ void VideoReader::reconfigure(const std::string& newFilePath)
                 // Read back from the decoder we just reconfigured, not through a
                 // pointer pinned before the lock.
                 properties = d.getVideoProperties();
+                rotationQuarterTurns();
                 filePath = newFilePath;
 
                 // Reallocate the output tensor if the geometry, layout or dtype

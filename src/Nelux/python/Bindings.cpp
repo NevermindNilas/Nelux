@@ -2,6 +2,8 @@
 #include "VideoReader.hpp"
 #include <spdlog/spdlog.h>
 #include "StreamMuxer.hpp"
+#include "AudioDecoder.hpp"
+#include "ImageCodec.hpp"
 #include <optional>
 #include <utility>
 #include <pybind11/pybind11.h>
@@ -177,6 +179,17 @@ const char* loadedFFmpegVersion()
 
 PYBIND11_MODULE(_nelux, m)
 {
+    m.def("_decode_jpegs_cuda", &nelux::decodeJpegsCUDA, py::call_guard<py::gil_scoped_release>());
+    m.def("_encode_jpeg_cuda", &nelux::encodeJpegCUDA, py::call_guard<py::gil_scoped_release>());
+    py::class_<nelux::ImageCodecCache>(m, "_ImageCodecCache")
+        .def(py::init<>())
+        .def("clear", &nelux::ImageCodecCache::clear, py::call_guard<py::gil_scoped_release>());
+    py::class_<nelux::AudioDecoder>(m, "_AudioDecoder")
+        .def(py::init<const std::string&, int, int, int, int>(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("samples", &nelux::AudioDecoder::samples, py::call_guard<py::gil_scoped_release>())
+        .def("metadata", &nelux::AudioDecoder::metadata, py::call_guard<py::gil_scoped_release>())
+        .def("close", &nelux::AudioDecoder::close, py::call_guard<py::gil_scoped_release>());
     m.doc() = "nelux – lightspeed video decoding into tensors";
     m.attr("__version__") = "0.20.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
@@ -408,6 +421,7 @@ Uses the secondary decoder; does not disturb iteration.)doc")
         .def("_decode_clips_played_at", &VideoReader::decodeClipsPlayedAt)
         .def("_get_frame_indices_played_at", &VideoReader::getFrameIndicesPlayedAt)
         .def("_get_metadata_snapshot", &VideoReader::getMetadataSnapshot)
+        .def("_set_apply_rotation", &VideoReader::setApplyRotation)
         .def("_decode_batch_approximate", &VideoReader::decodeBatchApproximate)
         .def("_get_frame_timing", &VideoReader::getFrameTiming,
              "Raw presentation timestamps and durations in decoded frame order.")
@@ -599,7 +613,7 @@ Example:
                     py::object preset, std::optional<int> cq,
                     std::optional<std::string> pixel_format,
                     std::optional<std::map<std::string, std::string>> options,
-                    bool resize, const std::string& resize_filter)
+                    bool resize, const std::string& resize_filter, bool memory_output)
                  {
                      // Dispatch `preset` on Python type: int → existing 1..N
                      // mapping table per codec; str → forwarded straight to
@@ -633,7 +647,7 @@ Example:
                      return std::make_shared<nelux::VideoEncoder>(
                          output_path, codec, width, height, bit_rate, fps,
                          presetInt, cq, pixel_format, presetStr,
-                         std::move(extraOptions), resize, resize_filter);
+                         std::move(extraOptions), resize, resize_filter, memory_output);
                  }),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
@@ -643,6 +657,7 @@ Example:
              py::arg("options") = py::none(),
              py::arg("resize") = false,
              py::arg("resize_filter") = "bilinear",
+             py::arg("_memory_output") = false,
              R"doc(Create a video encoder.
 
 Args:
@@ -787,6 +802,7 @@ Example:
     ...     enc.encode_frame(f)
     >>> enc.close()
 )doc")
+        .def("get_encoded_data", &nelux::VideoEncoder::getEncodedData)
         .def("close", &nelux::VideoEncoder::close,
              "Finalize file and flush video streams.")
         .def_property_readonly("is_hardware_encoder",

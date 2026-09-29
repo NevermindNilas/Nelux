@@ -171,8 +171,9 @@ VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> pixelFormat,
                            std::optional<std::string> presetStr,
                            std::map<std::string, std::string> extraOptions,
-                           bool resize, const std::string& resizeFilter)
+                           bool resize, const std::string& resizeFilter, bool memoryOutput)
 {
+    memoryOutput_ = memoryOutput;
     // Parse the filter name even when resize is off, so a typo raises at
     // construction rather than being silently carried until (never) used.
     resizeFlags_ = nelux::conversion::cpu::swsFlagFromResizeFilter(resizeFilter);
@@ -188,7 +189,7 @@ VideoEncoder::VideoEncoder(const std::string& filename,
     this->height = properties.height;
     this->outputPixelFormat = properties.pixelFormat;
 
-    encoder = std::make_unique<nelux::Encoder>(filename, properties);
+    encoder = std::make_unique<nelux::Encoder>(filename, properties, memoryOutput_);
 
     // Re-read what the encoder actually opened with. NVENC may have changed the
     // pixel format (e.g. to NV12), a codec may have fallen back to a format it
@@ -858,7 +859,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         encoder.reset();
         props.extraOptions["compression_level"] = "0";
         props.extraOptions["pred"] = "none";
-        encoder = std::make_unique<nelux::Encoder>(outputPath_, props);
+        encoder = std::make_unique<nelux::Encoder>(outputPath_, props, memoryOutput_);
         props = encoder->Properties();
         outputPixelFormat = props.pixelFormat;
     }
@@ -1474,6 +1475,19 @@ void VideoEncoder::close()
     underEncoderLock([this] { closeLocked(); });
 }
 
+torch::Tensor VideoEncoder::getEncodedData()
+{
+    return underEncoderLock([this] {
+        if (!memoryOutput_) throw std::invalid_argument("Encoded data is available only for a memory destination");
+        closeLocked();
+        if (encodedOutput_.empty()) throw std::runtime_error("Memory output did not produce a complete encoded stream");
+        auto result = torch::empty({static_cast<int64_t>(encodedOutput_.size())}, torch::kUInt8);
+        if (!encodedOutput_.empty())
+            std::memcpy(result.data_ptr(), encodedOutput_.data(), encodedOutput_.size());
+        return result;
+    });
+}
+
 void VideoEncoder::closeLocked()
 {
     // Drain + join the encode workers FIRST so every queued frame is sent to the
@@ -1530,6 +1544,7 @@ void VideoEncoder::closeLocked()
         assert(!PyGILState_Check() &&
                "closeLocked() must run under lifecycleMu_ with the GIL dropped");
         enc->close();
+        if (memoryOutput_) encodedOutput_ = enc->takeOutputBytes();
         enc.reset();
     }
 

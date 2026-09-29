@@ -87,6 +87,8 @@ for frame in reader:
 
 Frame indices follow decoded presentation order, including VFR. Batches support
 resize and CPU gray/RGBA output. [Presentation-aware video APIs](docs/indexed-video.md)
+and [media APIs](docs/media-apis.md) cover display orientation, audio tensors,
+image codecs, and encoded-memory/file-like destinations.
 cover exact/approximate startup tradeoffs, timing, clip samplers, CHW views,
 input adapters, stream selection, and owned CUDA frames.
 

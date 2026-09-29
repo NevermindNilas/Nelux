@@ -11,6 +11,7 @@
 extern "C"
 {
 #include <libavutil/avstring.h>
+#include <libavutil/display.h>
 }
 #ifdef _WIN32
 #include <malloc.h>
@@ -324,6 +325,21 @@ void Decoder::extractVideoProperties(AVFormatContext* formatCtx, int vIdx,
 
     properties.width = vpar->width;
     properties.height = vpar->height;
+    properties.rotationDegrees = 0.0;
+    properties.displayHFlip = false;
+    if (const auto* side = av_packet_side_data_get(vpar->coded_side_data,
+            vpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        side && side->size >= 9 * sizeof(int32_t)) {
+        int32_t matrix[9];
+        std::memcpy(matrix, side->data, sizeof(matrix));
+        const double determinant = static_cast<double>(matrix[0]) * matrix[4] -
+                                   static_cast<double>(matrix[1]) * matrix[3];
+        if (determinant < 0) {
+            properties.displayHFlip = true;
+            av_display_matrix_flip(matrix, 1, 0);
+        }
+        properties.rotationDegrees = av_display_rotation_get(matrix);
+    }
 
     // Canonical codec name (from codec_id), matching ffprobe's codec_name.
     {
@@ -1588,6 +1604,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 av_packet_unref(pkt.get());
                 continue;
             }
+            if (pkt->flags & AV_PKT_FLAG_CORRUPT)
+                decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
             const int sent = avcodec_send_packet(codecCtx.get(), pkt.get());
             av_packet_unref(pkt.get());
             if (sent == AVERROR(EAGAIN))
@@ -1658,13 +1676,11 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             return torch::Tensor();
         }
 
-        // A latched failure means the codec context is done. Do not call
-        // into it again -- the refill block below would return the same error
-        // every iteration with nothing to wait on, spinning on the convert
-        // workers' own mutex while holding VideoReader::lifecycleMu_
-        // exclusively with the GIL released. Drain what the workers already
-        // hold, in order, and let the branch above raise when it runs out.
-        if (decodeError_.load(std::memory_order_acquire) != 0)
+        // After EOF/flush, finish queued conversions before the empty-in-flight
+        // branch above drains remaining codec frames and reports the error.
+        // Packet/read failures before flush must continue receiving/refilling;
+        // stopping them here would wait for work that was never submitted.
+        if (decoder_drained && decodeError_.load(std::memory_order_acquire) != 0)
         {
             std::unique_lock<std::mutex> lk(syncConvertOutMu_);
             syncConvertOutCv_.wait(lk,
@@ -1742,6 +1758,8 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 }
                 else
                 {
+                    if (pkt->flags & AV_PKT_FLAG_CORRUPT)
+                        decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
                     int sret = avcodec_send_packet(codecCtx.get(), pkt.get());
                     av_packet_unref(pkt.get());
                     if (sret < 0 && sret != AVERROR(EAGAIN))
@@ -2676,11 +2694,10 @@ void Decoder::decodingLoop()
                 if (inputTimestampOrigin_.load() == 0)
                     inputTimestampOrigin_.store(
                         pkt->pts != AV_NOPTS_VALUE || pkt->dts != AV_NOPTS_VALUE ? 1 : -1);
-                // CUVID's bitstream filter can report EOF immediately after a
-                // truncated packet, before the next demux read exposes the
-                // partial-file error. Preserve the demuxer's corruption flag
-                // so draining hardware frames cannot turn that into clean EOF.
-                if (codecCtx->hw_device_ctx && (pkt->flags & AV_PKT_FLAG_CORRUPT))
+                // A decoder may report EOF immediately after a truncated
+                // packet, before another demux read exposes the partial-file
+                // error. Preserve corruption even when the codec conceals it.
+                if (pkt->flags & AV_PKT_FLAG_CORRUPT)
                     decodeError_.store(AVERROR_INVALIDDATA, std::memory_order_release);
                 int sendRet = avcodec_send_packet(codecCtx.get(), pkt.get());
                 if (sendRet == AVERROR(EAGAIN))

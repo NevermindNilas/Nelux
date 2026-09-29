@@ -140,14 +140,19 @@ def _run(script: str, path: Path, prefetch: bool, prefixes: tuple[str, ...]):
     return out[-1]
 
 
-def _drain(path: Path, *, prefetch: bool):
+def _drain(path: Path, *, prefetch: bool, num_threads=None, convert_workers=None):
     """Decode in a subprocess.
 
     Returns ``("ok", n)``, ``("raised", n, msg)`` or ``("hang",)``. The frame
     count is reported on the failure path too, so a parity assertion compares
     delivered frames rather than two identical error strings.
     """
-    line = _run(_DRAIN, path, prefetch, ("OK", "RAISED"))
+    script = _DRAIN
+    if num_threads is not None:
+        script = script.replace('prefetch=sys.argv[2] == "1"',
+                                f'prefetch=sys.argv[2] == "1", num_threads={num_threads}, '
+                                f'convert_workers={convert_workers}')
+    line = _run(script, path, prefetch, ("OK", "RAISED"))
     if line is None:
         return ("hang",)
     parts = line.split(" ", 2)
@@ -198,7 +203,8 @@ def test_clean_stream_is_unaffected(tmp_path, codec, ext, extra):
     assert _drain(clean, prefetch=True) == ("ok", 60)
 
 
-def test_truncated_download_raises_on_both_paths(tmp_path):
+@pytest.mark.parametrize("num_threads,convert_workers", [(0, None), (1, 0), (1, 2)])
+def test_truncated_download_raises_on_both_paths(tmp_path, num_threads, convert_workers):
     """The commonest real damage there is: a file that stops mid-stream.
 
     This is what the ``av_read_frame`` half of the fix is for. The demuxer
@@ -215,7 +221,8 @@ def test_truncated_download_raises_on_both_paths(tmp_path):
     cut.write_bytes(raw[: int(len(raw) * 0.6)])
 
     for prefetch in (False, True):
-        outcome = _drain(cut, prefetch=prefetch)
+        outcome = _drain(cut, prefetch=prefetch, num_threads=num_threads,
+                         convert_workers=convert_workers)
         assert outcome[0] == "raised", (
             f"prefetch={prefetch}: a truncated file reported success: {outcome}"
         )
