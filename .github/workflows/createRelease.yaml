@@ -188,7 +188,7 @@ jobs:
 
           # FFmpeg is bundled by CMake, NOT by delvewheel, and every FFmpeg DLL
           # is excluded here on purpose. delvewheel mangles the names it vendors
-          # (avcodec-62-<hash>.dll) while the /DELAYLOAD thunk resolves the
+          # (avcodec-63-<hash>.dll) while the /DELAYLOAD thunk resolves the
           # literal baked name next to the module - a mangled copy is invisible
           # to it, and letting delvewheel act would ALSO produce a second copy
           # of ~100 MB of FFmpeg in nelux.libs/.

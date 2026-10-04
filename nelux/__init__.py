@@ -75,7 +75,11 @@ def _dll_exists_noexec(dll_name: str) -> bool:
 
 @functools.lru_cache(maxsize=8)
 def _read_required_dlls_windows(extension_path: str) -> List[str]:
-    """Read direct DLL imports from a PE binary when possible.
+    """Read direct and delay-load DLL imports from a PE binary when possible.
+
+    The delay-load table matters: the extension delay-loads every FFmpeg DLL
+    (and c10_cuda/torch_cuda), so reading only the regular import table would
+    leave exactly the DLLs most likely to be missing unchecked.
 
     pefile stays a function-local import: the success-path import must never
     pay for (or require) it. Results are cached - diagnosis reads the same
@@ -88,9 +92,11 @@ def _read_required_dlls_windows(extension_path: str) -> List[str]:
         pe.parse_data_directories(
             directories=[
                 pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
             ]
         )
-        imports = getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []
+        imports = list(getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or [])
+        imports += list(getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []) or [])
         out: List[str] = []
         for entry in imports:
             name = entry.dll.decode("utf-8", errors="ignore")
@@ -160,22 +166,6 @@ def _likely_missing_transitive_dlls(dll_name: str) -> List[str]:
     return sorted(set(missing))
 
 
-_FFMPEG_DLL_FALLBACKS = {
-    "avcodec": ["avcodec-63.dll", "avcodec-62.dll"],
-    "avformat": ["avformat-63.dll", "avformat-62.dll"],
-    "avutil": ["avutil-61.dll", "avutil-60.dll"],
-    "swscale": ["swscale-10.dll", "swscale-9.dll"],
-    "swresample": ["swresample-7.dll", "swresample-6.dll"],
-    "avfilter": ["avfilter-12.dll", "avfilter-11.dll"],
-    "avdevice": ["avdevice-63.dll", "avdevice-62.dll"],
-}
-
-
-def _ffmpeg_dll_fallbacks(dll_name: str) -> List[str]:
-    base = dll_name.split("-", 1)[0].lower()
-    return _FFMPEG_DLL_FALLBACKS.get(base, [dll_name])
-
-
 @functools.lru_cache(maxsize=1)
 def diagnose_runtime_dlls() -> Dict[str, object]:
     """Diagnose missing runtime DLLs for Nelux on Windows.
@@ -201,6 +191,7 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
             "avformat-63.dll",
             "avutil-61.dll",
             "swscale-10.dll",
+            "swresample-7.dll",
             "avfilter-12.dll",
             "avdevice-63.dll",
             "fmt.dll",
@@ -231,17 +222,11 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
         "ntdll.dll",
     }
 
+    # No cross-generation FFmpeg fallback: the extension's delay-load hook
+    # only ever loads the soname generation it was compiled against (see
+    # src/Nelux/FFmpegDelayLoad.cpp), so a neighbouring build on disk does not
+    # satisfy the requirement and must not hide it here either.
     def _record(dll: str, load_err: OSError) -> None:
-        for fallback in _ffmpeg_dll_fallbacks(dll):
-            if fallback.lower() == dll.lower():
-                continue
-            # Existence-only: a sibling FFmpeg build on disk (or mappable
-            # without executing anything) satisfies the requirement, and no
-            # foreign DllMain runs during diagnosis. A present-but-unloadable
-            # fallback still leaves its sibling required entries reporting
-            # the true missing dependency.
-            if _resolve_dll_path_windows(fallback) is not None or _dll_exists_noexec(fallback):
-                return
         nested = _likely_missing_transitive_dlls(dll)
         if nested:
             missing[dll] = f"{load_err} | likely dependency: {', '.join(nested)}"
@@ -309,15 +294,15 @@ except ImportError as e:
         raise ImportError(
             f"Failed to load Nelux C extension.\n\n"
             f"On Windows this is usually a missing runtime DLL dependency.\n"
-            f"Released wheels bundle FFmpeg (avcodec-62.dll and friends) next to\n"
+            f"Released wheels bundle FFmpeg (avcodec-63.dll and friends) next to\n"
             f"_nelux.pyd, so a missing FFmpeg DLL here means either a self-built\n"
             f"wheel built with NELUX_BUNDLE_FFMPEG_DLLS=OFF, or a damaged install.\n\n"
             f"{missing_block}\n"
             f"To point at an external FFmpeg instead, add this before importing nelux:\n"
             f"  import os\n"
             f"  os.add_dll_directory(r'C:\\\\path\\\\to\\\\ffmpeg\\\\bin')\n"
-            f"It must be FFmpeg 8.x — avcodec 62 / avutil 60 / avformat 62 /\n"
-            f"avfilter 11 / swscale 9 / swresample 6.\n\n"
+            f"It must be FFmpeg 9.x — avcodec 63 / avutil 61 / avformat 63 /\n"
+            f"avfilter 12 / swscale 10 / swresample 7.\n\n"
             f"Make sure to also import torch first:\n"
             f"  import torch\n\n"
             f"Original error: {e}"
@@ -326,7 +311,7 @@ except ImportError as e:
 
 # Which FFmpeg actually got loaded. Wheels bundle the TAS-FFMPEG build
 # (tools/ffmpeg.lock is canonical) and it is tagged --extra-version=tas, so this
-# reads e.g. "8.1.2-tas"; anything else means a different FFmpeg won the load.
+# reads e.g. "9.0.2-tas"; anything else means a different FFmpeg won the load.
 # Fetched with getattr rather than in the import list above so an extension
 # built before this attribute existed degrades to "unknown" instead of tripping
 # the missing-DLL diagnostic, which would point at entirely the wrong problem.

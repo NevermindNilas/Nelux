@@ -75,6 +75,11 @@ HIGH_BIT_DEPTH_CLIPS = [
     (os.path.join(DATA, "output_yuv420p10le.mp4"), 0.05, None),
     (os.path.join(DATA, "output_yuv420p12le.mp4"), 0.05, None),
     (os.path.join(DATA, "output_yuv444p10le.mp4"), 0.05, (8, 0)),
+    # FFmpeg 9 surfaces 12-bit 4:4:4 as YUV444P12MSB (8.x said YUV444P16), and
+    # 10-bit 4:4:4 / 12-bit 4:2:0 above as YUV444P10MSB / P012. Each label
+    # needs its own case in the CUDA decoder's conversion switch, so each one
+    # gets a clip.
+    (os.path.join(DATA, "output_yuv444p12le.mp4"), 0.05, (8, 0)),
     # The only clip in this list that declares color_space=bt709, so the CPU and
     # NVDEC pipelines are directly comparable and the tolerance can be tight.
     (os.path.join(PIX_FMT_CLIPS, "yuv420p10le.mp4"), 0.005, None),
@@ -98,9 +103,10 @@ def _clip(path, needs_capability=None):
             pytest.skip(
                 f"{os.path.basename(path)} needs NVDEC compute capability "
                 f"{needs_capability[0]}.{needs_capability[1]}+ on device 0, "
-                f"have {have[0]}.{have[1]}. This is the ONLY clip covering the "
-                f"4:4:4 16-bit kernel (launchYuv444P16ToRgb48), so skipping it "
-                f"leaves that half of the fix untested on this machine")
+                f"have {have[0]}.{have[1]}. The 4:4:4 clips are the ONLY ones "
+                f"covering the 4:4:4 16-bit kernel (launchYuv444P16ToRgb48), so "
+                f"skipping them leaves that half of the fix untested on this "
+                f"machine")
     return path
 
 

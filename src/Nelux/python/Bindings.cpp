@@ -196,7 +196,7 @@ PYBIND11_MODULE(_nelux, m)
 
     // Identity of the FFmpeg actually loaded into this process, not the one we
     // compiled against. Wheels bundle the TAS-FFMPEG build, which is tagged
-    // --extra-version=tas, so this reads "8.1.2-tas" and no distro, gyan or
+    // --extra-version=tas, so this reads "9.0.2-tas" and no distro, gyan or
     // BtbN build can forge it. A different string means some other FFmpeg won
     // the load — on Windows that is a real possibility, since a DLL of the same
     // name already in the process serves everyone. Reads "unknown" when no

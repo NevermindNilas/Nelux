@@ -985,16 +985,16 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
     // A wider-than-8-bit destination is legal only for the formats that have an
     // RGB48 kernel in the switch below. Stated as an allowlist so that the
     // default for every format NOT named here is to throw — including formats
-    // not yet wired into the switch at all, such as NV16 and P216, whose 8-bit
-    // launchers already exist and are one case label away from being added.
+    // not yet wired into the switch at all, such as the 4:2:2 surfaces NVDEC
+    // emits as NV16 / P210 / P212 on FFmpeg 9 (NV16 / P216 on 8.x).
     // Whoever adds such a case gets a loud error on the first 16-bit decode
     // instead of an 8-bit kernel writing half of a 16-bit frame, and does not
     // have to know this check exists. Adding a format that does have a wide
     // kernel means naming it here; forgetting is likewise loud, not silent.
     const bool hasWideKernel =
-        (swFormat == AV_PIX_FMT_P010LE || swFormat == AV_PIX_FMT_P016LE ||
-         swFormat == AV_PIX_FMT_YUV444P10LE || swFormat == AV_PIX_FMT_YUV444P12LE ||
-         swFormat == AV_PIX_FMT_YUV444P16LE);
+        (swFormat == AV_PIX_FMT_P010LE || swFormat == AV_PIX_FMT_P012LE ||
+         swFormat == AV_PIX_FMT_P016LE || swFormat == AV_PIX_FMT_YUV444P10MSBLE ||
+         swFormat == AV_PIX_FMT_YUV444P12MSBLE || swFormat == AV_PIX_FMT_YUV444P16LE);
     if (elemSize != 1 && !hasWideKernel)
     {
         throw CxException(std::string("CUDA DECODER: ") +
@@ -1025,7 +1025,11 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         break;
     }
 
+    // FFmpeg 9 (FF_API_NVDEC_OLD_PIX_FMTS expired) labels 12-bit 4:2:0 NVDEC
+    // surfaces P012 instead of P016. Both are MSB-aligned in 16-bit words, so
+    // they share the P016 kernels; only the bit depth differs.
     case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_P012LE:
     case AV_PIX_FMT_P016LE:
     {
         // 10/12/16-bit 4:2:0: separate Y + interleaved UV device pointers.
@@ -1037,6 +1041,8 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         int bitDepth = properties.bitDepth;
         if (swFormat == AV_PIX_FMT_P010LE)
             bitDepth = 10;
+        else if (swFormat == AV_PIX_FMT_P012LE)
+            bitDepth = 12;
         else if (bitDepth != 10 && bitDepth != 12 && bitDepth != 16)
             bitDepth = 16;
         if (elemSize == 2)
@@ -1072,8 +1078,14 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         break;
     }
 
-    case AV_PIX_FMT_YUV444P10LE:
-    case AV_PIX_FMT_YUV444P12LE:
+    // FFmpeg 9 labels 10/12-bit 4:4:4 NVDEC surfaces YUV444P10MSB /
+    // YUV444P12MSB; FFmpeg 8 called the same MSB-aligned bytes YUV444P16.
+    // The plain YUV444P10LE / YUV444P12LE formats are deliberately NOT here:
+    // they are LSB-aligned (pixdesc shift 0) and these kernels assume samples
+    // in the top bits, so they would decode near-black instead of throwing.
+    // No NVDEC path emits them.
+    case AV_PIX_FMT_YUV444P10MSBLE:
+    case AV_PIX_FMT_YUV444P12MSBLE:
     case AV_PIX_FMT_YUV444P16LE:
     {
         // 10/12/16-bit YUV444: 3 separate 16-bit planes
@@ -1081,9 +1093,9 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
         const uint8_t* uPlane = hwFrame->data[1];
         const uint8_t* vPlane = hwFrame->data[2];
         int yuvPitch = hwFrame->linesize[0];
-        int bitDepth = (swFormat == AV_PIX_FMT_YUV444P10LE)   ? 10
-                       : (swFormat == AV_PIX_FMT_YUV444P12LE) ? 12
-                                                             : 16;
+        int bitDepth = (swFormat == AV_PIX_FMT_YUV444P10MSBLE)   ? 10
+                       : (swFormat == AV_PIX_FMT_YUV444P12MSBLE) ? 12
+                                                                 : 16;
 
         NELUX_DEBUG("CUDA DECODER: Using YUV444P16 kernel (10/12/16-bit), elemSize={}",
                     elemSize);
@@ -1109,8 +1121,8 @@ void Decoder::transferAndConvertFrame(AVFrame* hwFrame, void* outputBuffer,
             std::string("CUDA DECODER: Unsupported pixel format '") +
             av_get_pix_fmt_name(swFormat) +
             "' for GPU color conversion. "
-            "Supported formats: NV12, P010LE, P016LE, YUV444P, YUV444P10LE, "
-            "YUV444P12LE, YUV444P16LE. "
+            "Supported formats: NV12, P010LE, P012LE, P016LE, YUV444P, "
+            "YUV444P10MSBLE, YUV444P12MSBLE, YUV444P16LE. "
             "Consider using CPU decoder for this format.");
     }
     }

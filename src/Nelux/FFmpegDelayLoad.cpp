@@ -1,6 +1,6 @@
 // FFmpegDelayLoad.cpp
-// Delay-load hook for FFmpeg DLLs to support multiple versions
-// This allows Nelux to work with multiple FFmpeg DLL ABIs.
+// Delay-load hook for the FFmpeg DLLs: retries the baked name on the
+// default DLL search path and turns load failures into catchable exceptions.
 
 #ifdef _WIN32
 
@@ -12,14 +12,40 @@
 #include <stdexcept>
 #include <string>
 
-// FFmpeg DLL versions to try in order of preference (newest first)
-static const char* AVCODEC_VERSIONS[] = {"avcodec-63.dll", "avcodec-62.dll", nullptr};
-static const char* AVFORMAT_VERSIONS[] = {"avformat-63.dll", "avformat-62.dll", nullptr};
-static const char* AVUTIL_VERSIONS[] = {"avutil-61.dll", "avutil-60.dll", nullptr};
-static const char* SWSCALE_VERSIONS[] = {"swscale-10.dll", "swscale-9.dll", nullptr};
-static const char* SWRESAMPLE_VERSIONS[] = {"swresample-7.dll", "swresample-6.dll", nullptr};
-static const char* AVFILTER_VERSIONS[] = {"avfilter-12.dll", "avfilter-11.dll", nullptr};
-static const char* AVDEVICE_VERSIONS[] = {"avdevice-63.dll", "avdevice-62.dll", nullptr};
+extern "C" {
+#include <libavutil/macros.h>
+#include <libavcodec/version_major.h>
+#include <libavdevice/version_major.h>
+#include <libavfilter/version_major.h>
+#include <libavformat/version_major.h>
+#include <libavutil/version.h>
+#include <libswresample/version_major.h>
+#include <libswscale/version_major.h>
+}
+
+// FFmpeg DLL names this binary may load: exactly the soname generation of
+// the headers it was compiled against, never a neighbouring one. The structs
+// nelux touches directly (AVFrame, AVCodecContext, AVFormatContext, ...)
+// change layout across a major bump, so binding a 9.x-built module to an
+// 8.x avcodec-62.dll would "work" until it read a field at the wrong offset.
+// Deriving the names from the headers keeps this list from going stale on
+// the next bump (it used to be hand-written and crossed majors).
+#define NELUX_FFMPEG_DLL(base, major) base "-" AV_STRINGIFY(major) ".dll"
+static const char* AVCODEC_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("avcodec", LIBAVCODEC_VERSION_MAJOR), nullptr};
+static const char* AVFORMAT_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("avformat", LIBAVFORMAT_VERSION_MAJOR), nullptr};
+static const char* AVUTIL_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("avutil", LIBAVUTIL_VERSION_MAJOR), nullptr};
+static const char* SWSCALE_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("swscale", LIBSWSCALE_VERSION_MAJOR), nullptr};
+static const char* SWRESAMPLE_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("swresample", LIBSWRESAMPLE_VERSION_MAJOR), nullptr};
+static const char* AVFILTER_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("avfilter", LIBAVFILTER_VERSION_MAJOR), nullptr};
+static const char* AVDEVICE_VERSIONS[] = {
+    NELUX_FFMPEG_DLL("avdevice", LIBAVDEVICE_VERSION_MAJOR), nullptr};
+#undef NELUX_FFMPEG_DLL
 
 static HMODULE LoadFFmpegDll(const char* name) {
     HMODULE hMod = ::LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -44,7 +70,7 @@ static const DllVersionMap DLL_VERSIONS[] = {
     {"avdevice", AVDEVICE_VERSIONS},
 };
 
-// Extract base name from DLL (e.g., "avcodec-62.dll" -> "avcodec")
+// Extract base name from DLL (e.g., "avcodec-63.dll" -> "avcodec")
 static std::string GetBaseName(const char* dllName) {
     std::string name(dllName);
     size_t dashPos = name.find('-');
@@ -102,7 +128,8 @@ FARPROC WINAPI FFmpegDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
         const char* name = (pdli && pdli->szDll) ? pdli->szDll : "<unknown>";
         throw std::runtime_error(
             std::string("Failed to load delay-loaded DLL: ") + name +
-            " (no bundled copy and none on the DLL search path; "
+            " or one of its dependencies (no loadable copy on the DLL search "
+            "path; "
             "see nelux.diagnose_runtime_dlls())");
     }
     if (dliNotify == dliFailGetProc) {

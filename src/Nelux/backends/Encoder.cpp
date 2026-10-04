@@ -15,7 +15,6 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
-#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -41,27 +40,11 @@ namespace
 using AvcodecGetSupportedConfigFn = int (*)(const AVCodecContext*, const AVCodec*,
                                             AVCodecConfig, unsigned, const void**, int*);
 
+// A plain call: the delay-loaded avcodec is always the generation these
+// headers describe (see FFmpegDelayLoad.cpp), so the symbol is guaranteed.
 AvcodecGetSupportedConfigFn avcodecGetSupportedConfig()
 {
-#ifdef _WIN32
-    static AvcodecGetSupportedConfigFn fn = [] {
-        const char* names[] = {"avcodec-63.dll", "avcodec-62.dll", nullptr};
-        for (int i = 0; names[i] != nullptr; ++i)
-        {
-            HMODULE module = ::GetModuleHandleA(names[i]);
-            if (!module)
-                continue;
-
-            auto proc = ::GetProcAddress(module, "avcodec_get_supported_config");
-            if (proc)
-                return reinterpret_cast<AvcodecGetSupportedConfigFn>(proc);
-        }
-        return static_cast<AvcodecGetSupportedConfigFn>(nullptr);
-    }();
-    return fn;
-#else
     return avcodec_get_supported_config;
-#endif
 }
 
 bool getSupportedConfig(const AVCodecContext* ctx, const AVCodec* codec,

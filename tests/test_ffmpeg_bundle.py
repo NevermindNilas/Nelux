@@ -160,7 +160,7 @@ def test_gpl_paper_trail_is_installed(package_dir: Path) -> None:
 def test_bundled_dlls_are_not_name_mangled(lock: dict[str, str], package_dir: Path) -> None:
     """delvewheel must never be the one to vendor FFmpeg.
 
-    It renames what it copies (avcodec-62-<hash>.dll) while the /DELAYLOAD thunk
+    It renames what it copies (avcodec-63-<hash>.dll) while the /DELAYLOAD thunk
     asks the loader for the literal name baked at link time, so a mangled copy
     is invisible — the import fails, or worse, a different FFmpeg answers.
     """

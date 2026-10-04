@@ -826,7 +826,7 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   # FFmpeg runtime DLLs are kept in their OWN list, deliberately not merged into
   # NELUX_DLLS. NELUX_DLLS is the vcpkg set, which CI hands to delvewheel and
   # therefore skips installing (NELUX_SKIP_DLL_INSTALL). FFmpeg must go the
-  # other way: delvewheel mangles the names it vendors (avcodec-62-<hash>.dll)
+  # other way: delvewheel mangles the names it vendors (avcodec-63-<hash>.dll)
   # and the /DELAYLOAD thunk resolves the literal baked name next to the module,
   # so a mangled copy would never be found. These are installed unmangled into
   # nelux/ and excluded from delvewheel in the workflows.

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- **FFmpeg 9.0.2.** Wheels now bundle
+  [TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) v9.0.2 instead of
+  8.1.2; `nelux.__ffmpeg_version__` reports `9.0.2-tas`. This is a new soname
+  generation: avcodec/avformat/avdevice 63, avutil 61, avfilter 12, swscale 10,
+  swresample 7. An external FFmpeg passed in with `os.add_dll_directory()` must
+  now be a 9.x build.
+- FFmpeg 9 changes that reach nelux output, because nelux passes encoder
+  options straight through:
+  - `h264_nvenc` now defaults to the High profile instead of Main.
+  - NVENC's legacy preset names (`default`, `hp`, `hq`, `bd`, `ll`, `llhq`,
+    `llhp`, `lossless`, `losslesshp`), the legacy `rc` modes (`vbr_hq`,
+    `cbr_hq`, `cbr_ld_hq`, `vbr_minqp`, `ll_2pass_*`, `vbr_2pass`), and the
+    `cbr`, `2pass`, `spatial_aq` and `temporal_aq` options are gone. Use the
+    `p1`-`p7` presets and `spatial-aq` / `temporal-aq` instead.
+  - NVENC now rejects `b_ref_mode=middle` (which nelux sets whenever B-frames
+    are on) on a GPU that does not advertise middle B-frame references. 8.x
+    only rejected it when no B-frame reference mode was supported.
+  - MOV/MP4 `movie_timescale` now defaults to auto, and edit-list durations are
+    computed differently, so output bytes differ from 8.x builds.
+- NVDEC 10/12-bit 4:4:4 output is now normalised for its real bit depth
+  instead of as 16-bit. Values move by at most a quarter of an 8-bit step in
+  16-bit output (one code in 8-bit output) and are closer to exact BT.709;
+  4:2:0 already worked this way.
+- On Windows the extension now loads only the FFmpeg DLL generation it was
+  compiled against. It used to fall back from `avcodec-63.dll` to
+  `avcodec-62.dll` (and so on), which loaded libraries whose struct layouts
+  don't match the headers nelux was built with.
+
+### Fixed
+
+- NVDEC decode of 12-bit 4:2:0 and 10/12-bit 4:4:4 HEVC works on FFmpeg 9.
+  FFmpeg 9 now reports those surfaces as `P012`, `YUV444P10MSB` and
+  `YUV444P12MSB` (8.x used `P016` and `YUV444P16`), and the CUDA colour
+  conversion rejected the new formats. They now use the existing MSB-aligned
+  kernels with the correct bit depth.
+- `diagnose_runtime_dlls()` now checks delay-loaded DLLs as well. It used to
+  read only the regular import table, so it never saw any FFmpeg DLL and
+  reported nothing missing exactly when one was.
+
 ### Added
 
 - `merge_streams(video_source, audio_source, output)` copies the primary video

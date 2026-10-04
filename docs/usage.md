@@ -744,12 +744,14 @@ for frame in reader:
 - MPEG-1, MPEG-2, MPEG-4
 - VC1
 
-**Supported color formats:**
+**Supported color formats** (NVDEC surface formats, FFmpeg 9 names):
 - NV12 (8-bit 4:2:0)
-- P016 (10/16-bit 4:2:0)
-- NV16 (8-bit 4:2:2)
-- P216 (10/16-bit 4:2:2)
-- YUV444, YUV444P16
+- P010 / P012 (10/12-bit 4:2:0)
+- YUV444P (8-bit 4:4:4)
+- YUV444P10MSB / YUV444P12MSB (10/12-bit 4:4:4)
+
+4:2:2 surfaces (NV16 / P210 / P212) are not supported by the CUDA colour
+conversion and raise; decode those with `decode_accelerator="cpu"`.
 
 **Requirements:**
 - NVIDIA GPU with NVDEC support, compute capability 7.5+ (Turing or newer) for the published wheels. Pre-Turing cards with NVDEC (Maxwell/Pascal/Volta) need a source build against CUDA 12.x, since CUDA 13 no longer targets those architectures.
@@ -1099,7 +1101,7 @@ import nelux
 nelux.__version__        # str:  Library version (e.g., "0.20.0")
 nelux.__cuda_support__   # bool: True if CUDA/NVDEC support is compiled in
 nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.14"
-nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "8.1.2-tas"
+nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "9.0.2-tas"
 ```
 
 ```python
@@ -1177,7 +1179,7 @@ Released wheels bundle FFmpeg next to the extension module, so this should not
 happen on a `pip install nelux`. When it does:
 
 - Check `nelux.__ffmpeg_version__`. The expected value is the one pinned in
-  `tools/ffmpeg.lock` (`8.1.2-tas`). `'unknown'` means one of two things: the
+  `tools/ffmpeg.lock` (`9.0.2-tas`). `'unknown'` means one of two things: the
   built extension predates the attribute (rebuild it), or — on Windows — no
   FFmpeg could be loaded at all, which the extension reports as `'unknown'`
   rather than killing the interpreter mid-import. Any *other* string means
@@ -1189,9 +1191,9 @@ happen on a `pip install nelux`. When it does:
   answers that directly.
 - To force an external FFmpeg instead, call `os.add_dll_directory(...)`
   (Windows) or set `DYLD_LIBRARY_PATH` (macOS) before importing nelux. It must
-  be FFmpeg 8.x — avcodec 62 / avutil 60 / avformat 62 / avfilter 11 /
-  swscale 9 / swresample 6. The released Linux wheel cannot be overridden this
-  way: `auditwheel` renames the vendored libraries to `libavcodec-<hash>.so.62`
+  be FFmpeg 9.x — avcodec 63 / avutil 61 / avformat 63 / avfilter 12 /
+  swscale 10 / swresample 7. The released Linux wheel cannot be overridden this
+  way: `auditwheel` renames the vendored libraries to `libavcodec-<hash>.so.63`
   and rewrites the extension's `DT_NEEDED` to match, so `LD_LIBRARY_PATH` is
   never consulted for the plain soname. Use a wheel built with
   `NELUX_BUNDLE_FFMPEG_DLLS=OFF` if you need to supply your own.

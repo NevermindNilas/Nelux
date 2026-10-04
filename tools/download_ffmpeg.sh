@@ -107,7 +107,7 @@ rm -rf "${OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 
 # -R preserves the lib*.so -> lib*.so.MAJOR.MINOR.PATCH symlink chain, which
-# both the linker (libavcodec.so) and the loader (libavcodec.so.62) need. On
+# both the linker (libavcodec.so) and the loader (libavcodec.so.63) need. On
 # macOS it preserves the equivalent lib*.dylib chain. licenses/ and
 # manifest.json are the GPL paper trail that travels with the binaries into the
 # wheel — do not drop them.

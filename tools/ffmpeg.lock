@@ -34,7 +34,7 @@
 #   * One supplier, five platforms, ONE ABI — including macOS, which previously
 #     came from Homebrew and could not be pinned to a hash at all.
 #   * A hash for every archive, including macOS.
-#   * `--extra-version=tas`, so av_version_info() is exactly "8.1.2-tas". No
+#   * `--extra-version=tas`, so av_version_info() is exactly "9.0.2-tas". No
 #     distro, gyan or BtbN build can produce that string, which turns the
 #     runtime assertion into a "wrong build" detector, not just a "wrong
 #     version" detector. nelux exposes it as `nelux.__ffmpeg_version__`.
@@ -46,14 +46,15 @@
 #     fails the repair for the WHOLE wheel.
 #
 # Shared-library ABI, identical across all five platforms:
-#   avcodec 62 | avutil 60 | avformat 62 | avdevice 62
-#   avfilter 11 | swscale 9 | swresample 6
+#   avcodec 63 | avutil 61 | avformat 63 | avdevice 63
+#   avfilter 12 | swscale 10 | swresample 7
 #
-# NOT FFmpeg 9.x, deliberately. 9.0 expired FF_API_NVDEC_OLD_PIX_FMTS, and
-# src/Nelux/backends/cuda/Decoder.cpp still switches on the old NVDEC pixel
-# formats and hard-throws on the new YUV444P10MSB/YUV444P12MSB/P212/P012, so
-# HEVC 4:4:4 high-bit-depth NVDEC decode would raise. Do not bump to 9.x until
-# that is fixed.
+# FFmpeg 9.0 expired FF_API_NVDEC_OLD_PIX_FMTS: NVDEC now labels its
+# high-bit-depth surfaces YUV444P10MSB / YUV444P12MSB / P012 / P212 instead of
+# YUV444P16 / P016 / P216. src/Nelux/backends/cuda/Decoder.cpp maps the 4:2:0
+# and 4:4:4 ones onto the existing MSB-aligned kernels (4:2:2 NVDEC output was
+# unsupported under 8.x as well). Going back to 8.x means a soname-generation
+# change too: delay-load names, nelux/__init__.py and this file all move.
 #
 # ---------------------------------------------------------------------------
 # THESE BINARIES SHIP INSIDE THE WHEELS
@@ -61,7 +62,7 @@
 # Wheels are self-contained: users no longer need FFmpeg on PATH.
 #   Windows   CMake installs bin/av*.dll + sw*.dll next to _nelux.pyd. They are
 #             EXCLUDED from delvewheel on purpose — delvewheel mangles file
-#             names (avcodec-62-<hash>.dll) and the /DELAYLOAD thunk resolves
+#             names (avcodec-63-<hash>.dll) and the /DELAYLOAD thunk resolves
 #             the literal baked name, so a mangled copy would never be found.
 #   Linux     auditwheel vendors lib/libav*.so.* + libsw*.so.* into nelux.libs
 #             and patches the RPATH.
@@ -90,32 +91,33 @@
 #   4. Bump TAS_FFMPEG_RELEASE and re-run both download scripts with -Force /
 #      FORCE=1 locally to confirm the hashes.
 #
-# Vendored 2026-08-08 from TAS-FFMPEG v8.1.2's published ffmpeg-pin.lock.
+# Vendored 2026-10-04 from TAS-FFMPEG v9.0.2's published ffmpeg-pin.lock.
+# (Previously v8.1.2, 2026-08-08.)
 # ===========================================================================
 
 TAS_FFMPEG_REPO=NevermindNilas/TAS-FFMPEG
-TAS_FFMPEG_RELEASE=v8.1.2
-TAS_FFMPEG_PIN_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/ffmpeg-pin.lock
+TAS_FFMPEG_RELEASE=v9.0.2
+TAS_FFMPEG_PIN_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/ffmpeg-pin.lock
 
 # --- Identity — assert these at runtime --------------------------------------
-FFMPEG_VERSION=8.1.2
-FFMPEG_TAG=n8.1.2
-FFMPEG_COMMIT=38b88335f99e76ed89ff3c93f877fdefce736c13
+FFMPEG_VERSION=9.0.2
+FFMPEG_TAG=n9.0.2
+FFMPEG_COMMIT=946fcce07b6dcd0331c8cc609192aeff5e1924f8
 # av_version_info() returns exactly this string.
-AV_VERSION_INFO=8.1.2-tas
+AV_VERSION_INFO=9.0.2-tas
 
 # --- Shared-library ABI ------------------------------------------------------
-SONAME_AVCODEC=62
-SONAME_AVDEVICE=62
-SONAME_AVFILTER=11
-SONAME_AVFORMAT=62
-SONAME_AVUTIL=60
-SONAME_SWRESAMPLE=6
-SONAME_SWSCALE=9
+SONAME_AVCODEC=63
+SONAME_AVDEVICE=63
+SONAME_AVFILTER=12
+SONAME_AVFORMAT=63
+SONAME_AVUTIL=61
+SONAME_SWRESAMPLE=7
+SONAME_SWSCALE=10
 
 # --- Licensing of the shipped binaries ---------------------------------------
 LICENSE_SPDX=GPL-2.0-or-later
-CORRESPONDING_SOURCE_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-corresponding-source.tar.xz
+CORRESPONDING_SOURCE_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-corresponding-source.tar.xz
 
 # Files to preserve out of every archive. The GPL terms travel with the
 # binaries; extraction copies anything matching these globs into the FFmpeg
@@ -128,50 +130,51 @@ LICENSE_GLOBS=licenses;manifest.json;LICENSE*;COPYING*;GPL*
 
 # --- Windows x86_64 ----------------------------------------------------------
 # Ships bin/*.dll + bin/*.lib (MSVC import libs), lib/*.def, lib/*.dll.a.
-WIN64_VERSION=8.1.2
-WIN64_FILE=tas-ffmpeg-8.1.2-win64.zip
-WIN64_ROOT=tas-ffmpeg-8.1.2-win64
-WIN64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-win64.zip
-WIN64_SHA256=1d570273dc8be2b3f386467657591a22045d058a830b1eb1eaa881dafb689bfb
+WIN64_VERSION=9.0.2
+WIN64_FILE=tas-ffmpeg-9.0.2-win64.zip
+WIN64_ROOT=tas-ffmpeg-9.0.2-win64
+WIN64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-win64.zip
+WIN64_SHA256=148dfe8595ebf10a217d7e56fef732bcb2fabd3e33dfc4a37accf76f864ba19b
 
 # --- Linux x86_64 (built in manylinux_2_28 / glibc 2.28) ---------------------
-LINUX64_VERSION=8.1.2
-LINUX64_FILE=tas-ffmpeg-8.1.2-linux64.tar.xz
-LINUX64_ROOT=tas-ffmpeg-8.1.2-linux64
-LINUX64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-linux64.tar.xz
-LINUX64_SHA256=6205ef68cd9fdf2d1bd6478766c9c2b0c0363d901caea09aa91634a92a21ed28
+LINUX64_VERSION=9.0.2
+LINUX64_FILE=tas-ffmpeg-9.0.2-linux64.tar.xz
+LINUX64_ROOT=tas-ffmpeg-9.0.2-linux64
+LINUX64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-linux64.tar.xz
+LINUX64_SHA256=044420c9adf59c86050628302e8ea63bd4e8101c667157eaab949e3ca4fd57a9
 
 # --- Linux aarch64 (built in manylinux_2_28 / glibc 2.28) --------------------
-LINUXARM64_VERSION=8.1.2
-LINUXARM64_FILE=tas-ffmpeg-8.1.2-linuxarm64.tar.xz
-LINUXARM64_ROOT=tas-ffmpeg-8.1.2-linuxarm64
-LINUXARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-linuxarm64.tar.xz
-LINUXARM64_SHA256=6a0759046f0a0537743e6fc366eb19f5fcb91ba757a84b036e1b04bcf380a3b9
+LINUXARM64_VERSION=9.0.2
+LINUXARM64_FILE=tas-ffmpeg-9.0.2-linuxarm64.tar.xz
+LINUXARM64_ROOT=tas-ffmpeg-9.0.2-linuxarm64
+LINUXARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-linuxarm64.tar.xz
+LINUXARM64_SHA256=528224d56b34de7be7709ab19cf4a8af06941c9e2e61298bebfeb2b133a24717
 
 # --- macOS arm64 -------------------------------------------------------------
 # install_name is @rpath/lib<x>.<major>.dylib with LC_RPATH @loader_path/../lib,
 # so the dylibs resolve each other inside a flat lib/ directory and delocate can
 # follow them from _nelux.so.
-MACOS_ARM64_VERSION=8.1.2
-MACOS_ARM64_FILE=tas-ffmpeg-8.1.2-macos-arm64.tar.xz
-MACOS_ARM64_ROOT=tas-ffmpeg-8.1.2-macos-arm64
-MACOS_ARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-macos-arm64.tar.xz
-MACOS_ARM64_SHA256=c57c509ffc3c5456fb9a37101ec25468f4bfe20d2f68394b9f307066422642d0
+MACOS_ARM64_VERSION=9.0.2
+MACOS_ARM64_FILE=tas-ffmpeg-9.0.2-macos-arm64.tar.xz
+MACOS_ARM64_ROOT=tas-ffmpeg-9.0.2-macos-arm64
+MACOS_ARM64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-macos-arm64.tar.xz
+MACOS_ARM64_SHA256=2fc68f6e05baa91b4bb73125bab0d13c4a08c7c181f49e47545bf0e31435f1f8
 
 # --- macOS x86_64 ------------------------------------------------------------
 # KNOWN END DATE: AUGUST 2027. GitHub-hosted Intel macOS runners are the last
 # x86_64 images on Actions and GitHub has stated x86_64 will not be supported
 # after that (actions/runner-images#13045). When TAS-FFMPEG stops emitting these
 # keys, this block disappears — treat that as a decision to make, not a default.
-MACOS_X64_VERSION=8.1.2
-MACOS_X64_FILE=tas-ffmpeg-8.1.2-macos-x86_64.tar.xz
-MACOS_X64_ROOT=tas-ffmpeg-8.1.2-macos-x86_64
-MACOS_X64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v8.1.2/tas-ffmpeg-8.1.2-macos-x86_64.tar.xz
-MACOS_X64_SHA256=dcae9a250043be3ab898b59222c4a98c9da87b22ab4b181c69941714cc52ec6f
+MACOS_X64_VERSION=9.0.2
+MACOS_X64_FILE=tas-ffmpeg-9.0.2-macos-x86_64.tar.xz
+MACOS_X64_ROOT=tas-ffmpeg-9.0.2-macos-x86_64
+MACOS_X64_URL=https://github.com/NevermindNilas/TAS-FFMPEG/releases/download/v9.0.2/tas-ffmpeg-9.0.2-macos-x86_64.tar.xz
+MACOS_X64_SHA256=a8420d9f5e641001ce36499f4eca2a1221e61934e5a66ed1147f1459ede66a29
 
 # ===========================================================================
 # PER-PLATFORM FEATURE DIFFERENCES (TAS-FFMPEG README.md#encoders-per-platform)
 #   NVENC/NVDEC/CUVID   everywhere except macOS
+#   Vulkan              everywhere except macOS (new in v9.0.2; loader dlopen'd)
 #   QSV (libvpl)        Windows + Linux x86_64 only
 #   AMF                 Windows + Linux x86_64 only
 #   MediaFoundation     Windows only  (h264_mf, hevc_mf)

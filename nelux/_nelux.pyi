@@ -8,7 +8,7 @@ from enum import Enum
 __version__: str
 __torch_abi__: str
 __cuda_support__: bool
-# av_version_info() of the FFmpeg loaded at runtime, e.g. "8.1.2-tas" for the
+# av_version_info() of the FFmpeg loaded at runtime, e.g. "9.0.2-tas" for the
 # TAS-FFMPEG build bundled in the wheel.
 __ffmpeg_version__: str
 class _ImageCodecCache:

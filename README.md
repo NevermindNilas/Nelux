@@ -29,18 +29,18 @@ Supported platforms:
 
 **FFmpeg ships inside the wheel** — nothing needs to be installed or put on
 `PATH`. Every wheel carries the same build,
-[TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 8.1.2, pinned by
+[TAS-FFMPEG](https://github.com/NevermindNilas/TAS-FFMPEG) 9.0.2, pinned by
 hash in [`tools/ffmpeg.lock`](tools/ffmpeg.lock) and tagged so it is
 identifiable at runtime:
 
 ```python
 >>> nelux.__ffmpeg_version__
-'8.1.2-tas'
+'9.0.2-tas'
 ```
 
 If that reports anything else, a different FFmpeg of the same soname won the
 load — on Windows the first DLL of a given name into the process serves
-everyone, so another library shipping `avcodec-62.dll` can take over.
+everyone, so another library shipping `avcodec-63.dll` can take over.
 (`'unknown'` is the exception, and it has two causes: the extension predates
 this attribute — rebuild it — or, on Windows, no FFmpeg could be loaded at all,
 which the extension reports instead of aborting the import.)
