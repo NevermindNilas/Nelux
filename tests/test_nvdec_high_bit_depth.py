@@ -252,3 +252,111 @@ def test_eight_bit_source_is_unaffected():
         frame = next(iter(reader)).clone()
     assert frame.dtype == torch.uint8
     _assert_matches_cpu_per_half(frame, reference, 0.05)
+
+
+# --------------------------------------------------------------------------- #
+# Exact black / white / grey levels.
+#
+# The colour tolerances above are mean errors over a whole frame, and a
+# systematic 0.3% darkening sails through them. That is exactly what the
+# high-bit-depth kernels did for years: they divided every MSB-aligned sample
+# by the FULL-range maximum ((2^n-1) << (16-n), 65472 at 10 bit) even for
+# limited-range sources, where an n-bit sample is the 8-bit value * 2^(n-8)
+# exactly. Limited-range white (235 << (n-8)) therefore came out as 254
+# instead of 255 -- on ordinary 10-bit 4:2:0 HDR/SDR content, not just 4:4:4.
+#
+# These clips are flat bands at known code values, encoded losslessly, so the
+# expected RGB is exact arithmetic rather than a tolerance.
+# --------------------------------------------------------------------------- #
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+# NVDEC rejects HEVC smaller than 144x144.
+_LEVEL_W, _LEVEL_H = 384, 192
+
+
+def _ffmpeg_exe():
+    bundled = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "external", "ffmpeg", "bin",
+                           "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    return bundled if os.path.exists(bundled) else shutil.which("ffmpeg")
+
+
+def _level_clip(tmp_path, bits, chroma, full_range):
+    """Three vertical bands -- black, white, mid-grey luma -- with neutral
+    chroma, encoded losslessly with libx265 at the given depth and range."""
+    ffmpeg = _ffmpeg_exe()
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not available to generate level clips")
+    s = 1 << (bits - 8)
+    black, white = (0, (1 << bits) - 1) if full_range else (16 * s, 235 * s)
+    grey = 128 * s
+    y = np.empty((_LEVEL_H, _LEVEL_W), np.uint16)
+    third = _LEVEL_W // 3
+    y[:, :third] = black
+    y[:, third:2 * third] = white
+    y[:, 2 * third:] = grey
+    cw, ch = (_LEVEL_W, _LEVEL_H) if chroma == "444" else (_LEVEL_W // 2, _LEVEL_H // 2)
+    c = np.full((ch, cw), grey, np.uint16)
+    frame = np.concatenate([y.ravel(), c.ravel(), c.ravel()])
+    raw = tmp_path / f"lvl{bits}_{chroma}_{int(full_range)}.yuv"
+    np.concatenate([frame] * 3).tofile(raw)
+    out = tmp_path / f"lvl{bits}_{chroma}_{int(full_range)}.mp4"
+    pix_fmt = f"yuv{chroma}p{bits}le"
+    rng = "pc" if full_range else "tv"
+    params = "log-level=none:lossless=1" + (":range=full" if full_range else "")
+    # The raw input must carry the SAME colour tags as the output. Left
+    # untagged, ffmpeg auto-converts on the way in -- range (full-range grey
+    # 512 arrived as ~523) and matrix (neutral chroma 512 arrived as 511) --
+    # and the encoded samples are no longer the ones written here.
+    colour = ["-color_range", rng, "-colorspace", "bt709",
+              "-color_primaries", "bt709", "-color_trc", "bt709"]
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix_fmt,
+         "-s", f"{_LEVEL_W}x{_LEVEL_H}", "-r", "24", *colour, "-i", str(raw),
+         "-c:v", "libx265", "-x265-params", params, *colour, str(out)],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        pytest.skip(f"could not encode {pix_fmt} level clip: {proc.stderr.strip()}")
+    return str(out), (black, white, grey), third
+
+
+def _band_values(frame, third):
+    row = frame[_LEVEL_H // 2].cpu().to(torch.int64)
+    return [int(row[third // 2 + i * third, 0]) for i in range(3)]
+
+
+@pytest.mark.parametrize("full_range", [False, True], ids=["limited", "full"])
+@pytest.mark.parametrize("chroma", ["420", "444"])
+@pytest.mark.parametrize("bits", [10, 12])
+def test_exact_black_white_grey_levels(tmp_path, bits, chroma, full_range):
+    if chroma == "444":
+        have = torch.cuda.get_device_capability(0)
+        if have < (8, 0):
+            pytest.skip("NVDEC 4:4:4 needs compute capability 8.0+")
+    path, (black, white, grey), third = _level_clip(tmp_path, bits, chroma, full_range)
+
+    # Expected 8-bit-unit luma -> RGB for neutral chroma (R = G = B).
+    if full_range:
+        grey_rgb = grey * 255.0 / ((1 << bits) - 1)
+    else:
+        grey_rgb = (grey / (1 << (bits - 8)) - 16.0) * 255.0 / 219.0
+
+    with VideoReader(path, decode_accelerator="nvdec", force_8bit=True) as r:
+        eight = _band_values(next(iter(r)), third)
+    assert eight == [0, 255, round(grey_rgb)], (
+        f"{bits}-bit {chroma} {'full' if full_range else 'limited'}: NVDEC "
+        f"8-bit black/white/grey = {eight}, expected "
+        f"[0, 255, {round(grey_rgb)}]")
+
+    with VideoReader(path, decode_accelerator="nvdec", force_8bit=False) as r:
+        sixteen = _band_values(next(iter(r)), third)
+    expected16 = [0, 65535, grey_rgb * 257.0]
+    # +-2 LSB of 65535 covers float rounding in the fused matrix; the old bug
+    # sat 190+ LSB low on white (65343 at 10 bit).
+    for got, want, name in zip(sixteen, expected16, ("black", "white", "grey")):
+        assert abs(got - want) <= 2, (
+            f"{bits}-bit {chroma} {'full' if full_range else 'limited'}: NVDEC "
+            f"16-bit {name} = {got}, expected {want:.1f}")

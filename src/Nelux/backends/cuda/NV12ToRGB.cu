@@ -308,18 +308,28 @@ void SetMatYuv2Rgb(int iMatrix, cudaStream_t stream) {
 template<class T> __device__ __forceinline__ T Clamp(T x, T lower, T upper);
 
 // ===== Implementer E: P010 separate Y/UV + real bitDepth (10/12/16) =====
-// Fused scale: host uploads mat*kNorm (kNorm = 255/((2^bd-1)<<(16-bd)),
-// constexpr reciprocal (no runtime div). Device uses (y-low16) with scaled
-// matrix, float only (no half). low16/mid16 are 4096/32768 for MSB-aligned
-// limited-range data regardless of bd (16<<(bd-8)<<(16-bd)=4096).
+// Fused scale: host uploads mat*kNorm (see p016KNorm below), constexpr
+// reciprocal (no runtime div). Device uses (y-low16) with scaled matrix, float
+// only (no half). low16/mid16 are 4096/32768 for MSB-aligned limited-range
+// data regardless of bd (16<<(bd-8)<<(16-bd)=4096).
 static std::mutex g_matCacheScaledMu;
 static int g_matScaledMatrix = -1;
 static int g_matScaledRange = -1;
 static int g_matScaledBitDepth = -1;
 static cudaStream_t g_matScaledStream = nullptr;
 
-inline float p016KNormForBitDepth(int bitDepth) {
+// Maps an MSB-aligned 16-bit sample onto the 8-bit units the kMat* tables
+// are written in. The two ranges need DIFFERENT factors:
+//  * Limited range is defined by exact powers of two: an n-bit limited sample
+//    is the 8-bit value * 2^(n-8) (BT.709/BT.2020: white 235 -> 940 at 10 bit),
+//    and MSB alignment multiplies by another 2^(16-n), so every depth is the
+//    8-bit value * 256 exactly. Dividing by the full-range maximum instead
+//    (65472 for 10 bit) made limited-range white 254.0 rather than 255.
+//  * Full range spans 0..(2^n-1), so it maps that span onto 0..255.
+inline float p016KNorm(int bitDepth, bool fullRange) {
     // constexpr-equivalent reciprocal, hoisted: no per-pixel division.
+    if (!fullRange)
+        return 1.0f / 256.0f;
     // 10: 255/(1023<<6)=255/65472, 12: 255/(4095<<4)=255/65520, 16: 255/65535.
     switch (bitDepth) {
         case 10: return 255.0f / 65472.0f;
@@ -361,7 +371,7 @@ void SetMatYuv2RgbScaled(int iMatrix, int colorRange, int bitDepth, cudaStream_t
             mat = kMatFCCLimited;
             break;
     }
-    const float kNorm = p016KNormForBitDepth(bitDepth);
+    const float kNorm = p016KNorm(bitDepth, isFullRange);
     // Fuse scale into host matrix: mat' = mat * kNorm.
     float scaled[3][3];
     for (int r = 0; r < 3; ++r)
@@ -671,7 +681,11 @@ __device__ __forceinline__ RGB24 YuvToRgbForPixel(YuvUnit y, YuvUnit u, YuvUnit 
     
     // Normalize to 8-bit equivalent values before matrix multiplication
     // This ensures our 8-bit calibrated matrices work for all bit depths
-    float normScale = (bitDepth > 8) ? (255.0f / static_cast<float>((1 << bitDepth) - 1)) : 1.0f;
+    // Limited range scales by an exact power of two (see p016KNorm); only full
+    // range maps the 0..(2^n-1) span onto 0..255.
+    float normScale = (bitDepth <= 8) ? 1.0f
+                      : fullRange     ? (255.0f / static_cast<float>((1 << bitDepth) - 1))
+                                      : (1.0f / static_cast<float>(1 << (bitDepth - 8)));
     float lowNorm = static_cast<float>(low) * normScale;
     float midNorm = static_cast<float>(mid) * normScale;
     
@@ -713,7 +727,11 @@ __device__ __forceinline__ RGB48 YuvToRgb48ForPixel(YuvUnit y, YuvUnit u, YuvUni
     const int low = fullRange ? 0 : (1 << (bitDepth - 4));   // Y offset
     const int mid = 1 << (bitDepth - 1);                     // UV offset
 
-    float normScale = (bitDepth > 8) ? (255.0f / static_cast<float>((1 << bitDepth) - 1)) : 1.0f;
+    // Limited range scales by an exact power of two (see p016KNorm); only full
+    // range maps the 0..(2^n-1) span onto 0..255.
+    float normScale = (bitDepth <= 8) ? 1.0f
+                      : fullRange     ? (255.0f / static_cast<float>((1 << bitDepth) - 1))
+                                      : (1.0f / static_cast<float>(1 << (bitDepth - 8)));
     float lowNorm = static_cast<float>(low) * normScale;
     float midNorm = static_cast<float>(mid) * normScale;
 
