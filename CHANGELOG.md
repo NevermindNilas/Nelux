@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- NVDEC `frame_at()`, `get_batch()` and other exact random-access reads could
+  hang forever, intermittently and on any codec. The CUDA decoder woke its
+  decoding thread without holding the lock that thread sleeps under, so a
+  wake-up could be lost and both sides waited on each other. Exact reads hit
+  it most because skipping to a target frame releases each skipped frame
+  almost immediately. The wake-up now happens under the lock.
 - NVDEC output from limited-range 10/12-bit sources (4:2:0 and 4:4:4) was about
   0.3% too dark: white came out 254 instead of 255 in 8-bit output and ~190
   codes low in 16-bit output. The kernels normalised limited-range samples by
