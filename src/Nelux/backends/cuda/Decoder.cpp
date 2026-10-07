@@ -1216,7 +1216,15 @@ void Decoder::releaseDecodedFrame(Frame& frame)
     // small CUVID surface pool can advance/duplicate display output while the
     // just-consumed surface is still retained until the caller returns.
     av_frame_unref(frame.get());
-    producerBlocked_.store(false, std::memory_order_release);
+    releaseProducer();
+}
+
+void Decoder::releaseProducer()
+{
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        producerBlocked_.store(false, std::memory_order_release);
+    }
     producerCond.notify_one();
 }
 
@@ -1244,8 +1252,7 @@ void Decoder::enableAsyncFrameRelease()
             // The sole in-flight AVFrame owns the surface until conversion has
             // completed. Retirement happens off the Python calling thread.
             av_frame_unref(frame.get());
-            producerBlocked_.store(false, std::memory_order_release);
-            producerCond.notify_one();
+            releaseProducer();
             lock.lock();
             retireError_ = failure;
             retireBusy_ = false;
@@ -1350,15 +1357,13 @@ bool Decoder::decodeNextFrameSelective(void* buffer,
         try { selected = select(pts); }
         catch (...) {
             av_frame_unref(frame.get());
-            producerBlocked_.store(false, std::memory_order_release);
-            producerCond.notify_one();
+            releaseProducer();
             throw;
         }
         if (!selected)
         {
             av_frame_unref(frame.get());
-            producerBlocked_.store(false, std::memory_order_release);
-            producerCond.notify_one();
+            releaseProducer();
             return true;
         }
     }

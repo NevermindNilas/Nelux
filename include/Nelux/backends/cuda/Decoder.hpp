@@ -256,6 +256,17 @@ protected:
     void releaseDecodedFrame(Frame& frame);
 
     /**
+     * @brief Clear producerBlocked_ and wake the producer.
+     *
+     * The producer evaluates producerBlocked_ under queueMutex before it sleeps
+     * on producerCond, so the clear must happen under that mutex too. Cleared
+     * without it, the store and notify can land between the producer's predicate
+     * check and its sleep: the wakeup is lost and producer and consumer wait on
+     * each other forever.
+     */
+    void releaseProducer();
+
+    /**
      * @brief (Re)allocate the intermediate device buffer to at least `bytes`.
      *
      * Grow-only and shared by every conversion path, which each need a different
