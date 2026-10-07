@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- NVDEC output from limited-range 10/12-bit sources (4:2:0 and 4:4:4) was about
+  0.3% too dark: white came out 254 instead of 255 in 8-bit output and ~190
+  codes low in 16-bit output. The kernels normalised limited-range samples by
+  the full-range maximum; limited range is now scaled by its exact power of
+  two. Output matches FFmpeg's swscale with `accurate_rnd+full_chroma_int`.
+  Full-range sources are unchanged. The CPU path, which follows swscale's
+  default flags, still gives 253 for limited-range white.
 - NVDEC decode of 12-bit 4:2:0 and 10/12-bit 4:4:4 HEVC works on FFmpeg 9.
   FFmpeg 9 now reports those surfaces as `P012`, `YUV444P10MSB` and
   `YUV444P12MSB` (8.x used `P016` and `YUV444P16`), and the CUDA colour
