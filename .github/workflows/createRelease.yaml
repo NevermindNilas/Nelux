@@ -83,7 +83,7 @@ jobs:
       - name: Install C++ deps via vcpkg
         shell: cmd
         run: |
-          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
+          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt libjpeg-turbo --triplet x64-windows-release --recurse
 
       - name: Download pinned TAS-FFMPEG build (headers, import libs, DLLs)
         shell: powershell
@@ -307,7 +307,8 @@ jobs:
             ninja-build pkgconf-pkg-config \
             autoconf automake libtool \
             patchelf curl ca-certificates \
-            zip unzip tar xz git which perl-IPC-Cmd
+            zip unzip tar xz git which perl-IPC-Cmd \
+            nasm
           gcc --version
 
       - name: Upgrade pip & install Python build deps
@@ -355,7 +356,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt \
+          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt libjpeg-turbo \
             --triplet x64-linux-dynamic --recurse
 
       - name: Download pinned TAS-FFMPEG build (shipped in the wheel)
@@ -532,7 +533,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt \
+          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt libjpeg-turbo \
             --triplet ${VCPKG_TARGET_TRIPLET} --recurse
 
       - name: Download pinned TAS-FFMPEG build (shipped in the wheel)

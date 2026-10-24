@@ -77,10 +77,20 @@ applied by the nvJPEG path. Other image formats use the CPU API.
 
 PNG encoding preserves 8/16-bit grayscale, RGB, and RGBA. JPEG encoding accepts
 8-bit RGB or grayscale on CPU; CUDA JPEG requires RGB uint8. JPEG rejects alpha.
-`quality` is 1–100, with backend-specific quantization; equal quality does not
-promise identical CPU/GPU bytes. CUDA JPEG uses 4:4:4 sampling. The nvJPEG runtime
+`quality` is 1–100 on libjpeg's scale; equal quality does not promise identical
+CPU/GPU bytes. `subsampling` selects chroma subsampling, `"444"` (default),
+`"422"` or `"420"`, on both CPU and CUDA; grayscale ignores it. The nvJPEG runtime
 loads only on CUDA image use and is bundled when available in CUDA builds;
 CPU imports and CPU image operations do not depend on it.
+
+CPU JPEG encoding uses libjpeg-turbo, with the GIL released. Images above about
+64K pixels are cut into horizontal strips of whole MCU rows, encoded in
+parallel on up to `torch.get_num_threads()` threads, and joined into one
+baseline JPEG with restart markers (`DRI`/`RSTn`). Each strip's blocks are the
+blocks a single-pass encode produces, so the decoded pixels are identical; only
+the restart markers differ. The strip size depends on the image size alone, so
+the bytes do not depend on the thread count. Smaller images are a plain
+libjpeg-turbo encode.
 
 ## Encoded destinations
 

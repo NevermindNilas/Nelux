@@ -1552,6 +1552,13 @@ bool Encoder::encodeFrame(const Frame& frame)
         }
     }
 
+    // mpegvideo-family encoders (mjpeg, mpeg2/4, h263, ...) take the fixed
+    // q-scale from each frame, not from the context: `ffmpeg -q:v` copies
+    // global_quality into frame->quality. Without this, QSCALE encodes every
+    // frame at qmin and the quality setting is silently ignored.
+    if ((videoCodecCtx->flags & AV_CODEC_FLAG_QSCALE) && frameToEncode->quality == 0)
+        frameToEncode->quality = videoCodecCtx->global_quality;
+
     // 2) Send the frame to the encoder
     if (int err = avcodec_send_frame(videoCodecCtx.get(), frameToEncode); err < 0)
     {

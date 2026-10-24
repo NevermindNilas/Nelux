@@ -1,4 +1,4 @@
-"""Image tensors with FFmpeg CPU codecs and batched nvJPEG CUDA codecs."""
+"""Image tensors with FFmpeg and libjpeg-turbo CPU codecs and batched nvJPEG CUDA codecs."""
 import operator
 import atexit
 import os
@@ -73,8 +73,12 @@ def decode_image(source, **options) -> torch.Tensor:
 
 
 def encode_image(image: torch.Tensor, output_path=None, *, format="png", quality=90,
-                 dimension_order="HWC") -> torch.Tensor | None:
-    """Encode PNG or JPEG; CUDA RGB uint8 JPEG uses nvJPEG. None returns encoded bytes."""
+                 dimension_order="HWC", subsampling="444") -> torch.Tensor | None:
+    """Encode PNG or JPEG; None returns encoded bytes.
+
+    CPU JPEG uses libjpeg-turbo, CUDA RGB JPEG uses nvJPEG. ``subsampling`` is
+    the JPEG chroma subsampling, "444", "422" or "420"; grayscale ignores it.
+    """
     if dimension_order == "CHW" and image.ndim == 3:
         image = image.permute(1, 2, 0)
     elif dimension_order != "HWC":
@@ -92,15 +96,16 @@ def encode_image(image: torch.Tensor, output_path=None, *, format="png", quality
             raise ValueError("JPEG encoding requires uint8 pixels")
         if channels == 4:
             raise ValueError("JPEG cannot preserve alpha; supply RGB or grayscale pixels")
+        if subsampling not in ("444", "422", "420"):
+            raise ValueError("subsampling must be '444', '422', or '420'")
         if image.is_cuda:
-            encoded = _nelux._encode_jpeg_cuda(image, quality, _image_cache())
-            if output_path is None:
-                return encoded
-            write_encoded(output_path, encoded)
-            return None
-        codec, pixel_format = "mjpeg", "yuvj444p"
-        quantizer = round(2 + (100 - quality) * 29 / 99)
-        options = {"flags": "+qscale", "global_quality": str(quantizer * 118)}
+            encoded = _nelux._encode_jpeg_cuda(image, quality, int(subsampling), _image_cache())
+        else:
+            encoded = _nelux._encode_jpeg_cpu(image, quality, int(subsampling))
+        if output_path is None:
+            return encoded
+        write_encoded(output_path, encoded)
+        return None
     elif format == "png":
         codec = "png"
         pixel_format = {1: "gray", 3: "rgb24", 4: "rgba"}[channels]

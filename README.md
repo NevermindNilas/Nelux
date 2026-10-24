@@ -254,6 +254,7 @@ import nelux
 image = nelux.decode_image("photo.jpg")            # [H, W, 3] uint8; bytes work too
 batch = nelux.decode_images(["a.jpg", "b.jpg"], device="cuda")  # nvJPEG on CUDA
 png = nelux.encode_image(image, format="png")      # encoded bytes as a uint8 tensor
+jpg = nelux.encode_image(image, format="jpeg", quality=90, subsampling="420")  # libjpeg-turbo, multi-threaded
 
 with nelux.AudioReader("movie.mp4", sample_rate=16000, num_channels=1) as audio:
     clip = audio.get_samples_played_in_range(10.0, 20.0)   # clip.data: [1, 160000] float32

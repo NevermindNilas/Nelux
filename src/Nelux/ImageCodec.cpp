@@ -180,8 +180,15 @@ std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encod
     return result;
 }
 
-torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, ImageCodecCache& cache)
+torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, ImageCodecCache& cache)
 {
+    nvjpegChromaSubsampling_t css;
+    switch (subsampling) {
+    case 444: css = NVJPEG_CSS_444; break;
+    case 422: css = NVJPEG_CSS_422; break;
+    case 420: css = NVJPEG_CSS_420; break;
+    default: throw std::invalid_argument("subsampling must be 444, 422 or 420");
+    }
     if (!image.is_cuda() || image.scalar_type() != torch::kUInt8 || image.dim() != 3 ||
         image.size(2) != 3 || image.size(0) <= 0 || image.size(1) <= 0 ||
         image.size(0) > INT_MAX || image.size(1) > INT_MAX || quality < 1 || quality > 100)
@@ -197,7 +204,7 @@ torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, ImageCodecCache& 
         if (!c.encoder) checkJpeg(a.nvjpegEncoderStateCreate(c.handle, &c.encoder, stream));
         if (!c.params) checkJpeg(a.nvjpegEncoderParamsCreate(c.handle, &c.params, stream));
         checkJpeg(a.nvjpegEncoderParamsSetQuality(c.params, quality, stream));
-        checkJpeg(a.nvjpegEncoderParamsSetSamplingFactors(c.params, NVJPEG_CSS_444, stream));
+        checkJpeg(a.nvjpegEncoderParamsSetSamplingFactors(c.params, css, stream));
         nvjpegImage_t source{};
         source.channel[0] = image.data_ptr<unsigned char>();
         source.pitch[0] = image.size(1) * 3;
@@ -225,7 +232,7 @@ void ImageCodecCache::clear() {}
 std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>&, int, ImageCodecCache&) {
     throw std::runtime_error("CUDA JPEG decoding requires a CUDA-enabled Nelux build");
 }
-torch::Tensor encodeJpegCUDA(torch::Tensor, int, ImageCodecCache&) {
+torch::Tensor encodeJpegCUDA(torch::Tensor, int, int, ImageCodecCache&) {
     throw std::runtime_error("CUDA JPEG encoding requires a CUDA-enabled Nelux build");
 }
 }

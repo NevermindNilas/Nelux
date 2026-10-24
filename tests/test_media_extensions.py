@@ -100,6 +100,85 @@ def test_image_format_is_independent_of_destination_extension(tmp_path, format, 
         assert nelux.decode_image(destination).shape == image.shape
 
 
+def _jpeg_test_image(height, width, channels=3):
+    # Smooth gradients plus a texture: real images, not noise, so quality and
+    # subsampling change the output measurably.
+    y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    planes = [(x * 255 // max(width - 1, 1)), (y * 255 // max(height - 1, 1)),
+              ((x // 7 + y // 5) % 2) * 96 + 64]
+    image = torch.stack(planes[:channels], dim=-1).to(torch.uint8)
+    return image[..., 0].contiguous() if channels == 1 else image.contiguous()
+
+
+def _jpeg_markers(data):
+    """Marker bytes up to SOS, then the restart markers inside the scan."""
+    markers, pos = [], 2
+    while data[pos] == 0xFF and data[pos + 1] != 0xDA:
+        markers.append(data[pos + 1])
+        pos += 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
+    restarts = sum(data.count(bytes([0xFF, 0xD0 + n])) for n in range(8))
+    return markers, restarts
+
+
+# 48x64 is one strip; 1100x1301 is several, with a ragged last strip and an
+# odd width that pads the last MCU column.
+@pytest.mark.parametrize("height,width", [(48, 64), (1100, 1301)])
+@pytest.mark.parametrize("subsampling", ["444", "422", "420"])
+def test_cpu_jpeg_decodes_like_libjpeg(height, width, subsampling):
+    Image = pytest.importorskip("PIL.Image")
+    image = _jpeg_test_image(height, width)
+    encoded = nelux.encode_image(image, format="jpeg", quality=85, subsampling=subsampling)
+    reference = io.BytesIO()
+    Image.fromarray(image.numpy()).save(reference, "JPEG", quality=85,
+                                        subsampling={"444": 0, "422": 1, "420": 2}[subsampling])
+    decode = lambda data: np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+    data = encoded.numpy().tobytes()
+    np.testing.assert_array_equal(decode(data), decode(reference.getvalue()))
+    markers, restarts = _jpeg_markers(data)
+    if height * width > 1 << 16:
+        assert 0xDD in markers and restarts > 0
+    else:
+        assert 0xDD not in markers and restarts == 0
+
+
+def test_cpu_jpeg_bytes_do_not_depend_on_thread_count():
+    image = _jpeg_test_image(1440, 2560)
+    threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        single = nelux.encode_image(image, format="jpeg").numpy().tobytes()
+    finally:
+        torch.set_num_threads(threads)
+    assert nelux.encode_image(image, format="jpeg").numpy().tobytes() == single
+
+
+def test_cpu_jpeg_quality_grayscale_and_chw():
+    image = _jpeg_test_image(480, 640)
+    sizes = [nelux.encode_image(image, format="jpeg", quality=q).numel() for q in (30, 75, 95)]
+    assert sizes == sorted(sizes) and len(set(sizes)) == 3
+    chw = nelux.encode_image(image.permute(2, 0, 1), format="jpeg", dimension_order="CHW")
+    assert torch.equal(chw, nelux.encode_image(image, format="jpeg"))
+    gray = nelux.encode_image(_jpeg_test_image(480, 640, channels=1), format="jpeg")
+    data = gray.numpy().tobytes()
+    sof = data.index(b"\xff\xc0")
+    assert data[sof + 9] == 1  # one component
+    with pytest.raises(ValueError):
+        nelux.encode_image(image, format="jpeg", subsampling="411")
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_restart_marker_jpeg_decodes_in_nelux(device):
+    if device == "cuda" and not CUDA_AVAILABLE:
+        pytest.skip("requires CUDA-enabled Nelux and PyTorch")
+    # FFmpeg and nvJPEG use other IDCTs than libjpeg, so match libjpeg's decode
+    # closely rather than exactly; a mishandled restart would shift whole strips.
+    Image = pytest.importorskip("PIL.Image")
+    encoded = nelux.encode_image(_jpeg_test_image(1100, 1301), format="jpeg", quality=95)
+    reference = torch.from_numpy(np.asarray(Image.open(io.BytesIO(encoded.numpy().tobytes())).convert("RGB")).copy())
+    difference = (nelux.decode_image(encoded, device=device).cpu().int() - reference.int()).abs()
+    assert difference.float().mean() < 0.25 and difference.max() <= 4
+
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA-enabled Nelux and PyTorch")
 def test_nvjpeg_process_shutdown_is_clean():
     code = """

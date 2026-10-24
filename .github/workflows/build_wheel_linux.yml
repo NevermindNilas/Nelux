@@ -36,7 +36,8 @@ jobs:
             ninja-build pkgconf-pkg-config \
             autoconf automake libtool \
             patchelf curl ca-certificates \
-            zip unzip tar xz git which perl-IPC-Cmd
+            zip unzip tar xz git which perl-IPC-Cmd \
+            nasm
           # gcc-toolset-14 is already the default on manylinux_2_28.
           gcc --version
 
@@ -85,7 +86,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt \
+          "${RUNNER_TEMP}/vcpkg/vcpkg" install spdlog fmt libjpeg-turbo \
             --triplet x64-linux-dynamic --recurse
 
       - name: Download pinned TAS-FFMPEG build (headers + shared libs, shipped in the wheel)

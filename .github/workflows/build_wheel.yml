@@ -76,7 +76,7 @@ jobs:
       - name: Install C++ deps via vcpkg
         shell: cmd
         run: |
-          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt --triplet x64-windows-release --recurse
+          "${{ runner.temp }}\vcpkg\vcpkg" install spdlog fmt libjpeg-turbo --triplet x64-windows-release --recurse
 
       - name: Download pinned TAS-FFMPEG build (headers, import libs, DLLs)
         shell: powershell

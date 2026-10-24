@@ -1,4 +1,21 @@
 
+### **Unreleased**
+
+- **CPU JPEG encoding uses libjpeg-turbo** instead of FFmpeg's mjpeg encoder,
+  with the GIL released. Images above ~64K pixels are encoded as parallel
+  strips joined by restart markers; decoded pixels equal a single-pass encode
+  and the bytes do not depend on the thread count.
+  On 16 threads, with torchcodec 0.17 (also libjpeg-turbo 3.1.3, 4:2:0) at the
+  same quality and identical output size, nelux encodes 512x512 1.6-2.4x,
+  720p 2.9-3.1x, 1080p 3.8-3.9x and 4K 7.2-8.0x faster; on one thread they are
+  level. The old FFmpeg path was 3-5x slower than torchcodec.
+- `encode_image(..., subsampling="444" | "422" | "420")` on CPU and CUDA;
+  4:4:4 stays the default. Grayscale input writes a one-component JPEG.
+- Fixed: CPU JPEG `quality` was ignored (every value gave the same bytes), and
+  so were `VideoEncoder` `cq`/`flags=+qscale` for FFmpeg's mpegvideo encoders
+  (mjpeg, mpeg1/2/4, h263). They read the q-scale from each frame, which nelux
+  never set.
+
 ### **Version 0.20.0 (2026-10-17)**
 
 - **Encoder GOP/B-frame defaults (behaviour change):** `VideoEncoder` no longer

@@ -288,6 +288,15 @@ endif()
 # --- Dependencies ---
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+# CPU JPEG encode/decode. The TurboJPEG API carries its own copy of the libjpeg
+# core, so one library covers it; a static build is preferred when the triplet
+# offers one (nothing to bundle), the shared one ships like spdlog/fmt.
+find_package(libjpeg-turbo CONFIG REQUIRED)
+if(TARGET libjpeg-turbo::turbojpeg-static)
+  set(NELUX_TURBOJPEG_TARGET libjpeg-turbo::turbojpeg-static)
+else()
+  set(NELUX_TURBOJPEG_TARGET libjpeg-turbo::turbojpeg)
+endif()
 
 # Support both exported names (fmt changed the hyphen/underscore in some builds)
 if(TARGET fmt::fmt-header-only)
@@ -622,6 +631,7 @@ target_link_libraries(NeluxLib PUBLIC
   ${NELUX_FFMPEG_LIBS}
   spdlog::spdlog_header_only
   ${FMT_HO_TARGET}
+  ${NELUX_TURBOJPEG_TARGET}
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
@@ -790,7 +800,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   file(GLOB NELUX_DLLS
     "${VCPKG_INSTALLED_BIN}/spdlog*.dll"
     "${VCPKG_INSTALLED_BIN}/fmt*.dll"
-    "${VCPKG_INSTALLED_BIN}/jpeg*.dll"
     "${VCPKG_INSTALLED_BIN}/turbojpeg*.dll"
   )
 
@@ -799,7 +808,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
   file(GLOB NELUX_DLLS_BUILD_TREE
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/spdlog*.dll"
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/fmt*.dll"
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/jpeg*.dll"
     "${CMAKE_BINARY_DIR}/vcpkg_installed/*/bin/turbojpeg*.dll"
   )
   if(NELUX_DLLS_BUILD_TREE)
@@ -812,7 +820,6 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     file(GLOB NELUX_DLLS
       "${VCPKG_PACKAGES_DIR}/spdlog_${_vcpkg_triplet}/bin/spdlog*.dll"
       "${VCPKG_PACKAGES_DIR}/fmt_${_vcpkg_triplet}/bin/fmt*.dll"
-      "${VCPKG_PACKAGES_DIR}/libjpeg-turbo_${_vcpkg_triplet}/bin/jpeg*.dll"
       "${VCPKG_PACKAGES_DIR}/libjpeg-turbo_${_vcpkg_triplet}/bin/turbojpeg*.dll"
     )
   endif()
@@ -901,11 +908,13 @@ if(UNIX AND NELUX_BUILD_PYTHON)
     file(GLOB NELUX_SOS
       "${VCPKG_LIB}/libspdlog*.dylib"
       "${VCPKG_LIB}/libfmt*.dylib"
+      "${VCPKG_LIB}/libturbojpeg*.dylib"
     )
   else()
     file(GLOB NELUX_SOS
       "${VCPKG_LIB}/libspdlog.so*"
       "${VCPKG_LIB}/libfmt.so*"
+      "${VCPKG_LIB}/libturbojpeg.so*"
     )
   endif()
 
@@ -958,6 +967,12 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
     install(FILES ${NELUX_FFMPEG_RUNTIME_DLLS} DESTINATION nelux)
     message(STATUS "Bundling FFmpeg runtime DLLs into wheel: ${NELUX_FFMPEG_RUNTIME_DLLS}")
   endif()
+endif()
+
+# libjpeg-turbo's BSD/IJG licences require shipping their text with binaries.
+if(NELUX_BUILD_PYTHON AND EXISTS "${libjpeg-turbo_DIR}/copyright")
+  install(FILES "${libjpeg-turbo_DIR}/copyright" DESTINATION nelux/licenses/libjpeg-turbo
+          RENAME LICENSE.md)
 endif()
 
 # --- GPL paper trail --------------------------------------------------------

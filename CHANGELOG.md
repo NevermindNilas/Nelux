@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- **CPU JPEG encoding uses libjpeg-turbo.** `encode_image(format="jpeg")` on
+  the CPU no longer goes through FFmpeg's mjpeg encoder. It calls libjpeg-turbo
+  3.1.3 directly (a new vcpkg dependency, bundled in the wheels), with the GIL
+  released. Images above ~64K pixels are encoded as parallel strips joined by
+  restart markers (see [media APIs](docs/media-apis.md#image-tensors)).
+  `quality` now follows libjpeg's scale exactly, grayscale input writes a
+  one-component JPEG, and the output bytes differ from 0.20.
+  On 16 threads, with torchcodec 0.17 (also libjpeg-turbo 3.1.3, 4:2:0) at the
+  same quality and identical output size, nelux encodes 512x512 1.6-2.4x,
+  720p 2.9-3.1x, 1080p 3.8-3.9x and 4K 7.2-8.0x faster; on one thread they are
+  level. The old FFmpeg path was 3-5x slower than torchcodec.
+
+### Added
+
+- `encode_image(..., subsampling="444" | "422" | "420")` selects JPEG chroma
+  subsampling on CPU and CUDA. The default stays 4:4:4.
+
+### Fixed
+
+- `encode_image(format="jpeg", quality=...)` ignored `quality` on the CPU: every
+  value from 1 to 100 produced the same bytes, encoded at FFmpeg's finest
+  q-scale. The same bug made `VideoEncoder`'s `cq` for mjpeg, and any
+  `flags=+qscale` / `global_quality` option for FFmpeg's mpegvideo encoders
+  (mjpeg, mpeg1/2/4, h263, ...), do nothing. Those encoders read the q-scale
+  from each frame; `ffmpeg -q:v` copies it there and nelux now does too.
+
 ## [0.20.0] - 2026-10-17
 
 ### Changed

@@ -71,7 +71,7 @@ jobs:
 
       - name: Install C++ deps via vcpkg
         run: |
-          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt \
+          "${{ runner.temp }}/vcpkg/vcpkg" install spdlog fmt libjpeg-turbo \
             --triplet ${VCPKG_TARGET_TRIPLET} --recurse
 
       - name: Download pinned TAS-FFMPEG build (headers + dylibs, shipped in the wheel)

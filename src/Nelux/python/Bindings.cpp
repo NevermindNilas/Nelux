@@ -5,6 +5,7 @@
 #include "AudioDecoder.hpp"
 #include "ImageCodec.hpp"
 #include "ImageDecode.hpp"
+#include "JpegCodec.hpp"
 #include <optional>
 #include <utility>
 #include <pybind11/pybind11.h>
@@ -188,6 +189,7 @@ PYBIND11_MODULE(_nelux, m)
         return nelux::decodeImageCPU(data, source, channels, force8Bit);
     });
     m.def("_encode_jpeg_cuda", &nelux::encodeJpegCUDA, py::call_guard<py::gil_scoped_release>());
+    m.def("_encode_jpeg_cpu", &nelux::encodeJpegCPU, py::call_guard<py::gil_scoped_release>());
     py::class_<nelux::ImageCodecCache>(m, "_ImageCodecCache")
         .def(py::init<>())
         .def("clear", &nelux::ImageCodecCache::clear, py::call_guard<py::gil_scoped_release>());
