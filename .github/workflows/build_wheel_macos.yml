@@ -90,6 +90,8 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "OFF"
           NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # libturbojpeg is vendored by the repair step below, once.
+          NELUX_SKIP_DLL_INSTALL: "ON"
           CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"

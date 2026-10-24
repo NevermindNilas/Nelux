@@ -9,7 +9,8 @@ NELUX_BUNDLE_FFMPEG_DLLS that stayed OFF, a repair step that ran before the
 libraries existed. The failure mode is a wheel that imports fine on the build
 machine — which has FFmpeg everywhere — and dies on a user's box.
 
-So check the zip itself, not the build log.
+So check the zip itself, not the build log. It also fails a wheel that carries
+any shared library more than once.
 
     python tools/verify_wheel_ffmpeg.py dist/nelux-*.whl
 
@@ -92,6 +93,24 @@ def main(argv: list[str]) -> int:
     return worst
 
 
+def library_stem(name: str) -> str | None:
+    """The library a bundled binary is, independent of where and how it is named.
+
+    nelux.libs/libavcodec-1310f2a3.so.63.1.102, nelux/libfmt.12.2.0.dylib and
+    nelux.libs/turbojpeg-<32 hex>.dll become avcodec, fmt and turbojpeg. Returns
+    None for anything that is not a shared library, and for the extension itself.
+    """
+    base = name.rsplit("/", 1)[-1]
+    match = (
+        re.match(r"^(?:lib)?(.+?)(?:-[0-9a-f]{8})?\.so(?:\.[0-9.]+)?$", base)
+        or re.match(r"^(?:lib)?(.+?)(?:\.[0-9]+)*\.dylib$", base)
+        or re.match(r"^(.+?)(?:-[0-9a-f]{32})?\.dll$", base)
+    )
+    if not match or base.startswith("_nelux"):
+        return None
+    return match.group(1)
+
+
 def check_wheel(wheel: Path, lock: dict[str, str]) -> int:
     names = zipfile.ZipFile(wheel).namelist()
 
@@ -138,6 +157,20 @@ def check_wheel(wheel: Path, lock: dict[str, str]) -> int:
                 f"expected something matching {pattern.pattern}"
             )
 
+    # Each shared library once. Copying a lib*.so* glob into nelux/ follows every
+    # version symlink, so libturbojpeg.so.0 and .so.0.5.0 shipped as two full
+    # copies (three on macOS) and only one of them is ever loaded.
+    by_stem: dict[str, list[str]] = {}
+    for name in names:
+        stem = library_stem(name)
+        if stem:
+            by_stem.setdefault(stem, []).append(name)
+    duplicates = [
+        f"{stem} is in the wheel {len(copies)} times: {', '.join(sorted(copies))}"
+        for stem, copies in sorted(by_stem.items())
+        if len(copies) > 1
+    ]
+
     # The binaries are GPL-2.0-or-later. Shipping them without the licence texts
     # and the corresponding-source offer is a licence violation, so treat a
     # missing paper trail exactly as seriously as a missing DLL.
@@ -163,8 +196,14 @@ def check_wheel(wheel: Path, lock: dict[str, str]) -> int:
             file=sys.stderr,
         )
         return 1
+    if duplicates:
+        print("\nDuplicate library check FAILED:", file=sys.stderr)
+        for duplicate in duplicates:
+            print(f"  - {duplicate}", file=sys.stderr)
+        return 1
 
-    print("\nAll seven FFmpeg libraries and the licence paper trail are in the wheel.")
+    print("\nAll seven FFmpeg libraries and the licence paper trail are in the wheel,")
+    print("and every bundled library is in it once.")
     return 0
 
 

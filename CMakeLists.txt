@@ -307,6 +307,17 @@ else()
   message(FATAL_ERROR "fmt header-only target not found. Install a package that exports fmt::fmt-header-only.")
 endif()
 
+# vcpkg's spdlog_header_only links the compiled fmt::fmt, but everything here
+# builds fmt header-only, so the extension imports no fmt symbol and still
+# recorded libfmt as a dependency on Linux and macOS, which made the wheels
+# carry it. MSVC drops an import nothing uses, so Windows never had fmt.dll.
+get_target_property(_spdlog_ho_libs spdlog::spdlog_header_only INTERFACE_LINK_LIBRARIES)
+if(_spdlog_ho_libs)
+  list(TRANSFORM _spdlog_ho_libs REPLACE "^fmt::fmt$" "${FMT_HO_TARGET}")
+  set_target_properties(spdlog::spdlog_header_only PROPERTIES
+    INTERFACE_LINK_LIBRARIES "${_spdlog_ho_libs}")
+endif()
+
 # --- FFmpeg ---
 # Uses the TAS-FFMPEG build unpacked into external/ffmpeg by
 #   tools/download_ffmpeg.ps1   (Windows)
@@ -877,55 +888,34 @@ if(WIN32 AND NELUX_BUILD_PYTHON)
 
 endif()
 
-if(UNIX AND NELUX_BUILD_PYTHON)
-  # Locate the vcpkg install tree for this triplet. NOTE: FFmpeg libs are NOT
-  # bundled here — users must have FFmpeg installed (or use auditwheel/delocate
-  # at wheel-repair time).
-  if(DEFINED ENV{VCPKG_TARGET_TRIPLET})
-    set(_nelux_triplet "$ENV{VCPKG_TARGET_TRIPLET}")
-  elseif(DEFINED VCPKG_TARGET_TRIPLET)
-    set(_nelux_triplet "${VCPKG_TARGET_TRIPLET}")
-  elseif(APPLE)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-      set(_nelux_triplet "arm64-osx-dynamic")
-    else()
-      set(_nelux_triplet "x64-osx-dynamic")
-    endif()
-  else()
-    set(_nelux_triplet "x64-linux-dynamic")
-  endif()
+# Wheel builds in CI leave the vcpkg runtime libraries to the repair tool
+# (delvewheel, auditwheel, delocate), which vendors each one once, under the
+# name the loader asks for. Placing them in nelux/ as well would ship them
+# twice. Local builds (`pip install -e .`) still get them next to the extension.
+option(NELUX_SKIP_DLL_INSTALL "Skip placing vcpkg runtime libraries in nelux/ (use when delvewheel/auditwheel/delocate will repair the wheel)" OFF)
+if(DEFINED ENV{NELUX_SKIP_DLL_INSTALL})
+  set(NELUX_SKIP_DLL_INSTALL "$ENV{NELUX_SKIP_DLL_INSTALL}")
+endif()
 
-  if(DEFINED ENV{VCPKG_ROOT})
-    file(TO_CMAKE_PATH "$ENV{VCPKG_ROOT}" _vcpkg_root_cmake)
-    set(VCPKG_LIB "${_vcpkg_root_cmake}/installed/${_nelux_triplet}/lib")
-  else()
-    set(VCPKG_LIB "${CMAKE_SOURCE_DIR}/vcpkg/installed/${_nelux_triplet}/lib")
-  endif()
-
-  set(NELUX_SO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nelux")
-
+if(UNIX AND NELUX_BUILD_PYTHON AND NOT NELUX_SKIP_DLL_INSTALL
+   AND NELUX_TURBOJPEG_TARGET STREQUAL "libjpeg-turbo::turbojpeg")
+  # libturbojpeg is the only vcpkg library the extension loads (spdlog and fmt
+  # are header-only). Copy the one file, under the name the extension records,
+  # into the source nelux/ folder that the $ORIGIN / @loader_path rpath points
+  # at. Not a glob of lib*.so*: copying follows each version symlink into a
+  # full copy, and scikit-build-core packs all of nelux/ into the wheel.
   if(APPLE)
-    file(GLOB NELUX_SOS
-      "${VCPKG_LIB}/libspdlog*.dylib"
-      "${VCPKG_LIB}/libfmt*.dylib"
-      "${VCPKG_LIB}/libturbojpeg*.dylib"
-    )
+    # vcpkg sets the install name to the real file's name.
+    set(_nelux_tj_name "$<TARGET_FILE_NAME:libjpeg-turbo::turbojpeg>")
   else()
-    file(GLOB NELUX_SOS
-      "${VCPKG_LIB}/libspdlog.so*"
-      "${VCPKG_LIB}/libfmt.so*"
-      "${VCPKG_LIB}/libturbojpeg.so*"
-    )
+    set(_nelux_tj_name "$<TARGET_SONAME_FILE_NAME:libjpeg-turbo::turbojpeg>")
   endif()
-
-  foreach(sofile ${NELUX_SOS})
-    add_custom_command(TARGET nelux POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${sofile}"
-        "${NELUX_SO_DIR}"
-      COMMENT "Copying dependency shared lib: ${sofile} -> ${NELUX_SO_DIR}"
-    )
-  endforeach()
+  add_custom_command(TARGET nelux POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:libjpeg-turbo::turbojpeg>"
+      "${CMAKE_CURRENT_SOURCE_DIR}/nelux/${_nelux_tj_name}"
+    COMMENT "Copying libturbojpeg next to the extension"
+  )
 endif()
 
 install(TARGETS nelux
@@ -944,13 +934,7 @@ install(FILES
 if(WIN32 AND NELUX_BUILD_PYTHON)
   # In CI, delvewheel handles vcpkg DLL bundling via --add-path. Installing them
   # into nelux/ here would duplicate every DLL (one in nelux/, one hashed copy
-  # in nelux.libs/). Set NELUX_SKIP_DLL_INSTALL=ON in CI to opt out; default
-  # remains ON so local dev (`pip install -e .`) gets DLLs next to _nelux.pyd.
-  option(NELUX_SKIP_DLL_INSTALL "Skip installing vcpkg DLLs into nelux/ (use when delvewheel will repair the wheel)" OFF)
-  if(DEFINED ENV{NELUX_SKIP_DLL_INSTALL})
-    set(NELUX_SKIP_DLL_INSTALL "$ENV{NELUX_SKIP_DLL_INSTALL}")
-  endif()
-
+  # in nelux.libs/), hence NELUX_SKIP_DLL_INSTALL (defined above).
   if(NELUX_SKIP_DLL_INSTALL)
     message(STATUS "NELUX_SKIP_DLL_INSTALL=ON — leaving vcpkg DLL bundling to delvewheel")
   elseif(NELUX_DLLS)

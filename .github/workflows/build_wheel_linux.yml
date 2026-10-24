@@ -104,6 +104,8 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
           NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # libturbojpeg is vendored by the repair step below, once.
+          NELUX_SKIP_DLL_INSTALL: "ON"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
           export VCPKG_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"

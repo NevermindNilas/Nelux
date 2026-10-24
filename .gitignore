@@ -8,6 +8,8 @@ celux/_celux.pyd
 nelux/*.dll
 nelux/_nelux.pyd
 nelux/*.so
+nelux/*.so.*
+nelux/*.dylib
 
 scripts/
 

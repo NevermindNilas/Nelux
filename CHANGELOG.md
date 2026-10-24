@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `flags=+qscale` / `global_quality` option for FFmpeg's mpegvideo encoders
   (mjpeg, mpeg1/2/4, h263, ...), do nothing. Those encoders read the q-scale
   from each frame; `ffmpeg -q:v` copies it there and nelux now does too.
+- The Linux and macOS wheels shipped fmt and spdlog two or three times each,
+  once per version-symlink name, although the extension loads neither, and the
+  new libturbojpeg was bundled the same way. They now carry one libturbojpeg
+  and no fmt or spdlog (Linux 3.2 MB and macOS 3.9 MB smaller unpacked). The
+  release workflow's Windows wheels no longer ship the unused `fmt.dll` and
+  `spdlog.dll`.
 
 ## [0.20.0] - 2026-10-17
 

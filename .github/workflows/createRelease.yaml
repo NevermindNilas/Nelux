@@ -140,6 +140,9 @@ jobs:
           # renames what it vendors and the /DELAYLOAD thunk resolves the
           # literal baked file name.
           NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # vcpkg DLLs come from delvewheel only (as in build_wheel.yml); CMake
+          # placing them in nelux/ too shipped unused fmt.dll/spdlog.dll.
+          NELUX_SKIP_DLL_INSTALL: "ON"
         run: |
           # Convert backslashes to forward slashes to avoid CMake escaping issues on Windows
           TEMP_FWD=$(echo "$RUNNER_TEMP" | tr '\\' '/')
@@ -370,6 +373,8 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "ON"
           NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # libturbojpeg is vendored by the repair step below, once.
+          NELUX_SKIP_DLL_INSTALL: "ON"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"
           export VCPKG_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -548,6 +553,8 @@ jobs:
           SKBUILD_CONFIG: Release
           NELUX_ENABLE_CUDA: "OFF"
           NELUX_BUNDLE_FFMPEG_DLLS: "ON"
+          # libturbojpeg is vendored by the repair step below, once.
+          NELUX_SKIP_DLL_INSTALL: "ON"
           CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           export VCPKG_ROOT="${RUNNER_TEMP}/vcpkg"

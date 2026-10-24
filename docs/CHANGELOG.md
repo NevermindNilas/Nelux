@@ -15,6 +15,10 @@
   so were `VideoEncoder` `cq`/`flags=+qscale` for FFmpeg's mpegvideo encoders
   (mjpeg, mpeg1/2/4, h263). They read the q-scale from each frame, which nelux
   never set.
+- Fixed: the Linux and macOS wheels bundled fmt and spdlog (unused) and
+  libturbojpeg two or three times each, once per version-symlink name. They
+  now carry one libturbojpeg and nothing else from vcpkg; the release Windows
+  wheels drop the unused `fmt.dll` and `spdlog.dll`.
 
 ### **Version 0.20.0 (2026-10-17)**
 
