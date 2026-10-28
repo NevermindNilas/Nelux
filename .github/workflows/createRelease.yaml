@@ -450,9 +450,13 @@ jobs:
           # numpy is NOT installed by hand: it is a declared dependency of the
           # wheel, so pip must pull it in on its own here. If this job starts
           # failing on "No module named 'numpy'", the metadata regressed.
-          python -m pip install dist/*.whl
+          python -m pip install "${GITHUB_WORKSPACE}"/dist/*.whl
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
-          python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__)"
+          # Run outside the checkout: `python -c` puts the working directory
+          # first on sys.path, and the checkout's nelux/ holds the unrepaired
+          # build output (no vendored libturbojpeg), not the installed wheel.
+          cd "${RUNNER_TEMP}"
+          python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__, nelux.__file__)"
           # Locate the .so via find_spec (does NOT execute nelux/__init__.py, so it
           # avoids the "import torch first" guard) for the NEEDED assertion.
           SO=$(python -c "import importlib.util,glob,os; s=importlib.util.find_spec('nelux'); print(glob.glob(os.path.join(os.path.dirname(s.origin),'_nelux*.so'))[0])")
@@ -461,7 +465,8 @@ jobs:
             echo "FAIL: eager CUDA lib still in NEEDED (import would break on CPU-only torch)"; exit 1
           fi
           echo "OK: no eager CUDA libs in NEEDED"
-          python tests/wheel_smoke_test.py
+          python "${GITHUB_WORKSPACE}/tests/wheel_smoke_test.py"
+          cd "${GITHUB_WORKSPACE}"
           deactivate
 
       - name: Mandatory installed-wheel range gate
