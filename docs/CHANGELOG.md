@@ -1,6 +1,165 @@
 
 ### **Unreleased**
 
+- `VideoEncoder(...)` releases the GIL while it opens the codec, so other
+  Python threads keep running: their longest stall during the constructor
+  falls from the whole open (h264_nvenc 25-98 ms, jpeg2000 1080p 115 ms,
+  h264_qsv 574 ms) to 1-12 ms. libsvtav1 keeps it: that open points the
+  process's stderr at NUL (SVT's banner), and another thread's stderr lines
+  were lost meanwhile. Encoders constructed on several threads open side by
+  side. Same bytes.
+- A CPU encoder of 2560x1440 or more checks its AVX2 RGB conversion against
+  sws_scale (one full frame, ~31 ms at 4K, once per size per process) on a
+  helper thread right after its codec opens, instead of inside the first
+  `encode_frame`. With 50 ms of caller work before it, the first 4K frame
+  took 34.7 -> 3.6 ms (prores_ks) and 27.7 -> 3.0 ms (libx265); fed straight
+  away it still waits for the check. Same bytes.
+- `get_encoded_data()` returns a memory output over 16 MiB without copying
+  it: the muxer writes into one reserved address range and the tensor takes
+  it over. Every call returns that same tensor (it was a fresh copy;
+  `.clone()` it for an independent one), and it outlives the encoder. 1080p,
+  400 frames into avi in memory: rawvideo 572 -> 319 ms (a file: 320 ms),
+  ffvhuff 786 -> 492 ms, peak memory one output smaller (rawvideo 2.39 ->
+  1.21 GB). Same bytes.
+- NVENC runs in torch's CUDA context when that is live on device 0, instead
+  of a second one: ~222 MiB less VRAM per open encoder (three 1080p
+  h264_nvenc encoders 954 -> 306 MiB, 0 kept after close), and no
+  cross-context copy per CUDA frame. CPU per frame 4K CUDA input 0.48 ->
+  0.33 ms, 1080p 0.25 -> 0.21 ms, 1080p CPU input 0.70-0.88 -> 0.59 ms; fps
+  unchanged (4K CUDA input now 0.98x torchcodec, was 0.93x). Host frames
+  upload through page-locked staging there. Without torch's context the
+  idle-context cache applies as before. Byte-identical bitstreams.
+- CPU RGB frames into NVENC (even size, no resize) no longer
+  make a second CUDA context: NVENC opens in the primary context the GPU
+  convert runs in. 1080p h264_nvenc, cold process: first frame 55 -> 17 ms,
+  fixed cost 0.200 -> 0.154 s, CPU 0.91 -> 0.56 ms per frame, peak VRAM
+  -133 MiB, fps unchanged. Byte-identical bitstreams.
+- CUDA frames that stage through the host as RGB (resize, gray/RGB
+  destinations) land in page-locked memory and `encode_frame` sleeps on the
+  copy instead of spinning: 4K -> 1080p resize into h264_nvenc, caller
+  1.87 -> 0.09 ms per frame. Same bytes.
+- Fewer host copies into NVENC: CPU frames above 1080p go up from their
+  page-locked pool frames, not a staged copy (4K h264_nvenc, CPU uint8:
+  14.9 -> 12.7 Mcycles of CPU per frame); deep float/uint16 CPU frames up to
+  1080p load into page-locked buffers (1080p hevc_nvenc p010, float32: caller
+  6.45 -> 5.0 Mcycles); CUDA uint8/uint16 CHW views and padded rows skip
+  `contiguous()` (one frame-sized temporary and device copy less per frame).
+  fps unchanged, same bytes.
+- A huffyuv, ffvhuff or jpeg2000 encoder opened beside other frame-threaded
+  encoders in the process takes cores / (open + 1) frame-thread contexts
+  instead of one per core: two 1080p jpeg2000 encoders 6.9 -> 5.3 GB peak at
+  the same fps, two ffvhuff 1.99 -> 1.66 GB. CUDA frames into NVENC use 3
+  device slots instead of 6 (4K 443 -> 401 MiB VRAM). Same bytes, same fps.
+- **Fixed:** a CPU encode could crash with an access violation in
+  libswscale at widths that are not a multiple of 16: sws_scale reads up to
+  ~40 bytes past a packed RGB frame, and nelux's staging copy (1924x672
+  rgb24 on Windows, also in 0.20.0), the AVX2 check frame and a caller's
+  tensor converted in place (RGB into `gray` output) ended at the frame.
+  They are padded, or copied when they end near a page edge. Same bytes.
+- **Fixed:** `nelux.transcode` keeps the source's exact frame rate (the
+  CLI's): it went through a double, so 1199/40 was snapped to 30000/1001
+  (a frame lost every ~9.6k) and a phone's 5400000/179267 cut to another
+  time base (other libx264/NVENC frames); mpeg2video gets the nearest rate it
+  lists, as with the CLI, where it failed to open.
+- **Fixed:** `nelux.transcode` into formats without timestamps (y4m, raw
+  `.h264`, image sequences) uses the CLI's `cfr` mode: a variable-frame-rate
+  source's dropped frames were missing and the rest played back to back
+  (108 frames over 3.58 s against the CLI's 121 over 4.01 s). Same frames as
+  the CLI now; mp4/mkv/mov/webm/ts/avi unchanged.
+- **Fixed:** `nelux.transcode` counts the output from the source's start, on
+  any stream, as the CLI does, not from the first video frame: a video that
+  starts after the source's audio (an MKV leading with 0.29 s of audio, a
+  phone MP4 with 33 ms) lost that lead when the audio was not copied. Into
+  y4m, raw `.h264` or image sequences the first frame is now repeated over
+  the lead (57 frames, was 50) and into mp4/mkv the video starts that much
+  in, the CLI's frames and times, so it lines up with the source's audio.
+  MPEG-TS and sources whose video starts with them are unchanged.
+- **Fixed:** copied audio timed before 0 (an MP4's AAC priming packet, the
+  ~1 s pre-roll of a stream-copy cut such as `ffmpeg -ss 2 -i in.mp4 -c
+  copy`) was written at 0 by `nelux.transcode` and
+  `VideoEncoder.add_passthrough`, so the audio ran 21 ms to 1 s late. It keeps
+  its negative times, as `-c:a copy` does, behind an edit list in mp4/mov;
+  matroska audio copied into mp4 is retimed in samples as the CLI does it.
+  The CLI's audio packets; video unchanged.
+- **Fixed:** `nelux.transcode` counts a source that starts before 0 from
+  there (was 0) and an MPEG-TS from the start of its video stream (was the
+  first decoded frame of a mid-GOP cut), as the CLI does: the video started
+  0.1-0.5 s early, and y4m lacked the repeated lead frames.
+- **Fixed:** `nelux.transcode` gives each frame the stream's sample aspect
+  ratio, as the CLI does; ffv1 from a VP9 WebM or an `-aspect` remux coded
+  the bitstream's into its slice headers. Same pixels, the CLI's packets.
+- **Fixed:** `nelux.transcode` now stops on Ctrl+C (checked every 100 ms on
+  the main thread) instead of after the whole file; the output keeps the
+  frames coded so far.
+- **Fixed:** NVENC at an odd height (nv12, yuv420p, p010) coded garbage
+  colour in the bottom rows of CPU frames: FFmpeg's CUDA upload copies
+  height / 2 chroma rows rounded down, so the last one was whatever the
+  memory held, and the bytes changed with the process's earlier GPU work.
+  The row is uploaded now (320x241 bottom rows off by 200 -> 3); even
+  heights are unchanged.
+- **Fixed:** NVDEC on an odd-sized VP8/VP9 picture converted the frame at
+  NVDEC's even surface size: a 321-wide frame had every row skewed, and a
+  241-tall one wrote a row past the output (into the next `decode_batch`
+  frame, or past the tensor). It is cropped to the output now. An odd
+  height's colour stays a chroma row off (NVDEC's chroma is not where FFmpeg
+  points).
+- **Fixed:** `nelux.transcode` into NVENC sends odd-sized VP8/VP9 sources to
+  the CPU decoder: on NVDEC every frame was rescaled from the surface size and
+  coded with misplaced chroma. Same stream as the CPU route now; even sizes
+  and HEVC 4:4:4 unchanged.
+- **Fixed:** an encoder whose open failed after its codec opened (e.g. an
+  output directory that cannot be created) stayed counted as open, so every
+  later huffyuv/ffvhuff/jpeg2000 encoder in the process opened a share of
+  the cores while alone (24 -> 6 threads after three failures).
+- NVENC encoders reuse the CUDA context the last one closed instead of
+  creating (~36-40 ms) and destroying (~12-14 ms) one each: 30-frame 1080p
+  h264_nvenc clips after the first ~190 -> ~139 ms (CUDA input) and ~194 ->
+  ~130 ms (CPU input). Concurrent encoders still get one each; an encoder
+  that raised frees its own. The idle context keeps ~222 MiB VRAM and
+  ~390 MB committed memory until exit; `NELUX_NVENC_CONTEXT_CACHE=0` turns
+  it off. Byte-identical bitstreams.
+- Fixed: a failed NVENC open leaked its CUDA context (~222 MiB VRAM each).
+- Fixed: an NVENC encoder whose `close()` raised (e.g. a container header
+  that failed) leaked its CUDA context and took the idle one: ~224 MiB VRAM
+  per encoder, now 0.
+- Fixed: a GPU convert self-test that could not run (a transient CUDA
+  out-of-memory) was cached as a mismatch for the whole process; now only
+  that encoder falls back to the CPU convert.
+
+- Passthrough bounds the muxer's interleave queue at 2 s instead of 10 s, so
+  an idle copied stream (a sparse subtitle track, audio cut by `end=` or
+  shorter than the video) no longer holds 10 s of video in RAM: 1080p
+  h264_nvenc at ~160 Mb/s into mkv +222 -> +55 MB peak with audio + srt,
+  +187 -> +57 MB with audio `end=5.0`, fps unchanged. Source streams nothing
+  copies are skipped by the demuxer. Packets and their order are identical.
+- Fixed: `add_passthrough` of a joined MPEG-TS lost the copied audio after a
+  splice that steps back in time (the muxer refused each packet); splices
+  are corrected as the ffmpeg CLI corrects them. Other sources unchanged.
+- Fixed: `add_passthrough(start=S)` / `nelux.transcode(start=S)` wrote the
+  copied audio S seconds behind the video (the muxer queue hid it up to
+  S = 10 s, holding S seconds of video in RAM).
+- NVENC's CUDA frame pool starts empty and grows to peak use instead of
+  preallocating 20 frames: 4K h264_nvenc -280 MiB GPU memory after open and
+  -70 MiB at peak, hevc_nvenc p010 -480 / -120 MiB. Byte-identical
+  bitstreams, fps unchanged.
+- Thumbnail-size frames (up to 320x240) open about one mpeg4 / mpeg1video /
+  mpeg2video / h263p thread per 48 macroblocks instead of one per macroblock
+  row: 64x64 mpeg4 1.85x faster at half the CPU, 160x120-320x240 1.05-1.2x.
+  Fewer slices, so the stream changes (PSNR within 0.02 dB). Below 10000
+  pixels dpx/bmp/yuv4/... code on one context (byte-identical, less CPU).
+  `options={"threads": ...}` still wins.
+- A single named still up to 1024x1024 (`still.tiff`, `.exr`, `.qoi`, ...)
+  opens its frame-threaded codec on one context instead of one per core:
+  64x64 / 512x512 tiff 4.3 / 6.9 -> 2.9 / 4.7 ms, exr 4.5 / 7.8 -> 2.8 /
+  5.3 ms, qoi 2.8 / 6.5 -> 1.5 / 4.8 ms, open to close. Same bytes;
+  `options={"threads": ...}` still wins.
+- Numbered image sequences (`frame_%05d.bmp`, ...) are created and written by
+  writer threads instead of the encoder's thread, byte-identical, every file
+  written before `close()` returns: 720p bmp 1.66x, 64x64 bmp 1.2x. A file
+  that cannot be created is still reported on stderr
+  (`Could not open file : <path>`).
+- jpeg2000 at 4K keeps 8 frame contexts: 2.2x faster than 0.20 (18.4 vs
+  8.4 fps) in a third of the memory (4.2 vs 12.4 GB); 1080p is unchanged.
 - **CPU JPEG encoding uses libjpeg-turbo** instead of FFmpeg's mjpeg encoder,
   with the GIL released. Images above ~64K pixels are encoded as parallel
   strips joined by restart markers; decoded pixels equal a single-pass encode
@@ -11,6 +170,44 @@
   level. The old FFmpeg path was 3-5x slower than torchcodec.
 - `encode_image(..., subsampling="444" | "422" | "420")` on CPU and CUDA;
   4:4:4 stays the default. Grayscale input writes a one-component JPEG.
+- `nelux.transcode(source, output_path, **encoder_options)`: decoded frames
+  straight into the encoder, no RGB round trip; the stream equals the ffmpeg
+  CLI's. 1080p h264 -> libx264 at CLI wall time, 5-8 ms less CPU a frame than
+  a reader loop, +1.8 dB luma PSNR. Into NVENC, H.264/HEVC/VP8/VP9
+  sources decode on NVDEC and stay on the GPU (others, AV1 and H.264 High 10
+  among them, are uploaded), with the CLI's bitstream either way: 1080p
+  h264 -> h264_nvenc at the NVENC ceiling on 0.2-0.4 ms CPU a frame, against
+  5.2 ms for a CPU reader loop and 0.55 ms for an NVDEC one. Frames keep their source timing, so a
+  variable-frame-rate source stays in sync with its copied audio, with the
+  CLI's `vfr` rule deciding which frames are kept, on which tick and for how
+  long (a frame is dropped only when it ends 0.6 tick or more before the
+  next free one, so a capture whose timestamps wobble keeps its frames; its
+  `cfr` rule for formats without timestamps), and the
+  output starts with whichever track starts first, the other keeping its
+  source offset, as with the CLI: an MPEG-TS whose timestamps begin late
+  (1.4 s, or 600 s into a broadcast capture) no longer comes out with the
+  audio that far behind the video. A joined MPEG-TS has its timestamp
+  splices corrected on every track, as the CLI does (the copied audio was
+  first lost after a step back, or left ~100 s behind after a jump), and a
+  rotated (phone) source is turned upright with the CLI's autorotate filters
+  instead of coming out sideways, converted to the encoder's format once,
+  where the CLI converts it (a 4:2:2 source in front of the transpose).
+  The default format is the one the CLI's format negotiation picks, upright
+  source or not; it first differed in 140 of 1615 source x codec pairs: a
+  pal8 source (palette-PNG video, 8-bit BMP/AVI) took an alpha format, so
+  libx265 and libvpx-vp9 failed to open and prores_ks/ffv1/utvideo got an
+  alpha plane; gray10/16 into xwd or sunrast raised; DPX, sgi and pfm came
+  out little-endian where the CLI writes big-endian.
+  Into the other colour model (an RGB screen capture into libx264, a YUV
+  source into libx264rgb or ffv1 bgr0) the output gets the CLI's colour
+  tags, not the source's: they were first copied across and used for the
+  conversion, so an RGB source came out tagged with the GBR matrix on YUV
+  data (11.5 dB, garbage colours in every player) and a bt709 one into
+  libx264rgb decoded as YUV (12 dB). An RGB source into NVENC takes bgr0, the
+  closest format nelux can hand it (the CLI's gbrp cannot be uploaded as
+  CUDA frames), instead of being coded as 4:2:0 with the RGB matrix.
+  Fixed:
+  `options={"aspect": ...}` was missing from .mkv files.
 - Fixed: CPU JPEG `quality` was ignored (every value gave the same bytes), and
   so were `VideoEncoder` `cq`/`flags=+qscale` for FFmpeg's mpegvideo encoders
   (mjpeg, mpeg1/2/4, h263). They read the q-scale from each frame, which nelux
@@ -19,6 +216,188 @@
   libturbojpeg two or three times each, once per version-symlink name. They
   now carry one libturbojpeg and nothing else from vcpkg; the release Windows
   wheels drop the unused `fmt.dll` and `spdlog.dll`.
+- **Encoder defaults (behaviour change):** a quality target in `options`
+  (`crf`, `qp`, `cq`, `global_quality`) without `bit_rate` now runs at the
+  codec's own default rate, as `ffmpeg -crf` does, instead of beside the forced
+  4 Mb/s (libsvtav1 `crf` failed to open; libx265 `qp` and libaom/vp9 `crf`
+  were silently 4 Mb/s-capped). Only a key the codec has counts (`cq` on
+  libx264 keeps 4 Mb/s, and is logged as ignored). `codec="dnxhd"` without
+  `bit_rate`/`profile`
+  uses DNxHR. Image paths (`still.png`, `frame_%05d.tiff`) get their
+  extension's encoder instead of mjpeg.
+- Fixed: mjpeg, ljpeg, zmbv, msrle and smc did not open at defaults (limited
+  range for the JPEG codecs, pal8 for the rest), so `VideoEncoder("x.jpg")`
+  failed; dpx and exr wrote RGB input as gray; gif output varied between runs
+  (error-diffusion dither spread over several converters); prores_ks_vulkan
+  crashed. msrle/smc now match the ffmpeg CLI bit for bit, and fixed-size or
+  container-less codecs (h261, h263, dvvideo, dnxhd, bmp, a64multi, ...) fail
+  with the sizes, profile, muxer or image pattern that works.
+- **Encoder threading defaults (bitstream change for VP9/AV1):** libvpx-vp9
+  uses `row-mt=1` (720p 1.78-1.88x, -0.5% size, +0.005 dB) and libaom-av1 two
+  tile columns from 1920 wide (1080p 1.14-1.18x, +0.25% size, within 0.015 dB).
+  `options` can restore the library defaults.
+- Frame-threaded encoders (prores, huffyuv, utvideo, jpeg2000, mjpeg with a
+  q-scale, ...) no longer allocate and copy a whole frame per recycled input,
+  get 8 converters above 1440p, and huffyuv/ffvhuff cap their contexts to
+  ~1.5 GiB and jpeg2000 to ~3 GiB (1080p keeps a context per core on 24
+  threads; 4K takes 8 instead of ~12 GB). Byte-identical output; 4K mjpeg
+  1.37x, 4K huffyuv 1.31x (2.8 -> 2.1 GB), 1080p prores_aw 1.13x.
+- mpegvideo encoders (mpeg1/2/4, h263, msmpeg4, wmv, flv, mjpeg, ...) and the
+  *_qsv encoders reference nelux's YUV frames instead of copying each one on
+  the submit thread: the frames are allocated with the codec's strides
+  (mpegvideo) or libmfx's contiguous NV12/P010 planes (QSV), at sizes in
+  whole 16-pixel units (32 for hevc/av1_qsv and interlaced MPEG-2).
+  Byte-identical output; mpeg4 4K 1.48x, mpeg2video 4K 1.51x, mpeg4 720p
+  1.26x (more CPU per frame at 4K); h264_qsv 4K and hevc_qsv 1440p ~1.5-2 ms
+  less CPU a frame at equal fps.
+- From 1440p, a CPU tensor the AVX2 RGB->YUV kernel covers is converted
+  straight into the encoder's YUV frame in row bands (calling thread plus
+  convert workers) instead of being copied to a staging buffer first; it is
+  still read before `encode_frame` returns. Byte-identical output; 4K utvideo
+  1.24x, 4K magicyuv 1.27x, 1440p utvideo 1.16x, 4K libx264 unchanged.
+  Frame-threaded codecs (utvideo, huffyuv, prores, ...) band from 1080p:
+  1080p utvideo 1.31x, 1080p huffyuv 1.10x, 1080p libx264 unchanged.
+- CPU frames that are CHW views, have padded rows, or are uint16 / float32 /
+  float16 / bfloat16 / float64 are read by `encode_frame`'s own row loader
+  instead of being normalised with torch CPU ops every frame (each wakes
+  ATen's OpenMP pool, which spins between frames). Same bytes as torch's
+  normalisation, byte-identical output, input only read; deep destinations
+  and CUDA tensors are unchanged. CPU JPEG `encode_image` from a CHW view
+  loads per strip. 1080p h264_nvenc CHW uint8 41 -> 0.6-1.6 ms CPU a frame,
+  float32 43 -> 2.4-3.9 ms; 1080p libx264 veryfast CHW 345 -> 480 fps,
+  float32 260 -> 460 fps; 4K h264_nvenc float32 87 -> 105 fps.
+- The row loader also covers deep (10-16-bit) destinations: float frames and
+  CHW/padded uint16 frames are loaded straight into RGB48/RGBA64 rows (staging,
+  band scratch, or the NVENC GPU-convert upload) instead of torch's
+  `* 65535`/round/clamp/cast and `contiguous()`. Same bytes, byte-identical
+  output. 1080p float32: hevc_nvenc p010 312 -> 386 fps, 51 -> 2.7 ms CPU a
+  frame; prores_ks yuv422p10 53 -> 66 fps; 4K prores_ks 11.8 -> 12.2 fps.
+- CUDA float32 / float16 / bfloat16 frames into NVENC or a software encoder
+  on the GPU convert are read in place by the byte-exact RGB->YUV kernels
+  (HWC, CHW views, padded rows) and narrowed per sample as torch's
+  `* 255`/`* 65535`, round, clamp and cast would, instead of 3-4 torch CUDA
+  ops and full-frame temporaries every frame. Same bytes (every float16,
+  bfloat16 and float32 bit pattern checked against torch, and once per
+  process at run time), byte-identical output. 4K, fps unchanged: torch peak
+  allocation per encoder 214 -> 0 MiB (h264_nvenc), 333 -> 0 MiB (hevc_nvenc
+  p010); 21-25% fewer process CPU cycles a frame. float64, odd-width
+  4:2:0/4:2:2, resize and gray/RGB destinations keep the torch ops.
+- Still-image encoders without libavcodec threading (dpx, sgi, targa, bmp,
+  ppm/pgm/pam/pbm/pfm/phm, xwd, sunrast, pcx, fits, r210/r10k/avrp, y41p,
+  yuv4, avui, alias_pix, xbm, asv1/asv2) code up to 8 frames at once on
+  identically opened contexts (`options={"threads": N}` sets the count).
+  Byte-identical output; 4K sgi 4.7x, targa 2.6x, asv2 2.5x, dpx 1.17-1.26x.
+- `codec="libwebp"` (multi-frame `.webp` or a `%03d.webp` sequence) codes on
+  the same parallel contexts, one per core up to 16, memory-capped by
+  libwebp's working set. Byte-identical to `threads=1`; `cr_threshold` keeps
+  one context. 1080p lossy 6.8 -> 62 fps, lossless 2.4 -> 16.9 fps.
+- CPU-tensor encoding without resize converts packed RGB (rgb24, rgba, rgb48le,
+  rgba64le) to yuv420p/nv12/p010 and the 8/10/12-bit 4:2:0, 4:2:2 and 4:4:4
+  formats with a byte-exact AVX2 kernel, ~3x faster than `sws_scale`
+  (4K 9.9 -> 2.8 ms). Encoded streams are byte-identical, including the luma
+  sample past an odd 4:2:0/4:2:2 width that ljpeg and yuv4 code; it verifies itself
+  against `sws_scale` once per geometry and stays off on other libswscale
+  versions and CPUs without AVX2 (`NELUX_DISABLE_SIMD_RGB2YUV=1` also turns
+  it off). 4K h264_nvenc 12.8 -> 6.2 ms CPU per frame, 4K mjpeg 1.11x, mpeg4
+  1.04x with ~30% less CPU.
+- Packets of 1 MB or more (rawvideo, v210, r210, dnxhd, dpx, utvideo, huffyuv,
+  prores, ffv1, ...) reuse buffers from size-classed pools instead of a fresh
+  allocation each, which on Windows faulted in every page: byte-identical
+  output, 4K rawvideo 1.05x and 1080p v210 1.09x fps, 4K utvideo 1.04x, with
+  85-90% fewer page faults on the raw formats. cljr, y41p and the still-image
+  codecs (bmp, xwd, pnm, exr, hdr, fits, pcx, qoi, vbn, ...) pool theirs too.
+- CPU-tensor encoding without resize converts rgb24 into the other RGB
+  formats (bgr24, bgra/rgba/argb/abgr/rgb0/..., gbrp/gbrap, gbrp9-16le,
+  gbrpf32le, rgb48le/bgr48le, rgba64le/bgra64le) with a byte-exact AVX2
+  kernel too (r210, avrp, dpx, exr, bmp, xwd, targa, sgi, tiff, dnxhr_444,
+  planar-RGB utvideo/magicyuv/ffv1, ...), 2.5-3.7x faster than `sws_scale`,
+  and such frames take the banded no-staging path. Byte-identical streams;
+  `NELUX_DISABLE_SIMD_RGB2RGB=1` turns it off. 1080p dpx 10-bit 1.28x, dpx
+  16-bit 1.39x (4 ms less CPU a frame), bmp 1.16x, r210 1.12x.
+- cljr codes several frames at once (each context's frame counter, which its
+  dither starts from, is set to the frame's index): byte-identical, 1080p
+  387 -> 793 fps.
+- A file object gets each 1 MiB muxer flush as copies of at most 256 KiB
+  instead of one 1 MiB copy, a fresh allocation faulting in every page on Windows:
+  same bytes; with the two changes above, 1080p to a Python stream exr
+  111 -> 285 fps, dpx 10-bit 329 -> 715, bmp 338 -> 827, ppm 473 -> 1107.
+- CUDA-tensor encoding converts RGB to YUV on the GPU with kernels that write
+  the CPU path's bytes (rgb24/rgba/rgb48le/rgba64le into yuv420p, nv12,
+  yuv422p, yuv444p, their full-range and 10-bit forms, p010le): a CUDA and a
+  CPU tensor now give identical files. Software encoders download only the YUV
+  (4K libx264 from CUDA 1.04-1.06x). NVENC output changes (bilinear chroma as
+  on the CPU path instead of a 2x2 box; real 10-bit p010 from 8-bit input),
+  and float/uint16/RGBA CUDA tensors stay on the GPU.
+- NVENC fed CUDA tensors waits for the GPU convert on a blocking-sync event
+  instead of a `cudaStreamSynchronize` that spun in torch's CUDA context:
+  CPU per frame 1080p 0.54 -> 0.24 ms, 4K 1.14-1.39 -> 0.42 ms, same fps and
+  identical bitstream.
+- A CUDA tensor into a software encoder no longer waits for the GPU: the YUV
+  download is queued on a copy stream into page-locked frames (at most the
+  frames in flight + 2 + those a frame-threaded codec holds, capped at
+  256 MiB, freed at `close()`) and the submit thread sleeps until it lands.
+  Identical bitstream; `encode_frame` 0.5-3.5 ms -> 0.09-0.17 ms (libx264,
+  mpeg4, prores_ks, mjpeg at 1080p/4K), mpeg4 4K 350 -> 405 fps, mjpeg 4K
+  ~2.5 ms less CPU a frame.
+- A packed CPU tensor into NVENC is uploaded as RGB and converted by the same
+  byte-exact GPU kernels (self-tested against the CPU convert) instead of
+  swscale plus a YUV upload: identical bitstream, CPU per frame 1080p
+  h264_nvenc 2.12 -> 0.78 ms, 1080p hevc_nvenc p010 from uint16
+  5.64 -> 1.43 ms, 4K 8.52 -> 5.50 ms, 4K h264_nvenc from uint8
+  3.7 -> 1.8 ms, same fps (within 0.5%, paired). Odd sizes, resize and
+  non-bilinear filters keep the CPU path.
+  Without a CUDA torch this creates the CUDA runtime's primary context
+  (~224 MiB VRAM until exit, not freed by `NELUX_NVENC_CONTEXT_CACHE=0`);
+  formats no kernel covers do not.
+- The GPU convert's self-test runs once per process (per format, size,
+  colour and GPU), not once per encoder, and both self-tests fill their probe
+  frame faster: identical bitstreams, a later encoder's first `encode_frame`
+  23 -> 2 ms (1080p) and 86 -> 3-4 ms (4K, CUDA->libx264), the first
+  encoder's 4-74 ms less (CPU->libx264 4K 45-55 -> 29-35 ms).
+- The GPU convert's self-test checks against sws_scale directly when the
+  AVX2 kernel has no verdict yet, fills its probe frame on several threads and
+  overlaps the CPU and GPU converts: identical bitstreams, the first
+  `encode_frame` of CPU RGB into h264_nvenc 4K 58-65 -> 25-31 ms, 1080p
+  16 -> 11 ms.
+- Fixed: an NVENC encoder fed CUDA tensors (or CPU tensors, the
+  same GPU path) leaked its CUDA device and context when closed, +85 MB per
+  encoder, until NVENC and NVDEC stopped opening.
+- Fixed: a CUDA tensor rewritten after `encode_frame` (a recycled NVDEC
+  buffer) could change frames NVENC had not encoded yet (the caller's stream
+  is also recorded on the tensor, so one made on a side stream can be freed
+  right after `encode_frame`); concurrent NVENC
+  encoders could share one colour matrix; odd sizes left the last row/column
+  unwritten.
+- Fixed: NVENC no longer rewrites `yuv444p16le`, `yuv444p10msble`, `p016le`,
+  `p012le`, `bgra`, ... to nv12; any format NVENC and CUDA frames accept is
+  kept, and one the GPU lacks fails at open.
+- Fixed: libvpx/libvpx-vp9 ignored the int `preset` and dropped `cq`; they now
+  map to `cpu-used` 8..0 and to `crf`.
+- **Seekable file objects are written while encoding (behaviour change).**
+  `VideoEncoder(fh)`, `encode_video(frames, fh)` and `transcode(src, fh)` mux
+  straight into a seekable binary stream through its `write`/`seek` instead of
+  a memory buffer copied three times at close (and capped at 2 GiB): the same
+  bytes as a path, 85 MiB ffvhuff mkv 183 -> 79 ms (path 78 ms), no extra
+  memory. A failed encode leaves partial output and raises the stream's own
+  exception, also from a `close()` the muxer finished despite it (a stream
+  that reports `seekable()` but cannot seek back, like `gzip.GzipFile`, raises
+  instead of leaving an unreadable mp4/mov/avi; report `seekable()` False to
+  have it written at close); `get_encoded_data()` is for `None` destinations
+  only.
+  Unseekable streams and append mode are still written once at close.
+- Fixed: xwd, pcx and yuv4 encoded uninitialised row padding (heap garbage)
+  at widths that leave some, so their output changed from run to run. The
+  encoder's frames now have zeroed padding; other encoders' streams are
+  unchanged.
+- Fixed: memory output (`output_path=None`, unseekable streams) wrote avi
+  without a valid header or index (64 bytes short, codec "unknown") and
+  stopped at 2 GiB. It now holds the same bytes as a path for every container,
+  and fast lossless encodes into memory are 1.5-1.8x faster (1080p rawvideo
+  406 -> 222 ms, ffvhuff 281 -> 182 ms for 150 frames).
+- rv10/rv20 into .mkv (which matroska cannot mux) are refused when the
+  encoder is created, pointing at `.rm`, instead of failing at the first frame.
+- Fixed: `close()` after a failed header write crashed (a second
+  `avformat_write_header` on the torn-down muxer); it now raises.
 
 ### **Version 0.20.0 (2026-10-17)**
 

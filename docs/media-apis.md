@@ -18,6 +18,10 @@ can allocate another tensor; CHW layout remains a view over the oriented tensor.
 Motion vectors retain coded coordinates; disable orientation when matching them
 to coded pixels. Reconfiguration derives orientation from the new source.
 
+`nelux.transcode()` turns a rotated source upright as well, with the ffmpeg
+CLI's autorotate filters, so its output has the displayed dimensions and no
+rotation tag (see [Transcoding](usage.md#transcoding)).
+
 ## Audio samples
 
 ```python
@@ -104,21 +108,51 @@ encoded = encoder.get_encoded_data()
 Passing `None` stores output in FFmpeg's seekable dynamic memory buffer and
 returns encoded data as an owned one-dimensional CPU uint8 tensor. There is no
 temporary output file. This supports ordinary MP4 finalization, including the
-moov trailer. Memory use grows with encoded output size, and returning a tensor
-copies the completed buffer. FFmpeg's dynamic-buffer API limits output to an
-`int` byte count.
+moov trailer. The muxer writes into memory as it would into a file (it can
+seek back and ask the size), so every container holds the same bytes as a
+path's output. Memory use grows with encoded output size and nothing written
+is reallocated: up to 16 MiB in 1 MiB chunks, copied into the returned tensor;
+past that in one reserved address range, committed as it fills, that the
+returned tensor takes over without a copy. If the range cannot be reserved or
+the output outgrows it (64 GiB, or a quarter of the free address space), the
+bytes stay in chunks and the tensor is a copy. Outputs over 2 GiB work.
 
-`VideoEncoder`, `encode_video`, and `encode_image` also accept a path or binary
-file-like destination. File-like output is written from its current position
-after native finalization, handles short writes, and leaves the stream open.
-Specify `format` for `None`/file-like video destinations; named video outputs
-infer their container from the filename. `encode_image` always honors its
-explicit image format regardless of the destination extension. Concurrent or
-repeated closes do not append the data twice. A failed binary write can be
-retried with `close()`, resuming after the last confirmed write. Explicit
-context exit or `close()` finalizes file-like output.
-`get_encoded_data()` finalizes memory encoders and returns another independent
-copy; a closed encoder cannot accept more frames.
+`VideoEncoder`, `encode_video`, `transcode`, and `encode_image` also accept a
+path or binary file-like destination, written from its current position (bytes
+already in the stream stay in front), with short writes handled; the stream is
+left open. Specify `format` for `None`/file-like video destinations; named
+video outputs infer their container from the filename. `encode_image` always
+honors its explicit image format regardless of the destination extension.
+
+A seekable video destination (`seekable()` true, with `seek` and `tell`, not
+opened for append) is written while encoding: the muxer flushes 1 MiB at a
+time, each passed to `write` as `bytes` copies of at most 256 KiB that the
+stream may keep, and seeks back in it to finish the container, exactly as it does a
+file, so the bytes equal a path's output, no copy of the encoded file is held,
+and outputs over 2 GiB work. `write`/`seek` run on the encoder's threads with
+the GIL taken. An exception they raise stops the encode and is re-raised from
+`encode_frame` or `close()`, even where the muxer would carry on (mp4, mov
+and avi ignore a failed seek while finishing the file); what the stream
+already took stays there, so a failed encode leaves partial output. A stream
+that reports `seekable()` but cannot seek back, such as `gzip.GzipFile` in
+write mode, therefore raises from `close()`: have it report `seekable()`
+False to get the finished container in one piece instead. Calling the encoder from inside them
+raises `RuntimeError`. While they run, the encoder holds its own Python
+object, so an unclosed encoder dropped meanwhile (a garbage collection inside
+`write`, or the stream releasing the last reference) is finished and freed on
+the main thread, not on the encoder thread that is writing.
+`get_encoded_data()` is for `None` destinations only.
+
+Any other binary stream (a pipe, a socket, append mode) gets the finished
+container in one piece at close, from the same memory output. Concurrent
+or repeated closes do not append the data twice, and a failed write can be
+retried with `close()`, resuming after the last confirmed write.
+
+Explicit context exit or `close()` finalizes file-like output.
+`get_encoded_data()` finalizes memory encoders and returns the encoded data;
+every call returns the same tensor (`.clone()` it for an independent copy),
+and it stays valid after the encoder is gone. A closed encoder cannot accept
+more frames.
 
 `encode_video` accepts `[N,H,W,C]`, or `[N,C,H,W]` with
 `dimension_order="CHW"`, and forwards codec, pixel format, and other encoder

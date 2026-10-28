@@ -196,7 +196,7 @@ if(NELUX_ENABLE_CUDA)
     # *forward*, so every GPU older than the build arch fails every kernel
     # launch with cudaErrorNoKernelImageForDevice — which used to surface as
     # fully black decoded frames. (The launch-error checks in
-    # backends/cuda/Decoder.cpp and conversion/gpu/RGBToAutoGPU.hpp now turn
+    # backends/cuda/Decoder.cpp and conversion/gpu/RGBToYUVExactGPU.hpp turn
     # that failure into an exception rather than silent corruption.)
     #
     # Running the guard here instead means an explicit

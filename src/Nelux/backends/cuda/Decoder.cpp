@@ -1164,6 +1164,17 @@ std::optional<Frame> Decoder::acquireDecodedFrame(double* frame_timestamp,
     frameQueue.pop();
     producerBlocked_.store(true, std::memory_order_release);
     lock.unlock();
+    // NVDEC's 4:2:0 surfaces are even-sized, and FFmpeg can hand the frame
+    // out at the surface's size: an odd-sized VP8 or VP9 picture came with a
+    // row or column more. The conversion wrote the extra row past the
+    // caller's frame (into the next one of a decode_batch, or past the
+    // tensor), and the extra column skewed every row. Nothing larger than
+    // the output is converted.
+    if (AVFrame* f = frame.get(); f->format == AV_PIX_FMT_CUDA)
+    {
+        f->width = std::min(f->width, properties.width);
+        f->height = std::min(f->height, properties.height);
+    }
     // Entry ordering is now event-based (waitForProducer records cuvidDone on
     // the producer stream and makes cudaStream_ wait on it — no CPU sync).
     // The old cudaDeviceSynchronize-at-entry is removed; see waitForProducer.

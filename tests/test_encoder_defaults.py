@@ -151,6 +151,24 @@ def test_a_codec_the_container_really_cannot_hold_is_still_rejected(tmp_path):
     assert "avi" in message, "the message must name the container"
 
 
+@pytest.mark.parametrize("codec", ["rv10", "rv20"])
+def test_realvideo_is_refused_by_matroska_and_pointed_at_rm(tmp_path, codec):
+    """matroska's query_codec says yes to RealVideo, then its header write
+    refuses it ("does not yet support muxing", the ffmpeg CLI too). That
+    surfaced as "Error occurred when writing header" at the first frame, and
+    every other container's error suggested .mkv."""
+    for ext in ("mkv", "avi", "mp4"):
+        with pytest.raises(RuntimeError, match=r"cannot be written into .*\.rm\b") as excinfo:
+            VideoEncoder(str(tmp_path / f"{codec}.{ext}"), codec=codec, width=_W, height=_H, fps=30.0)
+        assert ".mkv" not in str(excinfo.value)
+    # rv10 takes the H.263 picture sizes' multiples of 16 only.
+    with VideoEncoder(str(tmp_path / f"{codec}.rm"), codec=codec, width=160, height=96,
+                      fps=30.0) as enc:
+        for _ in range(3):
+            enc.encode_frame(torch.zeros((96, 160, 3), dtype=torch.uint8))
+    assert _probe(tmp_path / f"{codec}.rm", "stream=codec_name") == codec
+
+
 def test_rejection_message_suggests_a_container_that_works(tmp_path):
     with pytest.raises(RuntimeError) as excinfo:
         _write(tmp_path / "prores.avi", codec="prores_ks")

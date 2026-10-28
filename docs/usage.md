@@ -24,6 +24,7 @@ This comprehensive guide covers all NeLux APIs for high-performance video proces
   - [Encoder-Side Resize](#encoder-side-resize)
   - [Accepted Input Frames](#accepted-input-frames)
   - [Audio / Subtitle Passthrough](#audio--subtitle-passthrough)
+  - [Transcoding](#transcoding)
 - [Logging](#logging)
 - [Module Attributes and Helpers](#module-attributes-and-helpers)
 - [Complete Example: ML Inference Pipeline](#complete-example-ml-inference-pipeline)
@@ -789,9 +790,9 @@ VideoEncoder(
 | `codec` | `str` | Container-aware | First of `libx264`, `libopenh264`, then the platform encoder (`h264_mf` on Windows, `h264_videotoolbox` on macOS) that exists in this build **and** fits the container inferred from `output_path`; failing that, the container's own default (`.webm` → VP9, `.gif` → gif, `.ogv` → VP8). Raises for containers with no encodable default (`.ogg`, `.wav`) |
 | `width` | `int` | `1920` | Output width |
 | `height` | `int` | `1080` | Output height |
-| `bit_rate` | `int` | `4000000` | Video bitrate (bits/s) |
+| `bit_rate` | `int` | `4000000` | Video bitrate (bits/s). Not applied when a quality target replaces it: a `crf`/`qp`/`cq`/`global_quality` key in `options` (except VP8, whose crf needs the rate as its ceiling), `cq` on libsvtav1, libaom-av1 or VP9, and `dnxhd` (DNxHR profile for the pixel format). Those run at the codec's own default rate |
 | `fps` | `float` | `30.0` | Output frame rate, tagged as an exact rational (see below) |
-| `preset` | `int \| str` | Auto | `int`: 1..N mapped per codec, always **low = faster** (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1..9` → SVT `12..4`, i.e. fastest to slowest, libaom-av1 → `cpu-used 0..8`, NVENC `1..7` → `p1..p7`). `str`: forwarded straight to ffmpeg (`"veryfast"`, `"medium"`, `"p4"`) |
+| `preset` | `int \| str` | Auto | `int`: 1..N mapped per codec, always **low = faster** (libx264/libx265 `1=ultrafast..9=veryslow`, libsvtav1 `1..9` → SVT `12..4`, i.e. fastest to slowest, libaom-av1, libvpx and libvpx-vp9 `1..9` → `cpu-used 8..0`, NVENC `1..7` → `p1..p7`). `str`: forwarded straight to ffmpeg (`"veryfast"`, `"medium"`, `"p4"`) |
 | `cq` | `int` | Auto | Constant quality (0-51, or 0-63 depending on codec); lower is better |
 | `pixel_format` | `str` | `"yuv420p"` | Output pixel format |
 | `options` | `dict[str, str]` | `None` | Extra AVOption pairs applied **after** the built-in options, so they override them: `options={"tune": "film", "x264-params": "ref=3"}` |
@@ -825,8 +826,7 @@ with VideoEncoder("out.mp4", width=1920, height=1080, fps=30.0,
 ```
 
 A CUDA tensor whose size differs from the output takes the CPU staging path
-(the fused NVENC GPU kernel converts but does not scale); same-size CUDA
-input keeps the zero-copy GPU path.
+(the GPU convert does not scale); same-size CUDA input converts on the GPU.
 
 ### Basic Usage
 
@@ -870,10 +870,39 @@ tensor in `[0, 1]` scales to the full 16-bit range rather than to 0-255.
 
 A 4-channel frame's alpha reaches the file only if the output `pixel_format` has
 an alpha plane (`yuva444p10le` with ProRes 4444 / 4444 XQ); otherwise it is
-dropped, as `ffmpeg -pix_fmt rgba` does. A CUDA tensor that is deep or
-4-channel takes the CPU staging path rather than the zero-copy GPU convert,
-whose fused kernel is 8-bit RGB-only — so a p010 NVENC encode keeps its extra
-bits whichever device the tensor came from.
+dropped, as `ffmpeg -pix_fmt rgba` does.
+
+A CUDA tensor is converted to YUV on the GPU — 8- or 16-bit, RGB or RGBA, into
+`yuv420p`/`yuvj420p`, `nv12`, `yuv422p`, `yuv444p`, their 10-bit forms and
+`p010` — by kernels that write the bytes the CPU path writes, so a CUDA tensor
+and the same pixels as a CPU tensor give the same file, NVENC and software
+encoders alike. NVENC gets the frame without leaving the GPU; a software encoder
+gets only the YUV planes back (half the bytes of RGB at 4:2:0), downloaded on
+nelux's own copy stream into page-locked frames while `encode_frame` returns
+(at most the frames in flight + 2, plus those a frame-threaded codec holds,
+and 256 MiB per encoder, released at `close()`). Other
+destinations (gray, RGB, 12-bit, alpha planes) stage the tensor through the
+CPU instead. The convert is queued on the current CUDA stream when
+`encode_frame` is called, so anything queued on that stream afterwards (writing
+into the same tensor, an NVDEC reader recycling its frame buffer) runs after
+the frame has been read. Work on another stream needs the usual stream handoff.
+The kernels read the tensor through its strides, so a CHW view
+(`chw.permute(1, 2, 0)`) or a frame with padded rows needs no `.contiguous()`
+first: nelux does not copy it either.
+
+A packed (HWC, contiguous) CPU tensor into NVENC goes the same way: it is
+uploaded as RGB and converted by those kernels, which leaves the CPU only the
+upload, for the same bitstream. `encode_frame` has read the tensor when it
+returns, pinned (`pin_memory()`) or not. This applies at even sizes without
+resize or a non-bilinear `resize_filter`, at any size (4K `h264_nvenc`:
+about 1.8 instead of 3.7 ms of CPU a frame, same fps); `uint16`/float
+tensors into a 10-bit format take it with CHW and padded-row layouts
+included. Other CPU frames (8-bit CHW views, float into
+8 bits) convert on the CPU. If torch has not
+initialised CUDA, the first such frame creates the CUDA runtime's primary
+context on device 0, about 224 MiB of VRAM that stays until the process exits
+(`NELUX_NVENC_CONTEXT_CACHE=0` does not free it); with CUDA torch in use it is
+torch's own context and costs nothing extra.
 
 ### Encoder Tuning Knobs (opt-in; defaults unchanged)
 
@@ -922,6 +951,11 @@ with VideoEncoder("frames_%08d.png", codec="png", width=640, height=360,
         encoder.encode_frame(frame)
 # frames_00000001.png, frames_00000002.png, ...
 ```
+
+The files are created and written by background writer threads, so the
+encoder does not wait on each file's open and close. Every file is complete
+once `close()` (or the `with` block) returns; a file that cannot be written
+is logged and the rest are still written.
 
 PNG can preserve 16-bit RGB data. Pass an HWC `torch.uint16` frame with
 `pixel_format="rgb48be"`; requesting `rgb48le` can fall back to 8-bit
@@ -977,6 +1011,23 @@ Outside a `with` block, `close()` must be called explicitly — it flushes the
 encoder and writes the trailers, and a file left unclosed is unplayable.
 `encoder.is_hardware_encoder` reports whether the chosen codec resolved to a
 hardware encoder (NVENC).
+
+When torch's CUDA context on device 0 is live (any CUDA tensor,
+`torch.cuda.init()`, a CUDA decoder), an NVENC encoder runs in it, on a CUDA
+stream of its own: no second context, nothing kept after `close()`. An encoder
+whose CPU RGB frames will take the GPU convert (even size, `resize`
+off) creates that context at open and runs in it too, rather than
+next to it. Otherwise an NVENC encoder runs on a CUDA context of its own. When it closes, that
+context is kept for the next NVENC encoder instead of being destroyed, so one
+encoder per short clip does not pay to create and destroy one every time
+(about 50 ms: a 30-frame 1080p `h264_nvenc` clip takes ~139 ms instead of
+~190 ms, the bitstream unchanged). Encoders open at the same time each get
+their own, and one at most stays idle, holding ~220 MiB of VRAM and ~390 MB of
+committed memory until the process exits. An encoder that raised keeps none.
+Set `NELUX_NVENC_CONTEXT_CACHE=0` before the first NVENC encoder to free each
+context with its encoder. (The CUDA runtime's primary context, which CPU
+frames into NVENC create when torch has not, is separate and stays; see
+[Accepted Input Frames](#accepted-input-frames).)
 
 ### Creating Encoder from Reader
 
@@ -1066,6 +1117,144 @@ with reader.create_encoder("clip.mp4") as encoder:
     for frame in reader:
         encoder.encode_frame(frame)
 ```
+
+### Transcoding
+
+`nelux.transcode(source, output_path=None, *, format="mp4", start=0.0, end=None,
+audio=True, subtitles=True, allow_transcode=True, **encoder_options)` re-encodes
+a file's video without the RGB round trip of a `VideoReader` -> `encode_frame`
+loop. That loop converts every decoded frame to RGB and the encoder converts it
+back; `transcode` decodes the source (on NVDEC for NVENC, see below) and hands
+each frame to the codec as it came out of the decoder, or through one
+libswscale pass when the encoder needs another pixel format, range or
+colorspace (yuv420p -> ProRes' yuv422p10le, for example). The output is the stream `ffmpeg -i source -c:v <codec> <same options>`
+writes: identical packets for libx264 (at a fixed `threads`), utvideo, ffv1,
+prores_ks and rawvideo in the tests.
+
+```python
+import nelux
+
+nelux.transcode("input.mp4", "output.mp4", codec="libx264", preset="veryfast",
+                options={"crf": "23"})
+
+# 2..6 s into ProRes, audio copied and trimmed to match
+nelux.transcode("input.mp4", "clip.mov", codec="prores_ks", start=2.0, end=6.0)
+
+encoded = nelux.transcode("input.mp4", None, format="mkv", codec="ffv1")
+```
+
+- `encoder_options` are `VideoEncoder` keywords. They default to the source's
+  displayed size and frame rate, its pixel format when the codec takes it (else the
+  one the ffmpeg CLI's format negotiation picks among the codec's: a pal8 source
+  counts as opaque, ties go to the first in FFmpeg's pixel-format order, so DPX
+  is big-endian; NVENC excepted, below),
+  and its colour tags,
+  chroma location and sample aspect ratio. Anything you pass wins; `options`
+  entries are merged over the source's tags.
+- Colour tags follow the CLI's format negotiation where the output's format
+  is in another colour model than the source's: an RGB or gray output is
+  full range with the RGB matrix (gray none), a YUV output from an RGB or
+  gray source has no matrix (swscale's default converts) and the encoder's
+  first range (limited for libx264 and prores_ks, full for mjpeg, none for
+  rawvideo). The source's matrix and range carry over only between YUV
+  formats. Primaries and transfer always carry over.
+- Into NVENC, the format is picked among those nelux can upload as CUDA
+  frames: an RGB source takes bgr0 where the CLI takes gbrp (lossless 4:4:4,
+  which NVENC is only given from system memory), so it is coded 4:2:0 as
+  `-pix_fmt bgr0` codes it. Pass `pixel_format="yuv444p"` for 4:4:4.
+- The frame rate is the one the CLI gives its encoder, exactly: the source's
+  (`av_guess_frame_rate`: 1199/40 stays 1199/40, a phone's 5400000/179267
+  stays that), the nearest one mpeg1video/mpeg2video list, bounded to 65535
+  for MPEG-4, and 25 fps for a source without one into a format without
+  timestamps. `fps=` replaces it, read as `VideoEncoder` reads it.
+- Each frame keeps its source time, counted from where the source starts and
+  rounded to ticks of 1/fps, so a
+  variable-frame-rate source keeps its timing and stays in sync with the copied
+  audio; a constant-rate one gets 0, 1, 2, ... ticks. As with the CLI, the
+  source starts with its earliest stream, also one that is not copied, and
+  before 0 too (an MPEG-TS counts only the video stream, from its first
+  packet even when that one cannot be decoded, and the copied tracks, as the
+  CLI counts it). So when the audio begins before the first
+  frame (an MKV or phone MP4 often leads with it), the video starts that much
+  later, with the audio copied or not; either way the tracks keep their source
+  offset, wherever the source's timestamps start. Copied packets before that
+  start (an AAC priming packet, the second of pre-roll that a stream-copy cut
+  such as `ffmpeg -ss 10 -i in.mp4 -c copy` leaves behind its edit list) keep
+  their negative times, as the CLI's do, and the muxer hides them again (an
+  edit list in mp4/mov). Copied audio is retimed into the output's time base
+  in samples, as the CLI's muxer does it. Each frame carries the stream's
+  sample aspect ratio (the container's when it has one), as the CLI's
+  decoder gives it, which ffv1 codes into its slice headers. With `start`, the output
+  starts with the first frame or copied packet from there. Which frames are kept, on which tick and for how long is
+  decided as in the CLI's `vfr` mode (mp4, mkv, webm, ...): a frame that
+  starts before the next free tick but ends after it is moved onto it, one
+  that ends 0.6 tick or more before it is dropped (counted in a warning),
+  one 0.6 tick or more past it moves the next free tick to its own, and each
+  frame's duration reaches its packet. So a source whose timestamps wobble
+  (a capture clock) keeps the frames the CLI keeps. Formats that carry no
+  timestamps (y4m, raw `.h264`/`.hevc`, numbered image sequences, ...) take
+  the CLI's `cfr` mode instead, as it picks it for them: every tick gets a
+  frame, so a frame that ends more than 1.1 ticks before the next free one
+  is dropped, gaps are filled by repeating frames (the first frame over the
+  time the source's audio leads it, and the last frame at the end as the CLI
+  repeats it), and a variable-frame-rate source plays at its own speed
+  (`vscfr` for a source of one stream: no repeats in front of a late first
+  frame). avi keeps `vfr`, as in the CLI.
+- A timestamp splice (joined MPEG-TS or HLS segments: a jump of over 10 s, or
+  a step back of over 0.1 s) is corrected as the CLI corrects it: the track that shows it
+  first carries on where it was heading, and the other tracks take the same
+  offset, so the copied audio stays with the video across the splice (the
+  CLI's packets and times). A smaller step back, where joined segments
+  overlap by a frame or two, is no splice: the frames that end before the
+  next free tick are dropped, as the CLI drops them. Re-encoded audio (AAC into WebM, say) is joined
+  sample to sample instead, so each splice can move it by up to an audio
+  frame against the video.
+- A source with a display rotation (phone video) is turned upright with the
+  filters the CLI's autorotate inserts (transpose, hflip/vflip, rotate), so the
+  output is the size `VideoReader` shows, with the CLI's frames and no
+  rotation left on the stream. A quarter turn swaps the width and height
+  (`width`/`height` default to the turned size) and the sample aspect ratio.
+  As in the CLI's graph, the filters end in the encoder's format, so the
+  frames are converted once, where the CLI converts them: in front of a
+  transpose for a 4:2:2 or 4:1:1 source (transpose takes neither), in front
+  of the flips for an RGB one. The encoder's default format is the one that
+  graph settles on (ffv1 keeps a turned 4:2:2 source in 4:4:4, libsvtav1
+  takes it in 10-bit 4:2:0), as the CLI's is. A rotated source decodes on
+  the CPU, also into NVENC.
+- `start`/`end` are seconds on the source's timestamps; frames from `start` up
+  to, not including, `end` are encoded, and the same values trim the
+  passthrough audio and subtitles (see above).
+- Into `h264_nvenc` / `hevc_nvenc`, a source NVDEC decodes exactly (H.264,
+  HEVC, VP8 or VP9 in 8-bit 4:2:0, HEVC or VP9 in 10-bit 4:2:0, or HEVC 8-bit
+  4:4:4, encoded in that format) is decoded on the GPU, on the encoder's own
+  CUDA device, and its frames reach NVENC without a copy to the CPU: `ffmpeg -hwaccel cuda
+  -hwaccel_output_format cuda`. Other sources decode on the CPU and the
+  encoder uploads them, among them AV1 (FFmpeg decodes it with libdav1d,
+  which has no NVDEC path, the CLI too), H.264 High 10 (no NVDEC up to
+  Ada decodes it) and 4:2:0 VP8/VP9 at an odd width or height (NVDEC hands
+  those out at its even surface size, and at an odd height with the chroma a
+  row off where FFmpeg points at it). Both routes give the CLI's bitstream;
+  at 1080p the NVDEC route costs about 0.3 ms of CPU a frame, the CPU route
+  about 3.8 ms.
+  QSV encoders take system-memory frames like a software encoder. Other
+  hardware encoders (AMF, Vulkan, D3D12) are refused.
+- A source that changes size mid-stream is scaled to the first size (bicubic,
+  vf_scale's default).
+- Frame side data (captions, HDR metadata) is not carried over.
+- Called on the main thread, it stops on Ctrl+C between two frames (it
+  checks every 100 ms) with `KeyboardInterrupt`, and the output is closed with the frames coded so
+  far, as a `VideoReader` -> `encode_frame` loop stops.
+- Not supported, raising `ValueError`: hardware encoders other than NVENC and
+  QSV (AMF, Vulkan, D3D12, ...), `resize`/`resize_filter`, a `width`/`height`
+  other than the source's, a single-image output path, and pixel formats
+  libswscale cannot write (pal8). Use a `VideoReader` -> `encode_frame` loop
+  for those.
+
+On a 300-frame 1080p h264 clip into libx264 veryfast crf 23, this runs at the
+ffmpeg CLI's wall time (610-616 ms against the loop's 643-653 ms) with about 5-8
+ms less CPU per frame than the loop, and it skips the loop's lossy RGB step:
++1.8 dB luma PSNR against the source for libx264 at the same crf, +9.5 dB for
+prores_ks.
 
 ---
 
@@ -1212,3 +1401,7 @@ happen on a `pip install nelux`. When it does:
 - Reduce `prefetch_size` if memory constrained
 - Use `force_8bit=True` to reduce frame size
 - Process frames in batches rather than loading all at once
+- `NELUX_NVENC_CONTEXT_CACHE=0` frees the ~220 MiB of VRAM the last NVENC
+  encoder's own CUDA context keeps after it closes, in a process where torch
+  has not started CUDA (see
+  [With Context Manager](#with-context-manager))

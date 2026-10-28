@@ -23,4 +23,14 @@ def encode_video(frames: torch.Tensor, output_path: None = None, *, format: str 
 @overload
 def encode_video(frames: torch.Tensor, output_path: EncodedDestination, *, format: str = "mp4",
                  dimension_order: Literal["HWC", "CHW"] = "HWC", **options: Any) -> None: ...
+@overload
+def transcode(source: str | PathLike[str], output_path: None = None, *, format: str = "mp4",
+              start: float = 0.0, end: float | None = None, audio: bool = True,
+              subtitles: bool = True, allow_transcode: bool = True,
+              **encoder_options: Any) -> torch.Tensor: ...
+@overload
+def transcode(source: str | PathLike[str], output_path: EncodedDestination, *, format: str = "mp4",
+              start: float = 0.0, end: float | None = None, audio: bool = True,
+              subtitles: bool = True, allow_transcode: bool = True,
+              **encoder_options: Any) -> None: ...
 def write_encoded(destination: EncodedDestination, encoded: torch.Tensor) -> None: ...

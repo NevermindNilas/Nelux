@@ -13,13 +13,17 @@ std::shared_ptr<spdlog::logger> Logger::logger_instance = nullptr;
 
 std::shared_ptr<spdlog::logger>& Logger::get_logger()
 {
-    if (!logger_instance)
+    // Once: encoders open on several threads at once, and a second
+    // stdout_color_mt("nelux") throws (the name is already registered).
+    static const bool created = []
     {
         // Create a console logger with color
         logger_instance = spdlog::stdout_color_mt("nelux");
         logger_instance->set_level(spdlog::level::off); // Default level
         logger_instance->set_pattern("[%^%Y-%m-%d %H:%M:%S%$] [%l] %v");
-    }
+        return true;
+    }();
+    (void)created;
     return logger_instance;
 }
 

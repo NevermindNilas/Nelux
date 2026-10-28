@@ -232,4 +232,15 @@ class Frame
   private:
     AVFrame* frame; ///< Pointer to the underlying AVFrame.
 };
+
+/**
+ * @brief Zero the bytes of a software frame outside the picture: each row
+ * past its visible width, and each plane past its last row.
+ *
+ * Frame::allocateBuffer does this already; call it again after moving the
+ * plane pointers or giving the frame a buffer some other way. Encoders such
+ * as xwd, pcx and yuv4 code whole aligned rows, so without it they would
+ * write leftover heap contents into the file.
+ */
+void clearFramePadding(AVFrame* frame);
 } // namespace nelux

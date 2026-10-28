@@ -3,9 +3,12 @@
 
 #include "Frame.hpp"
 
+#include <cstring>
+
 extern "C"
 {
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 }
 
 using namespace nelux::error;
@@ -56,18 +59,8 @@ Frame::Frame(AVBufferRef* hw_frames_ref) : frame(av_frame_alloc())
         throw CxException("Failed to allocate AVFrame");
     }
 
-    // Assign the hardware frames context reference to the frame
-    frame->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
-    if (!frame->hw_frames_ctx)
-    {
-        NELUX_ERROR("Failed to set hardware frames context in hardware constructor");
-        av_frame_free(&frame);
-        throw CxException("Failed to set hardware frames context");
-    }
-
     // Initialize format and dimensions from hw frames context
-    AVHWFramesContext* frames_ctx =
-        reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
+    AVHWFramesContext* frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ref->data);
     if (frames_ctx)
     {
         frame->format = frames_ctx->format;
@@ -75,8 +68,11 @@ Frame::Frame(AVBufferRef* hw_frames_ref) : frame(av_frame_alloc())
         frame->height = frames_ctx->height;
     }
 
-    // Allocate the frame buffers in hardware memory
-    if (av_hwframe_get_buffer(frame->hw_frames_ctx, frame, 0) < 0)
+    // Allocate the frame buffers in hardware memory. av_hwframe_get_buffer
+    // sets the frame's own hw_frames_ctx reference: one set here first was
+    // overwritten and leaked, which kept the frames context -- and with it
+    // the encoder's CUDA device and context -- alive for the whole process.
+    if (av_hwframe_get_buffer(hw_frames_ref, frame, 0) < 0)
     {
         NELUX_ERROR("Failed to allocate hardware frame buffer");
         av_frame_free(&frame);
@@ -330,7 +326,44 @@ void Frame::allocateBuffer(int align)
         throw CxException("Failed to allocate buffer for AVFrame with alignment " +
                           std::to_string(align));
     }
+    clearFramePadding(frame);
     NELUX_DEBUG("Buffer allocated for AVFrame with alignment {}", align);
+}
+
+void clearFramePadding(AVFrame* frame)
+{
+    // av_frame_get_buffer leaves its buffer uninitialised; libavcodec's and
+    // libavfilter's own frame pools zero theirs (av_buffer_allocz), so this
+    // gives an encoder the bytes the ffmpeg CLI would. Only the padding: the
+    // conversion writes every visible byte anyway.
+    const auto fmt = static_cast<AVPixelFormat>(frame->format);
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(fmt);
+    if (!desc || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+        return;
+    for (int p = 0; p < av_pix_fmt_count_planes(fmt); ++p)
+    {
+        uint8_t* data = frame->data[p];
+        const int stride = frame->linesize[p];
+        const AVBufferRef* buf = av_frame_get_plane_buffer(frame, p);
+        const int rowBytes = av_image_get_linesize(fmt, frame->width, p);
+        if (!data || !buf || stride <= 0 || rowBytes < 0 || rowBytes > stride)
+            continue;
+        const int rows = (p == 1 || p == 2) ? AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h)
+                                            : frame->height;
+        if (rowBytes < stride)
+            for (int y = 0; y < rows; ++y)
+                std::memset(data + static_cast<size_t>(y) * stride + rowBytes, 0,
+                            stride - rowBytes);
+        // The plane ends where the next one (or a palette) starts, else with
+        // its buffer.
+        const uint8_t* end = buf->data + buf->size;
+        for (int q = 0; q < 4; ++q)
+            if (frame->data[q] > data && frame->data[q] < end)
+                end = frame->data[q];
+        uint8_t* tail = data + static_cast<size_t>(rows) * stride;
+        if (tail < end)
+            std::memset(tail, 0, end - tail);
+    }
 }
 
 /**

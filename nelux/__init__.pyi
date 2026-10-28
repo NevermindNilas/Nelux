@@ -12,7 +12,7 @@ from ._nelux import VideoReader as _NativeVideoReader
 from .temporal import Frame as Frame, FrameBatch as FrameBatch, VideoMetadata as VideoMetadata
 from . import samplers as samplers
 from .audio import AudioReader as AudioReader, AudioSamples as AudioSamples, AudioMetadata as AudioMetadata
-from .encoding import VideoEncoder as VideoEncoder, encode_video as encode_video
+from .encoding import VideoEncoder as VideoEncoder, encode_video as encode_video, transcode as transcode
 from .images import decode_image as decode_image, decode_images as decode_images, encode_image as encode_image
 
 class VideoReader(_NativeVideoReader):

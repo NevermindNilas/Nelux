@@ -1,4 +1,5 @@
 #include <JpegCodec.hpp>
+#include <cpu/RowLoader.hpp>
 #include <ATen/Parallel.h>
 #include <turbojpeg.h>
 
@@ -214,11 +215,25 @@ torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling)
         }
     }
 
-    image = image.contiguous();
-    const auto* pixels = image.data_ptr<unsigned char>();
     const int height = static_cast<int>(image.size(0));
     const int width = static_cast<int>(image.size(1));
     const int pitch = width * channels;
+    // A CHW view (encode_image(dimension_order="CHW") permutes) or padded
+    // rows: each strip loads its own rows instead of a contiguous() copy of
+    // the whole image, a torch op that wakes ATen's OpenMP pool to spin.
+    conversion::cpu::RowSource rows;
+    if (image.dim() == 3) {
+        rows.data = image.data_ptr<unsigned char>();
+        rows.channels = channels;
+        rows.rowStride = image.stride(0);
+        rows.pixelStride = image.stride(1);
+        rows.channelStride = image.stride(2);
+    }
+    const bool loadRows = image.dim() == 3 && conversion::cpu::rowLoaderCovers(rows) &&
+                          !conversion::cpu::isPackedU8(rows, width);
+    if (!loadRows)
+        image = image.contiguous();
+    const auto* pixels = image.data_ptr<unsigned char>();
     const int format = channels == 1 ? TJPF_GRAY : TJPF_RGB;
     const int mcuWidth = tjMCUWidth[samp];
     const int mcuHeight = tjMCUHeight[samp];
@@ -247,10 +262,17 @@ torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling)
         tjhandle handle = threadCompressor();
         unsigned char* out = space + offset[i];
         size_t outSize = offset[i + 1] - offset[i];
+        const unsigned char* strip = pixels + size_t(i) * stripRows * pitch;
+        std::vector<unsigned char> loaded;
+        if (loadRows) {
+            loaded.resize(size_t(rowsOf(i)) * pitch);
+            conversion::cpu::loadRowsU8(rows, width, i * stripRows, i * stripRows + rowsOf(i),
+                                        loaded.data(), pitch);
+            strip = loaded.data();
+        }
         if (tj3Set(handle, TJPARAM_QUALITY, quality) || tj3Set(handle, TJPARAM_SUBSAMP, samp) ||
             tj3Set(handle, TJPARAM_NOREALLOC, 1) ||
-            tj3Compress8(handle, pixels + size_t(i) * stripRows * pitch, width, pitch, rowsOf(i),
-                         format, &out, &outSize))
+            tj3Compress8(handle, strip, width, pitch, rowsOf(i), format, &out, &outSize))
             throw std::runtime_error(std::string("libjpeg-turbo: ") + tj3GetErrorStr(handle));
         size[i] = outSize;
     };

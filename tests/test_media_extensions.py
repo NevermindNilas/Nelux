@@ -291,12 +291,21 @@ def test_filelike_concurrent_close_writes_once():
     encoder.encode_frame(torch.full((32, 48, 3), 70, dtype=torch.uint8))
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda _: encoder.close(), range(4)))
-    assert destination.getvalue() == encoder.get_encoded_data().numpy().tobytes()
+    reference = nelux.encode_video(torch.full((1, 32, 48, 3), 70, dtype=torch.uint8),
+                                   format="mkv", codec="ffv1", pixel_format="bgr0")
+    assert len(destination.getvalue()) == reference.numel()
+    with nelux.VideoReader(destination.getvalue()) as reader:
+        assert reader.frame_count == 1
 
 
 def test_filelike_failed_write_can_resume_without_duplicate_prefix():
+    # A stream that cannot seek gets the finished container at close; a
+    # seekable one is written while encoding (tests/test_filelike_streaming.py).
     class InterruptedWriter(io.BytesIO):
         interrupted = False
+
+        def seekable(self):
+            return False
 
         def write(self, data):
             if self.tell() and not self.interrupted:

@@ -1,4 +1,5 @@
 ﻿#include "python/VideoEncoder.hpp"
+#include <algorithm>
 #include <array>
 #include <spdlog/spdlog.h>
 #include <cassert>
@@ -8,16 +9,20 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 #include <cpu/RGBToAuto.hpp>
 #include <cpu/ResizeFilter.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <CudaStream.hpp>  // nelux::currentCudaStream (no eager c10_cuda link)
+#include <c10/core/impl/DeviceGuardImplInterface.h>
 #endif
 
 extern "C"
 {
 #include <libavutil/buffer.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 }
@@ -26,6 +31,30 @@ namespace fs = std::filesystem;
 
 namespace nelux
 {
+
+bool rowSourceFor(const torch::Tensor& frame, conversion::cpu::RowSource& rows)
+{
+    using conversion::cpu::SampleType;
+    if (!frame.device().is_cpu() || frame.layout() != torch::kStrided || frame.is_neg() ||
+        frame.dim() != 3)
+        return false;
+    switch (frame.scalar_type())
+    {
+    case torch::kUInt8:    rows.type = SampleType::U8; break;
+    case torch::kUInt16:   rows.type = SampleType::U16; break;
+    case torch::kFloat16:  rows.type = SampleType::F16; break;
+    case torch::kBFloat16: rows.type = SampleType::BF16; break;
+    case torch::kFloat32:  rows.type = SampleType::F32; break;
+    case torch::kFloat64:  rows.type = SampleType::F64; break;
+    default:               return false;
+    }
+    rows.data = static_cast<const uint8_t*>(frame.data_ptr());
+    rows.channels = static_cast<int>(frame.size(2));
+    rows.rowStride = frame.stride(0);
+    rows.pixelStride = frame.stride(1);
+    rows.channelStride = frame.stride(2);
+    return conversion::cpu::rowLoaderCovers(rows);
+}
 
 namespace
 {
@@ -159,6 +188,167 @@ namespace
             return g.to(torch::kInt32) * 257;
         return g.to(torch::kInt32).clamp(0, 65535);
     }
+
+    // Re-points `f`, whose buffer the codec still shares, at a fresh one from
+    // `pool` with the same layout, copying nothing: the converter rewrites
+    // every plane (and the PAL8 palette). False, leaving `f` untouched, unless
+    // the frame is the single buffer av_frame_get_buffer allocates and the
+    // pooled one keeps each plane's alignment.
+    bool swapInPooledBuffer(AVFrame* f, AVBufferPool* pool)
+    {
+        AVBufferRef* old = f->buf[0];
+        if (!pool || !old || f->buf[1] || f->extended_buf)
+            return false;
+        AVBufferRef* fresh = av_buffer_pool_get(pool);
+        if (!fresh)
+            return false;
+        const uintptr_t shift = reinterpret_cast<uintptr_t>(fresh->data) -
+                                reinterpret_cast<uintptr_t>(old->data);
+        if (fresh->size != old->size || shift % 64 != 0)
+        {
+            av_buffer_unref(&fresh);
+            return false;
+        }
+        for (uint8_t*& plane : f->data)
+        {
+            if (plane)
+                plane = fresh->data + (plane - old->data);
+        }
+        av_buffer_unref(&f->buf[0]);
+        f->buf[0] = fresh;
+        return true;
+    }
+
+    // encode_frame's normalisation of a [0,1] float RGB frame: full 16-bit
+    // range for a deep destination, 8 bits otherwise. The exact CUDA kernels
+    // narrow a float frame the same way while they read it, which
+    // cudaNarrowMatchesTorch checks against this.
+    torch::Tensor normalizeFloatRgb(const torch::Tensor& frame, bool deep)
+    {
+        if (deep)
+            return (frame.to(torch::kFloat32) * 65535.0f)
+                .round()
+                .clamp(0, 65535)
+                .to(torch::kUInt16);
+        return (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+    }
+
+#ifdef NELUX_ENABLE_CUDA
+    // The float dtypes the exact CUDA kernels narrow in place. float64 (and
+    // every integer dtype) keeps the torch ops.
+    bool exactFloatElement(torch::ScalarType type, nelux::backends::cuda::ExactElement& out)
+    {
+        using nelux::backends::cuda::ExactElement;
+        switch (type)
+        {
+        case torch::kFloat32:  out = ExactElement::Float32;  return true;
+        case torch::kFloat16:  out = ExactElement::Float16;  return true;
+        case torch::kBFloat16: out = ExactElement::BFloat16; return true;
+        default:               return false;
+        }
+    }
+
+    // A [H,W,C] or flat CUDA float frame as the kernels read it, through its
+    // strides (packed or padded HWC rows, a CHW view, a broadcast). False
+    // for what they do not read; that frame is normalised with torch.
+    bool exactFloatSource(const torch::Tensor& frame, int64_t channels, int width,
+                          nelux::backends::cuda::RgbToYuvExactSource& src)
+    {
+        if (frame.layout() != torch::kStrided || frame.is_neg() ||
+            !exactFloatElement(frame.scalar_type(), src.element))
+            return false;
+        src.data = frame.data_ptr();
+        if (frame.dim() == 1 && frame.stride(0) == 1)
+        {
+            src.rowStride = int64_t(width) * channels;
+            src.pixelStride = channels;
+            src.channelStride = 1;
+            return true;
+        }
+        if (frame.dim() != 3)
+            return false;
+        src.rowStride = frame.stride(0);
+        src.pixelStride = frame.stride(1);
+        src.channelStride = frame.stride(2);
+        return true;
+    }
+
+    // Whether the kernels' float narrowing gives what normalizeFloatRgb gives
+    // on this torch, for every float16 / bfloat16 value, or for float32 every
+    // high half with four low halves plus k/255 and k/65535 and their
+    // neighbours: NaN, infinities, negatives, values past 1, the rounding
+    // and truncation edges. The kernels are fixed, torch is not. Checked
+    // once per process for each dtype and depth, on @p stream (the caller's
+    // current stream, which the torch ops run on).
+    bool cudaNarrowMatchesTorch(torch::ScalarType type, bool deep, int device,
+                                cudaStream_t stream)
+    {
+        using nelux::backends::cuda::ExactElement;
+        static std::mutex verdictMutex;
+        static std::map<std::pair<int, bool>, bool> verdicts;
+        const std::pair<int, bool> key{static_cast<int>(type), deep};
+        std::lock_guard<std::mutex> lock(verdictMutex);
+        if (auto it = verdicts.find(key); it != verdicts.end())
+            return it->second;
+
+        ExactElement element;
+        if (!exactFloatElement(type, element))
+            return false;
+        bool same = false;
+        try
+        {
+            const auto cuda = torch::TensorOptions().device(torch::kCUDA, device);
+            torch::Tensor x;
+            if (element == ExactElement::Float32)
+            {
+                std::vector<uint32_t> bits;
+                bits.reserve(7 * 65536 + 3 * 256);
+                for (uint32_t hi = 0; hi < 65536; ++hi)
+                    for (uint32_t lo : {0x0000u, 0x0001u, 0x8000u, 0xFFFFu})
+                        bits.push_back(hi << 16 | lo);
+                auto addWithNeighbours = [&](float v) {
+                    uint32_t b;
+                    std::memcpy(&b, &v, 4);
+                    bits.insert(bits.end(), {b - 1, b, b + 1});
+                };
+                for (int k = 1; k < 65536; ++k)
+                    addWithNeighbours(float(k) / 65535.0f);
+                for (int k = 1; k < 256; ++k)
+                    addWithNeighbours(float(k) / 255.0f);
+                x = torch::from_blob(bits.data(), {int64_t(bits.size())}, torch::kInt32)
+                        .to(cuda)
+                        .view(torch::kFloat32);
+            }
+            else
+            {
+                x = torch::arange(65536, torch::TensorOptions().dtype(torch::kInt32))
+                        .to(torch::kInt16)
+                        .to(cuda)
+                        .view(type);
+            }
+            torch::Tensor got = torch::empty({x.numel()}, cuda.dtype(torch::kUInt16));
+            if (nelux::backends::cuda::RgbToYuvExactNarrow(
+                    element, deep ? 16 : 8, x.data_ptr(), x.numel(),
+                    static_cast<uint16_t*>(got.data_ptr()), stream) != cudaSuccess)
+            {
+                cudaGetLastError();
+                return false; // nothing compared (a launch failed): no verdict kept
+            }
+            same = torch::equal(got.to(torch::kInt32),
+                                normalizeFloatRgb(x, deep).to(torch::kInt32));
+        }
+        catch (const std::exception&)
+        {
+            return false; // e.g. out of memory: no verdict kept, the torch ops run
+        }
+        if (!same)
+            NELUX_WARN("CUDA {} frames do not narrow on the GPU as torch does here; they "
+                       "are normalised with torch ops first",
+                       c10::toString(type));
+        verdicts.emplace(key, same);
+        return same;
+    }
+#endif
 } // namespace
 
     //NOTE --- USED HWC
@@ -171,9 +361,26 @@ VideoEncoder::VideoEncoder(const std::string& filename,
                            std::optional<std::string> pixelFormat,
                            std::optional<std::string> presetStr,
                            std::map<std::string, std::string> extraOptions,
-                           bool resize, const std::string& resizeFilter, bool memoryOutput)
+                           bool resize, const std::string& resizeFilter, bool memoryOutput,
+                           pybind11::object destination,
+                           std::optional<std::pair<int, int>> exactFrameRate)
 {
+    if (exactFrameRate && fps)
+        throw std::invalid_argument("pass fps or _frame_rate, not both");
+    if (exactFrameRate && (exactFrameRate->first <= 0 || exactFrameRate->second <= 0))
+        throw std::invalid_argument("_frame_rate must be two positive integers");
     memoryOutput_ = memoryOutput;
+    if (destination && !destination.is_none())
+    {
+        // Positions the muxer asks for are relative to where the stream is
+        // now, so a stream that already holds a prefix keeps it.
+        destinationBase_ = destination.attr("tell")().cast<int64_t>();
+        destination_ = std::move(destination);
+        outputSink_.write = [this](const uint8_t* data, int size)
+        { return writeDestination(data, size); };
+        outputSink_.seek = [this](int64_t offset, int whence)
+        { return seekDestination(offset, whence); };
+    }
     // Parse the filter name even when resize is off, so a typo raises at
     // construction rather than being silently carried until (never) used.
     resizeFlags_ = nelux::conversion::cpu::swsFlagFromResizeFilter(resizeFilter);
@@ -184,12 +391,44 @@ VideoEncoder::VideoEncoder(const std::string& filename,
     auto properties = inferEncodingProperties(filename, codec, width, height, bitRate,
                                               fps, preset, cq, pixelFormat,
                                               presetStr, std::move(extraOptions));
+    if (exactFrameRate)
+        properties.frameRate = AVRational{exactFrameRate->first, exactFrameRate->second};
+#ifdef NELUX_ENABLE_CUDA
+    // RGB frames reach NVENC through the GPU convert in device 0's primary
+    // context (encodeCpuFrameOnGpu), so NVENC opens in that context rather
+    // than in a second one. A guess made before the first frame: other
+    // inputs then run NVENC in the primary context, one context all the same.
+    properties.preferPrimaryCudaContext =
+        nvenc::isNvencCodec(properties.codec) && !resize &&
+        ((properties.width | properties.height) & 1) == 0 &&
+        nelux::backends::cuda::RgbToYuvExactConverter::supported(
+            properties.width, properties.height, AV_PIX_FMT_RGB24, properties.pixelFormat,
+            properties.colorspace, properties.colorRange);
+#endif
     this->props = properties;
     this->width = properties.width;
     this->height = properties.height;
     this->outputPixelFormat = properties.pixelFormat;
 
-    encoder = std::make_unique<nelux::Encoder>(filename, properties, memoryOutput_);
+    {
+        // Opening the codec takes 30-150 ms for NVENC, about 350 ms for
+        // libsvtav1 at 4K and 550 ms for h264_qsv, all of which stalled every
+        // other Python thread. Nothing in it needs the GIL: a Python
+        // destination's header write takes it back in writeDestination. The
+        // release ends with this scope, so a throw reacquires it before the
+        // members (destination_) are destroyed. Guarded as underEncoderLock
+        // is: releasing a GIL this thread does not hold is UB.
+        //
+        // Except libsvtav1: its open runs with the process's fd 2 pointed at
+        // NUL (ScopedStderrSilence, for SVT's banner), and any other Python
+        // thread let in then would lose what it writes to stderr --
+        // tracebacks, logging, warnings. It keeps the GIL, as in 0.20.0.
+        std::optional<pybind11::gil_scoped_release> nogil;
+        if (PyGILState_Check() && properties.codec != "libsvtav1")
+            nogil.emplace();
+        encoder = std::make_unique<nelux::Encoder>(filename, properties, memoryOutput_,
+                                                   outputSink_);
+    }
 
     // Re-read what the encoder actually opened with. NVENC may have changed the
     // pixel format (e.g. to NV12), a codec may have fallen back to a format it
@@ -206,6 +445,53 @@ VideoEncoder::VideoEncoder(const std::string& filename,
         nelux::inferContainerFormatForFile(filename) == "image2" &&
         (props.codec == "png" || props.codec == "mjpeg") &&
         filename.find('%') == std::string::npos;
+
+    // The first uint8 CPU frame at a geometry this process has not seen pays
+    // for the AVX2 kernel's exactness verdict (makeVerifiedFastPlan): one
+    // full frame through both sws_scale and the kernel, about 31 ms at 4K
+    // and 15-22 ms at 1440p, inside the caller's first encode_frame. Run
+    // that same full-frame probe now, on a helper, on a converter built as
+    // the convert workers build theirs, so it overlaps whatever the caller
+    // does before its first frame (decoding it, a model producing it). That
+    // frame then finds the verdict kept, or waits for the rest of the probe.
+    // Not during the open: beside libx265's 4K open it cost the constructor
+    // ~12 ms. NVENC converts RGB on the GPU and a gray output has a
+    // converter of its own. If the frames come deep, the probe was spare
+    // work on another core, never a different verdict, and the verdict
+    // those frames need does not wait for it.
+    if (!nvenc::isNvencCodec(props.codec) && !resize &&
+        int64_t(this->width) * this->height >= int64_t(2560) * 1440 &&
+        !isGrayVerbatimPixfmt(outputPixelFormat) &&
+        !(directStillImage_ && outputPixelFormat == AV_PIX_FMT_RGB24))
+    {
+        try
+        {
+            auto probe = makeConverter();
+            if (probe->verdictPending(AV_PIX_FMT_RGB24))
+            {
+                NELUX_DEBUG("VideoEncoder: probing the AVX2 rgb24 -> {} kernel at {}x{} "
+                            "before the first frame",
+                            av_get_pix_fmt_name(outputPixelFormat), this->width,
+                            this->height);
+                verdictProbe_.thread = std::thread(
+                    [probe = std::move(probe)]
+                    {
+                        // A failure here fails the first frame's own converter.
+                        try
+                        {
+                            probe->fastKernelFor(AV_PIX_FMT_RGB24);
+                        }
+                        catch (...)
+                        {
+                        }
+                    });
+            }
+        }
+        catch (...)
+        {
+            // No probe then (no memory or no thread): the first frame runs it.
+        }
+    }
     outputPath_ = filename;
     adaptivePngStill_ = directStillImage_ && props.codec == "png" &&
                         !explicitPngCompression;
@@ -254,7 +540,9 @@ nelux::Encoder::EncodingProperties VideoEncoder::inferEncodingProperties(
     }
     props.width = width.value_or(1920);
     props.height = height.value_or(1080);
-    props.bitRate = bitRate.value_or(4000000); // 4 Mbps default
+    // -1 lets the Encoder pick: 4 Mbps, or the codec's own rate when
+    // `options` asks for a quality target instead (see EncodingProperties).
+    props.bitRate = bitRate.value_or(-1);
     props.frameRate = frameRateFromDouble(fps.value_or(30.0));
     // Leave GOP length and B-frame count to the codec's own defaults, exactly
     // as the ffmpeg CLI does (x264: keyint 250 / 3 B-frames; NVENC: g 250 and
@@ -467,29 +755,25 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         }
     }
 
-#ifdef NELUX_ENABLE_CUDA
-    // Free GPU tensors retired by the submit thread, here while pybind still
-    // holds the GIL (torch CUDA dealloc can need it). Moving this off the submit
-    // thread avoids a per-frame GIL acquire that otherwise stalls it behind the
-    // GIL-heavy host pipeline (TensorRT) and tanks NVENC throughput.
-    //
-    // Deliberately before the lifecycle lock: it only needs `mu`, which is the
-    // inner lock, and doing it here keeps the "free under the GIL" property
-    // without holding the GIL for the whole encode.
-    {
-        std::deque<torch::Tensor> toFree;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            toFree.swap(retiredTensors);
-        }
-        toFree.clear();  // destruct under the GIL
-    }
-#endif
-
     // Everything from here on drives the codec, the worker pipeline and the
     // buffer pools, so it runs serialised against every other operation on this
     // encoder — with the GIL dropped, so other encoders still run in parallel.
-    underEncoderLock([&] { encodeFrameLocked(frame); });
+    underEncoderLock(
+        [&]
+        {
+            try
+            {
+                encodeFrameLocked(frame);
+            }
+            catch (...)
+            {
+                // An NVENC encoder then frees its CUDA device at close instead
+                // of leaving it idle for the next encoder.
+                if (encoder)
+                    encoder->markFailed();
+                throw;
+            }
+        });
 }
 
 void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
@@ -592,10 +876,10 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     }
 
     // How much precision the destination can hold, and whether the caller
-    // actually supplied it. Decided here, ABOVE the NVENC zero-copy branch,
-    // because that branch narrows unconditionally: leaving the decision below
-    // it made a .cuda() tensor come out 8-bit-quantised while the byte-
-    // identical CPU tensor came out full 10-bit on the same p010 encoder.
+    // actually supplied it. Decided once for every path, CUDA and CPU alike:
+    // an NVENC branch that used to narrow on its own made a .cuda() tensor
+    // come out 8-bit-quantised while the byte-identical CPU tensor came out
+    // full 10-bit on the same p010 encoder.
     //
     // Restricted to uint16 and float on purpose. int16/int32/int64 remain
     // documented 0-255 integer levels (same convention as encodeGrayVerbatim),
@@ -619,89 +903,16 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
                            : (deep ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24);
 
 #ifdef NELUX_ENABLE_CUDA
-    // GPU path: tensor already on CUDA and the encoder is NVENC -> keep the
-    // whole pipeline on the GPU (zero-copy). The caller only does the GPU dtype
-    // normalize here, records an event so the worker's stream waits until that
-    // data is ready, then hands the tensor to the encode worker and returns.
-    // The RGB->NV12 convert, device copy, stream sync and avcodec_send_frame all
-    // run on the worker, overlapped with the caller's next decode/inference.
-    // Alpha and deep-colour input fall through to the CPU staging path: the
-    // fused GPU convert kernel is 8-bit RGB-only, and the CPU path handles a
-    // CUDA tensor natively (one stream-ordered D2H straight into staging).
-    // A resize with a genuinely different input size falls through too: the
-    // fused kernel converts but does not scale, so correctness over throughput
-    // — same policy as the deep/4-channel cases. (When resize is off,
-    // inW/inH == width/height by construction and this changes nothing.)
-    if (frame.device().is_cuda() && encoder->isHardwareEncoder() && !deep &&
-        srcChannels == 3 && inW == width && inH == height)
-    {
-        int deviceIndex = frame.device().index();
-        if (deviceIndex < 0)
-            deviceIndex = 0;
-
-        cudaError_t deviceErr = cudaSetDevice(deviceIndex);
-        if (deviceErr != cudaSuccess)
-        {
-            throw std::runtime_error("Failed to select CUDA device for NVENC encode: " +
-                                     std::string(cudaGetErrorString(deviceErr)));
-        }
-
-        // Convert tensor dtype to uint8 if needed (on GPU, on torch's stream).
-        if (frame.dtype() == torch::kFloat16 || frame.dtype() == torch::kFloat32)
-        {
-            frame = (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
-        }
-        else if (frame.scalar_type() == torch::ScalarType::UInt16)
-        {
-            frame = (frame.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
-        }
-        else if (frame.dtype() != torch::kUInt8)
-        {
-            frame = frame.to(torch::kUInt8);
-        }
-        if (!frame.is_contiguous())
-            frame = frame.contiguous();
-
-        // Record an event on the tensor's producer stream (torch current stream,
-        // which is where the decode + the dtype ops above ran). The worker makes
-        // its encode stream wait on this so the convert never reads stale data.
-        cudaEvent_t readyEvent = nullptr;
-        if (cudaEventCreateWithFlags(&readyEvent, cudaEventDisableTiming) != cudaSuccess)
-            readyEvent = nullptr;
-        if (readyEvent)
-        {
-            cudaStream_t producerStream = nelux::currentCudaStream(deviceIndex);
-            cudaEventRecord(readyEvent, producerStream);
-        }
-
-        startEncodeWorkersIfNeeded();
-
-        // GPU jobs skip the convert workers (convert is cheap on the GPU) and go
-        // straight into the reorder map for the submit thread to convert + send.
-        {
-            std::unique_lock<std::mutex> lk(mu);
-            cvFree.wait(lk, [&] {
-                return inFlight < static_cast<int64_t>(maxFramesInFlight) || workerError;
-            });
-            if (workerError)
-            {
-                if (readyEvent) cudaEventDestroy(readyEvent);
-                std::exception_ptr e = workerError;
-                std::rethrow_exception(e);
-            }
-            ReadyEntry entry;
-            entry.isGpu = true;
-            entry.gpuTensor = frame;     // holds CUDA storage alive until encoded
-            entry.readyEvent = readyEvent;
-            readyMap.emplace(enqueueSeq++, std::move(entry));
-            ++inFlight;
-        }
-        cvReady.notify_one();
+    // A CUDA float32/float16/bfloat16 frame goes to the exact kernels as it
+    // is, read through its strides and narrowed per sample to the bytes the
+    // normalisation below writes, instead of 3-4 torch kernels and
+    // full-frame float temporaries (~214 MB at 4K) per frame. What they
+    // decline (resize, gray/RGB destinations, odd-width 4:2:x) is normalised
+    // below and takes the path it always took.
+    if (!directStillImage_ && frame.device().is_cuda() && frame.is_floating_point() &&
+        encodeCudaFrame(frame, srcFmt, inW, inH))
         return;
-    }
 #endif
-
-    // CPU path (fallback for non-CUDA tensors or software encoders)
 
     // uint8 in keeps the exact RGB24 path it has always taken, so every
     // existing 8-bit caller stays bit-for-bit unchanged; a deep source into a
@@ -709,22 +920,36 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // 8 bits first (a uint16 tensor used to be divided by 257 down to uint8
     // before swscale ever saw it, which defeats a 10/12-bit codec entirely).
     //
-    // Normalize dtype FIRST, on whatever device the tensor is on. Doing this
-    // before any download means a CUDA float tensor is reduced on the GPU and
-    // we transfer 1-2 bytes/channel instead of 4 — at 4K that's a 24.8 MB D2H
+    // Normalize dtype FIRST, on whatever device the tensor is on, and the same
+    // way for every path, so a CUDA tensor converted on the GPU sees exactly
+    // the bytes the CPU staging copy would have. Doing this before any
+    // download also means a CUDA float tensor is reduced on the GPU and we
+    // transfer 1-2 bytes/channel instead of 4 — at 4K that's a 24.8 MB D2H
     // instead of ~99 MB for float32.
-    if (deep)
+    //
+    // A CPU frame the row loader reads (a CHW view, uint16, float, padded
+    // rows) skips the torch ops and their contiguous() copy: the loader
+    // produces the same bytes, 8-bit or RGB48/RGBA64 for a deep frame, while
+    // it fills staging, the band scratch or the NVENC upload buffer, and the
+    // input is only read. Each torch CPU op wakes ATen's OpenMP pool, which
+    // then spins through the gap to the next frame; that was 45-60 ms of CPU
+    // per 1080p frame for a few ms of work. A packed frame of the staged
+    // type is read where it lies, as before.
+    nelux::conversion::cpu::RowSource rows;
+    const bool loadRows = !directStillImage_ && rowSourceFor(frame, rows) &&
+                          !(deep ? nelux::conversion::cpu::isPackedU16(rows, inW)
+                                 : nelux::conversion::cpu::isPackedU8(rows, inW));
+    if (loadRows)
+    {
+        // Read as it is by the row loader below.
+    }
+    else if (deep)
     {
         // Float is normalized [0,1] and scales to the FULL 16-bit range (the
         // same convention encodeGrayVerbatim uses for 16-bit gray output);
         // uint16 is already the target representation and passes through.
         if (frame.is_floating_point())
-        {
-            frame = (frame.to(torch::kFloat32) * 65535.0f)
-                        .round()
-                        .clamp(0, 65535)
-                        .to(torch::kUInt16);
-        }
+            frame = normalizeFloatRgb(frame, true);
     }
     else if (frame.is_floating_point())
     {
@@ -733,7 +958,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         // below, which truncates a [0,1] tensor to an all-black frame. The deep
         // branch above uses the same predicate, so changing only pixel_format
         // can no longer flip a caller between correct and black.
-        frame = (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+        frame = normalizeFloatRgb(frame, false);
     }
     else if (frame.scalar_type() == torch::ScalarType::UInt16)
     {
@@ -752,8 +977,15 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         frame = frame.to(torch::kUInt8);
     }
 
-    if (!frame.is_contiguous())
+    if (!loadRows && !frame.is_contiguous())
     {
+#ifdef NELUX_ENABLE_CUDA
+        // The exact kernels read a CUDA frame's planar or padded layout as
+        // it lies, without this copy (a 25 MB temporary per 4K frame).
+        if (!directStillImage_ && frame.device().is_cuda() &&
+            encodeCudaFrame(frame, srcFmt, inW, inH))
+            return;
+#endif
         frame = frame.contiguous();
     }
 
@@ -763,6 +995,24 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         return;
     }
 
+#ifdef NELUX_ENABLE_CUDA
+    // A CUDA tensor converts on the GPU where a kernel covers the pair: into
+    // a device slot for NVENC, or downloaded as YUV for a software encoder.
+    // Everything else (resize, gray/RGB/12-bit destinations, a software
+    // encoder on a libswscale the kernels do not match) stages it below.
+    if (frame.device().is_cuda() && encodeCudaFrame(frame, srcFmt, inW, inH))
+        return;
+    // A packed CPU tensor into NVENC goes up as RGB and converts there with
+    // the same kernels: the CPU pays the upload instead of swscale plus the
+    // submit thread's YUV upload, for the same bytes. A deep frame the row
+    // loader reads goes up from its RGB48/RGBA64 rows.
+    if (frame.device().is_cpu() && (!loadRows || deep) &&
+        encodeCpuFrameOnGpu(frame, loadRows ? &rows : nullptr, srcFmt, inW, inH))
+        return;
+#endif
+
+    // CPU path (CPU tensors, and the CUDA cases encodeCudaFrame declines)
+
     // Hand the frame to the fan-out convert pipeline. The caller pays for ONE
     // copy of the RGB bytes into a recycled staging buffer; a pool of convert
     // workers does the (single-threaded, ~80%-of-the-cost) swscale RGB->YUV in
@@ -770,6 +1020,9 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     // The staging buffer is plain host memory -> no GIL needed on the workers.
     startEncodeWorkersIfNeeded();
     ensureConvertPipeline();   // CPU path needs the swscale convert pool
+
+    if (frame.device().is_cpu() && encodeBandedFrame(frame, loadRows ? &rows : nullptr, srcFmt))
+        return;
 
     const size_t rgbBytes = static_cast<size_t>(inW) * inH * srcChannels *
                             (deep ? 2 : 1);
@@ -797,7 +1050,14 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         ++inFlight;
     }
 
-    staging->resize(rgbBytes);  // no-op after the first frame
+    // Padded: a worker may sws_scale it, which reads past the frame.
+    const size_t stagingBytes =
+        rgbBytes + nelux::conversion::cpu::RGBToAutoConverter::kSourcePadding;
+#ifdef NELUX_ENABLE_CUDA
+    if (stagingBytes > staging->capacity())
+        unpinStaging(staging); // about to move
+#endif
+    staging->resize(stagingBytes);  // no-op after the first frame
 
     auto recycleOnError = [&]() {
         std::lock_guard<std::mutex> lk(mu);
@@ -815,10 +1075,13 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         int dev = frame.device().index();
         if (dev < 0) dev = 0;
         cudaStream_t s = nelux::currentCudaStream(dev);
+        const bool pinned = pinStaging(staging, dev);
         cudaError_t cerr = cudaMemcpyAsync(staging->data(), frame.data_ptr(),
                                            rgbBytes, cudaMemcpyDeviceToHost, s);
         if (cerr == cudaSuccess)
-            cerr = cudaStreamSynchronize(s);
+            cerr = pinned ? cudaEventRecord(stagingDone_, s) : cudaStreamSynchronize(s);
+        if (cerr == cudaSuccess && pinned)
+            cerr = cudaEventSynchronize(stagingDone_);
         if (cerr != cudaSuccess)
         {
             recycleOnError();
@@ -830,6 +1093,14 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
 #endif
     }
+    else if (loadRows)
+    {
+        const ptrdiff_t stride = static_cast<ptrdiff_t>(inW) * srcChannels * (deep ? 2 : 1);
+        if (deep)
+            nelux::conversion::cpu::loadRowsU16(rows, inW, 0, inH, staging->data(), stride);
+        else
+            nelux::conversion::cpu::loadRowsU8(rows, inW, 0, inH, staging->data(), stride);
+    }
     else
     {
         std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
@@ -840,6 +1111,180 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         convertQueue.push_back(ConvertJob{staging, yuv, seq, srcFmt});
     }
     cvConvert.notify_one();
+}
+
+namespace
+{
+// Rows [y0, y1) of the caller's frame into the pooled YUV frame `yuv`.
+// Packed RGB (`src`) is read where it lies; a frame the row loader reads
+// (`rows`) is loaded into `scratch` kLoadRows luma rows at a time, plus the
+// rows their chroma taps, small enough to stay in L2 between the load and
+// the convert. The kernel gives the same bytes for any split of the rows.
+void convertBand(const nelux::conversion::cpu::FastKernel& kernel, const uint8_t* src,
+                 const nelux::conversion::cpu::RowSource* rows, AVFrame* yuv, int y0, int y1,
+                 std::vector<uint8_t>& scratch)
+{
+    uint8_t* const dst[4] = {yuv->data[0], yuv->data[1], yuv->data[2], yuv->data[3]};
+    const int dstStride[4] = {yuv->linesize[0], yuv->linesize[1], yuv->linesize[2],
+                              yuv->linesize[3]};
+    const int width = kernel.width();
+    const ptrdiff_t stride = static_cast<ptrdiff_t>(width) * kernel.sourcePixelBytes();
+    if (!rows)
+    {
+        kernel.run(src, stride, dst, dstStride, y0, y1);
+        return;
+    }
+    // An RGB48/RGBA64 kernel takes 16-bit rows.
+    const bool deep = kernel.sourcePixelBytes() == 2 * rows->channels;
+    constexpr int kLoadRows = 32;  // a multiple of every chroma row height
+    for (int c0 = y0; c0 < y1; c0 += kLoadRows)
+    {
+        const int c1 = std::min(c0 + kLoadRows, y1);
+        int r0, r1;
+        kernel.sourceRows(c0, c1, r0, r1);
+        // Slack past the last row for the kernel's vector loads.
+        scratch.resize(static_cast<size_t>(r1 - r0) * stride + 64);
+        if (deep)
+            nelux::conversion::cpu::loadRowsU16(*rows, width, r0, r1, scratch.data(), stride);
+        else
+            nelux::conversion::cpu::loadRowsU8(*rows, width, r0, r1, scratch.data(), stride);
+        // Row r of the frame is at scratch + (r - r0) * stride.
+        const uint8_t* loaded = scratch.data() - static_cast<ptrdiff_t>(r0) * stride;
+        kernel.run(loaded, stride, dst, dstStride, c0, c1);
+    }
+}
+} // namespace
+
+bool VideoEncoder::encodeBandedFrame(const torch::Tensor& frame,
+                                     const nelux::conversion::cpu::RowSource* rows,
+                                     AVPixelFormat srcFmt)
+{
+    // From 1440p the staging copy is what holds back a fast codec: the
+    // caller writes 25 MB of RGB per 4K frame into staging and a worker
+    // reads it back, both against the codec's own threads for DRAM. Where
+    // an AVX2 kernel covers the conversion, convert the caller's tensor
+    // directly instead, split into row bands over the caller and the convert
+    // workers. The kernels give the same bytes for any split of the rows
+    // (RgbToYuvAvx2.hpp, RgbToRgbAvx2.hpp), so this is the staging path's
+    // output exactly. The
+    // tensor is read before encode_frame returns, as it is by the copy.
+    // A frame-threaded codec (utvideo, huffyuv, ...) codes 1080p fast enough
+    // that the 6 MB copy holds it back too: utvideo 1080p went from ~1280 to
+    // ~1680 fps, huffyuv +10%, byte-identical. At 720p the band handoff costs
+    // about as much as the copy it saves.
+    // A frame the row loader reads (CHW, float, ...) bands from about 0.3 MP
+    // whatever the codec: loading it is several times the cost of a copy, so
+    // the caller alone would hold the encoder back.
+    const bool frameThreaded = encoder && encoder->isFrameThreaded();
+    const bool large = rows ? int64_t(width) * height >= 300000
+                              : height >= (frameThreaded ? 1080 : 1440);
+    if (!large || numConvertWorkers < 2)
+        return false;
+    // Built like the workers' converters, so it takes the AVX2 kernel
+    // exactly when they would.
+    if (!bandConverter_)
+        bandConverter_ = makeConverter();
+    const nelux::conversion::cpu::FastKernel kernel = bandConverter_->fastKernelFor(srcFmt);
+    if (!kernel)
+        return false;
+
+    // The full workers + 2 depth even though a banded frame is converted
+    // before encode_frame returns: the queue absorbs the submit thread's
+    // stalls. Capped at 4 it saved 128 MB at 4K prores_ks but cost two
+    // concurrent 1080p prores_ks encoders 3.7% of their fps (7 of 8 pairs).
+    // The most recently freed frame is reused, so frames the queue never
+    // reaches stay untouched.
+    const int64_t depth = static_cast<int64_t>(maxFramesInFlight);
+    nelux::Frame* yuv = nullptr;
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cvFree.wait(lk, [&] {
+            return (inFlight < depth && !freeYuv.empty()) || workerError;
+        });
+        if (workerError)
+        {
+            std::exception_ptr e = workerError;
+            std::rethrow_exception(e);
+        }
+        yuv = freeYuv.back();
+        freeYuv.pop_back();
+        ++inFlight;
+    }
+
+    // Band edges on whole chroma rows, so each band computes its own.
+    const auto* src = rows ? nullptr : static_cast<const uint8_t*>(frame.data_ptr());
+    const int bands = numConvertWorkers + 1;
+    const int rowAlign = kernel.rowAlign();
+    auto bandEdge = [&](int i) {
+        return i == bands ? height
+                          : static_cast<int>(int64_t(height) * i / bands) & ~(rowAlign - 1);
+    };
+
+    std::exception_ptr error;
+    try
+    {
+        prepareYuvForWrite(yuv->get());
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            bandError = nullptr;
+            for (int i = 1; i < bands; ++i)
+            {
+                ConvertJob job;
+                job.yuv = yuv;
+                job.srcFmt = srcFmt;
+                job.kernel = kernel;
+                job.bandSrc = src;
+                job.bandRows = rows;
+                job.y0 = bandEdge(i);
+                job.y1 = bandEdge(i + 1);
+                convertQueue.push_back(job);
+                ++bandsPending;
+            }
+        }
+        cvConvert.notify_all();
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
+
+    // The caller converts the first band itself rather than idle.
+    if (!error)
+    {
+        try
+        {
+            convertBand(kernel, src, rows, yuv->get(), 0, bandEdge(1),
+                        loadScratch_[numConvertWorkers]);
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cvBands.wait(lk, [&] { return bandsPending == 0; });
+        if (!error)
+            error = bandError;
+        bandError = nullptr;
+        if (error)
+        {
+            freeYuv.push_back(yuv);
+            --inFlight;
+        }
+        else
+        {
+            readyMap[enqueueSeq++].yuv = yuv;
+        }
+    }
+    if (error)
+    {
+        cvFree.notify_all();
+        std::rethrow_exception(error);
+    }
+    cvReady.notify_one();
+    return true;
 }
 
 void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
@@ -864,7 +1309,8 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         encoder.reset();
         props.extraOptions["compression_level"] = "0";
         props.extraOptions["pred"] = "none";
-        encoder = std::make_unique<nelux::Encoder>(outputPath_, props, memoryOutput_);
+        encoder = std::make_unique<nelux::Encoder>(outputPath_, props, memoryOutput_,
+                                                   outputSink_);
         props = encoder->Properties();
         outputPixelFormat = props.pixelFormat;
     }
@@ -916,10 +1362,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         }
         else
         {
-            nelux::conversion::cpu::RGBToAutoConverter converter(
-                width, height, outputPixelFormat, props.colorspace, props.colorRange,
-                srcWidth_, srcHeight_, resizeFlags_);
-            converter.convert(image, frame.data_ptr(), srcFmt);
+            makeConverter()->convert(image, frame.data_ptr(), srcFmt);
         }
     }
 
@@ -1072,7 +1515,7 @@ void VideoEncoder::startEncodeWorkersIfNeeded()
         return;
 
     // Resolve convert worker count (used as backpressure depth even for the GPU
-    // path). Default: ~half the cores, clamped [2,6].
+    // path). Default: half the cores, clamped [2,4], with the exceptions below.
     if (numConvertWorkers <= 0)
     {
         unsigned hc = std::thread::hardware_concurrency();
@@ -1088,6 +1531,37 @@ void VideoEncoder::startEncodeWorkersIfNeeded()
         // thread runs a given frame's convert, and the submit thread restores
         // sequence order.
         numConvertWorkers = std::clamp(k, 2, 4);
+
+        // Past 1440p a frame-threaded codec outruns four converters: it codes
+        // up to a frame per core at once while each 4K convert takes ~11 ms.
+        // 4K mjpeg (q-scale) ran +21% with 8 workers, byte-identical; 1080p
+        // prores_aw, which four keep up with, gained nothing, so smaller
+        // frames and the codecs that thread themselves keep the cap.
+        if (encoder && encoder->isFrameThreaded() &&
+            int64_t(width) * height > int64_t(2560) * 1440)
+            numConvertWorkers = std::clamp(static_cast<int>(hc) / 4, numConvertWorkers, 8);
+
+        // ...except where a frame's conversion depends on the frames before
+        // it. RGB into the 8-bit-and-under packed RGB formats (gif's rgb8,
+        // bgr8 under msrle/smc's pal8, the 4-bit ones) runs swscale's
+        // error-diffusion dither, whose error rows persist in the SwsContext
+        // from one frame to the next. Spread over several contexts, each
+        // frame's dither depended on which worker had converted what before
+        // it, so gif output changed from run to run past the first few
+        // frames. One worker converts them in order, as ffmpeg's single
+        // scale filter does.
+        switch (outputPixelFormat)
+        {
+        case AV_PIX_FMT_RGB8:
+        case AV_PIX_FMT_BGR8:
+        case AV_PIX_FMT_RGB4_BYTE:
+        case AV_PIX_FMT_BGR4_BYTE:
+        case AV_PIX_FMT_PAL8:
+            numConvertWorkers = 1;
+            break;
+        default:
+            break;
+        }
     }
     // workers + 2 keeps every convert worker fed (one filling, one draining)
     // without over-buffering. The depth directly sets the pool RAM footprint,
@@ -1107,15 +1581,21 @@ void VideoEncoder::startEncodeWorkersIfNeeded()
     encodeThread = std::thread([this] { encodeSubmitLoop(); });
 }
 
-void VideoEncoder::ensureConvertPipeline()
+void VideoEncoder::ensureFramePools()
 {
-    if (convertStarted)
+    if (framePoolsReady_)
         return;
 
     // Pools sized exactly to the in-flight cap: the caller acquires a staging
     // buffer + a YUV frame under the same lock as the inFlight bump, so at most
-    // maxFramesInFlight of each are ever checked out at once.
+    // maxFramesInFlight of each are ever checked out at once. A staging buffer
+    // is sized on first use, so a CUDA-only encoder never allocates its RGB.
     const size_t poolSize = maxFramesInFlight;
+    // Laid out the way the codec takes a frame as is (mpegvideo strides,
+    // libmfx's contiguous planes), so the submit thread hands it over
+    // without a copy. swapInPooledBuffer keeps the layout: it moves every
+    // plane by the same offset.
+    const auto& layout = encoder->directInputLayout();
     stagingPool.reserve(poolSize);
     yuvPool.reserve(poolSize);
     for (size_t i = 0; i < poolSize; ++i)
@@ -1145,13 +1625,95 @@ void VideoEncoder::ensureConvertPipeline()
         f->get()->color_primaries = props.colorPrimaries;
         f->get()->color_trc = props.colorTrc;
         f->get()->color_range = props.colorRange;
+        std::copy(layout.linesize, layout.linesize + 4, f->get()->linesize);
         f->allocateBuffer(32);
+        if (layout.contiguousPlanes &&
+            av_image_fill_pointers(f->get()->data, outputPixelFormat, height,
+                                   f->get()->data[0], f->get()->linesize) < 0)
+            throw std::runtime_error("Failed to lay out encoder frame");
+        if (layout.contiguousPlanes)
+            nelux::clearFramePadding(f->get());
         {
             std::lock_guard<std::mutex> lk(mu);
             freeYuv.push_back(f.get());
         }
         yuvPool.push_back(std::move(f));
     }
+    // Zeroed, like the pool frames' padding (clearFramePadding): a swapped-in
+    // buffer keeps the layout, and the converter writes only the picture.
+    if (const AVBufferRef* b = yuvPool.front()->get()->buf[0])
+        yuvBufferPool.reset(av_buffer_pool_init(b->size, av_buffer_allocz));
+#ifdef NELUX_ENABLE_CUDA
+    if (encoder->sharedCudaStream() && encoder->getHwFramesCtx())
+        pinYuvPool();
+#endif
+    framePoolsReady_ = true;
+}
+
+#ifdef NELUX_ENABLE_CUDA
+void VideoEncoder::pinYuvPool()
+{
+    // Saves the copy into staging, one memcpy of the frame (12.4 MB at 4K
+    // yuv420p). The frame keeps its buffer and layout: the registration is
+    // wrapped in a buffer of its own, which unregisters it when the frame
+    // lets go. A frame that cannot be registered goes up through staging.
+    int prevDev = 0;
+    if (cudaGetDevice(&prevDev) != cudaSuccess || cudaSetDevice(0) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return;
+    }
+    for (auto& f : yuvPool)
+    {
+        AVFrame* av = f->get();
+        AVBufferRef* own = av->buf[0];
+        if (!own || av->buf[1] || av->extended_buf)
+            continue;
+        PinnedYuv pinned;
+        if (cudaEventCreateWithFlags(&pinned.uploaded,
+                                     cudaEventBlockingSync | cudaEventDisableTiming) != cudaSuccess)
+            break;
+        if (cudaHostRegister(own->data, own->size, cudaHostRegisterPortable) != cudaSuccess)
+        {
+            cudaEventDestroy(pinned.uploaded);
+            break;
+        }
+        AVBufferRef* registered = av_buffer_create(
+            own->data, own->size,
+            [](void* opaque, uint8_t* data)
+            {
+                cudaHostUnregister(data);
+                auto* buffer = static_cast<AVBufferRef*>(opaque);
+                av_buffer_unref(&buffer);
+            },
+            own, 0);
+        if (!registered)
+        {
+            cudaHostUnregister(own->data);
+            cudaEventDestroy(pinned.uploaded);
+            break;
+        }
+        av->buf[0] = registered;
+        pinned.buffer = registered;
+        pinnedYuv_.emplace(av, pinned);
+    }
+    cudaGetLastError();
+    cudaSetDevice(prevDev);
+}
+#endif
+
+std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter> VideoEncoder::makeConverter() const
+{
+    return std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
+        width, height, outputPixelFormat, props.colorspace, props.colorRange, srcWidth_,
+        srcHeight_, resizeFlags_);
+}
+
+void VideoEncoder::ensureConvertPipeline()
+{
+    if (convertStarted)
+        return;
+    ensureFramePools();
 
     // One converter (own SwsContext) per convert worker — SwsContext is not
     // safe to share across threads. Reached only from encodeFrameLocked AFTER
@@ -1161,9 +1723,9 @@ void VideoEncoder::ensureConvertPipeline()
     // convert-only context, same SWS_BILINEAR flags).
     converters.reserve(numConvertWorkers);
     for (int i = 0; i < numConvertWorkers; ++i)
-        converters.push_back(std::make_unique<nelux::conversion::cpu::RGBToAutoConverter>(
-            width, height, outputPixelFormat, props.colorspace, props.colorRange,
-            srcWidth_, srcHeight_, resizeFlags_));
+        converters.push_back(makeConverter());
+
+    loadScratch_.resize(static_cast<size_t>(numConvertWorkers) + 1);
 
     for (int i = 0; i < numConvertWorkers; ++i)
         convertWorkers.emplace_back([this, i] { convertWorkerLoop(i); });
@@ -1190,16 +1752,48 @@ void VideoEncoder::convertWorkerLoop(int workerId)
             convertQueue.pop_front();
         }
 
+        if (!job.staging)
+        {
+            // A band of a frame encodeBandedFrame is waiting on; the frame
+            // and its buffers stay the caller's.
+            std::exception_ptr error;
+            try
+            {
+                convertBand(job.kernel, job.bandSrc, job.bandRows, job.yuv->get(), job.y0,
+                            job.y1, loadScratch_[workerId]);
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+            bool last = false;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (error && !bandError)
+                    bandError = error;
+                last = --bandsPending == 0;
+            }
+            if (last)
+                cvBands.notify_one();
+            continue;
+        }
+
         bool converted = true;
         try
         {
-            // Each YUV frame is recycled; the encoder may still reference a prior
-            // submission (B-frames), so make_writable does a COW realloc when needed.
-            job.yuv->get()->pts = AV_NOPTS_VALUE;
-            if (av_frame_make_writable(job.yuv->get()) < 0)
-                throw std::runtime_error("Failed to make encoder frame writable");
-
-            conv->convert(*job.yuv, job.staging->data(), job.srcFmt);
+            // Each YUV frame is recycled while the encoder may still reference
+            // an earlier submission of it: a frame-threaded codec (prores,
+            // huffyuv, utvideo, jpeg2000, ...) holds every input until one of
+            // its ~cores+2 tasks has coded it, far longer than this pool of
+            // maxFramesInFlight frames takes to come round, so nearly every
+            // recycle found it shared. av_frame_make_writable answered each
+            // with a fresh full-frame allocation and a copy of the old pixels,
+            // which the converter then overwrote. Take a pooled buffer instead;
+            // the pool grows to the frames the codec holds, then stops
+            // allocating.
+            prepareYuvForWrite(job.yuv->get());
+            conv->convert(*job.yuv, job.staging->data(), job.srcFmt,
+                          /*sourcePadded=*/true);
         }
         catch (...)
         {
@@ -1231,8 +1825,34 @@ void VideoEncoder::convertWorkerLoop(int workerId)
     }
 }
 
+void VideoEncoder::prepareYuvForWrite(AVFrame* yuv)
+{
+#ifdef NELUX_ENABLE_CUDA
+    // Its last upload into NVENC may still be reading it.
+    if (auto it = pinnedYuv_.find(yuv); it != pinnedYuv_.end())
+        if (cudaError_t err = cudaEventSynchronize(it->second.uploaded); err != cudaSuccess)
+            throw std::runtime_error("CUDA upload of an encoder frame failed: " +
+                                     std::string(cudaGetErrorString(err)));
+#endif
+    yuv->pts = AV_NOPTS_VALUE;
+    if (av_frame_is_writable(yuv) || swapInPooledBuffer(yuv, yuvBufferPool.get()))
+        return;
+    // A fresh av_frame_get_buffer copy of the picture only.
+    if (av_frame_make_writable(yuv) < 0)
+        throw std::runtime_error("Failed to make encoder frame writable");
+    nelux::clearFramePadding(yuv);
+}
+
 void VideoEncoder::submitYuvFrame(nelux::Frame* yuv)
 {
+#ifdef NELUX_ENABLE_CUDA
+    if (auto it = pinnedYuv_.find(yuv->get());
+        it != pinnedYuv_.end() && yuv->get()->buf[0] == it->second.buffer)
+    {
+        encoder->encodeFrame(*yuv, it->second.uploaded);
+        return;
+    }
+#endif
     encoder->encodeFrame(*yuv);
 }
 
@@ -1255,14 +1875,14 @@ void VideoEncoder::encodeSubmitLoop()
                 if (workerError || (stopping && nextSubmitSeq >= enqueueSeq))
                 {
                     // Dispose anything still pending so CUDA events and GPU
-                    // tensors don't leak when we exit early on error. (Holding mu.)
+                    // slots don't leak when we exit early on error. (Holding mu.)
                     for (auto& kv : readyMap)
                     {
 #ifdef NELUX_ENABLE_CUDA
-                        if (kv.second.readyEvent)
-                            cudaEventDestroy(kv.second.readyEvent);
-                        if (kv.second.gpuTensor.defined())
-                            retiredTensors.push_back(std::move(kv.second.gpuTensor));
+                        if (kv.second.gpuSlot >= 0)
+                            freeGpuSlots_.push_back(kv.second.gpuSlot);
+                        if (kv.second.downloadDone)
+                            freeSwDownloads_.push_back(kv.second.downloadDone);
 #endif
                         if (kv.second.yuv)
                             freeYuv.push_back(kv.second.yuv);
@@ -1281,10 +1901,23 @@ void VideoEncoder::encodeSubmitLoop()
         {
 #ifdef NELUX_ENABLE_CUDA
             if (entry.isGpu)
-                submitGpuToEncoder(entry.gpuTensor, entry.readyEvent);
+            {
+                submitGpuToEncoder(entry.gpuSlot);
+            }
             else
-#endif
+            {
+                // Sleeps (blocking-sync event) until the frame's YUV is
+                // down from the GPU.
+                if (entry.downloadDone)
+                    if (cudaError_t err = cudaEventSynchronize(entry.downloadDone);
+                        err != cudaSuccess)
+                        throw std::runtime_error("CUDA YUV download failed: " +
+                                                 std::string(cudaGetErrorString(err)));
                 submitYuvFrame(entry.yuv);
+            }
+#else
+            submitYuvFrame(entry.yuv);
+#endif
         }
         catch (...)
         {
@@ -1296,8 +1929,10 @@ void VideoEncoder::encodeSubmitLoop()
         {
             std::lock_guard<std::mutex> lk(mu);
 #ifdef NELUX_ENABLE_CUDA
-            if (entry.gpuTensor.defined())
-                retiredTensors.push_back(std::move(entry.gpuTensor));  // freed by caller under GIL
+            if (entry.gpuSlot >= 0)
+                freeGpuSlots_.push_back(entry.gpuSlot);  // copied out (or failed)
+            if (entry.downloadDone)
+                freeSwDownloads_.push_back(entry.downloadDone);
 #endif
             if (entry.yuv)
                 freeYuv.push_back(entry.yuv);
@@ -1309,71 +1944,724 @@ void VideoEncoder::encodeSubmitLoop()
 }
 
 #ifdef NELUX_ENABLE_CUDA
-void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t readyEvent)
+nelux::backends::cuda::RgbToYuvExactConverter*
+VideoEncoder::gpuConverterFor(AVPixelFormat srcFmt, bool needCpuBytes, cudaStream_t stream)
 {
-    // Destroy the producer-ready event on every exit path (any call below can
-    // throw). Declared first so it also covers a cudaSetDevice failure; the
-    // parameter is nulled so nothing double-frees it.
-    struct EventGuard
-    {
-        cudaEvent_t e;
-        ~EventGuard() { if (e) cudaEventDestroy(e); }
-    } eventGuard{readyEvent};
-    readyEvent = nullptr;
-    const cudaEvent_t producerReady = eventGuard.e;
+    using nelux::backends::cuda::RgbToYuvExactConverter;
 
-    int deviceIndex = gpuTensor.device().index();
-    if (deviceIndex < 0)
-        deviceIndex = 0;
-    if (cudaError_t cerr = cudaSetDevice(deviceIndex); cerr != cudaSuccess)
+    // A software encoder, and a CPU frame into NVENC, must see the CPU
+    // path's bytes. The kernels reproduce libswscale 10.1.102 on x86-64; one
+    // synthetic frame through both converters proves it for the libswscale
+    // actually loaded (an FFmpeg bump, a patched or non-x86 build), else the
+    // CPU path stays. A CUDA frame into NVENC needs no proof: either
+    // conversion is a correct one. Run once per process for each input the
+    // test depends on, when a caller first needs it: the verdict is shared by
+    // every encoder, the plan and converter stay per encoder.
+    auto prove = [&](GpuConverterEntry& e) {
+        int device = 0, ccMajor = 0, ccMinor = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&ccMajor, cudaDevAttrComputeCapabilityMajor, device);
+        cudaDeviceGetAttribute(&ccMinor, cudaDevAttrComputeCapabilityMinor, device);
+        using Key = std::tuple<int, int, int, int, int, int, int, int, int>;
+        static std::mutex verdictMutex;
+        static std::map<Key, bool> verdicts;
+        const Key key{srcFmt,           outputPixelFormat, width,   height, props.colorspace,
+                      props.colorRange, resizeFlags_,      ccMajor, ccMinor};
+        e.tested = true;
+        {
+            std::lock_guard<std::mutex> lock(verdictMutex);
+            auto it = verdicts.find(key);
+            if (it != verdicts.end())
+            {
+                e.matchesCpu = it->second;
+                return;
+            }
+        }
+        nelux::conversion::cpu::RGBToAutoConverter cpu(
+            width, height, outputPixelFormat, props.colorspace, props.colorRange, 0, 0,
+            resizeFlags_);
+        // The CPU path writes sws_scale's bytes: its AVX2 kernel stands in
+        // only where a probe proved it does. Without a verdict yet (the usual
+        // case for NVENC, whose packed CPU frames skip the CPU convert),
+        // compare against sws_scale itself rather than pay that probe, a
+        // sws_scale and a kernel pass of its own (~30 ms at 4K).
+        if (cpu.verdictPending(srcFmt))
+            cpu.setSimdEnabled(false);
+        const auto result = e.conv->selfTest(
+            [&](const void* rgb, AVFrame* out) {
+                nelux::Frame f;
+                f.get()->format = outputPixelFormat;
+                f.get()->width = width;
+                f.get()->height = height;
+                f.allocateBuffer(32);
+                cpu.convert(f, const_cast<void*>(rgb), srcFmt);
+                av_frame_unref(out);
+                if (av_frame_ref(out, f.get()) < 0)
+                    throw std::bad_alloc();
+            },
+            stream);
+        if (result == RgbToYuvExactConverter::SelfTestResult::Failed)
+        {
+            // Nothing was compared (an allocation, copy or launch failed, e.g.
+            // a transient out-of-memory), so no verdict is kept: only this
+            // encoder takes the CPU convert.
+            e.matchesCpu = false;
+            NELUX_WARN("Could not run the GPU RGB->YUV self-test for {}; this encoder "
+                       "takes the CPU convert",
+                       av_get_pix_fmt_name(outputPixelFormat));
+            return;
+        }
+        e.matchesCpu = result == RgbToYuvExactConverter::SelfTestResult::Match;
+        std::lock_guard<std::mutex> lock(verdictMutex);
+        // Two encoders can test the same key at once; the first verdict stored
+        // wins, and only it warns.
+        const auto [it, first] = verdicts.emplace(key, e.matchesCpu);
+        e.matchesCpu = it->second;
+        if (first && !e.matchesCpu)
+            NELUX_WARN("GPU RGB->YUV does not reproduce this libswscale's {} output; "
+                       "frames that need its bytes take the CPU convert",
+                       av_get_pix_fmt_name(outputPixelFormat));
+    };
+    auto usable = [&](GpuConverterEntry& e) -> RgbToYuvExactConverter* {
+        if (!e.conv || !needCpuBytes)
+            return e.conv.get();
+        if (!e.tested)
+            prove(e);
+        return e.matchesCpu ? e.conv.get() : nullptr;
+    };
+    for (auto& e : gpuConverters_)
+        if (e.srcFmt == srcFmt)
+            return usable(e);
+
+    // Built once per source layout and cached, including a "no kernel"
+    // answer, so the plan and the self-test are never paid per frame.
+    GpuConverterEntry e;
+    e.srcFmt = srcFmt;
+    if (RgbToYuvExactConverter::supported(width, height, srcFmt, outputPixelFormat,
+                                          props.colorspace, props.colorRange))
+        e.conv = std::make_unique<RgbToYuvExactConverter>(
+            width, height, srcFmt, outputPixelFormat, props.colorspace, props.colorRange, stream);
+    gpuConverters_.push_back(std::move(e));
+    return usable(gpuConverters_.back());
+}
+
+void VideoEncoder::ensureGpuSlots(int count)
+{
+    if (gpuPlanes_ == 0)
+    {
+        // Rows padded to 256 bytes: the kernels store 16 bytes at a time
+        // where a row allows it, and the copies take any pitch.
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(outputPixelFormat);
+        const int planes = av_pix_fmt_count_planes(outputPixelFormat);
+        int64_t offset = 0;
+        for (int p = 0; p < planes; ++p)
+        {
+            gpuRowBytes_[p] = av_image_get_linesize(outputPixelFormat, width, p);
+            gpuRows_[p] = p == 0 ? height : AV_CEIL_RSHIFT(height, d->log2_chroma_h);
+            gpuSlotPitch_[p] = (gpuRowBytes_[p] + 255) & ~int64_t(255);
+            gpuPlaneOffset_[p] = offset;
+            offset += gpuSlotPitch_[p] * gpuRows_[p];
+        }
+        gpuSlotBytes_ = offset;
+        gpuPlanes_ = planes;
+    }
+    while (static_cast<int>(gpuSlots_.size()) < count)
+    {
+        void* slot = nullptr;
+        cudaEvent_t ready = nullptr;
+        cudaError_t err = cudaMalloc(&slot, gpuSlotBytes_);
+        if (err == cudaSuccess)
+            err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            cudaFree(slot);
+            throw std::runtime_error("Failed to allocate a CUDA encode frame: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+        gpuSlotReady_.push_back(ready);
+        gpuSlots_.push_back(static_cast<uint8_t*>(slot));
+        std::lock_guard<std::mutex> lk(mu);
+        freeGpuSlots_.push_back(static_cast<int>(gpuSlots_.size()) - 1);
+    }
+}
+
+nelux::backends::cuda::RgbToYuvExactDest VideoEncoder::gpuSlotDest(int slot) const
+{
+    nelux::backends::cuda::RgbToYuvExactDest dst{};
+    for (int p = 0; p < gpuPlanes_; ++p)
+    {
+        dst.plane[p] = gpuSlots_[slot] + gpuPlaneOffset_[p];
+        dst.pitch[p] = gpuSlotPitch_[p];
+    }
+    return dst;
+}
+
+bool VideoEncoder::encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat srcFmt,
+                                   int inW, int inH)
+{
+    // NVENC takes every pair a kernel covers. A software encoder's frames
+    // must be the CPU path's bytes, so it also needs the CPU path's chroma
+    // filter (resize_filter changes swscale's same-size taps even with
+    // resize off) and a converter that passed its self-test.
+    const bool hw = encoder->isHardwareEncoder();
+    if (inW != width || inH != height || (!hw && resizeFlags_ != SWS_BILINEAR) ||
+        (hw && !encoder->getHwFramesCtx()))
+        return false;
+    // At an odd width into horizontally subsampled 8- to 10-bit planes the CPU
+    // path also writes the luma sample past each row (swscale's SIMD output
+    // does, and so does its AVX2 stand-in), and ljpeg and yuv4 code it. The
+    // download takes only the visible bytes, so those stage through the CPU
+    // convert.
+    if (!hw && (width & 1))
+    {
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(outputPixelFormat);
+        if (d && d->log2_chroma_w && d->comp[0].depth <= 10 && d->comp[0].shift == 0)
+            return false;
+    }
+
+    // Slots and filter tables live on the first CUDA frame's device; a
+    // frame from another device stages through the host instead.
+    const int dev = std::max<int>(frame.device().index(), 0);
+    if (gpuSlotDevice_ >= 0 && dev != gpuSlotDevice_)
+        return false;
+    if (cudaError_t err = cudaSetDevice(dev); err != cudaSuccess)
+        throw std::runtime_error("Failed to select CUDA device for encode: " +
+                                 std::string(cudaGetErrorString(err)));
+    gpuSlotDevice_ = dev;
+
+    // The convert is enqueued on the caller's current stream, behind the work
+    // that produced the tensor and ahead of anything the caller (or an NVDEC
+    // reader recycling its buffer) queues there next: encode_frame reads the
+    // frame as of the call, as it does for a CPU tensor.
+    cudaStream_t stream = nelux::currentCudaStream(dev);
+
+    auto* conv = gpuConverterFor(srcFmt, !hw, stream);
+    if (!conv)
+        return false;
+
+    // An integer frame holds srcFmt's samples, contiguous HWC or in a layout
+    // the kernels read through its strides (a CHW view, padded rows). A
+    // float frame is read where it lies and narrowed in the kernel, when the
+    // kernels read its layout and narrow as this torch does.
+    const int64_t channels = (srcFmt == AV_PIX_FMT_RGBA || srcFmt == AV_PIX_FMT_RGBA64LE) ? 4 : 3;
+    nelux::backends::cuda::RgbToYuvExactSource src{frame.data_ptr(), int64_t(width) * channels,
+                                                   channels, 1};
+    if (frame.is_floating_point())
+    {
+        if (!(exactFloatSource(frame, channels, width, src) && conv->reads(src) &&
+              cudaNarrowMatchesTorch(frame.scalar_type(),
+                                     srcFmt == AV_PIX_FMT_RGB48LE || srcFmt == AV_PIX_FMT_RGBA64LE,
+                                     dev, stream)))
+            return false;
+    }
+    else if (!frame.is_contiguous())
+    {
+        if (frame.dim() != 3 || frame.layout() != torch::kStrided)
+            return false;
+        src.rowStride = frame.stride(0);
+        src.pixelStride = frame.stride(1);
+        src.channelStride = frame.stride(2);
+        if (!conv->reads(src))
+            return false;
+    }
+
+    startEncodeWorkersIfNeeded();
+
+    if (hw)
+    {
+        // NVENC: convert into a device slot and return. The submit thread
+        // waits on the event, copies the slot into a hw frame and sends it,
+        // overlapped with the caller's next frame.
+        enqueueGpuSlot(stream, [&](const nelux::backends::cuda::RgbToYuvExactDest& dst) {
+            conv->convert(src, dst, stream);
+            // encode_frame returns before that convert runs, and the caller may
+            // drop the tensor straight away. Tell the caching allocator about
+            // the stream that still reads it: a tensor allocated on a side
+            // stream would otherwise go back to that stream's pool and be
+            // rewritten under the queued convert. A no-op when the tensor was
+            // allocated on this stream or does not come from the allocator.
+            // The CUDA stream handle comes through c10's device-guard
+            // registry, so this needs no link against c10_cuda.
+            const c10::Device cudaDev(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(dev));
+            frame.record_stream(
+                c10::impl::getDeviceGuardImpl(c10::DeviceType::CUDA)->getStream(cudaDev));
+        });
+        return true;
+    }
+
+    // Software encoder: convert into a slot, download only the YUV planes
+    // (half the bytes of RGB for 4:2:0) into a pooled frame and hand it
+    // straight to the submit thread; no staging copy, no convert worker.
+    // Nothing here waits for the GPU: the download is queued on
+    // swDownloadStream_ behind the convert, and the submit thread waits for
+    // it.
+    ensureFramePools();
+    ensureGpuSlots(2);
+    ensureSwDownload();
+    nelux::Frame* yuv = nullptr;
+    cudaEvent_t downloaded = nullptr;
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cvFree.wait(lk, [&] {
+            return (inFlight < static_cast<int64_t>(maxFramesInFlight) && !freeYuv.empty() &&
+                    !freeSwDownloads_.empty()) ||
+                   workerError;
+        });
+        if (workerError)
+        {
+            std::exception_ptr e = workerError;
+            std::rethrow_exception(e);
+        }
+        yuv = freeYuv.front();
+        freeYuv.pop_front();
+        downloaded = freeSwDownloads_.front();
+        freeSwDownloads_.pop_front();
+        ++inFlight;
+    }
+
+    try
+    {
+        // The frame takes a buffer from the host pool even when its own is
+        // writable, so it lands in page-locked memory.
+        AVFrame* f = yuv->get();
+        f->pts = AV_NOPTS_VALUE;
+        if (!swapInPooledBuffer(f, swHostPool_.get()))
+            prepareYuvForWrite(f);
+
+        const int slot = swNextSlot_;
+        cudaError_t err = cudaStreamWaitEvent(stream, swSlotCopied_[slot], 0);
+        if (err == cudaSuccess)
+        {
+            conv->convert(src, gpuSlotDest(slot), stream);
+            err = cudaEventRecord(swConverted_, stream);
+        }
+        if (err == cudaSuccess)
+            err = cudaStreamWaitEvent(swDownloadStream_, swConverted_, 0);
+        for (int p = 0; p < gpuPlanes_ && err == cudaSuccess; ++p)
+            err = cudaMemcpy2DAsync(f->data[p], f->linesize[p], gpuSlots_[slot] + gpuPlaneOffset_[p],
+                                    gpuSlotPitch_[p], gpuRowBytes_[p], gpuRows_[p],
+                                    cudaMemcpyDeviceToHost, swDownloadStream_);
+        if (err == cudaSuccess)
+            err = cudaEventRecord(swSlotCopied_[slot], swDownloadStream_);
+        if (err == cudaSuccess)
+            err = cudaEventRecord(downloaded, swDownloadStream_);
+        if (err != cudaSuccess)
+            throw std::runtime_error("CUDA YUV download failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        swNextSlot_ = slot ^ 1;
+        // The convert may still be queued when encode_frame returns, as into
+        // NVENC (see there).
+        const c10::Device cudaDev(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(dev));
+        frame.record_stream(
+            c10::impl::getDeviceGuardImpl(c10::DeviceType::CUDA)->getStream(cudaDev));
+    }
+    catch (...)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        freeYuv.push_back(yuv);
+        freeSwDownloads_.push_back(downloaded);
+        --inFlight;
+        cvFree.notify_all();
+        throw;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ReadyEntry& entry = readyMap[enqueueSeq++];
+        entry.yuv = yuv;
+        entry.downloadDone = downloaded;
+    }
+    cvReady.notify_one();
+    return true;
+}
+
+AVBufferRef* VideoEncoder::allocSwHostBuffer(void* opaque, size_t size)
+{
+    // Called by av_buffer_pool_get on the caller, under lifecycleMu_. The
+    // pool only frees its buffers once it is uninitialised and every buffer
+    // is back, which can be after this encoder is gone: the free callback
+    // needs nothing from it.
+    auto* self = static_cast<VideoEncoder*>(opaque);
+    if (self->swPinnedBuffers_ < self->swPinnedCap_)
+    {
+        void* host = nullptr;
+        if (cudaHostAlloc(&host, size, cudaHostAllocPortable) == cudaSuccess)
+        {
+            // The download writes only the picture (see yuvBufferPool).
+            std::memset(host, 0, size);
+            AVBufferRef* buf = av_buffer_create(
+                static_cast<uint8_t*>(host), size,
+                [](void*, uint8_t* data) { cudaFreeHost(data); }, nullptr, 0);
+            if (buf)
+            {
+                ++self->swPinnedBuffers_;
+                return buf;
+            }
+            cudaFreeHost(host);
+        }
+        else
+        {
+            cudaGetLastError();
+        }
+    }
+    return av_buffer_allocz(size);
+}
+
+void VideoEncoder::ensureSwDownload()
+{
+    if (swHostPool_)
+        return;
+    const AVBufferRef* b = yuvPool.front()->get()->buf[0];
+    if (!b)
+        throw std::runtime_error("Encoder frame has no buffer");
+
+    // One download per frame in flight. Page-locked memory covers every
+    // buffer out at once: the frames in flight, two being recycled and the
+    // ones a frame-threaded codec still references, capped at 256 MiB. 4K
+    // yuv420p is 12.4 MB a frame, so libx264/mpeg4 take 6-10 frames, 75-124
+    // MB; 1080p prores_ks on 24 threads had 30 out (8.3 MB each, 249 MB). A
+    // buffer past the cap is plain memory and its download synchronous, as
+    // it used to be.
+    const size_t frames = maxFramesInFlight + 2 + static_cast<size_t>(encoder->framesHeld());
+    swPinnedCap_ = std::max<size_t>(2, std::min(frames, (size_t(256) << 20) / b->size));
+
+    // Each piece is created once, so a call after a failed one resumes.
+    cudaError_t err = cudaSuccess;
+    if (!swDownloadStream_)
+        err = cudaStreamCreateWithFlags(&swDownloadStream_, cudaStreamNonBlocking);
+    if (err == cudaSuccess && !swConverted_)
+        err = cudaEventCreateWithFlags(&swConverted_, cudaEventDisableTiming);
+    for (cudaEvent_t& e : swSlotCopied_)
+        if (err == cudaSuccess && !e)
+            err = cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    // Blocking-sync: the submit thread sleeps on these. torch's primary
+    // context runs other host waits as spin-waits while cores are free.
+    while (err == cudaSuccess && swDownloads_.size() < maxFramesInFlight)
+    {
+        cudaEvent_t e = nullptr;
+        err = cudaEventCreateWithFlags(&e, cudaEventBlockingSync | cudaEventDisableTiming);
+        if (err == cudaSuccess)
+        {
+            swDownloads_.push_back(e);
+            std::lock_guard<std::mutex> lk(mu);
+            freeSwDownloads_.push_back(e);
+        }
+    }
+    if (err == cudaSuccess)
+    {
+        swHostPool_.reset(av_buffer_pool_init2(b->size, this, &allocSwHostBuffer, nullptr));
+        if (!swHostPool_)
+            throw std::bad_alloc();
+    }
+    if (err != cudaSuccess)
+        throw std::runtime_error("Failed to set up the CUDA YUV download: " +
+                                 std::string(cudaGetErrorString(err)));
+}
+
+bool VideoEncoder::pinStaging(std::vector<uint8_t>* staging, int device)
+{
+    if (stagingPinFailed_)
+        return false;
+    if (!stagingDone_ || stagingDoneDevice_ != device)
+    {
+        // Made on the stream's device; the caller's current one is put back.
+        int prevDev = device;
+        cudaGetDevice(&prevDev);
+        if (stagingDone_)
+            cudaEventDestroy(std::exchange(stagingDone_, nullptr));
+        cudaError_t err = cudaSetDevice(device);
+        if (err == cudaSuccess)
+            err = cudaEventCreateWithFlags(&stagingDone_,
+                                           cudaEventBlockingSync | cudaEventDisableTiming);
+        cudaSetDevice(prevDev);
+        if (err != cudaSuccess)
+        {
+            cudaGetLastError();
+            stagingDone_ = nullptr;
+            stagingPinFailed_ = true;
+            return false;
+        }
+        stagingDoneDevice_ = device;
+    }
+    void*& registered = pinnedStaging_[staging];
+    if (registered == staging->data())
+        return true;
+    if (cudaHostRegister(staging->data(), staging->capacity(), cudaHostRegisterPortable) !=
+        cudaSuccess)
+    {
+        cudaGetLastError();
+        pinnedStaging_.erase(staging);
+        stagingPinFailed_ = true;
+        return false;
+    }
+    registered = staging->data();
+    return true;
+}
+
+void VideoEncoder::unpinStaging(std::vector<uint8_t>* staging)
+{
+    auto it = pinnedStaging_.find(staging);
+    if (it == pinnedStaging_.end())
+        return;
+    cudaHostUnregister(it->second);
+    pinnedStaging_.erase(it);
+}
+
+void VideoEncoder::enqueueGpuSlot(
+    cudaStream_t stream,
+    const std::function<void(const nelux::backends::cuda::RgbToYuvExactDest&)>& fill)
+{
+    // Three keep NVENC fed (one converting, one copying out, one queued):
+    // six ran the same fps at 1080p and 4K with 42 MiB more VRAM at 4K.
+    ensureGpuSlots(std::min(static_cast<int>(maxFramesInFlight), 3));
+    int slot = -1;
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cvFree.wait(lk, [&] {
+            return (inFlight < static_cast<int64_t>(maxFramesInFlight) &&
+                    !freeGpuSlots_.empty()) ||
+                   workerError;
+        });
+        if (workerError)
+        {
+            std::exception_ptr e = workerError;
+            std::rethrow_exception(e);
+        }
+        slot = freeGpuSlots_.front();
+        freeGpuSlots_.pop_front();
+        ++inFlight;
+    }
+
+    try
+    {
+        fill(gpuSlotDest(slot));
+        cudaError_t err = cudaEventRecord(gpuSlotReady_[slot], stream);
+        if (err != cudaSuccess)
+            throw std::runtime_error("Failed to record the CUDA encode event: " +
+                                     std::string(cudaGetErrorString(err)));
+    }
+    catch (...)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        freeGpuSlots_.push_back(slot);
+        --inFlight;
+        cvFree.notify_all();
+        throw;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ReadyEntry entry;
+        entry.isGpu = true;
+        entry.gpuSlot = slot;
+        readyMap.emplace(enqueueSeq++, std::move(entry));
+    }
+    cvReady.notify_one();
+}
+
+bool VideoEncoder::encodeCpuFrameOnGpu(const torch::Tensor& frame,
+                                       const nelux::conversion::cpu::RowSource* rows,
+                                       AVPixelFormat srcFmt, int inW, int inH)
+{
+    // NVENC only, and only where the kernel writes the CPU path's bytes, so
+    // the bitstream is the one swscale's frame gave: no resize, swscale's
+    // bilinear taps, a converter that passes its self-test, and an even
+    // size. At an odd size NVENC also codes a padding column/row, which the
+    // CPU path's upload takes from swscale's row tail and a slot leaves
+    // undefined.
+    if (cpuOnGpuFailed_ || !encoder->isHardwareEncoder() || !encoder->getHwFramesCtx() ||
+        inW != width || inH != height || resizeFlags_ != SWS_BILINEAR || ((width | height) & 1))
+        return false;
+    // At every size: paired in one process on an RTX 3090, the slot path
+    // runs within 0.2-0.5% of the upload path's fps at 1440p and 4K (h264,
+    // hevc, p010, 4:4:4) for half the process CPU or less (4K h264 3.7 ->
+    // 1.8 ms per frame). The 2-3% gap that once kept 8-bit sources above
+    // 1080p on the upload path was run-to-run noise between processes.
+    // Decline a format no kernel covers before the first CUDA runtime call:
+    // without a CUDA torch, that call creates the runtime's primary context on
+    // device 0 (~224 MiB of VRAM, held until the process exits).
+    {
+        using nelux::backends::cuda::RgbToYuvExactConverter;
+        auto known = std::find_if(gpuConverters_.begin(), gpuConverters_.end(),
+                                  [&](const GpuConverterEntry& e) { return e.srcFmt == srcFmt; });
+        if (known == gpuConverters_.end())
+        {
+            if (!RgbToYuvExactConverter::supported(width, height, srcFmt, outputPixelFormat,
+                                                   props.colorspace, props.colorRange))
+            {
+                GpuConverterEntry none; // cached, as gpuConverterFor would
+                none.srcFmt = srcFmt;
+                gpuConverters_.push_back(std::move(none));
+                return false;
+            }
+        }
+        else if (!known->conv || (known->tested && !known->matchesCpu))
+            return false;
+    }
+
+    // The slots' device: NVENC's own context is on device 0, unless a CUDA
+    // frame already placed them. The caller's current device is put back.
+    const int dev = gpuSlotDevice_ >= 0 ? gpuSlotDevice_ : 0;
+    int prevDev = 0;
+    if (cudaGetDevice(&prevDev) != cudaSuccess || cudaSetDevice(dev) != cudaSuccess)
+    {
+        cudaGetLastError();
+        cpuOnGpuFailed_ = true;
+        return false;
+    }
+    struct DeviceRestore
+    {
+        int prev, cur;
+        ~DeviceRestore() { if (prev != cur) cudaSetDevice(prev); }
+    } restore{prevDev, dev};
+
+    // nelux's own stream rather than torch's current one, which needs a
+    // CUDA torch: a CPU-only torch can still drive NVENC.
+    if (!cpuUploadStream_)
+    {
+        if (cudaStreamCreateWithFlags(&cpuUploadStream_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&cpuUploadDone_,
+                                     cudaEventBlockingSync | cudaEventDisableTiming) != cudaSuccess)
+        {
+            cudaGetLastError();
+            NELUX_WARN("Could not set up the GPU convert for CPU frames into {}; "
+                       "they take the CPU convert",
+                       props.codec);
+            cpuOnGpuFailed_ = true;
+            return false;
+        }
+    }
+    gpuSlotDevice_ = dev;
+
+    auto* conv = gpuConverterFor(srcFmt, true, cpuUploadStream_);
+    if (!conv)
+        return false;
+
+    const int64_t channels = (srcFmt == AV_PIX_FMT_RGBA || srcFmt == AV_PIX_FMT_RGBA64LE) ? 4 : 3;
+    // A frame the row loader reads is filled here as the packed tensor would
+    // be, into one of two page-locked buffers (cpuRgbPinned_) the DMA reads
+    // directly, rather than pageable memory the driver copies again into its
+    // own staging (12.4 MB per 1080p RGB48 frame). A buffer is reused once its
+    // blocking-sync event says its DMA is done.
+    const void* host = frame.data_ptr();
+    size_t bytes = frame.nbytes();
+    CpuRgbPinned* staged = nullptr;
+    if (rows)
+    {
+        const ptrdiff_t stride = static_cast<ptrdiff_t>(width) * channels * 2;
+        bytes = static_cast<size_t>(stride) * height;
+        staged = nextCpuRgbPinned(bytes);
+        uint8_t* dst = staged ? staged->host : nullptr;
+        if (!dst)
+        {
+            cpuRgbHost_.resize(bytes);
+            dst = cpuRgbHost_.data();
+        }
+        nelux::conversion::cpu::loadRowsU16(*rows, width, 0, height, dst, stride);
+        host = dst;
+    }
+    if (cpuRgbBytes_ < bytes)
+    {
+        cudaFree(cpuRgbDevice_);  // waits for the kernels still reading it
+        cpuRgbDevice_ = nullptr;
+        cpuRgbBytes_ = 0;
+        if (cudaError_t err = cudaMalloc(&cpuRgbDevice_, bytes); err != cudaSuccess)
+            throw std::runtime_error("Failed to allocate a CUDA encode frame: " +
+                                     std::string(cudaGetErrorString(err)));
+        cpuRgbBytes_ = bytes;
+    }
+
+    // From pageable memory cudaMemcpyAsync returns once the driver has staged
+    // the bytes, so the caller may reuse the tensor as soon as encode_frame
+    // returns, as with the staging copy. From pinned memory the DMA reads the
+    // tensor itself and is waited for, sleeping rather than spinning.
+    bool pinned = false;
+    if (!rows)
+    {
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, host) == cudaSuccess)
+            pinned = attr.type == cudaMemoryTypeHost;
+        else
+            cudaGetLastError();
+    }
+
+    const nelux::backends::cuda::RgbToYuvExactSource src{cpuRgbDevice_, int64_t(width) * channels,
+                                                         channels, 1};
+    startEncodeWorkersIfNeeded();
+    // One RGB buffer is enough: the next frame's upload queues on the same
+    // stream behind this frame's convert.
+    enqueueGpuSlot(cpuUploadStream_, [&](const nelux::backends::cuda::RgbToYuvExactDest& dst) {
+        cudaError_t err = cudaMemcpyAsync(cpuRgbDevice_, host, bytes, cudaMemcpyHostToDevice,
+                                          cpuUploadStream_);
+        if (err == cudaSuccess && staged)
+            err = cudaEventRecord(staged->done, cpuUploadStream_);
+        if (err == cudaSuccess && pinned)
+            err = cudaEventRecord(cpuUploadDone_, cpuUploadStream_);
+        if (err == cudaSuccess && pinned)
+            err = cudaEventSynchronize(cpuUploadDone_);
+        if (err != cudaSuccess)
+            throw std::runtime_error("CUDA upload of the encode frame failed: " +
+                                     std::string(cudaGetErrorString(err)));
+        conv->convert(src, dst, cpuUploadStream_);
+    });
+    return true;
+}
+
+VideoEncoder::CpuRgbPinned* VideoEncoder::nextCpuRgbPinned(size_t bytes)
+{
+    if (cpuRgbPinFailed_)
+        return nullptr;
+    CpuRgbPinned& b = cpuRgbPinned_[cpuRgbNext_];
+    cudaError_t err = b.done ? cudaEventSynchronize(b.done) // its last DMA
+                             : cudaEventCreateWithFlags(&b.done, cudaEventBlockingSync |
+                                                                     cudaEventDisableTiming);
+    if (err == cudaSuccess && b.size < bytes)
+    {
+        cudaFreeHost(std::exchange(b.host, nullptr));
+        b.size = 0;
+        err = cudaHostAlloc(reinterpret_cast<void**>(&b.host), bytes, cudaHostAllocPortable);
+        if (err == cudaSuccess)
+            b.size = bytes;
+    }
+    if (err != cudaSuccess)
+    {
+        cudaGetLastError();
+        cpuRgbPinFailed_ = true; // pageable from then on
+        return nullptr;
+    }
+    cpuRgbNext_ ^= 1;
+    return &b;
+}
+
+void VideoEncoder::submitGpuToEncoder(int gpuSlot)
+{
+    // The slot goes back to the pool in encodeSubmitLoop.
+    if (cudaError_t cerr = cudaSetDevice(gpuSlotDevice_); cerr != cudaSuccess)
         throw std::runtime_error("Failed to select CUDA device for NVENC encode: " +
                                  std::string(cudaGetErrorString(cerr)));
 
-    // Lazy one-time init of the encode stream + GPU converter, owned by the
-    // worker thread that exclusively uses them.
+    // Lazy one-time init of the copy stream and its done event, owned by this
+    // thread. The event is blocking-sync: torch's primary context schedules
+    // host waits as spin-waits when cores are free, so a cudaStreamSynchronize
+    // here burned a core for the whole convert + copy (~0.2 ms/frame at 1080p,
+    // ~0.8 ms at 4K). Only this thread records and waits on it, one frame at a
+    // time, so reusing it is safe.
+    //
+    // Also with NVENC in the slots' own context (Encoder::sharedCudaStream),
+    // where its stream could order the copy instead: NVENC then waits for
+    // that stream on the host itself, spinning under torch's scheduling for
+    // as long as the caller's stream holds the convert back.
     if (!encoderStream)
     {
         if (cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking) != cudaSuccess)
             throw std::runtime_error("Failed to create NVENC CUDA stream");
     }
-    if (!gpuConverter)
+    if (!encoderCopyDone)
     {
-        gpuConverter = std::make_unique<nelux::conversion::gpu::RGBToAutoGPUConverter>(
-            width, height, outputPixelFormat, encoderStream);
-
-        int gpuCs;
-        switch (props.colorspace)
-        {
-        case AVCOL_SPC_BT709:
-            gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT709;
-            break;
-        case AVCOL_SPC_BT2020_NCL:
-        case AVCOL_SPC_BT2020_CL:
-            gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT2020;
-            break;
-        case AVCOL_SPC_BT470BG:
-        case AVCOL_SPC_SMPTE170M:
-            gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT601;
-            break;
-        default:
-            gpuCs = nelux::backends::cuda::ColorSpaceEncode_BT709;
-            break;
-        }
-        gpuConverter->setColorSpace(gpuCs);
-        gpuConverter->setColorRange(props.colorRange == AVCOL_RANGE_JPEG
-                                        ? nelux::backends::cuda::ColorRangeEncode_Full
-                                        : nelux::backends::cuda::ColorRangeEncode_Limited);
+        if (cudaEventCreateWithFlags(&encoderCopyDone,
+                                     cudaEventBlockingSync | cudaEventDisableTiming) != cudaSuccess)
+            throw std::runtime_error("Failed to create NVENC CUDA event");
     }
-
-    // Make the encode stream wait until the producer (decode + dtype ops) has
-    // finished writing the tensor, so the convert below never reads stale data.
-    if (producerReady)
-        cudaStreamWaitEvent(encoderStream, producerReady, 0);
-
-    // RGB24 -> NV12/YUV on the GPU (writes into the converter's CUDA buffer).
-    gpuConverter->convert(
-        reinterpret_cast<const uint8_t*>(gpuTensor.data_ptr<uint8_t>()),
-        width * 3);  // RGB24 pitch
 
     AVBufferRef* hwFramesCtx = encoder->getHwFramesCtx();
     if (!hwFramesCtx)
@@ -1384,12 +2672,25 @@ void VideoEncoder::submitGpuToEncoder(torch::Tensor& gpuTensor, cudaEvent_t read
     hwFrame.get()->width = width;
     hwFrame.get()->height = height;
 
-    // Device-to-device copy into the CUDA AVFrame, then sync THIS stream (the
-    // worker blocks here, not the caller) before handing the frame to NVENC.
-    gpuConverter->copyToCudaFrame(hwFrame.get());
-    gpuConverter->synchronize();
+    // Device-to-device copy into the CUDA AVFrame once the convert has run,
+    // then wait for THIS stream (the worker sleeps here, not the caller)
+    // before handing the frame to NVENC. In NVENC's own context the copy
+    // crosses contexts, which costs the CPU more than the copy itself.
+    AVFrame* hw = hwFrame.get();
+    cudaError_t err = cudaStreamWaitEvent(encoderStream, gpuSlotReady_[gpuSlot], 0);
+    for (int p = 0; p < gpuPlanes_ && err == cudaSuccess; ++p)
+        err = cudaMemcpy2DAsync(hw->data[p], hw->linesize[p], gpuSlots_[gpuSlot] + gpuPlaneOffset_[p],
+                                gpuSlotPitch_[p], gpuRowBytes_[p], gpuRows_[p],
+                                cudaMemcpyDeviceToDevice, encoderStream);
+    if (err == cudaSuccess)
+        err = cudaEventRecord(encoderCopyDone, encoderStream);
+    if (err == cudaSuccess)
+        err = cudaEventSynchronize(encoderCopyDone);
+    if (err != cudaSuccess)
+        throw std::runtime_error("CUDA copy into the NVENC frame failed: " +
+                                 std::string(cudaGetErrorString(err)));
 
-    encoder->encodeFrame(hwFrame);  // eventGuard frees producerReady on return/throw
+    encoder->encodeFrame(hwFrame);
 }
 #endif
 
@@ -1408,8 +2709,7 @@ void VideoEncoder::stopEncodeWorkers()
     // The GIL is not held here, and must not be: joining is a blocking wait, and
     // stalling every other Python thread for its duration would be rude. Note
     // this is politeness, NOT deadlock avoidance — the workers never take the
-    // GIL (that is the whole point of retiredTensors: the submit thread MOVES
-    // tensors out and the caller frees them), so a join under the GIL would
+    // GIL (no torch tensor ever reaches them), so a join under the GIL would
     // merely be slow.
     //
     // Do NOT "restore" a release-if-we-hold-it branch here. Releasing the GIL
@@ -1473,10 +2773,8 @@ void VideoEncoder::close()
     // caller blocks on the lock, then finds `encoder` already swapped out and
     // does nothing.
     //
-    // underEncoderLock drops the GIL BEFORE taking the lock. That is what lets
-    // the holder re-acquire the GIL mid-teardown (it does, to free retired CUDA
-    // tensors) without deadlocking a waiter: no thread is ever parked on
-    // lifecycleMu_ while holding the GIL.
+    // underEncoderLock drops the GIL BEFORE taking the lock, so no thread is
+    // ever parked on lifecycleMu_ while holding the GIL.
     underEncoderLock([this] { closeLocked(); });
 }
 
@@ -1485,16 +2783,38 @@ torch::Tensor VideoEncoder::getEncodedData()
     return underEncoderLock([this] {
         if (!memoryOutput_) throw std::invalid_argument("Encoded data is available only for a memory destination");
         closeLocked();
-        if (encodedOutput_.empty()) throw std::runtime_error("Memory output did not produce a complete encoded stream");
-        auto result = torch::empty({static_cast<int64_t>(encodedOutput_.size())}, torch::kUInt8);
-        if (!encodedOutput_.empty())
-            std::memcpy(result.data_ptr(), encodedOutput_.data(), encodedOutput_.size());
-        return result;
+        if (encodedData_.defined()) return encodedData_;
+        const int64_t bytes = encodedOutput_.size();
+        if (bytes == 0) throw std::runtime_error("Memory output did not produce a complete encoded stream");
+        // The muxer wrote into one reserved range: the tensor takes it over
+        // without a copy. Its deleter holds only the range, so the tensor
+        // outlives this encoder. Chunked or small output is copied out.
+        const auto block = encodedOutput_.takeBlock();
+        if (block.data)
+        {
+            encodedData_ = torch::from_blob(
+                block.data, {bytes},
+                [reserved = block.reserved](void* data) {
+                    nelux::Encoder::MemoryOutput::releaseBlock(static_cast<uint8_t*>(data), reserved);
+                },
+                torch::kUInt8);
+        }
+        else
+        {
+            encodedData_ = torch::empty({bytes}, torch::kUInt8);
+            encodedOutput_.copyTo(encodedData_.data_ptr<uint8_t>());
+            encodedOutput_ = {};
+        }
+        return encodedData_;
     });
 }
 
 void VideoEncoder::closeLocked()
 {
+    // Normally long done: the first frame waited for its verdict. An encoder
+    // closed before its first frame waits out the probe here, without the GIL.
+    verdictProbe_.join();
+
     // Drain + join the encode workers FIRST so every queued frame is sent to the
     // codec before we flush. Flushing (encoder->close sends a null frame) must
     // happen only after the last real frame.
@@ -1506,7 +2826,7 @@ void VideoEncoder::closeLocked()
     // workersStarted true and convertWorkers uncleared — not the wedged
     // combination described below.) A later close() then has nothing to drain,
     // but the ordering matters for a second reason:
-    // gpuConverter->synchronize() below raises on a sticky CUDA error, and if
+    // the CUDA teardown below can raise on a sticky CUDA error, and if
     // `encoder` were still set when it did, the exception would propagate out of
     // close() leaving a live Python object in the one state stopEncodeWorkers()
     // cannot recover from — workersStarted false, convertStarted true, zero
@@ -1521,12 +2841,79 @@ void VideoEncoder::closeLocked()
     enc.swap(encoder);
 
 #ifdef NELUX_ENABLE_CUDA
-    if (gpuConverter)
+    // Every admitted frame has been copied out of its slot by now (the submit
+    // thread synced each copy), and cudaFree waits for any kernel an
+    // errored-out pipeline left queued on a caller stream.
+    if (gpuSlotDevice_ >= 0)
     {
-        gpuConverter->synchronize();
-        gpuConverter.reset();
+        int prevDev = gpuSlotDevice_;
+        cudaGetDevice(&prevDev);
+        cudaSetDevice(gpuSlotDevice_);
+        // An errored-out pipeline can leave downloads queued into host frames.
+        if (swDownloadStream_)
+        {
+            cudaStreamSynchronize(swDownloadStream_);
+            cudaStreamDestroy(swDownloadStream_);
+            swDownloadStream_ = nullptr;
+        }
+        for (cudaEvent_t& e : swSlotCopied_)
+            if (e)
+                cudaEventDestroy(std::exchange(e, nullptr));
+        if (swConverted_)
+            cudaEventDestroy(std::exchange(swConverted_, nullptr));
+        for (cudaEvent_t e : swDownloads_)
+            cudaEventDestroy(e);
+        swDownloads_.clear();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            freeSwDownloads_.clear();
+        }
+        for (uint8_t* slot : gpuSlots_)
+            cudaFree(slot);
+        gpuSlots_.clear();
+        for (cudaEvent_t e : gpuSlotReady_)
+            cudaEventDestroy(e);
+        gpuSlotReady_.clear();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            freeGpuSlots_.clear();
+        }
+        gpuConverters_.clear();
+        cudaFree(cpuRgbDevice_);
+        cpuRgbDevice_ = nullptr;
+        cpuRgbBytes_ = 0;
+        std::vector<uint8_t>().swap(cpuRgbHost_);
+        for (CpuRgbPinned& b : cpuRgbPinned_)
+        {
+            if (b.done)
+            {
+                cudaEventSynchronize(b.done);
+                cudaEventDestroy(std::exchange(b.done, nullptr));
+            }
+            if (b.host)
+                cudaFreeHost(std::exchange(b.host, nullptr));
+            b.size = 0;
+        }
+        if (cpuUploadDone_)
+            cudaEventDestroy(cpuUploadDone_);
+        cpuUploadDone_ = nullptr;
+        if (cpuUploadStream_)
+            cudaStreamDestroy(cpuUploadStream_);
+        cpuUploadStream_ = nullptr;
+        cudaSetDevice(prevDev);
     }
 
+    if (encoderCopyDone)
+    {
+        cudaEventDestroy(encoderCopyDone);
+        encoderCopyDone = nullptr;
+    }
+    // The workers that read the staging buffers have exited.
+    for (auto& [staging, registered] : pinnedStaging_)
+        cudaHostUnregister(registered);
+    pinnedStaging_.clear();
+    if (stagingDone_)
+        cudaEventDestroy(std::exchange(stagingDone_, nullptr));
     if (encoderStream)
     {
         cudaStreamDestroy(encoderStream);
@@ -1548,62 +2935,34 @@ void VideoEncoder::closeLocked()
         // than an active check.
         assert(!PyGILState_Check() &&
                "closeLocked() must run under lifecycleMu_ with the GIL dropped");
+        {
+            // A worker error not yet raised counts like one encode_frame raised.
+            std::lock_guard<std::mutex> lk(mu);
+            if (workerError)
+                enc->markFailed();
+        }
         enc->close();
-        if (memoryOutput_) encodedOutput_ = enc->takeOutputBytes();
+        if (memoryOutput_) encodedOutput_ = enc->takeOutput();
         enc.reset();
     }
 
 #ifdef NELUX_ENABLE_CUDA
-    // Drain any GPU tensors the submit thread retired but the caller didn't get
-    // to free.
-    //
-    // This needs `mu`, not just lifecycleMu_. stopEncodeWorkers() above excluded
-    // the WORKER threads, but not a concurrent encode_frame: its prologue swaps
-    // this same deque holding `mu` alone, deliberately outside lifecycleMu_ (it
-    // has to free under the GIL). `mu` is therefore the only lock the two have
-    // in common, and touching the deque without it is a data race.
-    //
-    // `mu` here is load-bearing, not belt-and-braces. It would be tempting to
-    // think the GIL covers this: the prologue holds the GIL continuously from
-    // the pybind entry through its swap, so anything else that also held the GIL
-    // would be excluded for free. That is exactly why the old shape survived —
-    // its clear() ran under gil_scoped_acquire and so could never overlap the
-    // swap. What was NOT covered was the `if (!retiredTensors.empty())` probe
-    // that guarded it: closeLocked() reaches this point with the GIL already
-    // dropped by underEncoderLock and without `mu`, so that read raced the
-    // prologue's write. The guard is gone and the swap below runs GIL-dropped,
-    // which means the GIL no longer serialises anything here and `mu` is the
-    // only thing that does.
-    //
-    // Swap out under `mu`, drop `mu`, and only THEN free. `mu` must never be
-    // held across the GIL acquisition below — see the invariant on `mu` in the
-    // header: encode_frame's prologue blocks on `mu` while holding the GIL, so a
-    // "hold `mu`, want GIL" edge here would close that into a real deadlock.
+    // Unlock the page-locked frames now rather than when Python drops the
+    // encoder: the codec has let go of them, and nothing encodes again.
+    if (swHostPool_)
     {
-        std::deque<torch::Tensor> toFree;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            toFree.swap(retiredTensors);
-        }
-        if (!toFree.empty())
-        {
-            // Freeing a CUDA tensor can re-enter Python — a tensor imported via
-            // DLPack carries a capsule deleter that does — so this needs the
-            // GIL. We got here through underEncoderLock, which already dropped
-            // it, so re-acquire.
-            //
-            // gil_scoped_acquire also covers the destructor-on-a-non-Python-
-            // thread case, but NOT teardown after Py_Finalize: PyGILState_Ensure
-            // is fatal there. Nothing in this class can prevent that — an
-            // encoder still holding retired tensors when the interpreter is
-            // finalising is already past the point where its memory can be
-            // released safely — so the contract is simply that encoders are
-            // closed (or dropped) before interpreter shutdown, which __exit__,
-            // an explicit close() and ordinary refcounting all satisfy.
-            pybind11::gil_scoped_acquire gil;
-            toFree.clear();
-        }
+        for (auto& f : yuvPool)
+            av_frame_unref(f->get());
+        swHostPool_.reset();
     }
+    // Their uploads are done (NVENC has coded every frame); unref unregisters.
+    for (auto& [frame, pinned] : pinnedYuv_)
+    {
+        cudaEventSynchronize(pinned.uploaded);
+        cudaEventDestroy(pinned.uploaded);
+        av_frame_unref(const_cast<AVFrame*>(frame));
+    }
+    pinnedYuv_.clear();
 #endif
 
     // Surface any error the worker hit mid-stream (it kept draining to avoid a
@@ -1611,9 +2970,9 @@ void VideoEncoder::closeLocked()
     //
     // Under `mu`, which is where the workers publish it. They are joined by now
     // so this is uncontended, but workerError is listed as `mu`-protected in the
-    // header and reading it through lifecycleMu_ alone would be the same shape
-    // of violation just fixed for retiredTensors above — benign by coincidence
-    // rather than by rule, and the next reader cannot tell those apart.
+    // header and reading it through lifecycleMu_ alone would be benign by
+    // coincidence rather than by rule, and the next reader cannot tell those
+    // apart.
     //
     // Keep the copy-then-null shape and the rethrow OUTSIDE the lock. Collapsing
     // this to a rethrow of std::exchange(workerError, nullptr) under `mu` looks
@@ -1651,6 +3010,212 @@ VideoEncoder::~VideoEncoder()
         {
         }
     }
+    // Python objects: drop them under the GIL. pybind11 frees the encoder with
+    // the GIL held, so this acquire is normally re-entrant.
+    if (destination_ || destinationError_)
+    {
+        pybind11::gil_scoped_acquire gil;
+        destinationError_ = pybind11::object();
+        destination_ = pybind11::object();
+    }
+}
+
+namespace
+{
+// A thread that waits for the GIL while the interpreter finalizes never gets
+// it, and the thread joining it would hang with it. An encoder dropped
+// unclosed at exit therefore stops writing its stream instead.
+bool destinationUnreachable()
+{
+    return !PyGILState_Check() && Py_IsFinalizing();
+}
+
+void raiseOSError(const char* message)
+{
+    PyErr_SetString(PyExc_OSError, message);
+    throw pybind11::error_already_set();
+}
+
+// Under the GIL. The first failure is the one to report.
+void recordDestinationError(pybind11::object& slot, pybind11::object error)
+{
+    if (!slot)
+        slot = std::move(error);
+}
+
+int releaseLastReference(void* object)
+{
+    Py_DECREF(static_cast<PyObject*>(object));
+    return 0;
+}
+
+// Holds the encoder's Python object while its stream's write/seek runs, under
+// the GIL. That Python code (a garbage collection inside write(), say) could
+// otherwise free a dropped encoder on the submit thread itself: ~VideoEncoder
+// cannot join the thread it runs on, and the muxer below it would go on
+// writing into the freed encoder. With the reference held, a collection sees
+// the encoder reachable. Dropping the last reference here would free it the
+// same way, so that one is dropped on the main thread instead. An encoder
+// already being freed (no Python object left: its destructor is closing it on
+// another thread) is not held.
+class HoldEncoderObject
+{
+  public:
+    explicit HoldEncoderObject(const VideoEncoder* encoder)
+        : self_(pybind11::detail::get_object_handle(
+              encoder, pybind11::detail::get_type_info(typeid(VideoEncoder))))
+    {
+        self_.inc_ref();
+    }
+    ~HoldEncoderObject()
+    {
+        if (!self_)
+            return;
+        if (Py_REFCNT(self_.ptr()) > 1)
+            self_.dec_ref();
+        else if (Py_AddPendingCall(&releaseLastReference, self_.ptr()) != 0)
+        {
+            // The queue is full: leak the encoder rather than free it here.
+        }
+    }
+    HoldEncoderObject(const HoldEncoderObject&) = delete;
+    HoldEncoderObject& operator=(const HoldEncoderObject&) = delete;
+
+  private:
+    pybind11::handle self_;
+};
+} // namespace
+
+int VideoEncoder::writeDestination(const uint8_t* data, int size)
+{
+    if (destinationUnreachable())
+        return AVERROR(EIO);
+    pybind11::gil_scoped_acquire gil;
+    if (!destination_)
+        return AVERROR(EIO);
+    HoldEncoderObject hold(this);
+    destinationThread_ = std::this_thread::get_id();
+    int result = AVERROR(EIO);
+    try
+    {
+        // Copies, not views of the AVIO buffer: the stream may keep what it
+        // is given, and the buffer is reused for the next write. At most
+        // 256 KiB each: a 1 MiB bytes object is a fresh VirtualAlloc that
+        // faults in 257 pages, 0.2 ms per MiB, where the heap reuses the
+        // smaller blocks (0.016 ms per MiB). 25 MB exr frames spent 5 ms a
+        // frame on it.
+        constexpr int kMaxPiece = 256 << 10;
+        pybind11::object write = destination_.attr("write");
+        for (int offset = 0; offset < size; offset += kMaxPiece)
+        {
+            const int pieceSize = std::min(kMaxPiece, size - offset);
+            pybind11::bytes chunk(reinterpret_cast<const char*>(data) + offset,
+                                  size_t(pieceSize));
+            pybind11::object pending = chunk;
+            int64_t position = 0;
+            while (position < pieceSize)
+            {
+                // Short writes resume where the stream stopped, as in
+                // nelux.encoding.write_encoded.
+                pybind11::object written = write(pending);
+                long long count =
+                    PyLong_Check(written.ptr()) ? PyLong_AsLongLong(written.ptr()) : -1;
+                if (count == -1 && PyErr_Occurred())
+                    PyErr_Clear();
+                if (count <= 0 || count > pieceSize - position)
+                    raiseOSError("Binary destination did not accept the encoded data");
+                position += count;
+                if (position < pieceSize)
+                    pending =
+                        pybind11::memoryview(chunk)[pybind11::slice(position, pieceSize, 1)];
+            }
+        }
+        result = size;
+    }
+    catch (pybind11::error_already_set& e)
+    {
+        recordDestinationError(destinationError_, e.value());
+    }
+    catch (const std::exception& e)
+    {
+        recordDestinationError(destinationError_,
+                               pybind11::reinterpret_borrow<pybind11::object>(PyExc_OSError)(e.what()));
+    }
+    destinationThread_ = std::thread::id();
+    return result;
+}
+
+int64_t VideoEncoder::seekDestination(int64_t offset, int whence)
+{
+    if (destinationUnreachable())
+        return AVERROR(EIO);
+    pybind11::gil_scoped_acquire gil;
+    if (!destination_)
+        return AVERROR(EIO);
+    HoldEncoderObject hold(this);
+    destinationThread_ = std::this_thread::get_id();
+    int64_t result = AVERROR(EIO);
+    try
+    {
+        pybind11::object seek = destination_.attr("seek");
+        // io streams return the new position; ask tell() of one that does not.
+        auto seekTo = [&](int64_t position, int from)
+        {
+            pybind11::object moved = seek(position, from);
+            return moved.is_none() ? destination_.attr("tell")().cast<int64_t>()
+                                   : moved.cast<int64_t>();
+        };
+        whence &= ~AVSEEK_FORCE;
+        if (whence == AVSEEK_SIZE)
+        {
+            const int64_t here = destination_.attr("tell")().cast<int64_t>();
+            result = seekTo(0, SEEK_END) - destinationBase_;
+            seekTo(here, SEEK_SET);
+        }
+        else if (whence == SEEK_SET)
+            result = seekTo(destinationBase_ + offset, SEEK_SET) - destinationBase_;
+        else if (whence == SEEK_CUR || whence == SEEK_END)
+            result = seekTo(offset, whence) - destinationBase_;
+        else
+            result = AVERROR(EINVAL);
+    }
+    catch (pybind11::error_already_set& e)
+    {
+        recordDestinationError(destinationError_, e.value());
+    }
+    catch (const std::exception& e)
+    {
+        recordDestinationError(destinationError_,
+                               pybind11::reinterpret_borrow<pybind11::object>(PyExc_OSError)(e.what()));
+    }
+    destinationThread_ = std::thread::id();
+    return result;
+}
+
+void VideoEncoder::rejectDestinationReentry() const
+{
+    if (destinationThread_.load() == std::this_thread::get_id())
+        throw std::runtime_error(
+            "Cannot use an encoder from its destination's write or seek method");
+    if (signalHandlerThread_.load() == std::this_thread::get_id())
+        throw std::runtime_error(
+            "Cannot use an encoder from a signal handler while it transcodes");
+}
+
+void VideoEncoder::raiseDestinationError(bool failed)
+{
+    // destination_ is set before any callback can run and cleared only in the
+    // destructor, so the unlocked null check is a plain read.
+    if (!destination_ || destinationUnreachable())
+        return;
+    pybind11::gil_scoped_acquire gil;
+    // Under the GIL, as recordDestinationError fills the slot.
+    if (!destinationError_ || (!failed && destinationErrorReported_))
+        return;
+    destinationErrorReported_ = true;
+    PyErr_SetObject(reinterpret_cast<PyObject*>(Py_TYPE(destinationError_.ptr())),
+                    destinationError_.ptr());
+    throw pybind11::error_already_set();
 }
 
 } // namespace nelux

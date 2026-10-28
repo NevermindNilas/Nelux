@@ -1,5 +1,6 @@
 ﻿#include "VideoEncoder.hpp"
 #include "VideoReader.hpp"
+#include "Transcode.hpp"
 #include <spdlog/spdlog.h>
 #include "StreamMuxer.hpp"
 #include "AudioDecoder.hpp"
@@ -11,6 +12,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
+
+#ifdef NELUX_ENABLE_CUDA
+#include <CudaStream.hpp>
+#endif
 
 extern "C"
 {
@@ -190,6 +195,115 @@ PYBIND11_MODULE(_nelux, m)
     });
     m.def("_encode_jpeg_cuda", &nelux::encodeJpegCUDA, py::call_guard<py::gil_scoped_release>());
     m.def("_encode_jpeg_cpu", &nelux::encodeJpegCPU, py::call_guard<py::gil_scoped_release>());
+    // Test hook (tests/test_nvenc_context_cache.py): which CUDA device, if
+    // any, is idle for the next NVENC encoder.
+    m.def("_nvenc_idle_device", &nelux::Encoder::idleHardwareDeviceId);
+    // Test hook (tests/test_simd_rgb_to_yuv.py, tests/test_simd_rgb_to_rgb.py):
+    // one encode-side RGBToAutoConverter pass over a packed RGB buffer into
+    // any destination, with its AVX2 kernels allowed or not. Returns the
+    // destination's visible bytes, tightly packed, and whether a kernel ran.
+    m.def("_convert_rgb_to_yuv", [](const py::bytes& src, const std::string& srcFmt,
+                                    const std::string& dstFmt, int width, int height,
+                                    int colorspace, int colorRange, bool simd, int align) {
+        const AVPixelFormat srcPixFmt = av_get_pix_fmt(srcFmt.c_str());
+        const AVPixelFormat dstPixFmt = av_get_pix_fmt(dstFmt.c_str());
+        if (srcPixFmt == AV_PIX_FMT_NONE || dstPixFmt == AV_PIX_FMT_NONE)
+            throw std::invalid_argument("unknown pixel format");
+        std::string input = src;
+        if (static_cast<int>(input.size()) !=
+            av_image_get_buffer_size(srcPixFmt, width, height, 1))
+            throw std::invalid_argument("source size does not match format and geometry");
+
+        nelux::Frame frame;
+        frame.get()->format = dstPixFmt;
+        frame.get()->width = width;
+        frame.get()->height = height;
+        frame.allocateBuffer(align);
+        nelux::conversion::cpu::RGBToAutoConverter converter(
+            width, height, dstPixFmt, static_cast<AVColorSpace>(colorspace),
+            static_cast<AVColorRange>(colorRange));
+        converter.setSimdEnabled(simd);
+        {
+            py::gil_scoped_release release;
+            converter.convert(frame, input.data(), srcPixFmt);
+        }
+
+        std::string out(av_image_get_buffer_size(dstPixFmt, width, height, 1), '\0');
+        av_image_copy_to_buffer(reinterpret_cast<uint8_t*>(out.data()),
+                                static_cast<int>(out.size()), frame.get()->data,
+                                frame.get()->linesize, dstPixFmt, width, height, 1);
+        return py::make_tuple(py::bytes(out), converter.usesSimd());
+    });
+    // Test hook: encode_frame's row loader on one [H, W, 3|4] CPU tensor, as
+    // packed uint8. Returns None for a dtype or layout it does not read.
+    m.def("_load_rows_u8", [](const torch::Tensor& frame, bool simd) -> py::object {
+        nelux::conversion::cpu::RowSource rows;
+        if (!nelux::rowSourceFor(frame, rows))
+            return py::none();
+        const int h = static_cast<int>(frame.size(0));
+        const int w = static_cast<int>(frame.size(1));
+        torch::Tensor out = torch::empty({h, w, rows.channels}, torch::kUInt8);
+        {
+            py::gil_scoped_release release;
+            const ptrdiff_t stride = static_cast<ptrdiff_t>(w) * rows.channels;
+            if (simd)
+                nelux::conversion::cpu::loadRowsU8(rows, w, 0, h, out.data_ptr<uint8_t>(), stride);
+            else
+                nelux::conversion::cpu::loadRowsU8Reference(rows, w, 0, h,
+                                                            out.data_ptr<uint8_t>(), stride);
+        }
+        return py::cast(out);
+    });
+    // Test hook: the same for a 10-16-bit destination, as packed uint16.
+    m.def("_load_rows_u16", [](const torch::Tensor& frame, bool simd) -> py::object {
+        nelux::conversion::cpu::RowSource rows;
+        if (!nelux::rowSourceFor(frame, rows) ||
+            rows.type == nelux::conversion::cpu::SampleType::U8)
+            return py::none();
+        const int h = static_cast<int>(frame.size(0));
+        const int w = static_cast<int>(frame.size(1));
+        torch::Tensor out = torch::empty({h, w, rows.channels}, torch::kUInt16);
+        {
+            py::gil_scoped_release release;
+            auto* dst = static_cast<uint8_t*>(out.data_ptr());
+            const ptrdiff_t stride = static_cast<ptrdiff_t>(w) * rows.channels * 2;
+            if (simd)
+                nelux::conversion::cpu::loadRowsU16(rows, w, 0, h, dst, stride);
+            else
+                nelux::conversion::cpu::loadRowsU16Reference(rows, w, 0, h, dst, stride);
+        }
+        return py::cast(out);
+    });
+#ifdef NELUX_ENABLE_CUDA
+    // Test hook (tests/test_cuda_encode_exact.py): the exact CUDA kernels'
+    // float narrowing alone on a contiguous 1-D CUDA float32 / float16 /
+    // bfloat16 tensor, as the 8- or 16-bit samples they read, in uint16.
+    m.def("_narrow_cuda_samples", [](const torch::Tensor& x, int bits) {
+        using nelux::backends::cuda::ExactElement;
+        ExactElement element;
+        switch (x.scalar_type())
+        {
+        case torch::kFloat32:  element = ExactElement::Float32;  break;
+        case torch::kFloat16:  element = ExactElement::Float16;  break;
+        case torch::kBFloat16: element = ExactElement::BFloat16; break;
+        default: throw std::invalid_argument("expected float32, float16 or bfloat16");
+        }
+        if (!x.is_cuda() || x.dim() != 1 || !x.is_contiguous())
+            throw std::invalid_argument("expected a contiguous 1-D CUDA tensor");
+        torch::Tensor out = torch::empty({x.numel()}, x.options().dtype(torch::kUInt16));
+        const cudaError_t err = nelux::backends::cuda::RgbToYuvExactNarrow(
+            element, bits, x.data_ptr(), x.numel(), static_cast<uint16_t*>(out.data_ptr()),
+            nelux::currentCudaStream(static_cast<int>(x.device().index())));
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("narrow failed: ") + cudaGetErrorString(err));
+        return out;
+    });
+#else
+    // Bound in every build, so the stub's module surface is one list.
+    m.def("_narrow_cuda_samples", [](const torch::Tensor&, int) -> torch::Tensor {
+        throw std::runtime_error("nelux was built without CUDA");
+    });
+#endif
     py::class_<nelux::ImageCodecCache>(m, "_ImageCodecCache")
         .def(py::init<>())
         .def("clear", &nelux::ImageCodecCache::clear, py::call_guard<py::gil_scoped_release>());
@@ -622,7 +736,9 @@ Example:
                     py::object preset, std::optional<int> cq,
                     std::optional<std::string> pixel_format,
                     std::optional<std::map<std::string, std::string>> options,
-                    bool resize, const std::string& resize_filter, bool memory_output)
+                    bool resize, const std::string& resize_filter, bool memory_output,
+                    py::object destination,
+                    std::optional<std::pair<int, int>> frame_rate)
                  {
                      // Dispatch `preset` on Python type: int → existing 1..N
                      // mapping table per codec; str → forwarded straight to
@@ -656,7 +772,8 @@ Example:
                      return std::make_shared<nelux::VideoEncoder>(
                          output_path, codec, width, height, bit_rate, fps,
                          presetInt, cq, pixel_format, presetStr,
-                         std::move(extraOptions), resize, resize_filter, memory_output);
+                         std::move(extraOptions), resize, resize_filter, memory_output,
+                         std::move(destination), frame_rate);
                  }),
              py::arg("output_path"), py::arg("codec") = py::none(),
              py::arg("width") = py::none(), py::arg("height") = py::none(),
@@ -667,6 +784,8 @@ Example:
              py::arg("resize") = false,
              py::arg("resize_filter") = "bilinear",
              py::arg("_memory_output") = false,
+             py::arg("_destination") = py::none(),
+             py::arg("_frame_rate") = py::none(),
              R"doc(Create a video encoder.
 
 Args:
@@ -681,7 +800,11 @@ Args:
         NVENC codecs: "h264_nvenc", "hevc_nvenc", "av1_nvenc"
     width (int, optional): Frame width. Defaults to 1920.
     height (int, optional): Frame height. Defaults to 1080.
-    bit_rate (int, optional): Video bitrate in bps. Defaults to 4000000 (4 Mbps).
+    bit_rate (int, optional): Video bitrate in bps. Defaults to 4000000 (4 Mbps)
+        unless a quality target replaces it: a crf/qp/cq/global_quality key in
+        options (except on VP8, whose crf needs the rate as its ceiling), cq on
+        libsvtav1, libaom-av1 or VP9, and dnxhd, which picks the DNxHR profile
+        for the pixel format. Those run at the codec's own default rate.
     fps (float, optional): Frames per second. Defaults to 30. Tagged as an
         exact rational, never rounded to an integer: NTSC abbreviations snap to
         their true fraction (23.976 -> 24000/1001, 29.97 -> 30000/1001, 47.952
@@ -811,6 +934,13 @@ Example:
     ...     enc.encode_frame(f)
     >>> enc.close()
 )doc")
+        .def("_transcode_from", &nelux::VideoEncoder::transcodeFrom,
+             py::arg("source"), py::arg("start") = 0.0, py::arg("end") = -1.0,
+             py::arg("gpu_decode") = true,
+             R"doc(nelux.transcode's encode loop: decode ``source`` and send its
+frames to this encoder without the RGB round trip. Into NVENC, H.264, HEVC,
+VP8 and VP9 sources decode on NVDEC unless gpu_decode=False. Returns
+``(frames sent as decoded, frames converted)``. Use nelux.transcode.)doc")
         .def("get_encoded_data", &nelux::VideoEncoder::getEncodedData)
         .def("close", &nelux::VideoEncoder::close,
              "Finalize file and flush video streams.")
@@ -828,6 +958,11 @@ Example:
              });
 
     // ---------- Module-level functions -----------
+    m.def("_transcode_settings", &nelux::transcodeSettings, py::arg("source"),
+          py::arg("output_path"), py::arg("codec") = py::none(),
+          py::arg("pixel_format") = py::none(),
+          "VideoEncoder arguments that re-encode source's video like the ffmpeg CLI "
+          "(nelux.transcode).");
     m.def(
         "merge_streams",
         [](const std::string& video_source, const std::string& audio_source,

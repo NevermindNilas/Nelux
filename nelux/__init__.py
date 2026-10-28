@@ -398,7 +398,7 @@ from . import samplers
 from .sources import prepare_source
 from ._nelux import FrameIndex
 from .audio import AudioReader, AudioSamples, AudioMetadata
-from .encoding import VideoEncoder, encode_video
+from .encoding import VideoEncoder, encode_video, transcode
 from .images import decode_image, decode_images, encode_image
 
 
@@ -595,6 +595,7 @@ __all__ = [
     "AudioSamples",
     "AudioMetadata",
     "encode_video",
+    "transcode",
     "decode_image",
     "decode_images",
     "encode_image",
