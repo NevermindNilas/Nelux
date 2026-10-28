@@ -92,7 +92,10 @@ def run(args):
         for name in TESTS + ["range_tools.py"]:
             shutil.copy2(REPO / "tests" / name, tests / name)
         (tests / "conftest.py").write_text("REPOSITORY = " + repr(str(REPO)) + "\nWHEEL_ENV = " + repr(str(wheel_env)) + "\n" + PLUGIN)
+        # A test still running after 5 minutes dumps every thread's stack into
+        # pytest.log, so a hang names its test and where it waits.
         code, timed_out = bounded_process([str(python), "-m", "pytest", "tests", "-q", "-ra",
+                                          "-o", "faulthandler_timeout=300",
                                           "--junitxml=" + str(output / "ranges.xml")],
                                          args.timeout, output / "pytest.log", cwd=stage, env=env)
         summary["pytest"] = {"exit_code": code, "timeout": timed_out}
