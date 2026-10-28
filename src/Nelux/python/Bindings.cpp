@@ -314,7 +314,7 @@ PYBIND11_MODULE(_nelux, m)
         .def("metadata", &nelux::AudioDecoder::metadata, py::call_guard<py::gil_scoped_release>())
         .def("close", &nelux::AudioDecoder::close, py::call_guard<py::gil_scoped_release>());
     m.doc() = "nelux – lightspeed video decoding into tensors";
-    m.attr("__version__") = "0.20.0";
+    m.attr("__version__") = "0.21.0";
     m.attr("__torch_abi__") = NELUX_TORCH_ABI;
 
     // Identity of the FFmpeg actually loaded into this process, not the one we

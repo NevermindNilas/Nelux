@@ -1,5 +1,5 @@
 
-### **Unreleased**
+### **Version 0.21.0 (2026-10-28)**
 
 - `VideoEncoder(...)` releases the GIL while it opens the codec, so other
   Python threads keep running: their longest stall during the constructor

@@ -1287,7 +1287,7 @@ nelux.set_log_level(LogLevel.off)    # Silence all output
 ```python
 import nelux
 
-nelux.__version__        # str:  Library version (e.g., "0.20.0")
+nelux.__version__        # str:  Library version (e.g., "0.21.0")
 nelux.__cuda_support__   # bool: True if CUDA/NVDEC support is compiled in
 nelux.__torch_abi__      # str:  torch minor this wheel was built against, e.g. "2.14"
 nelux.__ffmpeg_version__ # str:  FFmpeg loaded at runtime, e.g. "9.0.2-tas"
