@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         # cpXYZ tags map to /opt/python/<tag>-<tag> inside the manylinux image.
-        python: ["cp313", "cp314"]
+        python: ["cp313", "cp314", "cp315"]
     env:
       SKBUILD_CONFIG: Release
       VCPKG_TARGET_TRIPLET: x64-linux-dynamic
