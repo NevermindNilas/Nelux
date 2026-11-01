@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **PyTorch 2.15.0.** Release and CI builds use torch 2.15.0 and torchvision
+  0.29.2 (was 2.14.1 / 0.29.1). Wheels are tagged `215torch` and import only
+  under PyTorch 2.15.x; use a 0.21.x wheel with PyTorch 2.14.
+- **Python 3.15 wheels.** Windows, Linux and macOS wheels are now built for
+  Python 3.13, 3.14 and 3.15.
+
 ## [0.21.0] - 2026-10-28
 
 ### Changed

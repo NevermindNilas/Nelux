@@ -445,7 +445,7 @@ set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical
 import nelux
 nelux.__version__                    # "0.21.0"
 nelux.__cuda_support__               # True if compiled with CUDA
-nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.14"
+nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.15"
 nelux.__ffmpeg_version__             # FFmpeg loaded at runtime, e.g. "9.0.2-tas"
 
 from nelux import (get_available_encoders, get_nvenc_encoders,
@@ -658,8 +658,8 @@ def process_video(input_path, output_path, model):
 ## Requirements
 
 - Python **3.13+** (`requires-python = ">=3.13"`)
-- PyTorch **2.14.x** — each wheel is built against one torch minor, is
-  build-tagged (`214torch`) and raises `ImportError` under a different minor.
+- PyTorch **2.15.x** — each wheel is built against one torch minor, is
+  build-tagged (`215torch`) and raises `ImportError` under a different minor.
   The matching CUDA torch wheel supplies the CUDA runtime the NVDEC path needs.
 - CUDA **13.x** for the published NVDEC/NVENC wheels; GPU compute capability
   7.5+ (Turing or newer). Pre-Turing NVDEC cards need a source build against

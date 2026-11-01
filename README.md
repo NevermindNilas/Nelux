@@ -53,10 +53,10 @@ PyTorch must be importable **before** `nelux` — the package uses torch's C++ r
 
 ```bash
 # Windows / Linux CUDA
-pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
+pip install torch==2.15.0 torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cu132
 
 # macOS / Linux CPU
-pip install torch==2.14.1 torchvision==0.29.1
+pip install torch==2.15.0 torchvision==0.29.2
 ```
 
 ---
@@ -524,7 +524,7 @@ nelux.__version__, nelux.__cuda_support__, nelux.__torch_abi__, nelux.__ffmpeg_v
 ## Requirements
 
 - **Python**: 3.13+ (see `pyproject.toml` `requires-python`)
-- **PyTorch**: 2.14.x for current `214torch` wheels (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
+- **PyTorch**: 2.15.x for current `215torch` wheels (`import torch` must precede `import nelux`; the matching CUDA wheel provides the CUDA runtime nelux's NVDEC path needs)
 - **CUDA**: 13.x (for NVDEC/NVENC builds). CPU-only builds drop this requirement.
 - **GPU**: compute capability 7.5+ (Turing, GTX 16xx / RTX 20xx and newer) for the published CUDA wheels. CUDA 13 dropped Pascal and Volta, so Maxwell/Pascal/Volta cards need a source build against CUDA 12.x (`CUDAARCHS=61 pip install .`) even though they have NVDEC silicon.
 - **OS**: Windows 10/11, Linux (manylinux_2_28+ / Ubuntu 22.04+), macOS 14+ (Apple Silicon, CPU only)
