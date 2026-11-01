@@ -2,7 +2,7 @@
 
 > **Purpose**: Enable AI assistants to understand and correctly use Nelux instantly.
 > **Library**: Nelux — High-performance Python video decoding/encoding with GPU acceleration
-> **Version**: 0.21.0
+> **Version**: 0.22.0
 > **License**: AGPL-3.0
 > **Source**: https://github.com/NevermindNilas/NeLux
 
@@ -621,7 +621,7 @@ set_log_level(LogLevel.debug)        # trace, debug, info, warn, error, critical
 
 ```python
 import nelux
-nelux.__version__                    # "0.21.0"
+nelux.__version__                    # "0.22.0"
 nelux.__cuda_support__               # True if compiled with CUDA
 nelux.__torch_abi__                  # torch minor this wheel was built against, e.g. "2.15"
 nelux.__ffmpeg_version__             # FFmpeg loaded at runtime, e.g. "9.0.2-tas"
@@ -827,6 +827,7 @@ def process_video(input_path, output_path, model):
 
 ## Version History Highlights
 
+- **0.22.0** (2026-11-01): PyTorch 2.15.0 / torchvision 0.29.2 (cu132), `215torch` ABI-tagged wheels that refuse to import under another torch minor (stay on 0.21.x for PyTorch 2.14); Python 3.15 wheels on Windows, Linux and macOS alongside 3.13 and 3.14.
 - **0.21.0** (2026-10-28): Encoder overhaul — byte-exact AVX2 and CUDA RGB->YUV converters (CPU and CUDA input give identical bitstreams), frame-parallel encoding for 25 intra codecs (sgi 7.4x, libwebp 11x the ffmpeg CLI), CPU frames into NVENC converted on the GPU at every size, NVENC sharing torch's CUDA context, float/uint16/CHW input without torch ops, `nelux.transcode()` (CLI-equivalent autorotate, pixel format, colour tags and audio sync), file-object and zero-copy memory output, many broken encoder defaults fixed, and the 0.20.0 race where a CUDA frame rewritten after `encode_frame` (or an NVDEC frame fed straight in) was encoded wrong.
 - **0.20.0** (2026-10-17): `VideoEncoder` leaves GOP length and B-frames at each codec's own defaults like the ffmpeg CLI (was forced g=60/bf=2: -2.6 dB on libx264, B-frames in NVENC p1); pin with `options={"g", "bf"}`. FFmpeg 9.0.2 (soname 63), PyTorch 2.14.1, `merge_streams()`, `subtitle_codecs`, in-memory still-image decode, faster `AudioReader`, MOV Opus/Vorbis passthrough transcodes to AAC, NVDEC exact-read hang and limited-range high-bit-depth fixes.
 - **0.19.0** (2026-09-14): PyTorch 2.14.0 / torchvision 0.29.0, `214torch` ABI-tagged wheels; exact decoded-frame range counting, exclusive first-frame-relative time bounds, VP9 superframe fixes, explicit integer-versus-time `frame_at` dispatch, and corpus-driven installed-wheel CI gates. Large range gaps now decode linearly; NVDEC VP9 time cuts add CPU timing decode work.

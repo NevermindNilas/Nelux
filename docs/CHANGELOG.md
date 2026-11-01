@@ -1,4 +1,13 @@
 
+### **Version 0.22.0 (2026-11-01)**
+
+- **PyTorch 2.15.0.** Wheels are built against torch 2.15.0 and torchvision
+  0.29.2 (was 2.14.1 / 0.29.1) on the CUDA 13.2 `cu132` index. They are
+  tagged `215torch` and import only under PyTorch 2.15.x; stay on 0.21.x for
+  PyTorch 2.14.
+- **Python 3.15.** Windows, Linux and macOS wheels are now built for Python
+  3.13, 3.14 and 3.15.
+
 ### **Version 0.21.0 (2026-10-28)**
 
 - `VideoEncoder(...)` releases the GIL while it opens the codec, so other
