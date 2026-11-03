@@ -5,7 +5,7 @@
 
 #include <cuda_fp16.h>
 
-// (c10_cuda resolved delay-load-safe via CudaStream.hpp; no direct include)
+// (torch's current stream comes from CudaStream.hpp, through the stable ABI)
 
 #include <CudaStream.hpp>
 #include <CudaRuntimeGuard.hpp>
@@ -431,9 +431,9 @@ Decoder::Decoder(const std::string& filePath, int numThreads, int cudaDeviceInde
       mlInvStd_{1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f}
 {
     requestedVideoStreamIndex_ = streamIndex;
-    // c10_cuda.dll is delay-loaded on Windows so the module imports on a
-    // CPU-only PyTorch; fail clearly here if NVDEC is reached without it.
-    nelux::requireCudaRuntime();
+    // Nelux imports on a CPU-only PyTorch; fail clearly here if NVDEC is
+    // reached without torch's CUDA runtime.
+    nelux::requireCudaRuntime(cudaDeviceIndex);
 
     // Async fanout uses CPU libswscale convert workers; CUDA decoder produces
     // AV_PIX_FMT_CUDA frames that cannot be fed to libswscale on the host. Disable.
@@ -1935,7 +1935,7 @@ bool Decoder::rewindToStart()
     return seek(0.0);
 }
 
-torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
+nelux::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("CUDA DECODER: decode_batch called with {} indices", indices.size());
 
@@ -1943,14 +1943,14 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
     // rule, so a zero-length batch has the dtype the caller would have got had
     // the batch been populated.
     const int elemSize = outputElemSize();
-    const torch::ScalarType dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+    const nelux::ScalarType dtype = (elemSize == 1) ? nelux::kUInt8 : nelux::kUInt16;
 
     if (indices.empty())
     {
-        return torch::empty({0, properties.height, properties.width, 3},
-                            torch::TensorOptions()
+        return nelux::empty({0, properties.height, properties.width, 3},
+                            nelux::TensorOptions()
                                 .dtype(dtype)
-                                .device(torch::kCUDA, cudaDeviceIndex_));
+                                .device(nelux::kCUDA, cudaDeviceIndex_));
     }
 
     // Group requested positions by frame index (dedups, sorts, and records every
@@ -1971,8 +1971,8 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 
     // Allocate output tensor on GPU
     auto options =
-        torch::TensorOptions().dtype(dtype).device(torch::kCUDA, cudaDeviceIndex_);
-    torch::Tensor output = torch::empty(
+        nelux::TensorOptions().dtype(dtype).device(nelux::kCUDA, cudaDeviceIndex_);
+    nelux::Tensor output = nelux::empty(
         {static_cast<int64_t>(indices.size()), properties.height, properties.width, 3},
         options);
 
@@ -1982,7 +1982,7 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
     // decoder stream; the stream is drained before this local decoder dies.
     size_t frame_size_bytes = static_cast<size_t>(properties.width) *
                               static_cast<size_t>(properties.height) * 3 * elemSize;
-    torch::Tensor frame_buffer = torch::empty(
+    nelux::Tensor frame_buffer = nelux::empty(
         {properties.height, properties.width, 3}, options);
 
     // NVDEC seek/flush timestamps are not a reliable frame ordinal around

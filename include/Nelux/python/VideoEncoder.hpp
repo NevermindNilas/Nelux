@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
+#include <TensorCaster.hpp>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -34,7 +35,7 @@ namespace nelux
 // Describes a CPU [H, W, 3|4] tensor for the row loader. False when the
 // loader does not cover its dtype or strides (the caller then normalises it
 // with torch).
-bool rowSourceFor(const torch::Tensor& frame, conversion::cpu::RowSource& rows);
+bool rowSourceFor(const nelux::Tensor& frame, conversion::cpu::RowSource& rows);
 
 class VideoEncoder
 {
@@ -77,9 +78,9 @@ class VideoEncoder
 
     ~VideoEncoder();
 
-    void encodeFrame(torch::Tensor frame);
+    void encodeFrame(nelux::Tensor frame);
     void close();
-    torch::Tensor getEncodedData();
+    nelux::Tensor getEncodedData();
 
     // Check if using hardware encoder. Takes the lifecycle lock: it reads the
     // `encoder` member, which close() swaps out and destroys.
@@ -161,7 +162,7 @@ class VideoEncoder
     bool memoryOutput_ = false;
     nelux::Encoder::MemoryOutput encodedOutput_;
     // The finished memory output, handed out by every get_encoded_data().
-    torch::Tensor encodedData_;
+    nelux::Tensor encodedData_;
     bool directStillImage_ = false;   // one image2 file, no numbered pattern
     bool directStillImageEncoded_ = false;
     bool borrowStillImageInput_ = false; // safe only when codec has one thread
@@ -222,11 +223,25 @@ class VideoEncoder
     int gpuRows_[3] = {};
     void ensureGpuSlots(int count);
     nelux::backends::cuda::RgbToYuvExactDest gpuSlotDest(int slot) const;
-    bool encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat srcFmt, int inW, int inH);
+    bool encodeCudaFrame(const nelux::Tensor& frame, AVPixelFormat srcFmt, int inW, int inH);
     // NVENC: take a free slot, let @p fill enqueue its convert on @p stream
     // and queue the slot for the submit thread behind an event recorded there.
     void enqueueGpuSlot(cudaStream_t stream,
                         const std::function<void(const nelux::backends::cuda::RgbToYuvExactDest&)>& fill);
+    // CUDA input frames a queued convert still reads, each with an event
+    // recorded behind that convert on the caller's stream (stands in for
+    // torch's record_stream). Encoding thread only, under lifecycleMu_.
+    struct RetainedInput
+    {
+        cudaEvent_t done;
+        nelux::Tensor frame;
+    };
+    std::deque<RetainedInput> retainedInputs_;
+    std::vector<cudaEvent_t> freeRetainEvents_;
+    void retainUntilRead(const nelux::Tensor& frame, cudaStream_t stream);
+    // Drops the frames whose convert has run; @p wait blocks for all of them
+    // and frees the events (close).
+    void releaseReadInputs(bool wait);
 
     // CPU tensor into NVENC: the RGB goes up to cpuRgbDevice_ on
     // cpuUploadStream_ (nelux's own, so no torch CUDA is needed) and the
@@ -236,7 +251,7 @@ class VideoEncoder
     // the frame is loaded as RGB48/RGBA64 into the next of cpuRgbPinned_
     // (page-locked, reused once its blocking-sync `done` has fired) and goes
     // up from there; into cpuRgbHost_ if page-locked memory cannot be had.
-    bool encodeCpuFrameOnGpu(const torch::Tensor& frame,
+    bool encodeCpuFrameOnGpu(const nelux::Tensor& frame,
                              const nelux::conversion::cpu::RowSource* rows, AVPixelFormat srcFmt,
                              int inW, int inH);
     void* cpuRgbDevice_ = nullptr;
@@ -339,8 +354,8 @@ class VideoEncoder
     // The locked bodies of the public entry points. Called through
     // underEncoderLock() so the lock/GIL dance lives in exactly one place.
     // Both run with lifecycleMu_ held exclusively and the GIL dropped.
-    void encodeFrameLocked(torch::Tensor& frame);
-    void encodeStillImageDirect(torch::Tensor& frame, AVPixelFormat srcFmt,
+    void encodeFrameLocked(nelux::Tensor& frame);
+    void encodeStillImageDirect(nelux::Tensor& frame, AVPixelFormat srcFmt,
                                 int inW, int inH, int srcChannels, bool deep);
     void closeLocked();
     void convertWorkerLoop(int workerId);
@@ -358,7 +373,7 @@ class VideoEncoder
     // is enabled); grayInput says whether the caller passed a single-channel
     // frame (decided from the shape by encodeFrameLocked, which knows the
     // resize mode).
-    void encodeGrayVerbatim(torch::Tensor frame, int inW, int inH, bool grayInput);
+    void encodeGrayVerbatim(nelux::Tensor frame, int inW, int inH, bool grayInput);
     std::unique_ptr<nelux::conversion::cpu::RGBToAutoConverter> grayRgbConverter_;
 #ifdef NELUX_ENABLE_CUDA
     // GPU: wait for the slot's convert, copy it into a CUDA AVFrame, send.
@@ -371,7 +386,7 @@ class VideoEncoder
     // false (nothing taken) for every other frame, which stages as before.
     // `rows` is set for a frame the row loader reads (into a scratch buffer a
     // few rows at a time); otherwise `frame` is contiguous in `srcFmt`.
-    bool encodeBandedFrame(const torch::Tensor& frame,
+    bool encodeBandedFrame(const nelux::Tensor& frame,
                            const nelux::conversion::cpu::RowSource* rows,
                            AVPixelFormat srcFmt);
     // Caller-owned (lifecycleMu_): yields the plan the band jobs share.

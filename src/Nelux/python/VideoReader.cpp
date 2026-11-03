@@ -13,8 +13,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/extension.h>
-#include <torch/torch.h> // Ensure you have included the necessary Torch headers
+#include <TensorCaster.hpp>
 
 // Include CUDA decoder for ML mode support
 #ifdef NELUX_ENABLE_CUDA
@@ -170,10 +169,10 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
 
     try
     {
-        torch::Device torchDevice =
+        nelux::Device torchDevice =
             (decodeAccelerator == nelux::DecodeAccelerator::NVDEC)
-                ? torch::Device(torch::kCUDA, cuda_device_index)
-                : torch::Device(torch::kCPU);
+                ? nelux::Device(nelux::kCUDA, cuda_device_index)
+                : nelux::Device(nelux::kCPU);
 
         // Main sequential decoder. NVDEC failures are surfaced as hard errors
         // rather than silently downgraded to CPU: the caller explicitly asked
@@ -201,14 +200,14 @@ VideoReader::VideoReader(const std::string& filePath, int numThreads, bool force
         // - No BCHW conversion
         // - No floating point conversion
         // - Native bit depth preserved
-        torch::Dtype torchDataType = findTypeFromBitDepth();
-        tensor = torch::empty(
+        nelux::Dtype torchDataType = findTypeFromBitDepth();
+        tensor = nelux::empty(
             {properties.height, properties.width, outChannels_},
-            torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+            nelux::TensorOptions().dtype(torchDataType).device(torchDevice));
         CHECK_TENSOR(tensor);
         
         NELUX_INFO("VideoReader initialized with HWC format, dtype={}", 
-                   torchDataType == torch::kUInt8 ? "UInt8" : "UInt16");
+                   torchDataType == nelux::kUInt8 ? "UInt8" : "UInt16");
     }
     catch (const std::exception& ex)
     {
@@ -616,12 +615,12 @@ void VideoReader::rewindForFreshIteration()
     streamTouched_ = false;
 }
 
-torch::Tensor VideoReader::decodeRangeFrame()
+nelux::Tensor VideoReader::decodeRangeFrame()
 {
     if (rangeTimestampError_)
         throw std::runtime_error("Time range requires finite, nondecreasing frame "
                                  "timestamps; use frame-index ranges for this input.");
-    torch::Tensor frame = decodeFrame();
+    nelux::Tensor frame = decodeFrame();
     if (!segments_.empty() && !segments_.front().byFrames)
     {
         double timestamp = current_timestamp;
@@ -690,7 +689,7 @@ int VideoReader::exactRangeFrameCount()
     int64_t count = 0;
     for (;;)
     {
-        torch::Tensor frame = counter.decodeFrame();
+        nelux::Tensor frame = counter.decodeFrame();
         if (!frame.defined() || frame.numel() == 0)
             break;
         if (++count > std::numeric_limits<int>::max())
@@ -701,7 +700,7 @@ int VideoReader::exactRangeFrameCount()
     return static_cast<int>(count);
 }
 
-torch::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
+nelux::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
 {
     // Assumes the GIL is released and lifecycleMu_ is held EXCLUSIVE.
     // Single-frame body shared by decodeFrame() and the batched
@@ -709,7 +708,7 @@ torch::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
     std::shared_ptr<nelux::Decoder> dec = decoder;
     if (!dec)
         throw std::runtime_error("VideoReader is closed");
-    torch::Tensor outTensor;
+    nelux::Tensor outTensor;
     double ts = 0.0;
     try
     {
@@ -738,7 +737,7 @@ torch::Tensor VideoReader::decodeFrameNogilLocked(double* frame_timestamp)
     return orientFrameLocked(outTensor);
 }
 
-torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
+nelux::Tensor VideoReader::decodeRangeFrameNogilLocked()
 {
     // Assumes exclusive lock + released GIL (see above). Mirrors
     // decodeRangeFrame() without re-locking: the NVDEC VP9 timing sidecar is
@@ -748,7 +747,7 @@ torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
         throw std::runtime_error("Time range requires finite, nondecreasing frame "
                                  "timestamps; use frame-index ranges for this input.");
     double ts = 0.0;
-    torch::Tensor frame = decodeFrameNogilLocked(&ts);
+    nelux::Tensor frame = decodeFrameNogilLocked(&ts);
     // Caller updates current_timestamp/currentIndex/streamTouched_ GIL-held.
     // Range timestamp bookkeeping needs the raw ts + NVDEC VP9 sidecar:
     if (!segments_.empty() && !segments_.front().byFrames)
@@ -810,7 +809,7 @@ torch::Tensor VideoReader::decodeRangeFrameNogilLocked()
     return frame;
 }
 
-torch::Tensor VideoReader::decodeFrame()
+nelux::Tensor VideoReader::decodeFrame()
 {
     NELUX_TRACE("decodeFrame() called");
 
@@ -838,7 +837,7 @@ torch::Tensor VideoReader::decodeFrame()
     // it.
     double frame_timestamp = 0.0;
     bool success = false;
-    torch::Tensor outTensor;  // populated by zero-copy CPU path
+    nelux::Tensor outTensor;  // populated by zero-copy CPU path
 
     {
         py::gil_scoped_release release;
@@ -855,7 +854,7 @@ torch::Tensor VideoReader::decodeFrame()
     if (!success)
     {
         NELUX_WARN("Decoding failed or no more frames available");
-        return torch::Tensor(); // Return an empty tensor if decoding failed
+        return nelux::Tensor(); // Return an empty tensor if decoding failed
     }
 
     // Update current timestamp
@@ -873,7 +872,7 @@ torch::Tensor VideoReader::decodeFrame()
 py::object VideoReader::readFrame()
 {
     NELUX_TRACE("readFrame() called");
-    torch::Tensor frame = decodeFrame();
+    nelux::Tensor frame = decodeFrame();
     return tensorToOutput(frame);
 }
 
@@ -883,7 +882,7 @@ py::tuple VideoReader::readFrameWithMotionVectors()
     // Single locked nogil section for Tensor+MVs: decode and fetch vectors
     // under one release+exclusive lock so close() cannot tear the decoder
     // down between the two (the old two-lock version had that window).
-    torch::Tensor frame;
+    nelux::Tensor frame;
     std::vector<nelux::Decoder::MotionVector> mvs;
     {
         py::gil_scoped_release release;
@@ -942,7 +941,7 @@ std::string VideoReader::getFrameType() const
     return t == '?' ? "" : std::string(1, t);
 }
 
-py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
+py::object VideoReader::tensorToOutput(const nelux::Tensor& t) const
 {
     if (!t.defined() || t.numel() == 0)
     {
@@ -957,12 +956,12 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
                 sixteen ? py::dtype::of<uint16_t>() : py::dtype::of<uint8_t>();
             return py::array(dt, {0, properties.width, outChannels_});
         }
-        return py::cast(torch::Tensor());
+        return py::cast(nelux::Tensor());
     }
 
     if (backend == Backend::NumPy)
     {
-        // Convert torch::Tensor to numpy array.
+        // Convert nelux::Tensor to numpy array.
         //
         // Only ONE decode path hands back reused storage: the hardware path
         // writes in place into the shared `tensor` member (decodeFrame() ->
@@ -984,7 +983,7 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         // be the shared member on the host and a view would alias it.
         // Split: D2H + contiguous under release (torch-only, no Python),
         // capsule/array under GIL. Only the capsule/array needs the GIL.
-        torch::Tensor cpu_tensor;
+        nelux::Tensor cpu_tensor;
         {
             py::gil_scoped_release release;
             if (t.device().is_cpu() && t.is_contiguous())
@@ -999,31 +998,31 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
         py::dtype numpy_dtype;
         switch (cpu_tensor.scalar_type())
         {
-        case torch::kUInt8:
+        case nelux::kUInt8:
             numpy_dtype = py::dtype::of<uint8_t>();
             break;
-        case torch::kInt8:
+        case nelux::kInt8:
             numpy_dtype = py::dtype::of<int8_t>();
             break;
-        case torch::kInt16:
+        case nelux::kInt16:
             numpy_dtype = py::dtype::of<int16_t>();
             break;
-        case torch::kUInt16:
+        case nelux::kUInt16:
             numpy_dtype = py::dtype::of<uint16_t>();
             break;
-        case torch::kInt32:
+        case nelux::kInt32:
             numpy_dtype = py::dtype::of<int32_t>();
             break;
-        case torch::kUInt32:
+        case nelux::kUInt32:
             numpy_dtype = py::dtype::of<uint32_t>();
             break;
-        case torch::kInt64:
+        case nelux::kInt64:
             numpy_dtype = py::dtype::of<int64_t>();
             break;
-        case torch::kFloat32:
+        case nelux::kFloat32:
             numpy_dtype = py::dtype::of<float>();
             break;
-        case torch::kFloat64:
+        case nelux::kFloat64:
             numpy_dtype = py::dtype::of<double>();
             break;
         default:
@@ -1049,22 +1048,22 @@ py::object VideoReader::tensorToOutput(const torch::Tensor& t) const
             strides.push_back(static_cast<py::ssize_t>(stride_elems) * elem_size);
         }
 
-        auto* owner = new torch::Tensor(cpu_tensor);
+        auto* owner = new nelux::Tensor(cpu_tensor);
         py::capsule base(owner,
-                         [](void* p) { delete reinterpret_cast<torch::Tensor*>(p); });
+                         [](void* p) { delete reinterpret_cast<nelux::Tensor*>(p); });
 
         return py::array(numpy_dtype, shape, strides, cpu_tensor.data_ptr(), base);
     }
 
-    // Default: return as torch::Tensor
+    // Default: return as nelux::Tensor
     return py::cast(t);
 }
 
-torch::Tensor VideoReader::makeLikeOutputTensor() const
+nelux::Tensor VideoReader::makeLikeOutputTensor() const
 {
-    return torch::empty(
+    return nelux::empty(
         {properties.height, properties.width, outChannels_},
-        torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+        nelux::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
 }
 
 bool VideoReader::seek(double timestamp)
@@ -1101,7 +1100,7 @@ bool VideoReader::seek(double timestamp)
             while (liveTs < timestamp)
             {
                 double ts = 0.0;
-                torch::Tensor f = decodeFrameNogilLocked(&ts);
+                nelux::Tensor f = decodeFrameNogilLocked(&ts);
                 if (!f.defined() || f.numel() == 0)
                     break;
                 liveTs = ts;
@@ -1303,7 +1302,7 @@ py::object VideoReader::operator[](py::object key)
         {
             // Single release+exclusive lock for the whole forward walk
             // (was N releases+locks for N frames).
-            torch::Tensor f;
+            nelux::Tensor f;
             double lastTs = 0.0;
             int64_t steps = 0;
             std::exception_ptr decodeFailure;
@@ -1372,7 +1371,7 @@ py::object VideoReader::operator[](py::object key)
                     : 150;
 
             // Single release+exclusive lock for the whole timestamp walk.
-            torch::Tensor f;
+            nelux::Tensor f;
             double liveTs = current_timestamp;
             int64_t steps = 0;
             bool hit = false;
@@ -1387,7 +1386,7 @@ py::object VideoReader::operator[](py::object key)
                     for (int i = 0; i < cap; ++i)
                     {
                         double dts = 0.0;
-                        torch::Tensor cur = decodeFrameNogilLocked(&dts);
+                        nelux::Tensor cur = decodeFrameNogilLocked(&dts);
                         if (!cur.defined() || cur.numel() == 0)
                             break;
                         liveTs = dts;
@@ -1525,7 +1524,7 @@ void VideoReader::ensureRandDecoder()
     }
 }
 
-torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
+nelux::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
 {
     // EXCLUSIVE for the whole call. Random access seeks and flushes one shared
     // rand_decoder, so two concurrent frame_at() calls on the same reader would
@@ -1619,12 +1618,12 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     }
 
     // 2. Decode forward until we reach the requested timestamp
-    torch::Tensor out_frame;
+    nelux::Tensor out_frame;
     double hit_ts = -1.0;
     int safety = 0, cap = static_cast<int>(properties.fps * 3) + 16;
 
     // Allocate buffer once outside the loop
-    torch::Tensor buf = makeLikeOutputTensor();
+    nelux::Tensor buf = makeLikeOutputTensor();
 
     while (true)
     {
@@ -1657,20 +1656,20 @@ torch::Tensor VideoReader::decodeFrameAt(double timestamp_seconds)
     return orientFrameLocked(out_frame);
 }
 
-torch::Tensor VideoReader::decodeFrameAt(int frame_index)
+nelux::Tensor VideoReader::decodeFrameAt(int frame_index)
 {
     return decodeBatch({frame_index})[0];
 }
 
 py::object VideoReader::frameAt(double timestamp_seconds)
 {
-    torch::Tensor frame = decodeFrameAt(timestamp_seconds);
+    nelux::Tensor frame = decodeFrameAt(timestamp_seconds);
     return tensorToOutput(frame);
 }
 
 py::object VideoReader::frameAt(int frame_index)
 {
-    torch::Tensor frame = decodeFrameAt(frame_index);
+    nelux::Tensor frame = decodeFrameAt(frame_index);
     return tensorToOutput(frame);
 }
 
@@ -1688,7 +1687,7 @@ VideoReader& VideoReader::iter()
     // Reset iterator state
     currentIndex = 0;
     current_timestamp = 0.0;
-    bufferedFrame = torch::Tensor(); // Clear any old buffered frame
+    bufferedFrame = nelux::Tensor(); // Clear any old buffered frame
     hasBufferedFrame = false;
 
     // Start from the first configured segment. A single set_range() stores one
@@ -1723,7 +1722,7 @@ VideoReader& VideoReader::iter()
         // buffered for next(), including when the first range lies past EOF.
         for (;;)
         {
-            torch::Tensor frame = decodeRangeFrame();
+            nelux::Tensor frame = decodeRangeFrame();
             if (!frame.defined() || frame.numel() == 0)
                 break;
             if (classifyAgainstActiveRange() >= 0)
@@ -1769,7 +1768,7 @@ py::object VideoReader::next()
             continue;
         }
         // If we have a buffered frame from the discard loop, consume it first.
-        torch::Tensor frame;
+        nelux::Tensor frame;
         if (hasBufferedFrame)
         {
             frame = bufferedFrame;
@@ -1809,7 +1808,7 @@ py::object VideoReader::next()
             {
                 rangeFinished_ = true;
                 hasBufferedFrame = false;
-                bufferedFrame = torch::Tensor();
+                bufferedFrame = nelux::Tensor();
                 throw py::stop_iteration();
             }
             continue;
@@ -1846,34 +1845,34 @@ int VideoReader::length() const
 // the lifecycle lock (reconfigure()). Throws on a depth the reader cannot
 // represent, which is what keeps an unsupported depth out of every entry point
 // rather than only out of the constructor.
-static torch::ScalarType scalarTypeFromBitDepth(int bit_depth)
+static nelux::ScalarType scalarTypeFromBitDepth(int bit_depth)
 {
     switch (bit_depth)
     {
     case 8:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt8");
-        return torch::kUInt8;
+        NELUX_DEBUG("Setting tensor data type to nelux::kUInt8");
+        return nelux::kUInt8;
     case 10:
     case 12:
     case 16:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt16");
-        return torch::kUInt16;
+        NELUX_DEBUG("Setting tensor data type to nelux::kUInt16");
+        return nelux::kUInt16;
     case 32:
-        NELUX_DEBUG("Setting tensor data type to torch::kUInt32");
-        return torch::kUInt32;
+        NELUX_DEBUG("Setting tensor data type to nelux::kUInt32");
+        return nelux::kUInt32;
     default:
         NELUX_WARN("Unsupported bit depth: {}", bit_depth);
         throw std::runtime_error("Unsupported bit depth: " + std::to_string(bit_depth));
     }
 }
 
-torch::ScalarType VideoReader::findTypeFromBitDepth()
+nelux::ScalarType VideoReader::findTypeFromBitDepth()
 {
     if (force_8bit)
     {
-        NELUX_DEBUG("Forcing tensor data type to torch::kUInt8 (force_8bit={})",
+        NELUX_DEBUG("Forcing tensor data type to nelux::kUInt8 (force_8bit={})",
                     force_8bit);
-        return torch::kUInt8;
+        return nelux::kUInt8;
     }
     // getBitDepth() dereferences formatCtx/streams, so it is read under the
     // lock rather than through a pin.
@@ -1935,7 +1934,7 @@ nelux::IndexedDecoder& VideoReader::indexedDecoderLocked() const
     if (!decoder) throw std::runtime_error("VideoReader is closed");
     if (!indexed_decoder_) {
         auto device = decodeAccelerator == nelux::DecodeAccelerator::CPU
-            ? torch::Device(torch::kCPU) : torch::Device(torch::kCUDA, cudaDeviceIndex);
+            ? nelux::Device(nelux::kCPU) : nelux::Device(nelux::kCUDA, cudaDeviceIndex);
         indexed_decoder_ = std::make_unique<nelux::IndexedDecoder>(
             nelux::IndexedDecoder::Config{filePath, numThreads, properties.width,
                 properties.height, outChannels_, force_8bit, resizeFilter_,
@@ -1962,12 +1961,12 @@ void VideoReader::setApplyRotation(bool enable)
     });
 }
 
-torch::Tensor VideoReader::orientFrameLocked(torch::Tensor frame, bool batch) const
+nelux::Tensor VideoReader::orientFrameLocked(nelux::Tensor frame, bool batch) const
 {
     if (!frame.defined() || !applyRotation_) return frame;
     const int first = batch ? 1 : (frame.dim() == 4 ? 2 : 0);
     const int turns = rotationQuarterTurns();
-    if (turns) frame = torch::rot90(frame, turns, {first, first + 1});
+    if (turns) frame = nelux::rot90(frame, turns, {first, first + 1});
     if (properties.displayHFlip) frame = frame.flip({first + 1});
     return frame;
 }
@@ -2057,7 +2056,7 @@ std::array<int64_t, 5> VideoReader::getSamplingStats() const
     return indexedDecoderLocked().stats();
 }
 
-torch::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
+nelux::Tensor VideoReader::decodeBatch(const std::vector<int64_t>& indices)
 {
     py::gil_scoped_release release;
     std::unique_lock<std::shared_mutex> lock(lifecycleMu_);
@@ -2102,7 +2101,7 @@ VideoReader::TimedBatch VideoReader::decodeClipsPlayedAt(const std::vector<doubl
     return {orientFrameLocked(data, true), sampling.timingFor(indices)};
 }
 
-torch::Tensor VideoReader::decodeBatchApproximate(const std::vector<int64_t>& indices)
+nelux::Tensor VideoReader::decodeBatchApproximate(const std::vector<int64_t>& indices)
 {
     if (!indices.empty()) streamTouched_ = true;
     return underReaderLock([&](nelux::Decoder& decoder) {
@@ -2209,7 +2208,7 @@ void VideoReader::reconfigure(const std::string& newFilePath)
     nvdecTimestampOffset_ = 0.0;
     nvdecTimestampOffsetInitialized_ = false;
     hasBufferedFrame = false;
-    bufferedFrame = torch::Tensor();
+    bufferedFrame = nelux::Tensor();
     streamTouched_ = false;
     clearRanges();
 
@@ -2252,9 +2251,9 @@ void VideoReader::reconfigure(const std::string& newFilePath)
                 // (launchRgba32ToBchw) writes float32 unconditionally and documents
                 // that it ignores the flag, so honouring it here would hand a
                 // 4-byte-per-element kernel a 2-byte-per-element tensor.
-                const torch::Device torchDevice = tensor.device();
-                const torch::Dtype torchDataType =
-                    mlOutputMode_ ? torch::kFloat32 // FP16 disabled
+                const nelux::Device torchDevice = tensor.device();
+                const nelux::Dtype torchDataType =
+                    mlOutputMode_ ? nelux::kFloat32 // FP16 disabled
                                   : scalarTypeFromBitDepth(force_8bit ? 8
                                                                       : d.getBitDepth());
                 const std::vector<int64_t> wantShape =
@@ -2262,12 +2261,12 @@ void VideoReader::reconfigure(const std::string& newFilePath)
                         ? std::vector<int64_t>{1, 3, properties.height, properties.width}
                         : std::vector<int64_t>{properties.height, properties.width,
                                                outChannels_};
-                if (tensor.sizes() != c10::IntArrayRef(wantShape) ||
+                if (tensor.sizes() != nelux::IntArrayRef(wantShape) ||
                     tensor.dtype() != torchDataType)
                 {
-                    tensor = torch::empty(
+                    tensor = nelux::empty(
                         wantShape,
-                        torch::TensorOptions().dtype(torchDataType).device(torchDevice));
+                        nelux::TensorOptions().dtype(torchDataType).device(torchDevice));
                     NELUX_DEBUG("Reallocated tensor for new dimensions: {}x{} ({})",
                                 properties.width, properties.height,
                                 mlOutputMode_ ? "BCHW" : "HWC");
@@ -2358,10 +2357,10 @@ bool VideoReader::setMLOutputMode(bool enable, const std::vector<float>& mean, c
         mlStd_ = {stdRGB[0], stdRGB[1], stdRGB[2]};
         
         // Reallocate tensor for BCHW format with appropriate dtype
-        torch::Dtype dtype = useFP16 ? torch::kFloat16 : torch::kFloat32;
-        tensor = torch::empty(
+        nelux::Dtype dtype = useFP16 ? nelux::kFloat16 : nelux::kFloat32;
+        tensor = nelux::empty(
             {1, 3, properties.height, properties.width},
-            torch::TensorOptions().dtype(dtype).device(torch::kCUDA, cudaDeviceIndex));
+            nelux::TensorOptions().dtype(dtype).device(nelux::kCUDA, cudaDeviceIndex));
         
         NELUX_INFO("ML output mode enabled with {} mean=[{:.3f}, {:.3f}, {:.3f}], std=[{:.3f}, {:.3f}, {:.3f}]",
                    useFP16 ? "FP16" : "FP32",
@@ -2376,10 +2375,10 @@ bool VideoReader::setMLOutputMode(bool enable, const std::vector<float>& mean, c
         mlStd_.clear();
         
         // Reallocate tensor for standard uint8 HWC format
-        torch::Dtype torchDataType = findTypeFromBitDepth();
-        tensor = torch::empty(
+        nelux::Dtype torchDataType = findTypeFromBitDepth();
+        tensor = nelux::empty(
             {properties.height, properties.width, 3},
-            torch::TensorOptions().dtype(torchDataType).device(torch::kCUDA, cudaDeviceIndex));
+            nelux::TensorOptions().dtype(torchDataType).device(nelux::kCUDA, cudaDeviceIndex));
         
         NELUX_INFO("ML output mode disabled");
     }

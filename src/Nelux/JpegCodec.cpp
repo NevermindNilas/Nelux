@@ -1,6 +1,6 @@
 #include <JpegCodec.hpp>
 #include <cpu/RowLoader.hpp>
-#include <ATen/Parallel.h>
+#include <Tensor.hpp>
 #include <turbojpeg.h>
 
 #include <algorithm>
@@ -190,9 +190,9 @@ StripLayout parseStrip(const unsigned char* jpeg, size_t size)
 
 } // namespace
 
-torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling)
+nelux::Tensor encodeJpegCPU(nelux::Tensor image, int quality, int subsampling)
 {
-    if (image.device().type() != torch::kCPU || image.scalar_type() != torch::kUInt8)
+    if (image.device().type() != nelux::kCPU || image.scalar_type() != nelux::kUInt8)
         throw std::invalid_argument("JPEG encoding requires a CPU uint8 tensor");
     if (image.dim() != 2 && image.dim() != 3)
         throw std::invalid_argument("image must have a HW or HWC layout");
@@ -276,11 +276,11 @@ torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling)
             throw std::runtime_error(std::string("libjpeg-turbo: ") + tj3GetErrorStr(handle));
         size[i] = outSize;
     };
-    StripPool::instance().run(strips, at::get_num_threads(), encodeStrip);
+    StripPool::instance().run(strips, nelux::getNumThreads(), encodeStrip);
 
-    torch::Tensor result;
+    nelux::Tensor result;
     if (strips == 1) {
-        result = torch::empty({static_cast<int64_t>(size[0])}, torch::kUInt8);
+        result = nelux::empty({static_cast<int64_t>(size[0])}, nelux::kUInt8);
         std::memcpy(result.data_ptr<unsigned char>(), space, size[0]);
     } else {
         // Strip 0's headers with the full height and a DRI segment, then each
@@ -293,7 +293,7 @@ torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling)
             layout[i] = parseStrip(space + offset[i], size[i]);
             total += i == 0 ? size[0] - 2 : 2 + size[i] - layout[i].data - 2;
         }
-        result = torch::empty({static_cast<int64_t>(total)}, torch::kUInt8);
+        result = nelux::empty({static_cast<int64_t>(total)}, nelux::kUInt8);
         unsigned char* dst = result.data_ptr<unsigned char>();
         const unsigned char* first = space + offset[0];
         std::memcpy(dst, first, layout[0].sos);

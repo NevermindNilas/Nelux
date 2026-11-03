@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <Tensor.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,8 +30,8 @@ public:
         int channels;
         bool force8Bit;
         int resizeFilter;
-        torch::ScalarType dtype;
-        torch::Device device;
+        nelux::ScalarType dtype;
+        nelux::Device device;
         int streamIndex = -1;
         bool asyncFrames = false;
     };
@@ -47,7 +47,7 @@ public:
     std::shared_ptr<Index> getIndex();
     void setIndex(std::shared_ptr<Index> index);
     std::array<int64_t, 5> stats() const;
-    torch::Tensor decode(const std::vector<int64_t>& indices);
+    nelux::Tensor decode(const std::vector<int64_t>& indices);
 
 private:
     struct Impl;

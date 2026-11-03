@@ -144,7 +144,6 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
-          python tools/tag_wheel_torch.py dist/*.whl
           echo "=== Repaired wheel ==="
           ls -la dist/
 

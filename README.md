@@ -54,16 +54,16 @@ Originally created by [Trentonom0r3](https://github.com/Trentonom0r3).
 
 ## Installation
 
-Install PyTorch first, then NeLux. NeLux uses torch's C++ runtime, so the torch
-version must match the one the wheel was built against (2.15.x for current
-releases).
+Install PyTorch first, then NeLux. Any PyTorch from 2.14 on works: NeLux is
+built on PyTorch's stable ABI, so one wheel runs under every torch release from
+2.14 forward, CPU or CUDA build, with no version matching.
 
 ```bash
 # Windows / Linux with an NVIDIA GPU
-pip install torch==2.15.0 torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cu132
+pip install torch --index-url https://download.pytorch.org/whl/cu132
 
 # macOS, or Linux CPU-only
-pip install torch==2.15.0 torchvision==0.29.2
+pip install torch
 
 pip install nelux
 ```
@@ -80,7 +80,7 @@ from [`tools/ffmpeg.lock`](tools/ffmpeg.lock). Nothing needs to be installed or
 put on `PATH`. You can check which FFmpeg was loaded at runtime:
 
 ```python
->>> import torch, nelux
+>>> import nelux
 >>> nelux.__version__, nelux.__ffmpeg_version__, nelux.__cuda_support__
 ('0.21.0', '9.0.2-tas', True)
 ```
@@ -92,7 +92,6 @@ put on `PATH`. You can check which FFmpeg was loaded at runtime:
 ### Decode frames
 
 ```python
-import torch  # must be imported before nelux
 from nelux import VideoReader
 
 reader = VideoReader("input.mp4")                 # CPU decode
@@ -632,9 +631,8 @@ nelux.__version__, nelux.__ffmpeg_version__, nelux.__cuda_support__, nelux.__tor
 ## Requirements
 
 - **Python** 3.13+
-- **PyTorch** 2.15.x for current wheels. `import torch` must come before
-  `import nelux`. The CUDA torch wheel provides the CUDA runtime that NVDEC and
-  NVENC need.
+- **PyTorch** 2.14 or newer, any release (one wheel covers them all). The CUDA
+  torch wheel provides the CUDA runtime that NVDEC and NVENC need.
 - **NumPy**, which is installed automatically.
 - **For NVDEC/NVENC:** an NVIDIA GPU with compute capability 7.5+ (Turing, i.e.
   GTX 16xx / RTX 20xx, and newer), a recent driver, and CUDA 13.x torch.
@@ -676,8 +674,9 @@ NELUX_ENABLE_CUDA=ON pip wheel . -w dist/
 
 ## Troubleshooting
 
-- **`ImportError` about torch.** Import `torch` before `nelux`, and use the
-  torch minor version the wheel was built for (`nelux.__torch_abi__`).
+- **`ImportError` about torch.** NeLux needs PyTorch 2.14 or newer
+  (`nelux.__torch_abi__` is the oldest release the wheel supports). Any later
+  release works with the same wheel.
 - **`__ffmpeg_version__` isn't `'9.0.2-tas'`.** A different FFmpeg with the same
   soname was loaded first. On Windows, the first DLL of a given name to load
   serves the whole process, so another package that ships `avcodec-63.dll` can

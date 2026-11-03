@@ -6,6 +6,8 @@ from numpy.typing import NDArray
 from enum import Enum
 
 __version__: str
+# Oldest PyTorch this build loads under ("2.14"): it uses only the stable ABI,
+# so any torch release from this one on works with the same binary.
 __torch_abi__: str
 __cuda_support__: bool
 # av_version_info() of the FFmpeg loaded at runtime, e.g. "9.0.2-tas" for the

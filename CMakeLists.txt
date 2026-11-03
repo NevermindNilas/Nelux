@@ -523,21 +523,44 @@ if(NELUX_BUILD_PYTHON)
     execute_process(
       COMMAND ${Python3_EXECUTABLE}
               -c "import torch; v=torch.__version__.split('+', 1)[0].split('.')[:2]; print('.'.join(v))"
-      OUTPUT_VARIABLE NELUX_TORCH_ABI
+      OUTPUT_VARIABLE NELUX_BUILD_TORCH_VERSION
       OUTPUT_STRIP_TRAILING_WHITESPACE
     )
-    
-    # Main headers: torch/include and torch/include/torch/csrc/api/include
-    include_directories(
-      ${NELUX_PYTORCH_INCLUDEDIR}
-      ${NELUX_PYTORCH_INCLUDEDIR}/torch/csrc/api/include
-    )
+    # Nelux uses only the PyTorch stable ABI (torch/csrc/stable), pinned to
+    # the 2.14 feature set: the binary loads on every torch from 2.14 on,
+    # whichever release's headers it was compiled against. 2.14 is the floor
+    # because it adds the stable Python <-> Tensor conversion the bindings use.
+    set(NELUX_TORCH_ABI "2.14")
+    if(NELUX_BUILD_TORCH_VERSION VERSION_LESS NELUX_TORCH_ABI)
+      message(FATAL_ERROR
+        "Building Nelux needs PyTorch >= ${NELUX_TORCH_ABI} headers; found ${NELUX_BUILD_TORCH_VERSION}.")
+    endif()
+    add_compile_definitions(TORCH_TARGET_VERSION=0x020e000000000000)
+
+    # Stage ONLY the stable-ABI headers. torch/include also carries the
+    # version-locked C++ API (ATen, c10, torch/csrc/api) and torch's own fmt
+    # and pybind11 copies, which would shadow the ones spdlog and the bindings
+    # build against (torch's fmt refuses to compile with TORCH_TARGET_VERSION
+    # set). With only these on the path, any use of the ordinary API fails to
+    # compile instead of silently tying the binary to one torch release.
+    set(NELUX_TORCH_STABLE_INCLUDEDIR "${CMAKE_BINARY_DIR}/torch-stable-include")
+    file(REMOVE_RECURSE "${NELUX_TORCH_STABLE_INCLUDEDIR}")
+    foreach(_nelux_stable_dir
+        torch/csrc/stable
+        torch/headeronly
+        torch/csrc/inductor/aoti_torch/c
+        torch/csrc/inductor/aoti_torch/generated)
+      get_filename_component(_nelux_stable_parent "${_nelux_stable_dir}" DIRECTORY)
+      file(COPY "${NELUX_PYTORCH_INCLUDEDIR}/${_nelux_stable_dir}"
+           DESTINATION "${NELUX_TORCH_STABLE_INCLUDEDIR}/${_nelux_stable_parent}")
+    endforeach()
+    include_directories(${NELUX_TORCH_STABLE_INCLUDEDIR})
     # Add the lib directory to the linker
     link_directories(${NELUX_PYTORCH_LIBDIR})
     
     message(STATUS "Using torch headers: ${NELUX_PYTORCH_INCLUDEDIR}")
     message(STATUS "Using torch libs:    ${NELUX_PYTORCH_LIBDIR}")
-    message(STATUS "Building Nelux against PyTorch ABI: ${NELUX_TORCH_ABI}")
+    message(STATUS "Building Nelux against PyTorch ${NELUX_BUILD_TORCH_VERSION} headers, stable ABI ${NELUX_TORCH_ABI}")
   else()
     message(FATAL_ERROR "PyTorch not found. Run: pip install torch")
   endif()
@@ -635,6 +658,9 @@ target_include_directories(NeluxLib
     $<INSTALL_INTERFACE:include>
     ${NELUX_FFMPEG_INCS}
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:${Python3_INCLUDE_DIRS}>
+    # Python-facing headers (VideoReader/VideoEncoder) are compiled into the
+    # static lib too; torch no longer supplies pybind11 transitively.
+    ${NELUX_PYBIND11_INCS}
     $<$<BOOL:${NELUX_ENABLE_CUDA}>:${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}>
 )
 
@@ -643,17 +669,10 @@ target_link_libraries(NeluxLib PUBLIC
   spdlog::spdlog_header_only
   ${FMT_HO_TARGET}
   ${NELUX_TURBOJPEG_TARGET}
+  # The stable C ABI lives in torch_cpu (CUDA streams included, through the
+  # device-generic accelerator shims), so CPU-only torch loads Nelux and no
+  # c10/torch_python/torch_cuda C++ symbol is imported.
   $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
-  $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-  # Windows ONLY: c10_cuda/torch_cuda are delay-loaded (see /DELAYLOAD) so they
-  # stay out of the eager import table while the import lib is present for the
-  # delay-load thunk. On Linux a plain -lc10_cuda becomes a DT_NEEDED even when
-  # unused (no --as-needed), which would break import on CPU-only torch; there
-  # the symbol is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
-  $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
 )
 if(WIN32)
   target_link_libraries(NeluxLib PUBLIC ws2_32 bcrypt)
@@ -683,15 +702,6 @@ if(NELUX_BUILD_PYTHON)
     Python3::Module
     ${NELUX_PYBIND11_LIBS}
     $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_cpu>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:c10>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch>
-    $<$<BOOL:${NELUX_BUILD_PYTHON}>:torch_python>
-    # Windows ONLY (mirrors NeluxLib above): linked so the /DELAYLOAD thunk has
-    # its import lib. On Linux a plain -lc10_cuda/-ltorch_cuda becomes a
-    # DT_NEEDED even when unused and breaks import on CPU-only torch; the symbol
-    # is resolved at runtime via dlsym (src/Nelux/CudaStream.cpp).
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:torch_cuda>
-    $<$<AND:$<BOOL:${NELUX_BUILD_PYTHON}>,$<BOOL:${NELUX_ENABLE_CUDA}>,$<PLATFORM_ID:Windows>>:c10_cuda>
   )
 
   # Delay-load FFmpeg DLLs on Windows for version flexibility
@@ -719,23 +729,6 @@ if(NELUX_BUILD_PYTHON)
       message(STATUS "MSVC: Using /WHOLEARCHIVE for NeluxCuda to include all CUDA kernels in nelux")
     endif()
 
-    if(WIN32 AND MSVC)
-      # Delay-load the CUDA PyTorch runtime so the module still IMPORTS on a
-      # CPU-only PyTorch (where c10_cuda.dll is absent). Every c10::cuda / CUDA
-      # code path is runtime-gated (frame.is_cuda(), NVDEC accelerator), so
-      # c10_cuda is only resolved when a GPU op actually runs. cudart is
-      # static-linked and the NVDEC driver DLLs are LoadLibrary'd at runtime, so
-      # neither appears in the import table. Without this, the eager c10_cuda
-      # import makes `import nelux` fail with WinError 126 on CPU-only torch.
-      # (torch_cuda.dll is listed defensively; if a build doesn't import it the
-      #  linker emits a benign LNK4199 and ignores the directive.)
-      # delayimp.lib is already linked above (FFmpeg delay-load block).
-      target_link_options(nelux PRIVATE
-        "/DELAYLOAD:c10_cuda.dll"
-        "/DELAYLOAD:torch_cuda.dll"
-      )
-      message(STATUS "MSVC: c10_cuda.dll/torch_cuda.dll delay-loaded — import works on CPU-only PyTorch")
-    endif()
   endif()
 
   if(NELUX_TORCH_ABI)

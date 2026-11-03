@@ -7,7 +7,9 @@
 #include <VideoEncoder.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <TensorCaster.hpp>
 #include <atomic>
+#include <variant>
 #include <shared_mutex>
 
 
@@ -18,7 +20,7 @@ namespace py = pybind11;
  */
 enum class Backend
 {
-    PyTorch, // Return frames as torch::Tensor (default)
+    PyTorch, // Return frames as nelux::Tensor (default)
     NumPy    // Return frames as numpy.ndarray
 };
 
@@ -157,10 +159,10 @@ class VideoReader
     /**
      * @brief Read a frame from the video.
      *
-     * Depending on the configuration, returns either a torch::Tensor or a
+     * Depending on the configuration, returns either a nelux::Tensor or a
      * numpy.ndarray. Shape is always HWC.
      *
-     * @return py::object The next frame (torch::Tensor or numpy.ndarray based on
+     * @return py::object The next frame (nelux::Tensor or numpy.ndarray based on
      * backend).
      */
     py::object readFrame();
@@ -172,9 +174,9 @@ class VideoReader
     /**
      * @brief Internal method to decode the next frame into the internal tensor buffer.
      *
-     * @return torch::Tensor The decoded frame as torch::Tensor (internal use).
+     * @return nelux::Tensor The decoded frame as nelux::Tensor (internal use).
      */
-    torch::Tensor decodeFrame();
+    nelux::Tensor decodeFrame();
 
     /**
      * @brief Seek to a specific timestamp in the video.
@@ -303,7 +305,7 @@ class VideoReader
      * @brief Get the frame at (or immediately after) a timestamp, in seconds.
      *        Uses a secondary decoder; does not disturb sequential iteration.
      * @param timestamp_seconds Timestamp in seconds (0 <= t <= duration).
-     * @return py::object HWC frame (torch::Tensor or numpy.ndarray based on backend).
+     * @return py::object HWC frame (nelux::Tensor or numpy.ndarray based on backend).
      * @throws std::out_of_range on invalid timestamp, std::runtime_error on failure.
      */
     py::object frameAt(double timestamp_seconds);
@@ -312,7 +314,7 @@ class VideoReader
      * @brief Get the frame at (or immediately after) a frame index.
      *        Uses a secondary decoder; does not disturb sequential iteration.
      * @param frame_index 0-based frame index (0 <= idx < total_frames).
-     * @return py::object HWC frame (torch::Tensor or numpy.ndarray based on backend).
+     * @return py::object HWC frame (nelux::Tensor or numpy.ndarray based on backend).
      * @throws std::out_of_range on invalid index, std::runtime_error on failure.
      */
     py::object frameAt(int frame_index);
@@ -324,7 +326,7 @@ class VideoReader
 
     /**
      * @brief Iterator support: returns next frame or throws StopIteration.
-     * @return py::object HWC frame (torch::Tensor or numpy.ndarray based on backend).
+     * @return py::object HWC frame (nelux::Tensor or numpy.ndarray based on backend).
      */
     py::object next();
 
@@ -355,8 +357,8 @@ class VideoReader
     void setFrameIndex(std::shared_ptr<nelux::IndexedDecoder::Index> index);
     void enableAsyncFrames();
     std::array<int64_t, 5> getSamplingStats() const;
-    torch::Tensor decodeBatchApproximate(const std::vector<int64_t>& indices);
-    using TimedBatch = std::pair<torch::Tensor, std::vector<std::pair<double, double>>>;
+    nelux::Tensor decodeBatchApproximate(const std::vector<int64_t>& indices);
+    using TimedBatch = std::pair<nelux::Tensor, std::vector<std::pair<double, double>>>;
     TimedBatch decodeTimedBatch(const std::vector<int64_t>& indices);
     TimedBatch decodeBatchPlayedAt(const std::vector<double>& seconds);
     TimedBatch decodeClipsPlayedAt(const std::vector<double>& starts,
@@ -367,9 +369,9 @@ class VideoReader
     /**
      * @brief Decode a batch of frames at specified indices.
      * @param indices Vector of frame indices to decode.
-     * @return torch::Tensor Batch tensor of shape [B, H, W, C].
+     * @return nelux::Tensor Batch tensor of shape [B, H, W, C].
      */
-    torch::Tensor decodeBatch(const std::vector<int64_t>& indices);
+    nelux::Tensor decodeBatch(const std::vector<int64_t>& indices);
 
     // ----------------------------------
     // Prefetch Control API
@@ -487,19 +489,19 @@ class VideoReader
     }
 
     void ensureRandDecoder();
-    torch::ScalarType findTypeFromBitDepth();
+    nelux::ScalarType findTypeFromBitDepth();
     int exactRangeFrameCount();
-    torch::Tensor decodeRangeFrame();
+    nelux::Tensor decodeRangeFrame();
     // Internal decode assuming the GIL is released and lifecycleMu_ is held
     // EXCLUSIVE by the caller. Used by seek/operator[]/range-discard loops to
     // take one release+lock for N frames instead of N releases+locks.
     // Returns undefined Tensor on EOF; throws on decode failure. Does NOT
     // touch currentIndex/current_timestamp/streamTouched_ (caller updates
     // those GIL-held after the locked section).
-    torch::Tensor decodeFrameNogilLocked(double* frame_timestamp);
+    nelux::Tensor decodeFrameNogilLocked(double* frame_timestamp);
     // Range variant of the above (includes VP9 timing sidecar without
     // re-locking). Assumes exclusive lock + released GIL like above.
-    torch::Tensor decodeRangeFrameNogilLocked();
+    nelux::Tensor decodeRangeFrameNogilLocked();
 
     // ---- Multi-segment iteration ----
     // Load segments_[index] into the active start_frame/end_frame/start_time/
@@ -641,34 +643,34 @@ class VideoReader
     // the read and the write are not torn.
     std::atomic<double> randLastTs_{-1.0};
 
-    torch::Tensor makeLikeOutputTensor() const;
+    nelux::Tensor makeLikeOutputTensor() const;
     /**
      * @brief Close the video reader and release resources.
      */
 
     /**
-     * @brief Convert a torch::Tensor to a py::object based on the backend setting.
+     * @brief Convert a nelux::Tensor to a py::object based on the backend setting.
      *
-     * @param t The torch::Tensor to convert.
+     * @param t The nelux::Tensor to convert.
      * @return py::object Either the tensor or a numpy array.
      */
-    py::object tensorToOutput(const torch::Tensor& t) const;
+    py::object tensorToOutput(const nelux::Tensor& t) const;
 
     /**
      * @brief Internal method to decode frame at timestamp using rand_decoder.
      *
      * @param timestamp_seconds Timestamp in seconds.
-     * @return torch::Tensor The decoded frame.
+     * @return nelux::Tensor The decoded frame.
      */
-    torch::Tensor decodeFrameAt(double timestamp_seconds);
+    nelux::Tensor decodeFrameAt(double timestamp_seconds);
 
     /**
      * @brief Internal method to decode frame at index using rand_decoder.
      *
      * @param frame_index Frame index.
-     * @return torch::Tensor The decoded frame.
+     * @return nelux::Tensor The decoded frame.
      */
-    torch::Tensor decodeFrameAt(int frame_index);
+    nelux::Tensor decodeFrameAt(int frame_index);
 
     // Origin (seconds) of the container's timestamp timeline: the video
     // stream's start_time. Frame indices and `duration` count from the start
@@ -686,7 +688,7 @@ class VideoReader
     std::shared_ptr<nelux::Decoder> decoder;
     nelux::Decoder::VideoProperties properties;
 
-    torch::Tensor tensor;
+    nelux::Tensor tensor;
 
     // Variables for the ACTIVE frame range (the segment currently being emitted)
     int start_frame = 0;
@@ -722,7 +724,7 @@ class VideoReader
     // iter() knows the stream no longer sits at frame 0. Cleared by any rewind.
     bool streamTouched_ = false;
     // List of filters to be added before initialization
-    torch::Tensor bufferedFrame; // The "first valid" frame, if we found it early
+    nelux::Tensor bufferedFrame; // The "first valid" frame, if we found it early
     bool hasBufferedFrame = false;
 
     // Lazy loading support
@@ -738,7 +740,7 @@ class VideoReader
     int streamIndex_ = -1;
     bool applyRotation_ = true;
     int rotationQuarterTurns() const;
-    torch::Tensor orientFrameLocked(torch::Tensor frame, bool batch = false) const;
+    nelux::Tensor orientFrameLocked(nelux::Tensor frame, bool batch = false) const;
     bool asyncFrames_ = false;
     int resizeWidth_ = 0;
     int resizeHeight_ = 0;

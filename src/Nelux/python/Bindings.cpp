@@ -11,7 +11,7 @@
 #include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/extension.h>
+#include <TensorCaster.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
 #include <CudaStream.hpp>
@@ -186,6 +186,8 @@ const char* loadedFFmpegVersion()
 
 PYBIND11_MODULE(_nelux, m)
 {
+    // torch is imported first (nelux/__init__.py); cache its tensor type.
+    nelux::python::initTensorInterop();
     m.def("_decode_jpegs_cuda", &nelux::decodeJpegsCUDA, py::call_guard<py::gil_scoped_release>());
     m.def("_decode_image_cpu", [](std::optional<py::bytes> encoded, const std::string& source, int channels, bool force8Bit) {
         std::optional<std::string> data;
@@ -236,13 +238,13 @@ PYBIND11_MODULE(_nelux, m)
     });
     // Test hook: encode_frame's row loader on one [H, W, 3|4] CPU tensor, as
     // packed uint8. Returns None for a dtype or layout it does not read.
-    m.def("_load_rows_u8", [](const torch::Tensor& frame, bool simd) -> py::object {
+    m.def("_load_rows_u8", [](const nelux::Tensor& frame, bool simd) -> py::object {
         nelux::conversion::cpu::RowSource rows;
         if (!nelux::rowSourceFor(frame, rows))
             return py::none();
         const int h = static_cast<int>(frame.size(0));
         const int w = static_cast<int>(frame.size(1));
-        torch::Tensor out = torch::empty({h, w, rows.channels}, torch::kUInt8);
+        nelux::Tensor out = nelux::empty({h, w, rows.channels}, nelux::kUInt8);
         {
             py::gil_scoped_release release;
             const ptrdiff_t stride = static_cast<ptrdiff_t>(w) * rows.channels;
@@ -255,14 +257,14 @@ PYBIND11_MODULE(_nelux, m)
         return py::cast(out);
     });
     // Test hook: the same for a 10-16-bit destination, as packed uint16.
-    m.def("_load_rows_u16", [](const torch::Tensor& frame, bool simd) -> py::object {
+    m.def("_load_rows_u16", [](const nelux::Tensor& frame, bool simd) -> py::object {
         nelux::conversion::cpu::RowSource rows;
         if (!nelux::rowSourceFor(frame, rows) ||
             rows.type == nelux::conversion::cpu::SampleType::U8)
             return py::none();
         const int h = static_cast<int>(frame.size(0));
         const int w = static_cast<int>(frame.size(1));
-        torch::Tensor out = torch::empty({h, w, rows.channels}, torch::kUInt16);
+        nelux::Tensor out = nelux::empty({h, w, rows.channels}, nelux::kUInt16);
         {
             py::gil_scoped_release release;
             auto* dst = static_cast<uint8_t*>(out.data_ptr());
@@ -278,19 +280,19 @@ PYBIND11_MODULE(_nelux, m)
     // Test hook (tests/test_cuda_encode_exact.py): the exact CUDA kernels'
     // float narrowing alone on a contiguous 1-D CUDA float32 / float16 /
     // bfloat16 tensor, as the 8- or 16-bit samples they read, in uint16.
-    m.def("_narrow_cuda_samples", [](const torch::Tensor& x, int bits) {
+    m.def("_narrow_cuda_samples", [](const nelux::Tensor& x, int bits) {
         using nelux::backends::cuda::ExactElement;
         ExactElement element;
         switch (x.scalar_type())
         {
-        case torch::kFloat32:  element = ExactElement::Float32;  break;
-        case torch::kFloat16:  element = ExactElement::Float16;  break;
-        case torch::kBFloat16: element = ExactElement::BFloat16; break;
+        case nelux::kFloat32:  element = ExactElement::Float32;  break;
+        case nelux::kFloat16:  element = ExactElement::Float16;  break;
+        case nelux::kBFloat16: element = ExactElement::BFloat16; break;
         default: throw std::invalid_argument("expected float32, float16 or bfloat16");
         }
         if (!x.is_cuda() || x.dim() != 1 || !x.is_contiguous())
             throw std::invalid_argument("expected a contiguous 1-D CUDA tensor");
-        torch::Tensor out = torch::empty({x.numel()}, x.options().dtype(torch::kUInt16));
+        nelux::Tensor out = nelux::empty({x.numel()}, x.options().dtype(nelux::kUInt16));
         const cudaError_t err = nelux::backends::cuda::RgbToYuvExactNarrow(
             element, bits, x.data_ptr(), x.numel(), static_cast<uint16_t*>(out.data_ptr()),
             nelux::currentCudaStream(static_cast<int>(x.device().index())));
@@ -300,7 +302,7 @@ PYBIND11_MODULE(_nelux, m)
     });
 #else
     // Bound in every build, so the stub's module surface is one list.
-    m.def("_narrow_cuda_samples", [](const torch::Tensor&, int) -> torch::Tensor {
+    m.def("_narrow_cuda_samples", [](const nelux::Tensor&, int) -> nelux::Tensor {
         throw std::runtime_error("nelux was built without CUDA");
     });
 #endif

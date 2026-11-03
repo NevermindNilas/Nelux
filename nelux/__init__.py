@@ -10,13 +10,45 @@ import os
 import sys
 from typing import Dict, List
 
-# Check for PyTorch first
-if "torch" not in sys.modules:
+# The native module is built on the PyTorch stable ABI (one binary for every
+# torch from 2.14 on) and links torch_cpu, so torch must be loaded first.
+# Importing it here makes `import nelux` work on its own; importing torch
+# yourself beforehand, as older releases required, changes nothing.
+_TORCH_FLOOR = (2, 14)
+
+
+def _torch_release(version: str):
+    """(major, minor) of a torch version string such as '2.15.0+cu132'."""
+    parts = []
+    for piece in version.split("+", 1)[0].split(".")[:2]:
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits or 0))
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts)
+
+
+try:
+    import torch as _torch
+except ImportError as _torch_error:
     raise ImportError(
-        "PyTorch must be imported before Nelux.\n"
-        "Add this before importing nelux:\n"
-        "  import torch"
+        f"Nelux requires PyTorch >= {_TORCH_FLOOR[0]}.{_TORCH_FLOOR[1]}, which could not "
+        f"be imported: {_torch_error}\n"
+        "Install the CPU or CUDA build that matches your system, e.g.:\n"
+        "  pip install torch --index-url https://download.pytorch.org/whl/cu132"
+    ) from _torch_error
+
+if _torch_release(_torch.__version__) < _TORCH_FLOOR:
+    raise ImportError(
+        f"Nelux requires PyTorch >= {_TORCH_FLOOR[0]}.{_TORCH_FLOOR[1]}; the installed "
+        f"PyTorch is {_torch.__version__}. Upgrade torch (any release from "
+        f"{_TORCH_FLOOR[0]}.{_TORCH_FLOOR[1]} on works with this Nelux build)."
     )
+del _torch
 
 # Module-global path state. package_dir/libs_dir used to be locals of the
 # Windows-only setup branch while the diagnosis helpers re-derived them (and
@@ -77,8 +109,8 @@ def _dll_exists_noexec(dll_name: str) -> bool:
 def _read_required_dlls_windows(extension_path: str) -> List[str]:
     """Read direct and delay-load DLL imports from a PE binary when possible.
 
-    The delay-load table matters: the extension delay-loads every FFmpeg DLL
-    (and c10_cuda/torch_cuda), so reading only the regular import table would
+    The delay-load table matters: the extension delay-loads every FFmpeg DLL,
+    so reading only the regular import table would
     leave exactly the DLLs most likely to be missing unchecked.
 
     pefile stays a function-local import: the success-path import must never
@@ -197,8 +229,6 @@ def diagnose_runtime_dlls() -> Dict[str, object]:
             "fmt.dll",
             "spdlog.dll",
             "torch_cpu.dll",
-            "torch_python.dll",
-            "c10.dll",
         ]
 
     ignored_prefixes = (
@@ -303,8 +333,6 @@ except ImportError as e:
             f"  os.add_dll_directory(r'C:\\\\path\\\\to\\\\ffmpeg\\\\bin')\n"
             f"It must be FFmpeg 9.x — avcodec 63 / avutil 61 / avformat 63 /\n"
             f"avfilter 12 / swscale 10 / swresample 7.\n\n"
-            f"Make sure to also import torch first:\n"
-            f"  import torch\n\n"
             f"Original error: {e}"
         ) from e
     raise
@@ -322,15 +350,6 @@ _nelux_ext = sys.modules[__name__ + "._nelux"]
 
 __ffmpeg_version__ = getattr(_nelux_ext, "__ffmpeg_version__", "unknown")
 del _nelux_ext
-
-_torch_version = sys.modules["torch"].__version__.split("+", 1)[0].split(".")[:2]
-_torch_abi = ".".join(_torch_version)
-if __torch_abi__ != "unknown" and _torch_abi != __torch_abi__:
-    raise ImportError(
-        f"This Nelux wheel was built for PyTorch {__torch_abi__}.x, "
-        f"but the imported PyTorch is {sys.modules['torch'].__version__}. "
-        "Install the Nelux wheel tagged for your PyTorch minor version."
-    )
 
 # ---- probe() result cache ---------------------------------------------------
 # find_stream_info costs ~4ms per file; the probe-then-open pattern (and any
@@ -425,11 +444,10 @@ class VideoReader(TemporalMixin, BatchMixin, _VideoReaderBase):
             args = (path, *args[1:])
         elif "input_path" in kwargs:
             kwargs["input_path"], self._source_owner = prepare_source(kwargs["input_path"])
-        # NVDEC needs a CUDA-capable, *active* PyTorch. The CUDA runtime is
-        # delay-loaded so the module imports on CPU-only torch; guard here so
-        # requesting nvdec on a CPU/GPU-less torch raises a clear error up front
-        # instead of failing deep in the decoder. torch.cuda.is_available() is
-        # safe on CPU torch (returns False without needing c10_cuda).
+        # NVDEC needs a CUDA-capable, *active* PyTorch. The module imports on
+        # CPU-only torch (it links only torch_cpu); guard here so requesting
+        # nvdec on a CPU/GPU-less torch raises a clear error up front instead
+        # of failing deep in the decoder.
         accel = kwargs.get("decode_accelerator")
         if accel is None and len(args) >= 5:
             accel = args[4]  # input_path, num_threads, force_8bit, backend, decode_accelerator

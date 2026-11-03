@@ -15,8 +15,8 @@
 #include <cpu/ResizeFilter.hpp>
 
 #ifdef NELUX_ENABLE_CUDA
-#include <CudaStream.hpp>  // nelux::currentCudaStream (no eager c10_cuda link)
-#include <c10/core/impl/DeviceGuardImplInterface.h>
+#include <CudaStream.hpp>  // nelux::currentCudaStream (stable ABI, torch_cpu only)
+
 #endif
 
 extern "C"
@@ -32,20 +32,20 @@ namespace fs = std::filesystem;
 namespace nelux
 {
 
-bool rowSourceFor(const torch::Tensor& frame, conversion::cpu::RowSource& rows)
+bool rowSourceFor(const nelux::Tensor& frame, conversion::cpu::RowSource& rows)
 {
     using conversion::cpu::SampleType;
-    if (!frame.device().is_cpu() || frame.layout() != torch::kStrided || frame.is_neg() ||
+    if (!frame.device().is_cpu() || frame.layout() != nelux::kStrided || frame.is_neg() ||
         frame.dim() != 3)
         return false;
     switch (frame.scalar_type())
     {
-    case torch::kUInt8:    rows.type = SampleType::U8; break;
-    case torch::kUInt16:   rows.type = SampleType::U16; break;
-    case torch::kFloat16:  rows.type = SampleType::F16; break;
-    case torch::kBFloat16: rows.type = SampleType::BF16; break;
-    case torch::kFloat32:  rows.type = SampleType::F32; break;
-    case torch::kFloat64:  rows.type = SampleType::F64; break;
+    case nelux::kUInt8:    rows.type = SampleType::U8; break;
+    case nelux::kUInt16:   rows.type = SampleType::U16; break;
+    case nelux::kFloat16:  rows.type = SampleType::F16; break;
+    case nelux::kBFloat16: rows.type = SampleType::BF16; break;
+    case nelux::kFloat32:  rows.type = SampleType::F32; break;
+    case nelux::kFloat64:  rows.type = SampleType::F64; break;
     default:               return false;
     }
     rows.data = static_cast<const uint8_t*>(frame.data_ptr());
@@ -118,7 +118,7 @@ namespace
 
     void releaseCpuTensor(void* opaque, uint8_t*)
     {
-        delete static_cast<torch::Tensor*>(opaque);
+        delete static_cast<nelux::Tensor*>(opaque);
     }
 
     // Turn a frame rate given as a double into the exact rational the muxer
@@ -165,14 +165,14 @@ namespace
     // Float [0,1] scales to 0-255; a 16-bit source is downscaled uniformly
     // (v*255/65535). Shared by the direct-fill and resized gray paths, which
     // must agree on this mapping exactly.
-    torch::Tensor normalizeGrayTo8(torch::Tensor g)
+    nelux::Tensor normalizeGrayTo8(nelux::Tensor g)
     {
         if (g.is_floating_point())
-            return (g.to(torch::kFloat32) * 255.0f).round().clamp(0, 255).to(torch::kUInt8);
-        if (g.scalar_type() == torch::ScalarType::UInt16)
-            return (g.to(torch::kInt32) * 255 / 65535).clamp(0, 255).to(torch::kUInt8);
-        if (g.dtype() != torch::kUInt8)
-            return g.clamp(0, 255).to(torch::kUInt8);
+            return (g.to(nelux::kFloat32) * 255.0f).round().clamp(0, 255).to(nelux::kUInt8);
+        if (g.scalar_type() == nelux::ScalarType::UInt16)
+            return (g.to(nelux::kInt32) * 255 / 65535).clamp(0, 255).to(nelux::kUInt8);
+        if (g.dtype() != nelux::kUInt8)
+            return g.clamp(0, 255).to(nelux::kUInt8);
         return g;
     }
 
@@ -180,13 +180,13 @@ namespace
     // (the direct-fill path writes bytes from int32; the resized path narrows
     // to uint16 for swscale). Float [0,1] -> 0-65535; an 8-bit source is
     // promoted exactly (v*257); a 16-bit source passes through verbatim.
-    torch::Tensor normalizeGrayTo16(torch::Tensor g)
+    nelux::Tensor normalizeGrayTo16(nelux::Tensor g)
     {
         if (g.is_floating_point())
-            return (g.to(torch::kFloat32) * 65535.0f).round().clamp(0, 65535).to(torch::kInt32);
-        if (g.dtype() == torch::kUInt8)
-            return g.to(torch::kInt32) * 257;
-        return g.to(torch::kInt32).clamp(0, 65535);
+            return (g.to(nelux::kFloat32) * 65535.0f).round().clamp(0, 65535).to(nelux::kInt32);
+        if (g.dtype() == nelux::kUInt8)
+            return g.to(nelux::kInt32) * 257;
+        return g.to(nelux::kInt32).clamp(0, 65535);
     }
 
     // Re-points `f`, whose buffer the codec still shares, at a fresh one from
@@ -223,27 +223,27 @@ namespace
     // range for a deep destination, 8 bits otherwise. The exact CUDA kernels
     // narrow a float frame the same way while they read it, which
     // cudaNarrowMatchesTorch checks against this.
-    torch::Tensor normalizeFloatRgb(const torch::Tensor& frame, bool deep)
+    nelux::Tensor normalizeFloatRgb(const nelux::Tensor& frame, bool deep)
     {
         if (deep)
-            return (frame.to(torch::kFloat32) * 65535.0f)
+            return (frame.to(nelux::kFloat32) * 65535.0f)
                 .round()
                 .clamp(0, 65535)
-                .to(torch::kUInt16);
-        return (frame.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
+                .to(nelux::kUInt16);
+        return (frame.to(nelux::kFloat32) * 255.0f).clamp(0, 255).to(nelux::kUInt8);
     }
 
 #ifdef NELUX_ENABLE_CUDA
     // The float dtypes the exact CUDA kernels narrow in place. float64 (and
     // every integer dtype) keeps the torch ops.
-    bool exactFloatElement(torch::ScalarType type, nelux::backends::cuda::ExactElement& out)
+    bool exactFloatElement(nelux::ScalarType type, nelux::backends::cuda::ExactElement& out)
     {
         using nelux::backends::cuda::ExactElement;
         switch (type)
         {
-        case torch::kFloat32:  out = ExactElement::Float32;  return true;
-        case torch::kFloat16:  out = ExactElement::Float16;  return true;
-        case torch::kBFloat16: out = ExactElement::BFloat16; return true;
+        case nelux::kFloat32:  out = ExactElement::Float32;  return true;
+        case nelux::kFloat16:  out = ExactElement::Float16;  return true;
+        case nelux::kBFloat16: out = ExactElement::BFloat16; return true;
         default:               return false;
         }
     }
@@ -251,10 +251,10 @@ namespace
     // A [H,W,C] or flat CUDA float frame as the kernels read it, through its
     // strides (packed or padded HWC rows, a CHW view, a broadcast). False
     // for what they do not read; that frame is normalised with torch.
-    bool exactFloatSource(const torch::Tensor& frame, int64_t channels, int width,
+    bool exactFloatSource(const nelux::Tensor& frame, int64_t channels, int width,
                           nelux::backends::cuda::RgbToYuvExactSource& src)
     {
-        if (frame.layout() != torch::kStrided || frame.is_neg() ||
+        if (frame.layout() != nelux::kStrided || frame.is_neg() ||
             !exactFloatElement(frame.scalar_type(), src.element))
             return false;
         src.data = frame.data_ptr();
@@ -280,7 +280,7 @@ namespace
     // and truncation edges. The kernels are fixed, torch is not. Checked
     // once per process for each dtype and depth, on @p stream (the caller's
     // current stream, which the torch ops run on).
-    bool cudaNarrowMatchesTorch(torch::ScalarType type, bool deep, int device,
+    bool cudaNarrowMatchesTorch(nelux::ScalarType type, bool deep, int device,
                                 cudaStream_t stream)
     {
         using nelux::backends::cuda::ExactElement;
@@ -297,8 +297,8 @@ namespace
         bool same = false;
         try
         {
-            const auto cuda = torch::TensorOptions().device(torch::kCUDA, device);
-            torch::Tensor x;
+            const auto cuda = nelux::TensorOptions().device(nelux::kCUDA, device);
+            nelux::Tensor x;
             if (element == ExactElement::Float32)
             {
                 std::vector<uint32_t> bits;
@@ -315,18 +315,21 @@ namespace
                     addWithNeighbours(float(k) / 65535.0f);
                 for (int k = 1; k < 256; ++k)
                     addWithNeighbours(float(k) / 255.0f);
-                x = torch::from_blob(bits.data(), {int64_t(bits.size())}, torch::kInt32)
+                x = nelux::from_blob(bits.data(), {int64_t(bits.size())}, nelux::kInt32)
                         .to(cuda)
-                        .view(torch::kFloat32);
+                        .view(nelux::kFloat32);
             }
             else
             {
-                x = torch::arange(65536, torch::TensorOptions().dtype(torch::kInt32))
-                        .to(torch::kInt16)
+                // Every 16-bit pattern, as a 16-bit float type.
+                std::vector<int16_t> patterns(65536);
+                for (int k = 0; k < 65536; ++k)
+                    patterns[k] = static_cast<int16_t>(static_cast<uint16_t>(k));
+                x = nelux::from_blob(patterns.data(), {int64_t(patterns.size())}, nelux::kInt16)
                         .to(cuda)
                         .view(type);
             }
-            torch::Tensor got = torch::empty({x.numel()}, cuda.dtype(torch::kUInt16));
+            nelux::Tensor got = nelux::empty({x.numel()}, cuda.dtype(nelux::kUInt16));
             if (nelux::backends::cuda::RgbToYuvExactNarrow(
                     element, deep ? 16 : 8, x.data_ptr(), x.numel(),
                     static_cast<uint16_t*>(got.data_ptr()), stream) != cudaSuccess)
@@ -334,8 +337,8 @@ namespace
                 cudaGetLastError();
                 return false; // nothing compared (a launch failed): no verdict kept
             }
-            same = torch::equal(got.to(torch::kInt32),
-                                normalizeFloatRgb(x, deep).to(torch::kInt32));
+            same = nelux::equal(got.to(nelux::kInt32),
+                                normalizeFloatRgb(x, deep).to(nelux::kInt32));
         }
         catch (const std::exception&)
         {
@@ -344,7 +347,7 @@ namespace
         if (!same)
             NELUX_WARN("CUDA {} frames do not narrow on the GPU as torch does here; they "
                        "are normalised with torch ops first",
-                       c10::toString(type));
+                       nelux::toString(type));
         verdicts.emplace(key, same);
         return same;
     }
@@ -669,7 +672,7 @@ void VideoEncoder::addPassthrough(const std::string& source, bool audio,
         });
 }
 
-void VideoEncoder::encodeFrame(torch::Tensor frame)
+void VideoEncoder::encodeFrame(nelux::Tensor frame)
 {
     // Validate input shape up front, while the GIL is still held so this raises
     // as a clean Python exception.
@@ -776,7 +779,7 @@ void VideoEncoder::encodeFrame(torch::Tensor frame)
         });
 }
 
-void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
+void VideoEncoder::encodeFrameLocked(nelux::Tensor& frame)
 {
     // Re-checked (not merely checked) under the lock: a concurrent close() can
     // have swapped `encoder` out and destroyed it at any point before we got
@@ -836,32 +839,32 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
 
     // Grayscale input: replicate the single luma channel into a fresh 3-channel
     // RGB tensor so the rest of the pipeline is unchanged (R==G==B). Uses only
-    // .to()/.contiguous()/torch::empty plus a raw byte fill (no torch reshape/
+    // .to()/.contiguous()/nelux::empty plus a raw byte fill (no torch reshape/
     // expand/repeat) to keep the interleave explicit and cheap. The result is a
     // CPU tensor, so a grayscale frame handed to an NVENC encoder takes the
     // CPU-stage -> hwupload path instead of the zero-copy GPU path; RGB input
     // keeps the fast path.
     if (grayInput)
     {
-        torch::Tensor g = frame;
+        nelux::Tensor g = frame;
         if (g.device().is_cuda())
-            g = g.to(torch::kCPU);
+            g = g.to(nelux::kCPU);
         // is_floating_point(), for the same reason as the colour path below:
         // a kFloat16/kFloat32 list sends float64 and bfloat16 to the truncating
         // .to(kUInt8) catch-all, which turns a [0,1] tensor into an all-black
         // frame.
         if (g.is_floating_point())
-            g = (g.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (g.scalar_type() == torch::ScalarType::UInt16)
-            g = (g.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (g.dtype() != torch::kUInt8)
-            g = g.to(torch::kUInt8);
+            g = (g.to(nelux::kFloat32) * 255.0f).clamp(0, 255).to(nelux::kUInt8);
+        else if (g.scalar_type() == nelux::ScalarType::UInt16)
+            g = (g.to(nelux::kFloat32) / 257.0f).clamp(0, 255).to(nelux::kUInt8);
+        else if (g.dtype() != nelux::kUInt8)
+            g = g.to(nelux::kUInt8);
         if (!g.is_contiguous())
             g = g.contiguous();
 
-        torch::Tensor rgb = torch::empty(
+        nelux::Tensor rgb = nelux::empty(
             {inH, inW, 3},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+            nelux::TensorOptions().dtype(nelux::kUInt8).device(nelux::kCPU));
         const uint8_t* src = g.data_ptr<uint8_t>();
         uint8_t* dst = rgb.data_ptr<uint8_t>();
         const int64_t n = static_cast<int64_t>(inW) * inH;
@@ -887,7 +890,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
     const AVPixFmtDescriptor* outDesc = av_pix_fmt_desc_get(outputPixelFormat);
     const bool deepDest = outDesc && outDesc->comp[0].depth > 8;
     const bool deepSource = frame.is_floating_point() ||
-                            frame.scalar_type() == torch::ScalarType::UInt16;
+                            frame.scalar_type() == nelux::ScalarType::UInt16;
     const bool deep = deepDest && deepSource;
 
     // A 4-channel [H,W,4] input carries alpha. It is what makes ProRes 4444 /
@@ -960,21 +963,21 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
         // can no longer flip a caller between correct and black.
         frame = normalizeFloatRgb(frame, false);
     }
-    else if (frame.scalar_type() == torch::ScalarType::UInt16)
+    else if (frame.scalar_type() == nelux::ScalarType::UInt16)
     {
-        frame = (frame.to(torch::kFloat32) / 257.0f).clamp(0, 255).to(torch::kUInt8);
+        frame = (frame.to(nelux::kFloat32) / 257.0f).clamp(0, 255).to(nelux::kUInt8);
     }
-    else if (frame.dtype() == torch::kInt16 || frame.dtype() == torch::kInt32)
+    else if (frame.dtype() == nelux::kInt16 || frame.dtype() == nelux::kInt32)
     {
-        frame = frame.to(torch::kFloat32).clamp(0, 255).to(torch::kUInt8);
+        frame = frame.to(nelux::kFloat32).clamp(0, 255).to(nelux::kUInt8);
     }
-    else if (frame.dtype() == torch::kInt64)
+    else if (frame.dtype() == nelux::kInt64)
     {
-        frame = frame.clamp(0, 255).to(torch::kUInt8);
+        frame = frame.clamp(0, 255).to(nelux::kUInt8);
     }
-    else if (frame.dtype() != torch::kUInt8)
+    else if (frame.dtype() != nelux::kUInt8)
     {
-        frame = frame.to(torch::kUInt8);
+        frame = frame.to(nelux::kUInt8);
     }
 
     if (!loadRows && !frame.is_contiguous())
@@ -1089,7 +1092,7 @@ void VideoEncoder::encodeFrameLocked(torch::Tensor& frame)
                                      std::string(cudaGetErrorString(cerr)));
         }
 #else
-        frame = frame.to(torch::kCPU);
+        frame = frame.to(nelux::kCPU);
         std::memcpy(staging->data(), frame.data_ptr(), rgbBytes);
 #endif
     }
@@ -1155,7 +1158,7 @@ void convertBand(const nelux::conversion::cpu::FastKernel& kernel, const uint8_t
 }
 } // namespace
 
-bool VideoEncoder::encodeBandedFrame(const torch::Tensor& frame,
+bool VideoEncoder::encodeBandedFrame(const nelux::Tensor& frame,
                                      const nelux::conversion::cpu::RowSource* rows,
                                      AVPixelFormat srcFmt)
 {
@@ -1287,13 +1290,13 @@ bool VideoEncoder::encodeBandedFrame(const torch::Tensor& frame,
     return true;
 }
 
-void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
+void VideoEncoder::encodeStillImageDirect(nelux::Tensor& frame,
                                           AVPixelFormat srcFmt, int inW, int inH,
                                           int srcChannels, bool deep)
 {
     directStillImageEncoded_ = true;
     if (frame.device().is_cuda())
-        frame = frame.to(torch::kCPU);
+        frame = frame.to(nelux::kCPU);
     if (!frame.is_contiguous())
         frame = frame.contiguous();
 
@@ -1334,7 +1337,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         // staging copy or swscale context is needed for this identity path.
         const size_t rowBytes = static_cast<size_t>(width) * srcChannels *
                                 (deep ? 2 : 1);
-        auto holder = std::make_unique<torch::Tensor>(frame);
+        auto holder = std::make_unique<nelux::Tensor>(frame);
         auto* data = static_cast<uint8_t*>(frame.data_ptr());
         AVBufferRef* buffer = av_buffer_create(
             data, rowBytes * height, releaseCpuTensor, holder.get(),
@@ -1370,7 +1373,7 @@ void VideoEncoder::encodeStillImageDirect(torch::Tensor& frame,
         throw std::runtime_error("Failed to encode still image");
 }
 
-void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
+void VideoEncoder::encodeGrayVerbatim(nelux::Tensor frame, int inW, int inH,
                                       bool grayInput)
 {
     const AVPixelFormat pf = outputPixelFormat;
@@ -1389,7 +1392,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
     workersStarted = true;
 
     if (frame.device().is_cuda())
-        frame = frame.to(torch::kCPU);
+        frame = frame.to(nelux::kCPU);
 
     // Build the output gray frame, tagged full range so the stored samples are
     // read back verbatim (no 16-235 expansion) by a range-aware decoder.
@@ -1413,7 +1416,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         // the same one-pass swscale the RGB paths use, at the output depth so
         // 16-bit data is resampled at 16-bit precision, never through 8-bit
         // RGB. Same-size input keeps the exact direct-fill path below.
-        torch::Tensor g = frame.reshape({inH, inW});
+        nelux::Tensor g = frame.reshape({inH, inW});
         AVPixelFormat srcGrayFmt;
         if (!is16)
         {
@@ -1424,7 +1427,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         {
             // Feed swscale little-endian 16-bit; a GRAY16BE destination is
             // byte-swapped by swscale itself.
-            g = normalizeGrayTo16(g).to(torch::kUInt16);
+            g = normalizeGrayTo16(g).to(nelux::kUInt16);
             srcGrayFmt = AV_PIX_FMT_GRAY16LE;
         }
         g = g.contiguous();
@@ -1441,7 +1444,7 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
 
     if (grayInput)
     {
-        torch::Tensor g = frame.reshape({height, width});
+        nelux::Tensor g = frame.reshape({height, width});
         if (!is16)
         {
             // 8-bit output: keep 8-bit samples verbatim.
@@ -1483,11 +1486,11 @@ void VideoEncoder::encodeGrayVerbatim(torch::Tensor frame, int inW, int inH,
         // for full precision. The channel count has to be honoured here -- a
         // hardcoded 3 turned a documented "alpha is dropped" case into an
         // internal reshape error that also left the encoder half-started.
-        torch::Tensor rgb = frame;
+        nelux::Tensor rgb = frame;
         if (rgb.is_floating_point())
-            rgb = (rgb.to(torch::kFloat32) * 255.0f).clamp(0, 255).to(torch::kUInt8);
-        else if (rgb.dtype() != torch::kUInt8)
-            rgb = rgb.clamp(0, 255).to(torch::kUInt8);
+            rgb = (rgb.to(nelux::kFloat32) * 255.0f).clamp(0, 255).to(nelux::kUInt8);
+        else if (rgb.dtype() != nelux::kUInt8)
+            rgb = rgb.clamp(0, 255).to(nelux::kUInt8);
         const int64_t ch =
             (rgb.numel() == static_cast<int64_t>(inW) * inH * 4) ? 4 : 3;
         rgb = rgb.reshape({inH, inW, ch}).contiguous();
@@ -2096,7 +2099,7 @@ nelux::backends::cuda::RgbToYuvExactDest VideoEncoder::gpuSlotDest(int slot) con
     return dst;
 }
 
-bool VideoEncoder::encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat srcFmt,
+bool VideoEncoder::encodeCudaFrame(const nelux::Tensor& frame, AVPixelFormat srcFmt,
                                    int inW, int inH)
 {
     // NVENC takes every pair a kernel covers. A software encoder's frames
@@ -2156,7 +2159,7 @@ bool VideoEncoder::encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat src
     }
     else if (!frame.is_contiguous())
     {
-        if (frame.dim() != 3 || frame.layout() != torch::kStrided)
+        if (frame.dim() != 3 || frame.layout() != nelux::kStrided)
             return false;
         src.rowStride = frame.stride(0);
         src.pixelStride = frame.stride(1);
@@ -2175,16 +2178,11 @@ bool VideoEncoder::encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat src
         enqueueGpuSlot(stream, [&](const nelux::backends::cuda::RgbToYuvExactDest& dst) {
             conv->convert(src, dst, stream);
             // encode_frame returns before that convert runs, and the caller may
-            // drop the tensor straight away. Tell the caching allocator about
-            // the stream that still reads it: a tensor allocated on a side
-            // stream would otherwise go back to that stream's pool and be
-            // rewritten under the queued convert. A no-op when the tensor was
-            // allocated on this stream or does not come from the allocator.
-            // The CUDA stream handle comes through c10's device-guard
-            // registry, so this needs no link against c10_cuda.
-            const c10::Device cudaDev(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(dev));
-            frame.record_stream(
-                c10::impl::getDeviceGuardImpl(c10::DeviceType::CUDA)->getStream(cudaDev));
+            // drop the tensor straight away. A tensor allocated on a side
+            // stream would then go back to that stream's pool and be
+            // rewritten under the queued convert; keep it until the convert
+            // has read it (see retainUntilRead).
+            retainUntilRead(frame, stream);
         });
         return true;
     }
@@ -2251,9 +2249,7 @@ bool VideoEncoder::encodeCudaFrame(const torch::Tensor& frame, AVPixelFormat src
         swNextSlot_ = slot ^ 1;
         // The convert may still be queued when encode_frame returns, as into
         // NVENC (see there).
-        const c10::Device cudaDev(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(dev));
-        frame.record_stream(
-            c10::impl::getDeviceGuardImpl(c10::DeviceType::CUDA)->getStream(cudaDev));
+        retainUntilRead(frame, stream);
     }
     catch (...)
     {
@@ -2407,6 +2403,53 @@ void VideoEncoder::unpinStaging(std::vector<uint8_t>* staging)
     pinnedStaging_.erase(it);
 }
 
+void VideoEncoder::retainUntilRead(const nelux::Tensor& frame, cudaStream_t stream)
+{
+    // torch's record_stream has no stable-ABI form. Holding a reference until
+    // an event recorded behind the convert completes gives the caching
+    // allocator the same guarantee: the storage is not recycled under a
+    // queued read. Released on a later encode_frame or at close, both on the
+    // encoding thread with the GIL dropped.
+    releaseReadInputs(false);
+    cudaEvent_t done = nullptr;
+    if (!freeRetainEvents_.empty())
+    {
+        done = freeRetainEvents_.back();
+        freeRetainEvents_.pop_back();
+    }
+    else if (cudaError_t err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+             err != cudaSuccess)
+        throw std::runtime_error("Failed to create CUDA event: " +
+                                 std::string(cudaGetErrorString(err)));
+    if (cudaError_t err = cudaEventRecord(done, stream); err != cudaSuccess)
+    {
+        freeRetainEvents_.push_back(done);
+        throw std::runtime_error("Failed to record CUDA event: " +
+                                 std::string(cudaGetErrorString(err)));
+    }
+    retainedInputs_.push_back({done, frame});
+}
+
+void VideoEncoder::releaseReadInputs(bool wait)
+{
+    while (!retainedInputs_.empty())
+    {
+        RetainedInput& front = retainedInputs_.front();
+        if (wait)
+            cudaEventSynchronize(front.done);
+        else if (cudaEventQuery(front.done) != cudaSuccess)
+            break;
+        freeRetainEvents_.push_back(front.done);
+        retainedInputs_.pop_front();
+    }
+    if (wait)
+    {
+        for (cudaEvent_t done : freeRetainEvents_)
+            cudaEventDestroy(done);
+        freeRetainEvents_.clear();
+    }
+}
+
 void VideoEncoder::enqueueGpuSlot(
     cudaStream_t stream,
     const std::function<void(const nelux::backends::cuda::RgbToYuvExactDest&)>& fill)
@@ -2459,7 +2502,7 @@ void VideoEncoder::enqueueGpuSlot(
     cvReady.notify_one();
 }
 
-bool VideoEncoder::encodeCpuFrameOnGpu(const torch::Tensor& frame,
+bool VideoEncoder::encodeCpuFrameOnGpu(const nelux::Tensor& frame,
                                        const nelux::conversion::cpu::RowSource* rows,
                                        AVPixelFormat srcFmt, int inW, int inH)
 {
@@ -2778,7 +2821,7 @@ void VideoEncoder::close()
     underEncoderLock([this] { closeLocked(); });
 }
 
-torch::Tensor VideoEncoder::getEncodedData()
+nelux::Tensor VideoEncoder::getEncodedData()
 {
     return underEncoderLock([this] {
         if (!memoryOutput_) throw std::invalid_argument("Encoded data is available only for a memory destination");
@@ -2792,16 +2835,16 @@ torch::Tensor VideoEncoder::getEncodedData()
         const auto block = encodedOutput_.takeBlock();
         if (block.data)
         {
-            encodedData_ = torch::from_blob(
+            encodedData_ = nelux::from_blob(
                 block.data, {bytes},
                 [reserved = block.reserved](void* data) {
                     nelux::Encoder::MemoryOutput::releaseBlock(static_cast<uint8_t*>(data), reserved);
                 },
-                torch::kUInt8);
+                nelux::kUInt8);
         }
         else
         {
-            encodedData_ = torch::empty({bytes}, torch::kUInt8);
+            encodedData_ = nelux::empty({bytes}, nelux::kUInt8);
             encodedOutput_.copyTo(encodedData_.data_ptr<uint8_t>());
             encodedOutput_ = {};
         }
@@ -2963,6 +3006,8 @@ void VideoEncoder::closeLocked()
         av_frame_unref(const_cast<AVFrame*>(frame));
     }
     pinnedYuv_.clear();
+    // Every convert has run: the codec drained them all.
+    releaseReadInputs(true);
 #endif
 
     // Surface any error the worker hit mid-stream (it kept draining to avoid a

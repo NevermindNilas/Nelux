@@ -375,14 +375,14 @@ void IndexedDecoder::setIndex(std::shared_ptr<Index> mapping)
     impl_->nextOrdinal = 0;
 }
 
-torch::Tensor IndexedDecoder::decode(const std::vector<int64_t>& indices)
+nelux::Tensor IndexedDecoder::decode(const std::vector<int64_t>& indices)
 {
     auto& state = *impl_;
     const auto& config = state.config;
     const int64_t elements = static_cast<int64_t>(config.height) * config.width * config.channels;
-    auto options = torch::TensorOptions().dtype(config.dtype).device(config.device);
+    auto options = nelux::TensorOptions().dtype(config.dtype).device(config.device);
     // swscale's SIMD tail may write past the final visible row.
-    auto storage = torch::empty({static_cast<int64_t>(indices.size()) * elements + 128}, options);
+    auto storage = nelux::empty({static_cast<int64_t>(indices.size()) * elements + 128}, options);
     auto output = storage.narrow(0, 0, static_cast<int64_t>(indices.size()) * elements)
                          .view({static_cast<int64_t>(indices.size()), config.height, config.width, config.channels});
     if (indices.empty()) return output;

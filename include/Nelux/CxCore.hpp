@@ -14,7 +14,7 @@
 #include <thread>
 #include <Logger.hpp>
 
-#include <torch/extension.h>
+#include <Tensor.hpp>
 #include <vector>
 #include <optional>
 #include <type_traits>

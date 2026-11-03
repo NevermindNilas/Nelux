@@ -1109,7 +1109,7 @@ bool Decoder::decodeNextFrame(void* buffer, double* frame_timestamp)
     }
 }
 
-torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
+nelux::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
 {
     if (!decodingThread.joinable())
     {
@@ -1162,7 +1162,7 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
                 // Everything the producer managed to convert has been handed
                 // over; only now is it honest to report why it stopped.
                 throwIfDecodeFailed();
-                return torch::Tensor();
+                return nelux::Tensor();
             }
             syncConvertOutCv_.wait_for(olk, std::chrono::milliseconds(50));
         }
@@ -1182,7 +1182,7 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
         if (convertedQueue.empty())
         {
             throwIfDecodeFailed();
-            return torch::Tensor();
+            return nelux::Tensor();
         }
 
         ConvertedFrame cf = std::move(convertedQueue.front());
@@ -1204,7 +1204,7 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
 
         // Fallback: legacy buffer queued before tensorHandoff_ flipped on.
         // Route through the pooled buffer (uninitialized, recycled) instead of
-        // torch::empty + memcpy: acquire + memcpy + from_blob wrap. Pixels
+        // nelux::empty + memcpy: acquire + memcpy + from_blob wrap. Pixels
         // identical, no zero-init, buffer recycles via deleter.
         const size_t legacyBytes = cf.buffer.size();
         auto pooledLegacy = acquireOutputBuffer(legacyBytes);
@@ -1221,7 +1221,7 @@ torch::Tensor Decoder::decodeNextFrameTensor(double* frame_timestamp)
     if (frameQueue.empty())
     {
         throwIfDecodeFailed();
-        return torch::Tensor();
+        return nelux::Tensor();
     }
 
     Frame frame = std::move(frameQueue.front());
@@ -1321,7 +1321,7 @@ void Decoder::syncConvertWorkerLoop()
         }
 
         // Convert into a pooled 64B-aligned buffer on this worker thread. The
-        // output torch::Tensor wraps this buffer on the consumer thread via
+        // output nelux::Tensor wraps this buffer on the consumer thread via
         // from_blob -- never allocated here -- so torch's CPU allocator never
         // sees an alloc-on-worker / free-on-main split, which leaks ~one frame
         // of host RAM per frame. Plain heap/pool ops are cross-thread safe.
@@ -1450,10 +1450,10 @@ Decoder::PooledBufferPtr Decoder::acquireOutputBuffer(size_t nbytes)
     return PooledBufferPtr(raw);
 }
 
-torch::Tensor Decoder::tensorFromPooledBuffer(PooledBufferPtr buf)
+nelux::Tensor Decoder::tensorFromPooledBuffer(PooledBufferPtr buf)
 {
     const int elemSize = (force_8bit || properties.bitDepth <= 8) ? 1 : 2;
-    const auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
+    const auto dtype = (elemSize == 1) ? nelux::kUInt8 : nelux::kUInt16;
     const size_t nbytes = static_cast<size_t>(properties.width) *
                           static_cast<size_t>(properties.height) * static_cast<size_t>(outChannels_) *
                           static_cast<size_t>(elemSize);
@@ -1471,7 +1471,7 @@ torch::Tensor Decoder::tensorFromPooledBuffer(PooledBufferPtr buf)
     {
         // Corrupt stamp: do not wrap; let the buffer free via its deleter.
         // Caller treats empty tensor as fatal (latched via decodeError_).
-        return torch::Tensor();
+        return nelux::Tensor();
     }
     // The deleter captures the pool by shared_ptr so recycling works even if
     // the Decoder is destroyed while Python still holds frames. It runs on
@@ -1496,12 +1496,12 @@ torch::Tensor Decoder::tensorFromPooledBuffer(PooledBufferPtr buf)
         }
         alignedFree64(bytes);
     };
-    return torch::from_blob(
+    return nelux::from_blob(
         raw, {properties.height, properties.width, outChannels_}, std::move(deleter),
-        torch::TensorOptions().dtype(dtype).device(torch::kCPU));
+        nelux::TensorOptions().dtype(dtype).device(nelux::kCPU));
 }
 
-torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
+nelux::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
 {
     // Reading packets moves the shared demuxer position, so a later
     // decode_batch can no longer resume from where it left off.
@@ -1513,7 +1513,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
         // sticky. Without it the second call after a failure reports a clean
         // end of stream -- and prefetch=False is the default path.
         throwIfDecodeFailed();
-        return torch::Tensor();
+        return nelux::Tensor();
     }
 
     // Single-threaded fallback (worker count == 0): keep the original
@@ -1557,7 +1557,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 // drains cleanly, but the container did not end, it broke.
                 syncDrained_ = true;
                 throwIfDecodeFailed();
-                return torch::Tensor();
+                return nelux::Tensor();
             }
             if (ret != AVERROR(EAGAIN))
             {
@@ -1569,7 +1569,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 // Unreachable (the store above guarantees the throw), but
                 // falling out of a `while (true)` on a failing codec context
                 // is the spin this whole change exists to remove.
-                return torch::Tensor();
+                return nelux::Tensor();
             }
             // receive_frame asked for input. FFmpeg's send/receive contract
             // forbids both sides returning EAGAIN without progress.
@@ -1676,7 +1676,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
             }
             syncDrained_ = true;
             throwIfDecodeFailed();
-            return torch::Tensor();
+            return nelux::Tensor();
         }
 
         // After EOF/flush, finish queued conversions before the empty-in-flight
@@ -1719,7 +1719,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 {
                     syncDrained_ = true;
                     throwIfDecodeFailed();
-                    return torch::Tensor();
+                    return nelux::Tensor();
                 }
                 std::unique_lock<std::mutex> lk(syncConvertOutMu_);
                 syncConvertOutCv_.wait(lk,
@@ -1787,7 +1787,7 @@ torch::Tensor Decoder::decodeNextFrameTensorSync(double* frame_timestamp)
                 {
                     syncDrained_ = true;
                     throwIfDecodeFailed();
-                    return torch::Tensor();
+                    return nelux::Tensor();
                 }
                 std::unique_lock<std::mutex> lk(syncConvertOutMu_);
                 syncConvertOutCv_.wait(lk,
@@ -2574,11 +2574,11 @@ void Decoder::decodingLoop()
                 }
                 else if (tensorHandoff_.load(std::memory_order_relaxed))
                 {
-                    // Zero-copy: convert directly into a fresh torch::Tensor
+                    // Zero-copy: convert directly into a fresh nelux::Tensor
                     // and hand it to the consumer. Saves one W*H*3 memcpy per
                     // frame (~2.7 MB for 720p RGB).
-                    auto dtype = (elemSize == 1) ? torch::kUInt8 : torch::kUInt16;
-                    cf.tensor = [&]() -> torch::Tensor {
+                    auto dtype = (elemSize == 1) ? nelux::kUInt8 : nelux::kUInt16;
+                    cf.tensor = [&]() -> nelux::Tensor {
                         const size_t hb = static_cast<size_t>(properties.width) *
                                           static_cast<size_t>(properties.height) *
                                           static_cast<size_t>(outChannels_) *
@@ -2853,7 +2853,7 @@ int64_t Decoder::countVideoPacketsExact()
     return count;
 }
 
-torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
+nelux::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
 {
     NELUX_DEBUG("decode_batch called with {} indices", indices.size());
 
@@ -2867,13 +2867,13 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
     // device match what BatchDecoder returns for a non-empty batch.
     if (indices.empty())
     {
-        return torch::empty(
+        return nelux::empty(
             {0, properties.height, properties.width, outChannels_},
-            torch::TensorOptions()
-                .dtype(force_8bit ? torch::kUInt8
-                                  : (properties.bitDepth <= 8 ? torch::kUInt8
-                                                              : torch::kUInt16))
-                .device(torch::kCPU));
+            nelux::TensorOptions()
+                .dtype(force_8bit ? nelux::kUInt8
+                                  : (properties.bitDepth <= 8 ? nelux::kUInt8
+                                                              : nelux::kUInt16))
+                .device(nelux::kCPU));
     }
 
     // The batch path shares formatCtx with the producer thread. Concurrent
@@ -2896,9 +2896,9 @@ torch::Tensor Decoder::decode_batch(const std::vector<int64_t>& indices)
             properties.height,           // height
             properties.width,            // width
             outChannels_,                // channels (grayscale batch is rejected upstream)
-            force_8bit ? torch::kUInt8 : // dtype
-                (properties.bitDepth <= 8 ? torch::kUInt8 : torch::kUInt16),
-            torch::kCPU, // device - always decode to CPU first
+            force_8bit ? nelux::kUInt8 : // dtype
+                (properties.bitDepth <= 8 ? nelux::kUInt8 : nelux::kUInt16),
+            nelux::kCPU, // device - always decode to CPU first
             false        // normalize
         };
 

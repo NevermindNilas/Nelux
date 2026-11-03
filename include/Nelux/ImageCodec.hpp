@@ -1,5 +1,5 @@
 #pragma once
-#include <torch/torch.h>
+#include <Tensor.hpp>
 #include <string>
 #include <vector>
 #include <memory>
@@ -13,10 +13,10 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    friend std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>&, int, ImageCodecCache&);
-    friend torch::Tensor encodeJpegCUDA(torch::Tensor, int, int, ImageCodecCache&);
+    friend std::vector<nelux::Tensor> decodeJpegsCUDA(const std::vector<std::string>&, int, ImageCodecCache&);
+    friend nelux::Tensor encodeJpegCUDA(nelux::Tensor, int, int, ImageCodecCache&);
 };
-std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encoded, int device, ImageCodecCache& cache);
+std::vector<nelux::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encoded, int device, ImageCodecCache& cache);
 // subsampling is 444, 422 or 420.
-torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, ImageCodecCache& cache);
+nelux::Tensor encodeJpegCUDA(nelux::Tensor image, int quality, int subsampling, ImageCodecCache& cache);
 }

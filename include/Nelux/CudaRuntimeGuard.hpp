@@ -1,15 +1,14 @@
 #pragma once
-// Guard for the delay-loaded CUDA PyTorch runtime (Windows).
+// Guard for the CUDA PyTorch runtime.
 //
-// On Windows the CUDA torch DLL (c10_cuda.dll) is delay-loaded (see /DELAYLOAD
-// in CMakeLists.txt) so that `import nelux` works on a CPU-only PyTorch, where
-// that DLL is absent. Call requireCudaRuntime() at the entry of a GPU-only code
-// path (e.g. the NVDEC decoder) to fail with a clear message rather than a raw
-// delay-load crash when that runtime is missing. No-op off Windows / non-CUDA.
+// Nelux links only torch_cpu, so `import nelux` works on a CPU-only PyTorch.
+// Call requireCudaRuntime() at the entry of a GPU-only code path (e.g. the
+// NVDEC decoder) to fail with a clear message when torch has no CUDA runtime,
+// instead of a failure deep in the first tensor allocation.
 namespace nelux {
-#if defined(NELUX_ENABLE_CUDA) && defined(_WIN32)
-void requireCudaRuntime();  // defined in src/Nelux/FFmpegDelayLoad.cpp
+#ifdef NELUX_ENABLE_CUDA
+void requireCudaRuntime(int device);  // defined in src/Nelux/CudaStream.cpp
 #else
-inline void requireCudaRuntime() {}
+inline void requireCudaRuntime(int) {}
 #endif
 }  // namespace nelux

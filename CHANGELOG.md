@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **One wheel for every PyTorch from 2.14 on.** The native module uses only
+  PyTorch's stable ABI (targeting 2.14) and imports only stable C symbols from
+  `torch_cpu`, so the same wheel loads under torch 2.14, 2.15 and later, CPU
+  or CUDA build. The `215torch` build tag and the exact-minor import check are
+  removed; torch older than 2.14 raises `ImportError`.
+- `import nelux` imports torch itself; importing torch first is no longer
+  required.
+- `nelux.__torch_abi__` reports the oldest supported torch (`"2.14"`), not the
+  torch minor the wheel was built with.
+
 ## [0.22.0] - 2026-11-01
 
 ### Changed

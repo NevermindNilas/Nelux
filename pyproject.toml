@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11", "wheel", "torch"]
+requires = ["scikit-build-core", "pybind11", "wheel", "torch>=2.14"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -22,9 +22,10 @@ classifiers = [
 keywords = ["ffmpeg", "video", "ml", "pytorch", "decode", "tensors", "inference"]
 # numpy is imported unconditionally by nelux/batch.py, which nelux/__init__.py
 # imports, so `import nelux` fails without it. torch is deliberately absent:
-# the wheel is built against one torch minor and pinning it here would fight
-# the user's own CUDA/CPU index choice, so __init__.py raises a clear
-# ImportError on a mismatch instead.
+# the wheel uses only the PyTorch stable ABI and works with any torch >= 2.14,
+# but a torch requirement here would let pip replace the user's CUDA/CPU build
+# with PyPI's default one (CPU-only on Windows) whenever theirs is older, so
+# __init__.py raises a clear ImportError below 2.14 instead.
 dependencies = ["numpy"]
 
 [project.urls]

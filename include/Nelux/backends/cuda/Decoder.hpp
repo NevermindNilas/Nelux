@@ -28,7 +28,7 @@ namespace nelux::backends::cuda
  * This decoder uses FFmpeg's hwaccel API with NVDEC to decode video
  * frames directly on the GPU. The decoded NV12 frames are converted
  * to RGB using a custom CUDA kernel, and the output remains on the GPU
- * as a torch::Tensor with device='cuda'.
+ * as a nelux::Tensor with device='cuda'.
  * 
  * Thread safety:
  * - C++ side: Uses mutex for frame queue access
@@ -182,9 +182,9 @@ public:
      * Overrides the base implementation to keep frames on the GPU.
      * 
      * @param indices Frame indices to decode
-     * @return torch::Tensor Output tensor of shape [B, H, W, C] on CUDA device
+     * @return nelux::Tensor Output tensor of shape [B, H, W, C] on CUDA device
      */
-    torch::Tensor decode_batch(const std::vector<int64_t>& indices) override;
+    nelux::Tensor decode_batch(const std::vector<int64_t>& indices) override;
 
 protected:
     void initialize(const std::string& filePath);

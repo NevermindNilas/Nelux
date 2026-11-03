@@ -87,7 +87,7 @@ bool looksLikeStillImage(const std::optional<std::string>& encoded, const std::s
 }
 } // namespace
 
-std::optional<torch::Tensor> decodeImageCPU(const std::optional<std::string>& encoded, const std::string& source,
+std::optional<nelux::Tensor> decodeImageCPU(const std::optional<std::string>& encoded, const std::string& source,
                                             int channels, bool force8Bit)
 {
     if ((channels != 1 && channels != 3 && channels != 4) || !looksLikeStillImage(encoded, source))
@@ -161,9 +161,9 @@ std::optional<torch::Tensor> decodeImageCPU(const std::optional<std::string>& en
         return std::nullopt;
     // The reader's dtype follows the stream's first-component depth.
     const int depth = force8Bit ? 8 : desc->comp[0].depth;
-    torch::ScalarType dtype;
-    if (depth == 8) dtype = torch::kUInt8;
-    else if (depth == 10 || depth == 12 || depth == 16) dtype = torch::kUInt16;
+    nelux::ScalarType dtype;
+    if (depth == 8) dtype = nelux::kUInt8;
+    else if (depth == 10 || depth == 12 || depth == 16) dtype = nelux::kUInt16;
     else return std::nullopt;
 
     conversion::cpu::AutoToRGBConverter converter;
@@ -171,7 +171,7 @@ std::optional<torch::Tensor> decodeImageCPU(const std::optional<std::string>& en
     converter.setOutputChannels(channels);
     const int64_t elements = static_cast<int64_t>(picture->height) * picture->width * channels;
     // swscale's SIMD tail may write past the final visible row.
-    auto storage = torch::empty({elements + 128}, torch::TensorOptions().dtype(dtype));
+    auto storage = nelux::empty({elements + 128}, nelux::TensorOptions().dtype(dtype));
     auto output = storage.narrow(0, 0, elements).view({picture->height, picture->width, channels});
     converter.convert(frame, output.data_ptr());
     return output;

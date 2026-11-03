@@ -1,4 +1,17 @@
 
+### **Unreleased**
+
+- **One wheel for every PyTorch from 2.14 on.** The native module is built on
+  PyTorch's stable ABI (`torch/csrc/stable`, targeting 2.14) instead of the
+  version-locked C++ API, and imports only stable C symbols from `torch_cpu`.
+  The same wheel loads under torch 2.14, 2.15 and later releases, CPU or CUDA
+  build; the `215torch` build tag and the exact-minor import check are gone.
+  Torch older than 2.14 raises a clear `ImportError`.
+- `import nelux` imports torch itself; `import torch` first is no longer
+  required.
+- `nelux.__torch_abi__` now reports the oldest supported torch (`"2.14"`)
+  rather than the torch minor the wheel was built with.
+
 ### **Version 0.22.0 (2026-11-01)**
 
 - **PyTorch 2.15.0.** Wheels are built against torch 2.15.0 and torchvision

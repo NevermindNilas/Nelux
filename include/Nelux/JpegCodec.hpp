@@ -1,5 +1,5 @@
 #pragma once
-#include <torch/torch.h>
+#include <Tensor.hpp>
 
 namespace nelux {
 // Baseline JPEG from a CPU uint8 HW or HWC image (1 or 3 channels) with
@@ -7,5 +7,5 @@ namespace nelux {
 // Larger images are encoded as independent horizontal strips in parallel and
 // joined with restart markers. The strip layout depends only on the image
 // geometry, so the bytes are the same at any thread count.
-torch::Tensor encodeJpegCPU(torch::Tensor image, int quality, int subsampling);
+nelux::Tensor encodeJpegCPU(nelux::Tensor image, int quality, int subsampling);
 }

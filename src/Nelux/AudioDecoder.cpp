@@ -162,7 +162,7 @@ struct AudioDecoder::Impl {
             packet.reset();
             resampler.reset();
         } catch (...) {
-            block = torch::Tensor();
+            block = nelux::Tensor();
             blockUsed = 0;
             chunks.clear();
             ends.clear();
@@ -180,8 +180,8 @@ struct AudioDecoder::Impl {
         if (!block.defined() || block.size(1) - blockUsed < samples) {
             seal();
             blockSize = std::min<int64_t>(blockSize * 2, 1 << 20);
-            block = torch::empty({channels, std::max(blockSize, samples)},
-                                 torch::TensorOptions().dtype(torch::kFloat32));
+            block = nelux::empty({channels, std::max(blockSize, samples)},
+                                 nelux::TensorOptions().dtype(nelux::kFloat32));
         }
         float* base = block.data_ptr<float>() + blockUsed;
         for (int c = 0; c < channels; ++c)
@@ -194,15 +194,15 @@ struct AudioDecoder::Impl {
             chunks.push_back(block.narrow(1, 0, blockUsed));
             ends.push_back(totalSamples += blockUsed);
         }
-        block = torch::Tensor();
+        block = nelux::Tensor();
         blockUsed = 0;
     }
 
     // Samples [begin, end) as one owned tensor, copied straight from the
     // decoded chunks rather than through a concatenated copy of the stream.
-    torch::Tensor gather(int64_t begin, int64_t end) const
+    nelux::Tensor gather(int64_t begin, int64_t end) const
     {
-        auto output = torch::empty({channels, end - begin}, torch::TensorOptions().dtype(torch::kFloat32));
+        auto output = nelux::empty({channels, end - begin}, nelux::TensorOptions().dtype(nelux::kFloat32));
         size_t i = std::upper_bound(ends.begin(), ends.end(), begin) - ends.begin();
         for (int64_t position = begin; position < end; ++i) {
             const int64_t start = ends[i] - chunks[i].size(1);
@@ -221,10 +221,10 @@ struct AudioDecoder::Impl {
     std::unique_ptr<SwrContext, ResamplerDeleter> resampler;
     AVChannelLayout inputLayout{};
     AVRational timeBase{};
-    std::vector<torch::Tensor> chunks;
+    std::vector<nelux::Tensor> chunks;
     std::vector<int64_t> ends;  // Cumulative sample count after each chunk.
     int64_t totalSamples = 0;
-    torch::Tensor block;  // Being filled; sealed into chunks when full.
+    nelux::Tensor block;  // Being filled; sealed into chunks when full.
     int64_t blockUsed = 0, blockSize = 1 << 13;
     std::exception_ptr failure;
     std::string codecName;
@@ -238,7 +238,7 @@ AudioDecoder::AudioDecoder(const std::string& path, int streamIndex, int sampleR
     : impl_(std::make_unique<Impl>(path, streamIndex, sampleRate, channels, threads)) {}
 AudioDecoder::~AudioDecoder() = default;
 
-std::tuple<torch::Tensor, double, int> AudioDecoder::samples(double start, std::optional<double> end)
+std::tuple<nelux::Tensor, double, int> AudioDecoder::samples(double start, std::optional<double> end)
 {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->decode();

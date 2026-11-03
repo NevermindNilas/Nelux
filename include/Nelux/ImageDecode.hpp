@@ -1,5 +1,5 @@
 #pragma once
-#include <torch/torch.h>
+#include <Tensor.hpp>
 #include <optional>
 #include <string>
 
@@ -10,6 +10,6 @@ namespace nelux {
 // Returns nullopt for anything outside that fast path (non-image demuxers,
 // display matrices, any failure); the caller then uses the reader, which also
 // owns the error reporting.
-std::optional<torch::Tensor> decodeImageCPU(const std::optional<std::string>& encoded, const std::string& source,
+std::optional<nelux::Tensor> decodeImageCPU(const std::optional<std::string>& encoded, const std::string& source,
                                             int channels, bool force8Bit);
 }

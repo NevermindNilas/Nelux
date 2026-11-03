@@ -32,7 +32,7 @@ BatchDecoder::BatchDecoder(const Config& config)
     NELUX_DEBUG("BatchDecoder created: {}x{}x{}, dtype={}, device={}",
                 config_.width, config_.height, config_.channels,
                 static_cast<int>(config_.dtype),
-                config_.device.str());
+                config_.device.is_cuda() ? "cuda:" + std::to_string(config_.device.index()) : std::string("cpu"));
 }
 
 BatchDecoder::~BatchDecoder()
@@ -344,7 +344,7 @@ bool BatchDecoder::decodeUntilFrame(
 
 void BatchDecoder::copyFrameToOutput(
     AVFrame* frame,
-    torch::Tensor& output,
+    nelux::Tensor& output,
     const std::vector<size_t>& positions,
     SwsContext* sws_ctx)
 {
@@ -353,7 +353,7 @@ void BatchDecoder::copyFrameToOutput(
 
 void BatchDecoder::copyFrameToOutput(
     AVFrame* frame,
-    torch::Tensor& output,
+    nelux::Tensor& output,
     const size_t* positions,
     size_t count,
     SwsContext* sws_ctx)
@@ -471,7 +471,7 @@ void BatchDecoder::copyFrameToOutput(
         std::memcpy(out_base + positions[i] * frameBytes, first, frameBytes);
 }
 
-torch::Tensor BatchDecoder::decode_batch(
+nelux::Tensor BatchDecoder::decode_batch(
     const std::vector<int64_t>& indices,
     AVFormatContext* fmt_ctx,
     AVCodecContext* codec_ctx,
@@ -483,8 +483,8 @@ torch::Tensor BatchDecoder::decode_batch(
     NELUX_INFO("Decoding batch of {} frames", indices.size());
     
     if (indices.empty()) {
-        return torch::empty({0, config_.height, config_.width, config_.channels},
-                           torch::TensorOptions().dtype(config_.dtype).device(config_.device));
+        return nelux::empty({0, config_.height, config_.width, config_.channels},
+                           nelux::TensorOptions().dtype(config_.dtype).device(config_.device));
     }
 
     // Validate all indices
@@ -551,9 +551,9 @@ torch::Tensor BatchDecoder::decode_batch(
     // [N,H,W,C] uint8 tensor with the usual strides.
     const int64_t visible = static_cast<int64_t>(indices.size()) *
                             config_.height * config_.width * config_.channels;
-    torch::Tensor output =
-        torch::empty({visible + SWS_DST_SLACK},
-                     torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+    nelux::Tensor output =
+        nelux::empty({visible + SWS_DST_SLACK},
+                     nelux::TensorOptions().dtype(nelux::kUInt8).device(nelux::kCPU))
             .narrow(0, 0, visible)
             .view({static_cast<int64_t>(indices.size()), config_.height,
                    config_.width, config_.channels});
@@ -803,7 +803,7 @@ torch::Tensor BatchDecoder::decode_batch(
     // uint8/CPU (the common path: narrow+view over a uint8 slack buffer, no
     // trailing .to()). Otherwise a single fused .to(device,dtype) replaces
     // the old two-step .to(device).to(dtype) (two full-tensor copies).
-    if (config_.device.is_cuda() || config_.dtype != torch::kUInt8)
+    if (config_.device.is_cuda() || config_.dtype != nelux::kUInt8)
     {
         output = output.to(config_.device, config_.dtype);
     }

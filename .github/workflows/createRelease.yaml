@@ -226,7 +226,6 @@ jobs:
           Remove-Item dist/*.whl -Force
           Move-Item dist_repaired/*.whl dist/
           Remove-Item dist_repaired -Recurse -Force
-          python tools/tag_wheel_torch.py (Get-ChildItem dist/*.whl).FullName
           Write-Host "=== Wheel repair complete ==="
 
       - name: List wheel contents
@@ -422,7 +421,6 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
-          python tools/tag_wheel_torch.py dist/*.whl
 
       - name: Verify the wheel ships FFmpeg and its licences
         run: |
@@ -436,17 +434,19 @@ jobs:
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python tests/wheel_smoke_test.py
 
-      - name: Verify import on CPU-only torch (lite-profile regression guard)
+      - name: Verify import on CPU-only torch at the stable-ABI floor
         run: |
           set -euo pipefail
-          # Fresh env with CPU-only torch — the previously-broken "lite" profile.
-          # The wheel MUST import here: no eager libc10_cuda.so (resolved via
-          # dlsym) and no eager libcudart.so (static-linked). A failure means the
-          # CPU-torch import regression is back.
+          # Fresh env with CPU-only torch 2.14.0: the oldest torch the wheel
+          # supports, and a different release than it was built against. The
+          # wheel MUST import and decode here: it uses only the stable C ABI
+          # (no libc10/libtorch_python/libtorch_cuda) and static cudart. A
+          # failure means either the CPU-torch import or the cross-version
+          # stable-ABI guarantee regressed.
           python -m venv /tmp/cpuenv
           . /tmp/cpuenv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install "torch==2.15.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "torch==2.14.0" --index-url https://download.pytorch.org/whl/cpu
           # numpy is NOT installed by hand: it is a declared dependency of the
           # wheel, so pip must pull it in on its own here. If this job starts
           # failing on "No module named 'numpy'", the metadata regressed.
@@ -457,14 +457,20 @@ jobs:
           # build output (no vendored libturbojpeg), not the installed wheel.
           cd "${RUNNER_TEMP}"
           python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__, nelux.__file__)"
-          # Locate the .so via find_spec (does NOT execute nelux/__init__.py, so it
-          # avoids the "import torch first" guard) for the NEEDED assertion.
+          # Locate the .so via find_spec (does NOT execute nelux/__init__.py) for
+          # the NEEDED and symbol assertions.
           SO=$(python -c "import importlib.util,glob,os; s=importlib.util.find_spec('nelux'); print(glob.glob(os.path.join(os.path.dirname(s.origin),'_nelux*.so'))[0])")
           echo "== NEEDED of $SO =="; readelf -d "$SO" | grep NEEDED || true
-          if readelf -d "$SO" | grep -qE 'NEEDED.*(libc10_cuda|libcudart|libtorch_cuda)'; then
-            echo "FAIL: eager CUDA lib still in NEEDED (import would break on CPU-only torch)"; exit 1
+          if readelf -d "$SO" | grep -qE 'NEEDED.*(libc10|libcudart|libtorch_cuda|libtorch_python|libtorch\.so)'; then
+            echo "FAIL: NEEDED lists a torch library besides libtorch_cpu, or eager cudart"; exit 1
           fi
-          echo "OK: no eager CUDA libs in NEEDED"
+          echo "OK: libtorch_cpu is the only torch library in NEEDED"
+          # Only stable C shims may be imported from torch: a mangled c10/at/torch
+          # C++ symbol ties the wheel to the torch release it was built with.
+          if nm -D --undefined-only "$SO" | awk '{print $2}' | grep -E '^_ZN?K?(3c10|2at|5torch)'; then
+            echo "FAIL: imports torch C++ symbols (not stable-ABI)"; exit 1
+          fi
+          echo "OK: only stable C ABI symbols imported from torch"
           python "${GITHUB_WORKSPACE}/tests/wheel_smoke_test.py"
           cd "${GITHUB_WORKSPACE}"
           deactivate
@@ -597,7 +603,6 @@ jobs:
           rm -f dist/*.whl
           mv dist_repaired/*.whl dist/
           rm -rf dist_repaired
-          python tools/tag_wheel_torch.py dist/*.whl
 
       - name: Verify the wheel ships FFmpeg and its licences
         run: |

@@ -251,7 +251,6 @@ jobs:
           Remove-Item dist/*.whl -Force
           Move-Item dist_repaired/*.whl dist/
           Remove-Item dist_repaired -Recurse -Force
-          python tools/tag_wheel_torch.py (Get-ChildItem dist/*.whl).FullName
           Write-Host "=== Wheel repair complete ==="
 
       - name: List wheel contents

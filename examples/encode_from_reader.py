@@ -2,7 +2,7 @@
 
 import os
 import sys
-import torch  # Must be imported before nelux
+import torch
 
 def _add_ffmpeg_dll_dir() -> None:
     if os.name != "nt":

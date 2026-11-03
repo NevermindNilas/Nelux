@@ -131,7 +131,7 @@ ImageCodecCache::ImageCodecCache() : impl_(std::make_unique<Impl>()) {}
 ImageCodecCache::~ImageCodecCache() = default;
 void ImageCodecCache::clear() { impl_->contexts.clear(); }
 
-std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encoded, int device, ImageCodecCache& cache)
+std::vector<nelux::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encoded, int device, ImageCodecCache& cache)
 {
     if (encoded.empty()) return {};
     if (encoded.size() > INT_MAX) throw std::invalid_argument("JPEG batch is too large");
@@ -139,7 +139,7 @@ std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encod
     auto& a = api();
     auto& c = context(cache.impl_->contexts, device);
     auto stream = currentCudaStream(device);
-    std::vector<torch::Tensor> result;
+    std::vector<nelux::Tensor> result;
     std::vector<const unsigned char*> pointers;
     std::vector<size_t> lengths;
     std::vector<nvjpegImage_t> destinations;
@@ -154,8 +154,8 @@ std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encod
             bytes.size(), &components, &subsampling, widths, heights));
         if (widths[0] <= 0 || heights[0] <= 0 || (components != 1 && components != 3))
             throw std::invalid_argument("CUDA JPEG decode requires a grayscale or RGB JPEG");
-        result.push_back(torch::empty({heights[0], widths[0], 3},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device))));
+        result.push_back(nelux::empty({heights[0], widths[0], 3},
+            nelux::TensorOptions().dtype(nelux::kUInt8).device(nelux::Device(nelux::kCUDA, device))));
         nvjpegImage_t destination{};
         destination.channel[0] = result.back().data_ptr<unsigned char>();
         destination.pitch[0] = static_cast<size_t>(widths[0]) * 3;
@@ -180,7 +180,7 @@ std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>& encod
     return result;
 }
 
-torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, ImageCodecCache& cache)
+nelux::Tensor encodeJpegCUDA(nelux::Tensor image, int quality, int subsampling, ImageCodecCache& cache)
 {
     nvjpegChromaSubsampling_t css;
     switch (subsampling) {
@@ -189,7 +189,7 @@ torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, 
     case 420: css = NVJPEG_CSS_420; break;
     default: throw std::invalid_argument("subsampling must be 444, 422 or 420");
     }
-    if (!image.is_cuda() || image.scalar_type() != torch::kUInt8 || image.dim() != 3 ||
+    if (!image.is_cuda() || image.scalar_type() != nelux::kUInt8 || image.dim() != 3 ||
         image.size(2) != 3 || image.size(0) <= 0 || image.size(1) <= 0 ||
         image.size(0) > INT_MAX || image.size(1) > INT_MAX || quality < 1 || quality > 100)
         throw std::invalid_argument("CUDA JPEG encoding requires HWC RGB uint8 and quality in [1, 100]");
@@ -198,7 +198,7 @@ torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, 
     auto stream = currentCudaStream(device);
     auto& a = api();
     auto& c = context(cache.impl_->contexts, device);
-    torch::Tensor output;
+    nelux::Tensor output;
     image = image.contiguous();
     try {
         if (!c.encoder) checkJpeg(a.nvjpegEncoderStateCreate(c.handle, &c.encoder, stream));
@@ -213,7 +213,7 @@ torch::Tensor encodeJpegCUDA(torch::Tensor image, int quality, int subsampling, 
         checkCuda(cudaStreamSynchronize(stream));
         size_t size = 0;
         checkJpeg(a.nvjpegEncodeRetrieveBitstream(c.handle, c.encoder, nullptr, &size, stream));
-        output = torch::empty({static_cast<int64_t>(size)}, torch::kUInt8);
+        output = nelux::empty({static_cast<int64_t>(size)}, nelux::kUInt8);
         checkJpeg(a.nvjpegEncodeRetrieveBitstream(c.handle, c.encoder, output.data_ptr<unsigned char>(), &size, stream));
         checkCuda(cudaStreamSynchronize(stream));
         return output.narrow(0, 0, size);
@@ -229,10 +229,10 @@ struct ImageCodecCache::Impl {};
 ImageCodecCache::ImageCodecCache() : impl_(std::make_unique<Impl>()) {}
 ImageCodecCache::~ImageCodecCache() = default;
 void ImageCodecCache::clear() {}
-std::vector<torch::Tensor> decodeJpegsCUDA(const std::vector<std::string>&, int, ImageCodecCache&) {
+std::vector<nelux::Tensor> decodeJpegsCUDA(const std::vector<std::string>&, int, ImageCodecCache&) {
     throw std::runtime_error("CUDA JPEG decoding requires a CUDA-enabled Nelux build");
 }
-torch::Tensor encodeJpegCUDA(torch::Tensor, int, int, ImageCodecCache&) {
+nelux::Tensor encodeJpegCUDA(nelux::Tensor, int, int, ImageCodecCache&) {
     throw std::runtime_error("CUDA JPEG encoding requires a CUDA-enabled Nelux build");
 }
 }
