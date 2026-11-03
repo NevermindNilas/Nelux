@@ -1,4 +1,5 @@
 #include "BatchDecoder.hpp"
+#include <cpu/AutoToRGB.hpp>
 #include "Logger.hpp"
 #include <spdlog/spdlog.h>
 #include "error/CxException.hpp"
@@ -458,12 +459,14 @@ void BatchDecoder::copyFrameToOutput(
     uint8_t* out_base = output.data_ptr<uint8_t>();
 
     uint8_t* first = out_base + positions[0] * frameBytes;
-    uint8_t* dstData[4] = {first, nullptr, nullptr, nullptr};
-    int dstLines[4] = {rowBytes, 0, 0, 0};
 
+    // Through swsScaleIntoRows: for a width that is not a multiple of 8,
+    // swscale's unscaled x86 converters leave each tight row's tail unwritten.
     SwsContext* use_sws = sws_ctx ? sws_ctx : copySws_;
-    sws_scale(use_sws, frame->data, frame->linesize, 0, frame->height,
-              dstData, dstLines);
+    nelux::conversion::cpu::swsScaleIntoRows(
+        use_sws, frame->data, frame->linesize, static_cast<AVPixelFormat>(frame->format),
+        frame->height, first, config_.width, 3, config_.height,
+        frame->width == config_.width && frame->height == config_.height);
 
     // Duplicate indices in the request share one decode; fan the finished slice
     // out to the remaining positions.

@@ -228,20 +228,6 @@ class VideoEncoder
     // and queue the slot for the submit thread behind an event recorded there.
     void enqueueGpuSlot(cudaStream_t stream,
                         const std::function<void(const nelux::backends::cuda::RgbToYuvExactDest&)>& fill);
-    // CUDA input frames a queued convert still reads, each with an event
-    // recorded behind that convert on the caller's stream (stands in for
-    // torch's record_stream). Encoding thread only, under lifecycleMu_.
-    struct RetainedInput
-    {
-        cudaEvent_t done;
-        nelux::Tensor frame;
-    };
-    std::deque<RetainedInput> retainedInputs_;
-    std::vector<cudaEvent_t> freeRetainEvents_;
-    void retainUntilRead(const nelux::Tensor& frame, cudaStream_t stream);
-    // Drops the frames whose convert has run; @p wait blocks for all of them
-    // and frees the events (close).
-    void releaseReadInputs(bool wait);
 
     // CPU tensor into NVENC: the RGB goes up to cpuRgbDevice_ on
     // cpuUploadStream_ (nelux's own, so no torch CUDA is needed) and the

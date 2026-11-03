@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nelux.__torch_abi__` reports the oldest supported torch (`"2.14"`), not the
   torch minor the wheel was built with.
 
+### Fixed
+
+- **Odd widths decoded the last pixels of every row from uninitialized
+  memory.** For 8-bit YUV video and JPEGs whose width is not a multiple of 8
+  (854x480, 1366x768, ...), CPU decoding to RGB on x86 left the last
+  `width % 8` pixels of each row unwritten: swscale's SIMD converter assumes
+  padded rows, and a tensor's are tight. Iteration, `get_batch` and
+  `decode_image` now match ffmpeg's output exactly at every width.
+- `encode_frame` / `encode_video` with a meta tensor (or one on a device other
+  than CPU or CUDA) raises `ValueError` instead of crashing the process.
+
 ## [0.22.0] - 2026-11-01
 
 ### Changed

@@ -16,6 +16,7 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/inductor/aoti_torch/generated/c_shim_aten.h>
 #include <torch/headeronly/core/ScalarType.h>
 
 #include <algorithm>
@@ -56,6 +57,55 @@ inline constexpr DeviceType kCPU = DeviceType::CPU;
 inline constexpr DeviceType kCUDA = DeviceType::CUDA;
 inline constexpr Layout kStrided = Layout::Strided;
 
+// A torch error that crossed the stable C boundary. The C++ exception type
+// (c10::OutOfMemoryError, c10::IndexError, ...) does not cross it, only the
+// message, so the kind is recovered from torch's message wording. The Python
+// bindings translate each kind to the exception torch itself would raise
+// (torch.OutOfMemoryError, IndexError, ...); C++ callers can still catch it
+// as std::runtime_error.
+class TorchError : public std::runtime_error
+{
+  public:
+    enum class Kind
+    {
+        Runtime,
+        OutOfMemory,
+        Accelerator,
+        NotImplemented,
+        Index,
+    };
+
+    explicit TorchError(const std::string& message)
+        : std::runtime_error(message), kind_(classify(message))
+    {
+    }
+    Kind kind() const noexcept { return kind_; }
+
+    static Kind classify(const std::string& m)
+    {
+        auto has = [&](const char* s) { return m.find(s) != std::string::npos; };
+        // c10::OutOfMemoryError (the CUDA caching allocator's message).
+        if (has("out of memory. Tried to allocate") || m.rfind("CUDA out of memory", 0) == 0)
+            return Kind::OutOfMemory;
+        // c10::AcceleratorError (C10_CUDA_CHECK on a failed CUDA call).
+        if (m.rfind("CUDA error: ", 0) == 0)
+            return Kind::Accelerator;
+        // c10::NotImplementedError: a missing kernel for the backend, or an
+        // AT_DISPATCH with no case for the dtype.
+        if ((has("Could not run '") && has("' with arguments from the '")) ||
+            has("\" not implemented for '"))
+            return Kind::NotImplemented;
+        // c10::IndexError (TORCH_CHECK_INDEX: wrap_dim, select, index ops).
+        if (has("Dimension out of range") || has("is out of bounds for dimension") ||
+            has("index out of range in self"))
+            return Kind::Index;
+        return Kind::Runtime;
+    }
+
+  private:
+    Kind kind_;
+};
+
 namespace tensor_detail
 {
 // torch's own message for a failed shim call, without the C++ backtrace and
@@ -64,8 +114,8 @@ namespace tensor_detail
 [[noreturn]] inline void throwTorchError(const char* what)
 {
     const char* message = torch_exception_get_what_without_backtrace();
-    throw std::runtime_error(message && *message ? std::string(message)
-                                                 : std::string(what) + " failed");
+    throw TorchError(message && *message ? std::string(message)
+                                         : std::string(what) + " failed");
 }
 } // namespace tensor_detail
 
@@ -77,6 +127,8 @@ namespace tensor_detail
     } while (0)
 
 // The ordinary at::TensorOptions subset Nelux uses: dtype, device, pinning.
+// As there, an unset dtype means "keep" in to() and torch's default dtype in
+// a factory.
 class TensorOptions
 {
   public:
@@ -108,12 +160,15 @@ class TensorOptions
         return o;
     }
 
-    ScalarType dtype() const { return dtype_; }
+    bool has_dtype() const { return dtype_.has_value(); }
+    // Only meaningful when has_dtype(); torch's stock default otherwise.
+    ScalarType dtype() const { return dtype_.value_or(ScalarType::Float); }
+    std::optional<ScalarType> dtype_opt() const { return dtype_; }
     Device device() const { return device_; }
     bool pinned_memory() const { return pinned_; }
 
   private:
-    ScalarType dtype_ = ScalarType::Float;
+    std::optional<ScalarType> dtype_;
     Device device_ = Device(DeviceType::CPU);
     bool pinned_ = false;
 };
@@ -142,6 +197,7 @@ class Tensor : public torch::stable::Tensor
     ScalarType dtype() const { return scalar_type(); }
     TensorOptions options() const { return TensorOptions(scalar_type()).device(device()); }
 
+    // c10::isFloatingType.
     bool is_floating_point() const
     {
         switch (scalar_type())
@@ -154,26 +210,32 @@ class Tensor : public torch::stable::Tensor
         case ScalarType::Float8_e4m3fn:
         case ScalarType::Float8_e5m2fnuz:
         case ScalarType::Float8_e4m3fnuz:
+        case ScalarType::Float8_e8m0fnu:
+        case ScalarType::Float4_e2m1fn_x2:
             return true;
         default:
             return false;
         }
     }
 
+    // The shim wraps a negative dim and raises torch's IndexError for one
+    // out of range.
     int64_t size(int64_t dim) const
     {
-        const int64_t n = this->dim();
-        return Base::size(dim < 0 ? dim + n : dim);
+        int64_t size = 0;
+        NELUX_TORCH_CHECK(aoti_torch_get_size(get(), dim, &size));
+        return size;
     }
     int64_t stride(int64_t dim) const
     {
-        const int64_t n = this->dim();
-        return Base::stride(dim < 0 ? dim + n : dim);
+        int64_t stride = 0;
+        NELUX_TORCH_CHECK(aoti_torch_get_stride(get(), dim, &stride));
+        return stride;
     }
     int64_t nbytes() const { return numel() * static_cast<int64_t>(element_size()); }
 
     void* data_ptr() const { return get() ? Base::data_ptr() : nullptr; }
-    template <class T> T* data_ptr() const { return Base::mutable_data_ptr<T>(); }
+    template <class T> T* data_ptr() const;
 
     Tensor to(ScalarType dtype, bool non_blocking = false, bool copy = false) const;
     Tensor to(Device device, bool non_blocking = false, bool copy = false) const;
@@ -183,10 +245,12 @@ class Tensor : public torch::stable::Tensor
     }
     Tensor to(Device device, ScalarType dtype, bool non_blocking = false,
               bool copy = false) const;
+    // An unset dtype in @p options keeps this tensor's.
     Tensor to(const TensorOptions& options, bool non_blocking = false,
               bool copy = false) const
     {
-        return to(options.device(), options.dtype(), non_blocking, copy);
+        return to(options.device(), options.has_dtype() ? options.dtype() : scalar_type(),
+                  non_blocking, copy);
     }
     Tensor cpu() const { return to(Device(DeviceType::CPU)); }
 
@@ -249,7 +313,9 @@ inline StableIValue iv(const T& v)
     return torch::stable::detail::from(v);
 }
 
-// One boxed dispatcher call; the result is the first stack slot.
+// One boxed dispatcher call; the result is the first stack slot. A Tensor
+// result is a new reference the caller owns: take it with call() or
+// callInPlace(), never drop the slot.
 template <class... Args>
 inline StableIValue callRaw(const char* name, const char* overload, const Args&... args)
 {
@@ -263,33 +329,86 @@ inline Tensor call(const char* name, const char* overload, const Args&... args)
     return Tensor(torch::stable::detail::to<torch::stable::Tensor>(
         callRaw(name, overload, args...)));
 }
-
-// A Python-number operand for a Tensor overload. The stable dispatcher has no
-// Scalar argument, so the number travels as a 0-dim tensor typed to promote
-// exactly as the ordinary Scalar overload's wrapped number does: an integer
-// keeps the tensor's dtype; a float keeps a floating tensor's dtype (and stays
-// double so its value is unrounded) and makes an integral one float32, the
-// default dtype.
-template <class S>
-inline Tensor scalarOperand(const Tensor& self, S value)
+// An in-place op (`Tensor(a!)` result): the returned handle is a second
+// reference to self, released here.
+template <class... Args>
+inline void callInPlace(const char* name, const char* overload, const Args&... args)
 {
-    static_assert(std::is_arithmetic_v<S>, "scalar operand must be arithmetic");
-    AtenTensorHandle handle = nullptr;
-    if constexpr (std::is_integral_v<S>)
-        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_int64(static_cast<int64_t>(value), &handle));
-    else if (self.is_floating_point())
-        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_float64(static_cast<double>(value), &handle));
-    else
-        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_float32(static_cast<float>(value), &handle));
-    return Tensor(handle);
+    (void)call(name, overload, args...);
 }
 
-template <class S>
-inline Tensor binary(const char* name, const Tensor& self, S value)
+// torch.get_default_dtype(): what an unset factory dtype, or a Python float
+// meeting an integral tensor, becomes.
+inline ScalarType defaultDtype()
 {
-    return call(name, "Tensor", self, scalarOperand(self, value));
+    return call("aten::empty", "memory_format", IntArrayRef(), std::optional<ScalarType>(),
+                std::optional<Layout>(), std::optional<torch::stable::Device>(),
+                std::optional<bool>(), std::optional<MemoryFormat>())
+        .scalar_type();
+}
+
+// The dtype of a 0-dim tensor standing in for a Python number next to @p self
+// (of at least one dim), chosen so the result type and the value the kernel
+// sees match the ordinary Scalar overload's wrapped number: a number of
+// self's category leaves self's dtype (and travels as int64/double, as a
+// wrapped number does, so it is not rounded first); an integer next to a bool
+// tensor makes int64, a float next to an integral one the default dtype.
+template <class S> inline ScalarType scalarOperandDtype(const Tensor& self)
+{
+    static_assert(std::is_arithmetic_v<S> && !std::is_same_v<S, bool>,
+                  "scalar operand must be a number");
+    if constexpr (std::is_integral_v<S>)
+        return ScalarType::Long;
+    else
+        return self.is_floating_point() ? ScalarType::Double : defaultDtype();
+}
+
+template <class S> inline Tensor scalarOperand(const Tensor& self, S value)
+{
+    AtenTensorHandle handle = nullptr;
+    const ScalarType dtype = scalarOperandDtype<S>(self);
+    switch (dtype)
+    {
+    case ScalarType::Long:
+        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_int64(static_cast<int64_t>(value), &handle));
+        return Tensor(handle);
+    case ScalarType::Double:
+        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_float64(static_cast<double>(value), &handle));
+        return Tensor(handle);
+    default:
+        // float32, or a float16/bfloat16 default dtype (no shim of its own).
+        NELUX_TORCH_CHECK(aoti_torch_scalar_to_tensor_float32(static_cast<float>(value), &handle));
+        return Tensor(handle).to(dtype);
+    }
+}
+
+// A wrapped number never promotes a 0-dim tensor of its category, but a 0-dim
+// operand does: run the op on a 1-element view and drop the dim again.
+template <class Op> inline Tensor atLeast1d(const Tensor& self, Op op)
+{
+    if (self.dim() != 0)
+        return op(self);
+    return op(self.unsqueeze(0)).squeeze(0);
+}
+
+template <class S> inline Tensor binary(const char* name, const Tensor& self, S value)
+{
+    return atLeast1d(self, [&](const Tensor& t) {
+        return call(name, "Tensor", t, scalarOperand(t, value));
+    });
 }
 } // namespace tensor_detail
+
+template <class T> inline T* Tensor::data_ptr() const
+{
+    // at::Tensor::data_ptr<T>'s check and message.
+    const ScalarType want = torch::headeronly::CppTypeToScalarType<T>::value;
+    const ScalarType have = scalar_type();
+    if (have != want)
+        throw TorchError(std::string("expected scalar type ") + torch::headeronly::toString(want) +
+                         " but found " + torch::headeronly::toString(have));
+    return static_cast<T*>(Base::data_ptr());
+}
 
 inline Tensor::Base Tensor::nullHandle()
 {
@@ -377,7 +496,7 @@ inline Tensor Tensor::flip(IntArrayRef dims) const
 }
 inline const Tensor& Tensor::copy_(const Tensor& source, bool non_blocking) const
 {
-    tensor_detail::callRaw("aten::copy_", "", *this, source, non_blocking);
+    tensor_detail::callInPlace("aten::copy_", "", *this, source, non_blocking);
     return *this;
 }
 inline Tensor Tensor::round() const { return tensor_detail::call("aten::round", "", *this); }
@@ -389,24 +508,25 @@ inline bool Tensor::is_neg() const
 namespace tensor_detail
 {
 // clamp.Tensor, unlike the arithmetic ops, wants its bounds on self's device.
-// A CUDA bound is filled from the CPU number by a kernel, without a host sync.
+// A CUDA bound is filled from the number by a kernel, without a host sync.
 template <class S> inline Tensor boundOperand(const Tensor& self, S value)
 {
-    Tensor number = scalarOperand(self, value);
     if (self.is_cpu())
-        return number;
-    Tensor bound = empty(IntArrayRef(), TensorOptions(number.scalar_type()).device(self.device()));
-    callRaw("aten::fill_", "Tensor", bound, number);
+        return scalarOperand(self, value);
+    Tensor bound = empty(IntArrayRef(), TensorOptions(scalarOperandDtype<S>(self)).device(self.device()));
+    NELUX_TORCH_CHECK(aoti_torch_aten_fill__Scalar(bound.get(), static_cast<double>(value)));
     return bound;
 }
 } // namespace tensor_detail
 
 template <class Lo, class Hi> inline Tensor Tensor::clamp(Lo minimum, Hi maximum) const
 {
-    return tensor_detail::call(
-        "aten::clamp", "Tensor", *this,
-        std::optional<torch::stable::Tensor>(tensor_detail::boundOperand(*this, minimum)),
-        std::optional<torch::stable::Tensor>(tensor_detail::boundOperand(*this, maximum)));
+    return tensor_detail::atLeast1d(*this, [&](const Tensor& t) {
+        return tensor_detail::call(
+            "aten::clamp", "Tensor", t,
+            std::optional<torch::stable::Tensor>(tensor_detail::boundOperand(t, minimum)),
+            std::optional<torch::stable::Tensor>(tensor_detail::boundOperand(t, maximum)));
+    });
 }
 
 template <class S, std::enable_if_t<std::is_arithmetic_v<S>, int> = 0>
@@ -420,6 +540,15 @@ inline Tensor operator/(const Tensor& self, S value)
     return tensor_detail::binary("aten::div", self, value);
 }
 
+// "[2, 3]", as torch prints a size in its messages.
+inline std::string shapeString(IntArrayRef shape)
+{
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i)
+        s += (i ? ", " : "") + std::to_string(shape[i]);
+    return s + "]";
+}
+
 // Contiguous row-major strides for @p shape.
 inline std::vector<int64_t> contiguousStrides(IntArrayRef shape)
 {
@@ -427,6 +556,9 @@ inline std::vector<int64_t> contiguousStrides(IntArrayRef shape)
     int64_t stride = 1;
     for (size_t i = shape.size(); i > 0; --i)
     {
+        if (shape[i - 1] < 0)
+            throw TorchError("Trying to create tensor with negative dimension " +
+                             std::to_string(shape[i - 1]) + ": " + shapeString(shape));
         strides[i - 1] = stride;
         stride *= std::max<int64_t>(shape[i - 1], 1);
     }
@@ -438,7 +570,7 @@ inline std::vector<int64_t> contiguousStrides(IntArrayRef shape)
 // frame on several paths.
 inline Tensor empty(IntArrayRef shape, const TensorOptions& options)
 {
-    if (!options.pinned_memory())
+    if (!options.pinned_memory() && options.has_dtype())
     {
         std::array<int64_t, 8> inlineStrides{};
         std::vector<int64_t> heapStrides;
@@ -452,8 +584,8 @@ inline Tensor empty(IntArrayRef shape, const TensorOptions& options)
         for (size_t i = shape.size(); i > 0; --i)
         {
             if (shape[i - 1] < 0)
-                throw std::invalid_argument("Trying to create tensor with negative dimension " +
-                                            std::to_string(shape[i - 1]));
+                throw TorchError("Trying to create tensor with negative dimension " +
+                                 std::to_string(shape[i - 1]) + ": " + shapeString(shape));
             strides[i - 1] = stride;
             stride *= std::max<int64_t>(shape[i - 1], 1);
         }
@@ -469,10 +601,11 @@ inline Tensor empty(IntArrayRef shape, const TensorOptions& options)
             &handle));
         return Tensor(handle);
     }
-    return tensor_detail::call("aten::empty", "memory_format", shape,
-                               std::optional<ScalarType>(options.dtype()), std::optional<Layout>(),
+    return tensor_detail::call("aten::empty", "memory_format", shape, options.dtype_opt(),
+                               std::optional<Layout>(),
                                std::optional<torch::stable::Device>(options.device()),
-                               std::optional<bool>(true), std::optional<MemoryFormat>());
+                               std::optional<bool>(options.pinned_memory()),
+                               std::optional<MemoryFormat>());
 }
 inline Tensor empty(std::initializer_list<int64_t> shape, const TensorOptions& options = {})
 {
@@ -483,14 +616,44 @@ inline Tensor empty(const std::vector<int64_t>& shape, const TensorOptions& opti
     return empty(IntArrayRef(shape.data(), shape.size()), options);
 }
 
+namespace tensor_detail
+{
+inline int32_t shimDtype(ScalarType t)
+{
+    return torch::stable::detail::to<int32_t>(torch::stable::detail::from(t));
+}
+inline int32_t shimDeviceType(DeviceType t)
+{
+    return torch::stable::detail::to<int32_t>(torch::stable::detail::from(t));
+}
+inline int32_t shimStrided()
+{
+    return torch::stable::detail::to<int32_t>(torch::stable::detail::from(Layout::Strided));
+}
+} // namespace tensor_detail
+
 // torch::from_blob over a contiguous buffer, with a deleter that runs once
-// the last reference to the storage dies.
+// the last reference to the storage dies. The shape is validated (by
+// contiguousStrides) before the deleter is handed over, so the shim call has
+// nothing left to reject for a valid dtype and device.
 template <class F, std::enable_if_t<std::is_invocable_v<F, void*>, int> = 0>
 inline Tensor from_blob(void* data, IntArrayRef shape, F deleter, const TensorOptions& options)
 {
     const std::vector<int64_t> strides = contiguousStrides(shape);
-    return torch::stable::from_blob(data, shape, IntArrayRef(strides.data(), strides.size()),
-                                    options.device(), options.dtype(), std::move(deleter));
+    const Device device = options.device();
+    auto* ctx = new F(std::move(deleter));
+    AtenTensorHandle handle = nullptr;
+    NELUX_TORCH_CHECK(torch_from_blob(
+        data, static_cast<int64_t>(shape.size()), shape.data(), strides.data(), 0,
+        tensor_detail::shimDtype(options.dtype()), tensor_detail::shimDeviceType(device.type()),
+        device.index(), &handle, tensor_detail::shimStrided(), nullptr, 0,
+        [](void* p, void* c) {
+            F* f = static_cast<F*>(c);
+            (*f)(p);
+            delete f;
+        },
+        ctx));
+    return Tensor(handle);
 }
 
 // torch::from_blob without a deleter: the tensor borrows @p data, which must
@@ -498,8 +661,13 @@ inline Tensor from_blob(void* data, IntArrayRef shape, F deleter, const TensorOp
 inline Tensor from_blob(void* data, IntArrayRef shape, const TensorOptions& options)
 {
     const std::vector<int64_t> strides = contiguousStrides(shape);
-    return torch::stable::from_blob(data, shape, IntArrayRef(strides.data(), strides.size()),
-                                    options.device(), options.dtype());
+    const Device device = options.device();
+    AtenTensorHandle handle = nullptr;
+    NELUX_TORCH_CHECK(aoti_torch_create_tensor_from_blob_v2(
+        data, static_cast<int64_t>(shape.size()), shape.data(), strides.data(), 0,
+        tensor_detail::shimDtype(options.dtype()), tensor_detail::shimDeviceType(device.type()),
+        device.index(), &handle, tensor_detail::shimStrided(), nullptr, 0));
+    return Tensor(handle);
 }
 inline Tensor from_blob(void* data, std::initializer_list<int64_t> shape,
                         const TensorOptions& options)
@@ -543,9 +711,14 @@ inline int getNumThreads() { return static_cast<int>(torch::stable::get_num_thre
 // would report it, through the device-generic stable accelerator API.
 inline void* currentStreamHandle(int device)
 {
-    return torch::stable::accelerator::getCurrentStream(
-               static_cast<torch::stable::accelerator::DeviceIndex>(device))
-        .nativeHandle();
+    StreamHandle stream = nullptr;
+    NELUX_TORCH_CHECK(aoti_torch_get_current_stream(device, &stream));
+    void* native = nullptr;
+    const AOTITorchError err = torch_stream_native_handle(stream, &native);
+    aoti_torch_delete_stream(stream);
+    if (err != TORCH_SUCCESS)
+        tensor_detail::throwTorchError("torch_stream_native_handle");
+    return native;
 }
 #endif
 

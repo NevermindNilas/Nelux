@@ -54,9 +54,11 @@ Originally created by [Trentonom0r3](https://github.com/Trentonom0r3).
 
 ## Installation
 
-Install PyTorch first, then NeLux. Any PyTorch from 2.14 on works: NeLux is
-built on PyTorch's stable ABI, so one wheel runs under every torch release from
-2.14 forward, CPU or CUDA build, with no version matching.
+Install PyTorch first, then NeLux. Any PyTorch release from 2.14 on works:
+NeLux is built on PyTorch's stable ABI, so one wheel runs under every torch
+release from 2.14 forward, CPU or CUDA build, with no version matching. The
+GPU paths (NVDEC/NVENC) need a CUDA build of torch and an NVIDIA driver for
+CUDA 13 (see [Requirements](#requirements)).
 
 ```bash
 # Windows / Linux with an NVIDIA GPU
@@ -631,11 +633,13 @@ nelux.__version__, nelux.__ffmpeg_version__, nelux.__cuda_support__, nelux.__tor
 ## Requirements
 
 - **Python** 3.13+
-- **PyTorch** 2.14 or newer, any release (one wheel covers them all). The CUDA
-  torch wheel provides the CUDA runtime that NVDEC and NVENC need.
+- **PyTorch** 2.14 or newer, any release (one wheel covers them all). NVDEC and
+  NVENC need a CUDA build; ROCm builds are not supported for the GPU paths.
 - **NumPy**, which is installed automatically.
 - **For NVDEC/NVENC:** an NVIDIA GPU with compute capability 7.5+ (Turing, i.e.
-  GTX 16xx / RTX 20xx, and newer), a recent driver, and CUDA 13.x torch.
+  GTX 16xx / RTX 20xx, and newer) and a driver for CUDA 13 (R580 or newer).
+  NeLux carries its own CUDA 13 runtime, so this holds whichever CUDA version
+  your torch wheel was built for; the cu13x wheels are the ones tested.
   CUDA 13 dropped Maxwell, Pascal and Volta. Those cards need a source build
   against CUDA 12.x (`CUDAARCHS=61 pip install .`).
 - **OS:** Windows 10/11; Linux (manylinux_2_28+, e.g. Ubuntu 22.04+); macOS 14+

@@ -11,6 +11,14 @@
   required.
 - `nelux.__torch_abi__` now reports the oldest supported torch (`"2.14"`)
   rather than the torch minor the wheel was built with.
+- Fixed: for 8-bit YUV video and JPEGs whose width is not a multiple of 8
+  (854x480, 1366x768, ...), CPU decoding to RGB on x86 left the last
+  `width % 8` pixels of every row unwritten (uninitialized memory): swscale's
+  SIMD converter assumes padded rows, and a tensor's are tight. Iteration,
+  `get_batch` and `decode_image` now match ffmpeg's output exactly at every
+  width.
+- Fixed: `encode_frame` / `encode_video` with a meta tensor (or one on a
+  device other than CPU or CUDA) raises `ValueError` instead of crashing.
 
 ### **Version 0.22.0 (2026-11-01)**
 

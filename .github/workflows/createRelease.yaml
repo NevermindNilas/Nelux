@@ -269,6 +269,40 @@ jobs:
             exit 1
           }
 
+      - name: Verify import on CPU-only torch at the stable-ABI floor
+        shell: powershell
+        run: |
+          # Fresh env with CPU-only torch 2.14.0: the oldest torch the wheel
+          # supports, a different release than it was built against, and no
+          # torch_cuda/c10_cuda DLLs for anything to bind to.
+          $ErrorActionPreference = 'Continue'
+          $venv = Join-Path $env:RUNNER_TEMP "floorenv"
+          python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          & $py -m pip install --upgrade pip
+          & $py -m pip install "torch==2.14.0" pefile --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          if ($LASTEXITCODE -ne 0) { Write-Error "torch 2.14.0 install failed"; exit 1 }
+          & $py -m pip install (Get-ChildItem dist/*.whl).FullName
+          if ($LASTEXITCODE -ne 0) { Write-Error "wheel install failed"; exit 1 }
+          $env:FFMPEG_BIN = Join-Path $pwd "external\ffmpeg\bin"
+          $workspace = $pwd
+          # Outside the checkout, so the installed wheel is what is imported.
+          Push-Location $env:RUNNER_TEMP
+          & $py -c "import torch; assert torch.version.cuda is None and torch.__version__.startswith('2.14.'), torch.__version__; import nelux; print('import OK on CPU torch', torch.__version__, nelux.__file__)"
+          if ($LASTEXITCODE -ne 0) { Write-Error "import on torch 2.14.0 CPU failed"; exit 1 }
+          & $py (Join-Path $workspace "tools\verify_stable_abi.py")
+          if ($LASTEXITCODE -ne 0) { Write-Error "stable-ABI symbol check failed"; exit 1 }
+          $output = & $py (Join-Path $workspace "tests\wheel_smoke_test.py") 2>&1 | Out-String
+          Write-Host $output
+          Pop-Location
+          if ($output -match '\[smoke\] SKIP:') {
+            Write-Host "Smoke test skipped - import and symbol checks passed."
+            exit 0
+          } elseif ($LASTEXITCODE -ne 0) {
+            Write-Error "Smoke test on torch 2.14.0 CPU failed (exit $LASTEXITCODE)"
+            exit 1
+          }
+
       - name: Mandatory installed-wheel range gate
         uses: ./.github/actions/range-gate
         with:
@@ -457,20 +491,9 @@ jobs:
           # build output (no vendored libturbojpeg), not the installed wheel.
           cd "${RUNNER_TEMP}"
           python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; import nelux; print('import OK on CPU torch:', nelux.__version__, nelux.__file__)"
-          # Locate the .so via find_spec (does NOT execute nelux/__init__.py) for
-          # the NEEDED and symbol assertions.
-          SO=$(python -c "import importlib.util,glob,os; s=importlib.util.find_spec('nelux'); print(glob.glob(os.path.join(os.path.dirname(s.origin),'_nelux*.so'))[0])")
-          echo "== NEEDED of $SO =="; readelf -d "$SO" | grep NEEDED || true
-          if readelf -d "$SO" | grep -qE 'NEEDED.*(libc10|libcudart|libtorch_cuda|libtorch_python|libtorch\.so)'; then
-            echo "FAIL: NEEDED lists a torch library besides libtorch_cpu, or eager cudart"; exit 1
-          fi
-          echo "OK: libtorch_cpu is the only torch library in NEEDED"
-          # Only stable C shims may be imported from torch: a mangled c10/at/torch
+          # torch_cpu only, and only stable C shims imported from it: a torch
           # C++ symbol ties the wheel to the torch release it was built with.
-          if nm -D --undefined-only "$SO" | awk '{print $2}' | grep -E '^_ZN?K?(3c10|2at|5torch)'; then
-            echo "FAIL: imports torch C++ symbols (not stable-ABI)"; exit 1
-          fi
-          echo "OK: only stable C ABI symbols imported from torch"
+          python "${GITHUB_WORKSPACE}/tools/verify_stable_abi.py"
           python "${GITHUB_WORKSPACE}/tests/wheel_smoke_test.py"
           cd "${GITHUB_WORKSPACE}"
           deactivate
@@ -615,6 +638,23 @@ jobs:
           # vendored dylibs or this step has verified nothing.
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           python tests/wheel_smoke_test.py
+
+      - name: Verify import on torch at the stable-ABI floor
+        run: |
+          # Fresh env with torch 2.14.0, the oldest torch the wheel supports
+          # and a different release than it was built against.
+          python -m venv "${RUNNER_TEMP}/floorenv"
+          . "${RUNNER_TEMP}/floorenv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.14.0"
+          python -m pip install "${GITHUB_WORKSPACE}"/dist/*.whl
+          export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
+          # Outside the checkout, so the installed wheel is what is imported.
+          cd "${RUNNER_TEMP}"
+          python -c "import torch; assert torch.__version__.startswith('2.14.'), torch.__version__; import nelux; print('import OK on torch', torch.__version__, nelux.__file__)"
+          python "${GITHUB_WORKSPACE}/tools/verify_stable_abi.py"
+          python "${GITHUB_WORKSPACE}/tests/wheel_smoke_test.py"
+          deactivate
 
       - name: Mandatory installed-wheel range gate
         uses: ./.github/actions/range-gate

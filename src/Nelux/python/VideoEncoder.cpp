@@ -676,6 +676,16 @@ void VideoEncoder::encodeFrame(nelux::Tensor frame)
 {
     // Validate input shape up front, while the GIL is still held so this raises
     // as a clean Python exception.
+    //
+    // Only CPU and CUDA memory can be read; a meta tensor has no data at all
+    // (its data pointer is null) and a tensor of another backend is not
+    // readable through a host or CUDA pointer.
+    if (!frame.is_cpu() && !frame.is_cuda())
+        throw std::invalid_argument(
+            std::string("encode_frame: expected a CPU or CUDA tensor, got a ") +
+            (frame.device().type() == nelux::DeviceType::Meta ? "meta tensor (it holds no data)"
+                                                              : "tensor on another device") +
+            "; move it to the CPU or a CUDA device first");
     if (!resizeEnabled_)
     {
         // Fixed-size mode: the convert pipeline consumes exactly
@@ -757,6 +767,21 @@ void VideoEncoder::encodeFrame(nelux::Tensor frame)
                 "got shape [" + got + "]");
         }
     }
+
+#ifdef NELUX_ENABLE_CUDA
+    // A CUDA frame is read by a convert queued on the caller's current stream,
+    // which may still be pending when encode_frame returns. Recording that use
+    // on the frame's storage (record_stream, as torch's own async consumers
+    // do) keeps the caching allocator from handing the memory out again
+    // before the convert has read it, however the caller drops or rebinds the
+    // tensor. Done here, before the GIL is dropped: it goes through torch's
+    // Python binding, and the encoder lock below must never wait on the GIL.
+    if (frame.is_cuda())
+    {
+        pybind11::gil_scoped_acquire gil;
+        nelux::python::recordCurrentStream(frame);
+    }
+#endif
 
     // Everything from here on drives the codec, the worker pipeline and the
     // buffer pools, so it runs serialised against every other operation on this
@@ -2176,13 +2201,10 @@ bool VideoEncoder::encodeCudaFrame(const nelux::Tensor& frame, AVPixelFormat src
         // waits on the event, copies the slot into a hw frame and sends it,
         // overlapped with the caller's next frame.
         enqueueGpuSlot(stream, [&](const nelux::backends::cuda::RgbToYuvExactDest& dst) {
+            // encode_frame returns before this convert runs; encode_frame
+            // recorded the frame's use on this stream (recordCurrentStream),
+            // so its memory is not reused before the convert reads it.
             conv->convert(src, dst, stream);
-            // encode_frame returns before that convert runs, and the caller may
-            // drop the tensor straight away. A tensor allocated on a side
-            // stream would then go back to that stream's pool and be
-            // rewritten under the queued convert; keep it until the convert
-            // has read it (see retainUntilRead).
-            retainUntilRead(frame, stream);
         });
         return true;
     }
@@ -2249,7 +2271,6 @@ bool VideoEncoder::encodeCudaFrame(const nelux::Tensor& frame, AVPixelFormat src
         swNextSlot_ = slot ^ 1;
         // The convert may still be queued when encode_frame returns, as into
         // NVENC (see there).
-        retainUntilRead(frame, stream);
     }
     catch (...)
     {
@@ -2401,53 +2422,6 @@ void VideoEncoder::unpinStaging(std::vector<uint8_t>* staging)
         return;
     cudaHostUnregister(it->second);
     pinnedStaging_.erase(it);
-}
-
-void VideoEncoder::retainUntilRead(const nelux::Tensor& frame, cudaStream_t stream)
-{
-    // torch's record_stream has no stable-ABI form. Holding a reference until
-    // an event recorded behind the convert completes gives the caching
-    // allocator the same guarantee: the storage is not recycled under a
-    // queued read. Released on a later encode_frame or at close, both on the
-    // encoding thread with the GIL dropped.
-    releaseReadInputs(false);
-    cudaEvent_t done = nullptr;
-    if (!freeRetainEvents_.empty())
-    {
-        done = freeRetainEvents_.back();
-        freeRetainEvents_.pop_back();
-    }
-    else if (cudaError_t err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
-             err != cudaSuccess)
-        throw std::runtime_error("Failed to create CUDA event: " +
-                                 std::string(cudaGetErrorString(err)));
-    if (cudaError_t err = cudaEventRecord(done, stream); err != cudaSuccess)
-    {
-        freeRetainEvents_.push_back(done);
-        throw std::runtime_error("Failed to record CUDA event: " +
-                                 std::string(cudaGetErrorString(err)));
-    }
-    retainedInputs_.push_back({done, frame});
-}
-
-void VideoEncoder::releaseReadInputs(bool wait)
-{
-    while (!retainedInputs_.empty())
-    {
-        RetainedInput& front = retainedInputs_.front();
-        if (wait)
-            cudaEventSynchronize(front.done);
-        else if (cudaEventQuery(front.done) != cudaSuccess)
-            break;
-        freeRetainEvents_.push_back(front.done);
-        retainedInputs_.pop_front();
-    }
-    if (wait)
-    {
-        for (cudaEvent_t done : freeRetainEvents_)
-            cudaEventDestroy(done);
-        freeRetainEvents_.clear();
-    }
 }
 
 void VideoEncoder::enqueueGpuSlot(
@@ -3006,8 +2980,6 @@ void VideoEncoder::closeLocked()
         av_frame_unref(const_cast<AVFrame*>(frame));
     }
     pinnedYuv_.clear();
-    // Every convert has run: the codec drained them all.
-    releaseReadInputs(true);
 #endif
 
     // Surface any error the worker hit mid-stream (it kept draining to avoid a

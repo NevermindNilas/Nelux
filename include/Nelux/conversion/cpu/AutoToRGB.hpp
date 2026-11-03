@@ -29,6 +29,47 @@ namespace cpu
 /**
  * @brief Robust color-accurate converter dynamically handling pixel formats to RGB24.
  */
+// sws_scale into tight rows: @p width pixels of @p channels 8-bit samples,
+// rows back to back, as in a tensor.
+//
+// swscale's unscaled x86 YUV->packed-RGB converters work in 8-pixel groups,
+// and when the destination stride has no room for the rounded-up group they
+// convert 8 pixels fewer, leaving the last (width % 8) pixels of every row
+// unwritten (libswscale/x86/yuv2rgb.c, YUV2RGB_LOOP). FFmpeg's own frame
+// buffers are padded, so ffmpeg never sees it; a tight tensor row is not. For
+// such a width the frame is converted into padded rows and copied out, which
+// gives exactly the pixels ffmpeg produces, the tail included. Every other
+// conversion goes straight into @p dst.
+// @p unscaled: same source and destination size (only then do those
+// converters run). Returns sws_scale's result.
+inline int swsScaleIntoRows(SwsContext* ctx, const uint8_t* const srcData[4],
+                            const int srcLineSize[4], AVPixelFormat srcFmt, int srcHeight,
+                            uint8_t* dst, int width, int channels, int dstHeight, bool unscaled)
+{
+    const int rowBytes = width * channels;
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(srcFmt);
+    const bool tail = unscaled && (width % 8) != 0 && (channels == 3 || channels == 4) && desc &&
+                      !(desc->flags & AV_PIX_FMT_FLAG_RGB) && desc->nb_components >= 3;
+    if (!tail)
+    {
+        uint8_t* dstData[4] = {dst, nullptr, nullptr, nullptr};
+        const int dstLineSize[4] = {rowBytes, 0, 0, 0};
+        return sws_scale(ctx, srcData, srcLineSize, 0, srcHeight, dstData, dstLineSize);
+    }
+    // 64-byte-aligned rows with a spare 16-pixel group for the SIMD overrun,
+    // plus a slack row. Per thread: decode workers convert concurrently.
+    thread_local std::vector<uint8_t> scratch;
+    const int paddedBytes = FFALIGN((width + 16) * channels, 64);
+    scratch.resize(static_cast<size_t>(paddedBytes) * (dstHeight + 1));
+    uint8_t* dstData[4] = {scratch.data(), nullptr, nullptr, nullptr};
+    const int dstLineSize[4] = {paddedBytes, 0, 0, 0};
+    const int result = sws_scale(ctx, srcData, srcLineSize, 0, srcHeight, dstData, dstLineSize);
+    for (int y = 0; y < result; ++y)
+        std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
+                    scratch.data() + static_cast<size_t>(y) * paddedBytes, rowBytes);
+    return result;
+}
+
 class AutoToRGBConverter
 {
   public:
@@ -558,12 +599,19 @@ class AutoToRGBConverter
         const int srcLineSize[4] = {av_frame->linesize[0], av_frame->linesize[1],
                                     av_frame->linesize[2], av_frame->linesize[3]};
 
-        uint8_t* dstData[4] = {static_cast<uint8_t*>(buffer), nullptr, nullptr,
-                               nullptr};
-        const int dstLineSize[4] = {dst_w * channels * elem_size, 0, 0, 0};
-
-        const int result =
-            sws_scale(sws_ctx, srcData, srcLineSize, 0, height, dstData, dstLineSize);
+        int result;
+        if (elem_size == 1)
+        {
+            result = swsScaleIntoRows(sws_ctx, srcData, srcLineSize, src_fmt, height,
+                                      static_cast<uint8_t*>(buffer), dst_w, channels, dst_h,
+                                      !resize_active);
+        }
+        else
+        {
+            uint8_t* dstData[4] = {static_cast<uint8_t*>(buffer), nullptr, nullptr, nullptr};
+            const int dstLineSize[4] = {dst_w * channels * elem_size, 0, 0, 0};
+            result = sws_scale(sws_ctx, srcData, srcLineSize, 0, height, dstData, dstLineSize);
+        }
         if (result != dst_h)
             throw std::runtime_error("sws_scale failed or incomplete");
     }

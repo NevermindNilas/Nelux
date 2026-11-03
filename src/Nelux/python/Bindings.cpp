@@ -188,6 +188,7 @@ PYBIND11_MODULE(_nelux, m)
 {
     // torch is imported first (nelux/__init__.py); cache its tensor type.
     nelux::python::initTensorInterop();
+    nelux::python::registerTorchErrorTranslator();
     m.def("_decode_jpegs_cuda", &nelux::decodeJpegsCUDA, py::call_guard<py::gil_scoped_release>());
     m.def("_decode_image_cpu", [](std::optional<py::bytes> encoded, const std::string& source, int channels, bool force8Bit) {
         std::optional<std::string> data;

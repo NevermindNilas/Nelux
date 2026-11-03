@@ -307,6 +307,28 @@ try:
         merge_streams,
     )
 except ImportError as e:
+    # A torch that passes the version check but lacks a stable-ABI entry
+    # point Nelux binds to: a 2.14 nightly or source build from before that
+    # shim landed. Linux/macOS name the symbol; Windows reports a missing
+    # procedure (a missing DLL reads "module could not be found" instead).
+    _msg = str(e)
+    if (
+        any(
+            marker in _msg
+            for marker in ("undefined symbol: aoti_torch", "undefined symbol: torch_",
+                           "Symbol not found: _aoti_torch", "Symbol not found: _torch_")
+        )
+        or (os.name == "nt" and "procedure could not be found" in _msg)
+    ):
+        import torch as _torch
+
+        raise ImportError(
+            f"Nelux needs the PyTorch {_TORCH_FLOOR[0]}.{_TORCH_FLOOR[1]} stable ABI, which "
+            f"the installed PyTorch {_torch.__version__} does not fully provide (a "
+            "pre-release or source build older than the final release?). Install a "
+            f"released PyTorch >= {_TORCH_FLOOR[0]}.{_TORCH_FLOOR[1]}.\n\n"
+            f"Original error: {e}"
+        ) from e
     if os.name == "nt":
         diag = diagnose_runtime_dlls()
         missing = diag.get("missing", {}) if isinstance(diag, dict) else {}
