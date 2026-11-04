@@ -31,6 +31,20 @@ STABLE_C_SYMBOL = re.compile(r"^_?(aoti_torch_|torch_)")
 CXX_TORCH = re.compile(r"(c10|caffe2|torch)::|(^|[^A-Za-z0-9_:])at::")
 
 
+CXX_RUNTIME = re.compile(
+    r"^((typeinfo|typeinfo name|vtable|VTT|construction vtable|guard variable) for )?"
+    r"(std|__gnu_cxx|__cxxabiv1)::"
+)
+
+
+def cxx_runtime_symbol(mangled, demangled):
+    # A std:: template instantiated over a torch type still carries torch's
+    # layout, so anything naming a torch namespace is never exempt.
+    if CXX_TORCH.search(demangled):
+        return False
+    return bool(CXX_RUNTIME.match(demangled) or re.match(r"^__(cxa|gxx)_", mangled))
+
+
 def fail(message):
     print(f"FAIL: {message}")
     sys.exit(1)
@@ -84,7 +98,13 @@ def check_linux(so):
     for lib in re.findall(r"=>\s+(/\S+)", subprocess.run(["ldd", so], capture_output=True, text=True).stdout):
         if not re.search(r"(torch|c10)", os.path.basename(lib)):
             others |= defined_symbols(lib, "-D", "--defined-only")
-    bad = sorted(n for n in (raw & from_torch) - others if not STABLE_C_SYMBOL.match(n))
+    candidates = sorted(n for n in (raw & from_torch) - others if not STABLE_C_SYMBOL.match(n))
+    # torch's libraries also export the libstdc++ pieces they link statically
+    # (std::filesystem among them). Where the system libstdc++ is older than
+    # those (the manylinux_2_28 image's is GCC 8), the extension's references
+    # can bind to torch's copy; they are the C++ runtime's ABI, not torch's.
+    demangled = run("c++filt", *candidates).splitlines() if candidates else []
+    bad = [n for n, d in zip(candidates, demangled) if not cxx_runtime_symbol(n, d)]
     if bad:
         fail("imports non-stable symbols that torch exports: " + ", ".join(bad[:20]))
     return libs, names, undefined
