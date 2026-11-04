@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -97,7 +98,7 @@ class TorchError : public std::runtime_error
             return Kind::NotImplemented;
         // c10::IndexError (TORCH_CHECK_INDEX: wrap_dim, select, index ops).
         if (has("Dimension out of range") || has("is out of bounds for dimension") ||
-            has("index out of range in self"))
+            has("index out of range in self") || has(" out of range for tensor of size "))
             return Kind::Index;
         return Kind::Runtime;
     }
@@ -234,8 +235,35 @@ class Tensor : public torch::stable::Tensor
     }
     int64_t nbytes() const { return numel() * static_cast<int64_t>(element_size()); }
 
-    void* data_ptr() const { return get() ? Base::data_ptr() : nullptr; }
+    // The metadata calls that can fail on a valid tensor (one without storage
+    // or strides: sparse, meta), through NELUX_TORCH_CHECK so a failure is a
+    // TorchError with torch's message and nothing goes to stderr.
+    void* data_ptr() const
+    {
+        void* ptr = nullptr;
+        if (get())
+            NELUX_TORCH_CHECK(aoti_torch_get_data_ptr(get(), &ptr));
+        return ptr;
+    }
     template <class T> T* data_ptr() const;
+    bool is_contiguous() const
+    {
+        bool contiguous = false;
+        NELUX_TORCH_CHECK(aoti_torch_is_contiguous(get(), &contiguous));
+        return contiguous;
+    }
+    IntArrayRef strides() const
+    {
+        int64_t* strides = nullptr;
+        NELUX_TORCH_CHECK(aoti_torch_get_strides(get(), &strides));
+        return IntArrayRef(strides, static_cast<size_t>(dim()));
+    }
+    int64_t storage_offset() const
+    {
+        int64_t offset = 0;
+        NELUX_TORCH_CHECK(aoti_torch_get_storage_offset(get(), &offset));
+        return offset;
+    }
 
     Tensor to(ScalarType dtype, bool non_blocking = false, bool copy = false) const;
     Tensor to(Device device, bool non_blocking = false, bool copy = false) const;
@@ -407,7 +435,7 @@ template <class T> inline T* Tensor::data_ptr() const
     if (have != want)
         throw TorchError(std::string("expected scalar type ") + torch::headeronly::toString(want) +
                          " but found " + torch::headeronly::toString(have));
-    return static_cast<T*>(Base::data_ptr());
+    return static_cast<T*>(data_ptr());
 }
 
 inline Tensor::Base Tensor::nullHandle()
@@ -509,8 +537,34 @@ namespace tensor_detail
 {
 // clamp.Tensor, unlike the arithmetic ops, wants its bounds on self's device.
 // A CUDA bound is filled from the number by a kernel, without a host sync.
+// clamp.Tensor also casts its bounds to self's dtype, where clamp.Scalar
+// compares in the wider type: int8.clamp(0, 255) must leave 127 alone, not
+// clamp to 255 wrapped to -1. An integer bound next to an integral tensor is
+// first saturated to that dtype's range, which compares the same.
+template <class S> inline S saturatedBound(const Tensor& self, S value)
+{
+    if constexpr (std::is_integral_v<S>)
+    {
+        int64_t lo = 0, hi = 0;
+        switch (self.scalar_type())
+        {
+        case ScalarType::Byte: lo = 0, hi = 255; break;
+        case ScalarType::Char: lo = -128, hi = 127; break;
+        case ScalarType::Short: lo = -32768, hi = 32767; break;
+        case ScalarType::UInt16: lo = 0, hi = 65535; break;
+        case ScalarType::Int: lo = INT32_MIN, hi = INT32_MAX; break;
+        case ScalarType::UInt32: lo = 0, hi = UINT32_MAX; break;
+        default: return value; // int64/uint64 hold any bound; floats take it as is
+        }
+        const int64_t v = static_cast<int64_t>(value);
+        return static_cast<S>(std::clamp<int64_t>(v, lo, hi));
+    }
+    return value;
+}
+
 template <class S> inline Tensor boundOperand(const Tensor& self, S value)
 {
+    value = saturatedBound(self, value);
     if (self.is_cpu())
         return scalarOperand(self, value);
     Tensor bound = empty(IntArrayRef(), TensorOptions(scalarOperandDtype<S>(self)).device(self.device()));
@@ -641,18 +695,39 @@ inline Tensor from_blob(void* data, IntArrayRef shape, F deleter, const TensorOp
 {
     const std::vector<int64_t> strides = contiguousStrides(shape);
     const Device device = options.device();
-    auto* ctx = new F(std::move(deleter));
+    // The shim either rejects its arguments before building the storage
+    // (the deleter was never handed over: it is destroyed here without
+    // running, as torch::from_blob does) or builds it, after which the
+    // storage owns the deleter, even if a later step fails and frees it.
+    // `ran` tells the two apart; it is cleared once the call has succeeded,
+    // before the storage can outlive this frame.
+    struct Context
+    {
+        F deleter;
+        bool* ran;
+    };
+    bool ran = false;
+    auto* ctx = new Context{std::move(deleter), &ran};
     AtenTensorHandle handle = nullptr;
-    NELUX_TORCH_CHECK(torch_from_blob(
+    const AOTITorchError err = torch_from_blob(
         data, static_cast<int64_t>(shape.size()), shape.data(), strides.data(), 0,
         tensor_detail::shimDtype(options.dtype()), tensor_detail::shimDeviceType(device.type()),
         device.index(), &handle, tensor_detail::shimStrided(), nullptr, 0,
         [](void* p, void* c) {
-            F* f = static_cast<F*>(c);
-            (*f)(p);
-            delete f;
+            auto* context = static_cast<Context*>(c);
+            if (context->ran)
+                *context->ran = true;
+            context->deleter(p);
+            delete context;
         },
-        ctx));
+        ctx);
+    if (err != TORCH_SUCCESS)
+    {
+        if (!ran)
+            delete ctx;
+        tensor_detail::throwTorchError("torch_from_blob");
+    }
+    ctx->ran = nullptr;
     return Tensor(handle);
 }
 

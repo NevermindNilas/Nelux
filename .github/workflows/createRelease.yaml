@@ -646,7 +646,8 @@ jobs:
           python -m venv "${RUNNER_TEMP}/floorenv"
           . "${RUNNER_TEMP}/floorenv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install "torch==2.14.0"
+          # PyPI has no 2.14.0 macOS wheel for Python 3.15; the PyTorch index does.
+          python -m pip install "torch==2.14.0" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install "${GITHUB_WORKSPACE}"/dist/*.whl
           export FFMPEG_BIN="${GITHUB_WORKSPACE}/external/ffmpeg/bin"
           # Outside the checkout, so the installed wheel is what is imported.

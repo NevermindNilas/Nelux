@@ -8,6 +8,7 @@
 #include <CudaRuntimeGuard.hpp>
 #include <Tensor.hpp>
 
+#include <pybind11/gil_safe_call_once.h>
 #include <pybind11/pybind11.h>
 #include <torch/csrc/stable/pyobject.h>
 
@@ -18,6 +19,13 @@ namespace nelux::python
 // torch._C.TensorBase, the base of every torch.Tensor (and subclass).
 // Resolved once at module import, with the GIL held.
 inline PyTypeObject*& tensorBaseType()
+{
+    static PyTypeObject* type = nullptr;
+    return type;
+}
+
+// torch.Tensor itself (not a subclass).
+inline PyTypeObject*& plainTensorType()
 {
     static PyTypeObject* type = nullptr;
     return type;
@@ -36,6 +44,7 @@ inline void initTensorInterop()
     py::module_ torch = py::module_::import("torch");
     py::object base = py::module_::import("torch._C").attr("TensorBase");
     tensorBaseType() = reinterpret_cast<PyTypeObject*>(base.release().ptr());
+    plainTensorType() = reinterpret_cast<PyTypeObject*>(py::object(torch.attr("Tensor")).release().ptr());
     // Kept for the life of the process: the module never unloads.
     auto keep = [&](TorchError::Kind kind, const char* name) {
         if (py::hasattr(torch, name))
@@ -106,9 +115,14 @@ inline void recordCurrentStream(const nelux::Tensor& frame)
         }
     if (!stream)
     {
-        static PyObject* currentStream =
-            py::object(py::module_::import("torch.cuda").attr("current_stream")).release().ptr();
-        py::object s = py::reinterpret_borrow<py::object>(currentStream)(device);
+        // Not a function-local static initialised by Python code: another
+        // thread could take the GIL during the import and then block on the
+        // static's guard while holding it.
+        PYBIND11_CONSTINIT static py::gil_safe_call_once_and_store<py::object> currentStream;
+        py::object s = currentStream
+                           .call_once_and_store_result(
+                               [] { return py::module_::import("torch.cuda").attr("current_stream"); })
+                           .get_stored()(device);
         if (s.attr("cuda_stream").cast<uintptr_t>() != reinterpret_cast<uintptr_t>(handle))
             throw std::runtime_error("torch.cuda.current_stream() disagrees with torch's "
                                      "current stream handle");
@@ -130,6 +144,12 @@ inline void recordCurrentStream(const nelux::Tensor& frame)
     static PyObject* name = PyUnicode_InternFromString("record_stream");
     py::object tensor =
         py::reinterpret_steal<py::object>(static_cast<PyObject*>(torch::stable::tensor_to_pyobject(frame)));
+    // A subclass's __torch_function__ would see this call (master called
+    // record_stream in C++, out of its reach): record on a plain alias of the
+    // same storage instead, which marks the same allocator block.
+    if (Py_TYPE(tensor.ptr()) != plainTensorType())
+        tensor = py::reinterpret_steal<py::object>(
+            static_cast<PyObject*>(torch::stable::tensor_to_pyobject(frame.detach())));
     PyObject* result = PyObject_CallMethodOneArg(tensor.ptr(), name, stream);
     if (!result)
         throw py::error_already_set();

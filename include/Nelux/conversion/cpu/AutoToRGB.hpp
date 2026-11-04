@@ -10,6 +10,7 @@ extern "C"
 }
 
 #include "Frame.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
@@ -32,41 +33,108 @@ namespace cpu
 // sws_scale into tight rows: @p width pixels of @p channels 8-bit samples,
 // rows back to back, as in a tensor.
 //
-// swscale's unscaled x86 YUV->packed-RGB converters work in 8-pixel groups,
-// and when the destination stride has no room for the rounded-up group they
-// convert 8 pixels fewer, leaving the last (width % 8) pixels of every row
-// unwritten (libswscale/x86/yuv2rgb.c, YUV2RGB_LOOP). FFmpeg's own frame
-// buffers are padded, so ffmpeg never sees it; a tight tensor row is not. For
-// such a width the frame is converted into padded rows and copied out, which
-// gives exactly the pixels ffmpeg produces, the tail included. Every other
-// conversion goes straight into @p dst.
-// @p unscaled: same source and destination size (only then do those
-// converters run). Returns sws_scale's result.
+// swscale's unscaled x86 YUV->packed-RGB converters (libswscale/x86/yuv2rgb.c,
+// planar 4:2:0/4:2:2 to RGB24/BGR24/RGB32-class) work in 8-pixel groups, and
+// when the destination stride has no room for the rounded-up group they
+// convert 8 pixels fewer (YUV2RGB_LOOP), leaving the last (width % 8) pixels
+// of every row unwritten. FFmpeg's own frame buffers are padded, so ffmpeg
+// never sees it; a tight tensor row is not. For such a frame the rows are
+// converted in place as before, and then the last 16 columns again, as a
+// strip into padded rows, from which the tail is copied: those converters
+// compute each pixel from its own luma and its column pair's chroma, so the
+// strip (started on an even column) gives exactly the full frame's pixels.
+// Returns sws_scale's result for the frame.
+namespace sws_tail_detail
+{
+// swscale picks those converters only for an even output height
+// (ff_get_unscaled_swscale); any other conversion writes whole rows.
+inline bool leavesTail(AVPixelFormat src, AVPixelFormat dst, int width, int height)
+{
+    if (width % 8 == 0 || height % 2 != 0)
+        return false;
+    switch (src)
+    {
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_YUVA420P:
+        break;
+    default:
+        return false;
+    }
+    return dst == AV_PIX_FMT_RGB24 || dst == AV_PIX_FMT_BGR24 || dst == AV_PIX_FMT_RGBA ||
+           dst == AV_PIX_FMT_BGRA || dst == AV_PIX_FMT_ARGB || dst == AV_PIX_FMT_ABGR;
+}
+
+// One cached strip context per thread (decode workers convert concurrently).
+struct StripContext
+{
+    SwsContext* ctx = nullptr;
+    std::vector<uint8_t> rows;
+    ~StripContext() { sws_freeContext(ctx); }
+};
+} // namespace sws_tail_detail
+
 inline int swsScaleIntoRows(SwsContext* ctx, const uint8_t* const srcData[4],
                             const int srcLineSize[4], AVPixelFormat srcFmt, int srcHeight,
-                            uint8_t* dst, int width, int channels, int dstHeight, bool unscaled)
+                            AVPixelFormat dstFmt, uint8_t* dst, int width, int channels,
+                            int dstHeight, bool unscaled)
 {
     const int rowBytes = width * channels;
-    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(srcFmt);
-    const bool tail = unscaled && (width % 8) != 0 && (channels == 3 || channels == 4) && desc &&
-                      !(desc->flags & AV_PIX_FMT_FLAG_RGB) && desc->nb_components >= 3;
-    if (!tail)
-    {
-        uint8_t* dstData[4] = {dst, nullptr, nullptr, nullptr};
-        const int dstLineSize[4] = {rowBytes, 0, 0, 0};
-        return sws_scale(ctx, srcData, srcLineSize, 0, srcHeight, dstData, dstLineSize);
-    }
-    // 64-byte-aligned rows with a spare 16-pixel group for the SIMD overrun,
-    // plus a slack row. Per thread: decode workers convert concurrently.
-    thread_local std::vector<uint8_t> scratch;
-    const int paddedBytes = FFALIGN((width + 16) * channels, 64);
-    scratch.resize(static_cast<size_t>(paddedBytes) * (dstHeight + 1));
-    uint8_t* dstData[4] = {scratch.data(), nullptr, nullptr, nullptr};
-    const int dstLineSize[4] = {paddedBytes, 0, 0, 0};
+    uint8_t* dstData[4] = {dst, nullptr, nullptr, nullptr};
+    const int dstLineSize[4] = {rowBytes, 0, 0, 0};
     const int result = sws_scale(ctx, srcData, srcLineSize, 0, srcHeight, dstData, dstLineSize);
-    for (int y = 0; y < result; ++y)
-        std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
-                    scratch.data() + static_cast<size_t>(y) * paddedBytes, rowBytes);
+    if (result != dstHeight || !unscaled || !sws_tail_detail::leavesTail(srcFmt, dstFmt, width, dstHeight))
+        return result;
+
+    // The strip: the last 16 columns (17 for an odd width), from an even
+    // column so its chroma lines up with the frame's.
+    const int x0 = std::max(0, (width - 16) & ~1);
+    const int stripWidth = width - x0;
+    // swscale stores a YUVJ source as its plain format (the range is the
+    // separate flag copied below), so a context asked for YUVJ never matches
+    // the cache and would be rebuilt, with a deprecation warning, every call.
+    AVPixelFormat stripFmt = srcFmt;
+    if (srcFmt == AV_PIX_FMT_YUVJ420P)
+        stripFmt = AV_PIX_FMT_YUV420P;
+    else if (srcFmt == AV_PIX_FMT_YUVJ422P)
+        stripFmt = AV_PIX_FMT_YUV422P;
+    thread_local sws_tail_detail::StripContext strip;
+    strip.ctx = sws_getCachedContext(strip.ctx, stripWidth, srcHeight, stripFmt, stripWidth,
+                                     dstHeight, dstFmt, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!strip.ctx)
+        throw std::runtime_error("Failed to initialize the row-tail swsContext");
+    // The frame context's colour matrix and ranges, as configured by the caller.
+    int* invTable = nullptr;
+    int* table = nullptr;
+    int srcRange = 0, dstRange = 0, brightness = 0, contrast = 0, saturation = 0;
+    if (sws_getColorspaceDetails(ctx, &invTable, &srcRange, &table, &dstRange, &brightness,
+                                 &contrast, &saturation) < 0 ||
+        sws_setColorspaceDetails(strip.ctx, invTable, srcRange, table, dstRange, brightness,
+                                 contrast, saturation) < 0)
+        throw std::runtime_error("Failed to configure the row-tail swsContext");
+
+    const uint8_t* stripSrc[4] = {srcData[0] + x0, srcData[1] + x0 / 2, srcData[2] + x0 / 2,
+                                  srcData[3] ? srcData[3] + x0 : nullptr};
+    // Rows padded past the 8-pixel group the converter rounds up to, plus
+    // room for its 16-pixel SIMD stores and a slack row.
+    const int stripBytes = FFALIGN((stripWidth + 32) * channels, 64);
+    strip.rows.resize(static_cast<size_t>(stripBytes) * (dstHeight + 1));
+    uint8_t* stripDst[4] = {strip.rows.data(), nullptr, nullptr, nullptr};
+    const int stripLineSize[4] = {stripBytes, 0, 0, 0};
+    if (sws_scale(strip.ctx, stripSrc, srcLineSize, 0, srcHeight, stripDst, stripLineSize) !=
+        dstHeight)
+        throw std::runtime_error("sws_scale failed on the row tail");
+
+    // Only the pixels the frame pass left unwritten are copied.
+    const int tail = width % 8;
+    const size_t tailBytes = static_cast<size_t>(tail) * channels;
+    const size_t from = static_cast<size_t>(stripWidth - tail) * channels;
+    const size_t to = static_cast<size_t>(width - tail) * channels;
+    for (int y = 0; y < dstHeight; ++y)
+        std::memcpy(dst + static_cast<size_t>(y) * rowBytes + to,
+                    strip.rows.data() + static_cast<size_t>(y) * stripBytes + from, tailBytes);
     return result;
 }
 
@@ -602,7 +670,7 @@ class AutoToRGBConverter
         int result;
         if (elem_size == 1)
         {
-            result = swsScaleIntoRows(sws_ctx, srcData, srcLineSize, src_fmt, height,
+            result = swsScaleIntoRows(sws_ctx, srcData, srcLineSize, src_fmt, height, dst_fmt,
                                       static_cast<uint8_t*>(buffer), dst_w, channels, dst_h,
                                       !resize_active);
         }

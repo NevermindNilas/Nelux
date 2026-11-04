@@ -5,7 +5,8 @@ Run from outside the checkout, in the environment the wheel is installed in:
     python tools/verify_stable_abi.py
 
 The extension may depend on torch_cpu and nothing else from torch, and import
-from it only the stable C shims (aoti_torch_* / torch_*). Any C++ symbol
+from it only the stable C shims (aoti_torch_* / torch_*): every import that a
+torch library provides must be one of those. Any C++ symbol
 (c10::, at::, torch::, caffe2:: - functions, typeinfo, vtables, guard
 variables) ties the binary to the torch release it was built against, which
 is what the 2.14 stable-ABI floor exists to avoid. Locating the extension uses
@@ -51,10 +52,41 @@ def run(*cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
 
 
+def torch_dir():
+    spec = importlib.util.find_spec("torch")
+    if spec is None or not spec.origin:
+        fail("torch is not installed")
+    return os.path.dirname(spec.origin)
+
+
+def defined_symbols(lib, *nm_args):
+    out = subprocess.run(["nm", *nm_args, lib], capture_output=True, text=True).stdout
+    return {line.split()[-1].split("@")[0] for line in out.splitlines() if line.strip()}
+
+
 def check_linux(so):
     libs = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", run("readelf", "-d", so))
     undefined = run("nm", "-D", "--undefined-only", "-C", so).split("\n")
     names = [line.split()[-1] for line in undefined if line.strip()]
+
+    # ELF imports do not say which library provides them, so every import
+    # that some torch library exports must be a stable C shim. torch's
+    # libraries also export copies of libstdc++/libc symbols; those resolve
+    # to the system libraries the extension links, so they are dropped.
+    raw = {line.split()[-1].split("@")[0]
+           for line in run("nm", "-D", "--undefined-only", so).splitlines() if line.strip()}
+    torch_libs = glob.glob(os.path.join(torch_dir(), "lib", "lib*.so*"))
+    torch_libs += glob.glob(os.path.join(torch_dir(), "_C*.so"))
+    from_torch = set()
+    for lib in torch_libs:
+        from_torch |= defined_symbols(lib, "-D", "--defined-only")
+    others = set()
+    for lib in re.findall(r"=>\s+(/\S+)", subprocess.run(["ldd", so], capture_output=True, text=True).stdout):
+        if not re.search(r"(torch|c10)", os.path.basename(lib)):
+            others |= defined_symbols(lib, "-D", "--defined-only")
+    bad = sorted(n for n in (raw & from_torch) - others if not STABLE_C_SYMBOL.match(n))
+    if bad:
+        fail("imports non-stable symbols that torch exports: " + ", ".join(bad[:20]))
     return libs, names, undefined
 
 
@@ -62,6 +94,16 @@ def check_macos(so):
     libs = [line.split()[0] for line in run("otool", "-L", so).splitlines()[1:] if line.strip()]
     undefined = run("nm", "-u", "-C", so).split("\n")
     names = [line.strip() for line in undefined if line.strip()]
+
+    # Two-level namespace: nm -m names the library each import binds to.
+    bound = run("nm", "-m", "-u", so).splitlines()
+    from_torch = [m.group(1) for m in (re.search(r"external (\S+) \(from (?:lib)?(?:torch|c10)\w*\)", line)
+                                       for line in bound) if m]
+    if not any(re.match(r"^_?torch_call_dispatcher$", n) for n in from_torch):
+        fail("torch_call_dispatcher is not bound to torch_cpu: the binding listing was not read")
+    bad = [n for n in from_torch if not STABLE_C_SYMBOL.match(n)]
+    if bad:
+        fail("imports non-stable symbols from torch: " + ", ".join(bad[:20]))
     return libs, names, undefined
 
 

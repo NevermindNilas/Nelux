@@ -465,7 +465,7 @@ void BatchDecoder::copyFrameToOutput(
     SwsContext* use_sws = sws_ctx ? sws_ctx : copySws_;
     nelux::conversion::cpu::swsScaleIntoRows(
         use_sws, frame->data, frame->linesize, static_cast<AVPixelFormat>(frame->format),
-        frame->height, first, config_.width, 3, config_.height,
+        frame->height, AV_PIX_FMT_RGB24, first, config_.width, 3, config_.height,
         frame->width == config_.width && frame->height == config_.height);
 
     // Duplicate indices in the request share one decode; fan the finished slice
