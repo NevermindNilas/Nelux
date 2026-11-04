@@ -1,5 +1,5 @@
 
-### **Unreleased**
+### **Version 0.23.0 (2026-11-04)**
 
 - **One wheel for every PyTorch from 2.14 on.** The native module is built on
   PyTorch's stable ABI (`torch/csrc/stable`, targeting 2.14) instead of the
