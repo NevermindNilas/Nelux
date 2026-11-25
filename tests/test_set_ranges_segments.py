@@ -102,10 +102,11 @@ class TestFrameSegmentIdentity:
             got = [_index_of(f) for f in r]
         assert got == _expected(segments)
 
-    @pytest.mark.parametrize("prefetch", CPU_MODES)
     @pytest.mark.parametrize("segments", SEGMENTS)
-    def test_segments_on_both_cpu_modes(self, marker_clip, prefetch, segments):
-        with _reader(marker_clip, "cpu", prefetch=prefetch) as r:
+    def test_segments_with_cpu_prefetch(self, marker_clip, segments):
+        # prefetch=False is the default, already covered by
+        # test_segments_yield_requested_indices[cpu].
+        with _reader(marker_clip, "cpu", prefetch=True) as r:
             r.set_ranges(segments)
             got = [_index_of(f) for f in r]
         assert got == _expected(segments)

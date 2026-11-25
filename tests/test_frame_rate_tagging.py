@@ -451,17 +451,10 @@ def _open_or_skip(case: Case, fps: float, path: Path) -> None:
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
-def test_ntsc_film_rate_is_not_rounded(case: Case, tmp_path: Path):
-    """23.976 must land as 24000/1001, not 24. The headline regression."""
-    fps, expected = RATES_BY_LABEL["ntsc_film"]
-    out = tmp_path / f"out.{case.container}"
-    _open_or_skip(case, fps, out)
-    _assert_rate(out, expected, f"{case.id}@{fps}", case.codec)
-
-
-@pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
 @pytest.mark.parametrize("label", [l for l, _, _ in RATES])
 def test_every_rate_survives_every_encoder(case: Case, label: str, tmp_path: Path):
+    """The ntsc_film cells are the headline regression: 23.976 must land as
+    24000/1001, not 24."""
     fps, expected = RATES_BY_LABEL[label]
     if case.fixed_rate_table and expected not in MPEG_TABLE:
         pytest.skip(f"{case.codec} only accepts the fixed MPEG rate table")

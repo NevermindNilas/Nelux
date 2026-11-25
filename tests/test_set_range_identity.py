@@ -126,10 +126,11 @@ class TestSetRangeFrameIdentity:
         assert _iter_indices(marker_clip, accel, start, RUN) == \
             list(range(start, start + RUN))
 
-    @pytest.mark.parametrize("accel", ACCELS)
-    def test_full_iteration_unaffected(self, marker_clip, accel):
+    # The CPU case is test_set_ranges_segments.py::test_full_file_iterates_identically_twice.
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_full_iteration_unaffected_nvdec(self, marker_clip):
         with VideoReader(marker_clip, force_8bit=True,
-                         decode_accelerator=accel) as r:
+                         decode_accelerator="nvdec") as r:
             got = [_index_of(f) for f in r]
         assert got == list(range(N))
 

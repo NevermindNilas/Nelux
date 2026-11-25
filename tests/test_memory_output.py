@@ -76,21 +76,6 @@ def test_memory_avi_reads_back(tmp_path):
     assert torch.equal(decoded[0], decoded[1])
 
 
-def test_memory_output_spans_many_commit_steps(tmp_path):
-    # ~37 MB of rawvideo crosses the range's commit steps (1, 2, 4 ... MiB)
-    # many times, and the avi trailer seeks back across them to patch the
-    # header.
-    frames = torch.randint(0, 256, (6, 1080, 1920, 3), dtype=torch.uint8)
-    path = tmp_path / "ref.avi"
-    nelux.encode_video(frames, str(path), codec="rawvideo", fps=24)
-    memory = nelux.encode_video(frames, format="avi", codec="rawvideo", fps=24)
-    # The tensor took over the muxer's range: no copy, so its storage is a
-    # fixed external block, not one torch allocated. (Check before .numpy(),
-    # which makes any storage non-resizable.)
-    assert not memory.untyped_storage().resizable()
-    assert bytes(memory.numpy()) == path.read_bytes()
-
-
 def test_get_encoded_data_returns_the_same_tensor_each_call():
     with nelux.VideoEncoder(None, format="nut", codec="ffv1", width=W, height=H, fps=24) as enc:
         for frame in _frames(3):
@@ -104,6 +89,9 @@ def test_get_encoded_data_returns_the_same_tensor_each_call():
 
 
 def test_encoded_data_outlives_the_encoder(tmp_path):
+    # ~37 MB of rawvideo crosses the range's commit steps (1, 2, 4 ... MiB)
+    # many times, and the avi trailer seeks back across them to patch the
+    # header.
     frames = torch.randint(0, 256, (6, 1080, 1920, 3), dtype=torch.uint8,
                            generator=torch.Generator().manual_seed(4))
     path = tmp_path / "ref.avi"
@@ -113,7 +101,10 @@ def test_encoded_data_outlives_the_encoder(tmp_path):
     for frame in frames:
         enc.encode_frame(frame)
     data = enc.get_encoded_data()
-    assert not data.untyped_storage().resizable()  # the handed-over range
+    # The tensor took over the muxer's range: no copy, so its storage is a
+    # fixed external block, not one torch allocated. (Check before .numpy(),
+    # which makes any storage non-resizable.)
+    assert not data.untyped_storage().resizable()
     del enc
     gc.collect()
     assert bytes(data.numpy()) == path.read_bytes()

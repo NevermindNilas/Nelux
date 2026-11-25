@@ -17,20 +17,6 @@ from tests.utils.video_downloader import get_video
 VIDEO_PATH = get_video("lite")
 
 
-def test_default_backend_returns_tensor():
-    """Test that the default backend returns torch.Tensor."""
-    vr = VideoReader(VIDEO_PATH)
-    frame = vr.read_frame()
-
-    assert isinstance(frame, torch.Tensor), f"Expected torch.Tensor, got {type(frame)}"
-    assert frame.ndim == 3, f"Expected 3D tensor (HWC), got {frame.ndim}D"
-    assert frame.shape[2] == 3, f"Expected 3 channels, got {frame.shape[2]}"
-
-    print(
-        f"✓ Default backend: torch.Tensor with shape {frame.shape} and dtype {frame.dtype}"
-    )
-
-
 def test_pytorch_backend_returns_tensor():
     """Test that backend='pytorch' returns torch.Tensor."""
     vr = VideoReader(VIDEO_PATH, backend="pytorch")

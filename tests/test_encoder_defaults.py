@@ -82,6 +82,9 @@ def _probe(path: Path, entry: str) -> str:
         (".mkv", "h264"),
         (".mov", "h264"),
         (".avi", "h264"),
+        # mpegts is the one muxer whose "cannot tell" must not be read as no:
+        # it genuinely carries H.264 but has no query_codec table, so a strict
+        # reading would quietly hand .ts back to its nominal default, MPEG-2.
         (".ts", "h264"),
         (".webm", "vp9"),   # libx264 does not fit webm; fall back to the
         (".gif", "gif"),    # container's own default rather than failing
@@ -201,17 +204,6 @@ def test_muxers_that_cannot_answer_get_their_own_default(tmp_path, ext, expect_c
     assert out.stat().st_size > 0
     assert _probe(out, "stream=codec_name") == expect_codec
 
-
-def test_mpegts_is_carved_out_and_still_gets_h264(tmp_path):
-    """mpegts is the one muxer whose "cannot tell" must not be read as no.
-
-    It genuinely carries H.264 — it is what broadcast is made of — but it has
-    no query_codec table to say so. A strict reading with no exception would
-    quietly hand ``.ts`` back to its nominal default of MPEG-2.
-    """
-    out = tmp_path / "carveout.ts"
-    _write(out)
-    assert _probe(out, "stream=codec_name") == "h264"
 
 
 @pytest.mark.parametrize("ext", [".ogg", ".wav"])

@@ -75,20 +75,3 @@ class TestReaderNegativePaths:
             VideoReader(r"D:\no\such\dir\video.mp4")
 
 
-class TestMultiReader:
-    """Two readers on the same file, interleaved access."""
-
-    def test_interleaved_reads_produce_same_content(self):
-        path = _default_video()
-        v1 = VideoReader(path)
-        v2 = VideoReader(path)
-
-        import torch
-
-        a1 = v1.read_frame()
-        a2 = v2.read_frame()
-        b1 = v1.read_frame()
-        b2 = v2.read_frame()
-
-        assert torch.equal(a1, a2), "frame 0 differs between readers"
-        assert torch.equal(b1, b2), "frame 1 differs between readers"

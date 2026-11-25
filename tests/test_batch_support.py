@@ -276,7 +276,7 @@ class TestBatchGetItem:
         vr = VideoReader(VIDEO_PATH)
         frame = vr[10]
         # Should return single frame, not batch
-        assert not isinstance(frame, torch.Tensor) or frame.dim() == 3
+        assert isinstance(frame, torch.Tensor) and frame.dim() == 3
 
     def test_getitem_slice(self):
         """Test that slice returns batch."""

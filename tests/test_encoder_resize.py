@@ -424,18 +424,12 @@ def test_byte_exact_parity_with_ffmpeg_scale(tmp_path):
 def test_cuda_tensor_resize_falls_back_to_staging(tmp_path):
     """A CUDA tensor with a different input size cannot use the fused GPU
     kernel; it must still come out correct via the CPU staging path."""
-    try:
-        _roundtrip(tmp_path, "cuda_nvenc", "h264_nvenc", "mp4", mad=6,
-                   device="cuda")
-    except RuntimeError as e:
-        pytest.skip(f"NVENC unavailable: {e}")
+    # _roundtrip skips when NVENC cannot open; any later error is a failure.
+    _roundtrip(tmp_path, "cuda_nvenc", "h264_nvenc", "mp4", mad=6, device="cuda")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_tensor_same_size_keeps_gpu_path(tmp_path):
     """resize=True + matching dims must not break the zero-copy GPU path."""
-    try:
-        _roundtrip(tmp_path, "cuda_same", "h264_nvenc", "mp4", mad=6,
-                   in_w=OUT_W, in_h=OUT_H, device="cuda")
-    except RuntimeError as e:
-        pytest.skip(f"NVENC unavailable: {e}")
+    _roundtrip(tmp_path, "cuda_same", "h264_nvenc", "mp4", mad=6,
+               in_w=OUT_W, in_h=OUT_H, device="cuda")

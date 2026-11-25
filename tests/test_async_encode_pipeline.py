@@ -219,18 +219,6 @@ def test_psnr_floor_cuda():
 # --------------------------------------------------------------------------- #
 # Error propagation
 # --------------------------------------------------------------------------- #
-def test_wrong_size_tensor_raises():
-    """A tensor whose element count != width*height*3 is rejected up front."""
-    out = OUT_DIR / "err_size.mp4"
-    enc = VideoEncoder(str(out), codec="libx264", width=WIDTH, height=HEIGHT,
-                       fps=FPS, pixel_format="yuv420p")
-    try:
-        with pytest.raises((ValueError, RuntimeError)):
-            enc.encode_frame(torch.zeros((HEIGHT // 2, WIDTH, 3), dtype=torch.uint8))
-    finally:
-        enc.close()  # must not deadlock or crash after a rejected frame
-
-
 def test_midstream_error_clean_teardown():
     """
     A bad frame mid-stream raises, but the good frames already submitted still

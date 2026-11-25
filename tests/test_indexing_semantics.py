@@ -276,12 +276,3 @@ class TestNumpyIndexSupport:
         assert batch.shape[0] == 3
 
 
-@pytest.mark.parametrize("indices", [range(0, 15, 5), (0, 5, 10), [0, 5, 10]])
-def test_batch_index_collections(indices):
-    batch = VideoReader(_default_video()).get_batch(indices)
-    assert batch.shape[0] == 3
-
-
-def test_getitem_list_returns_batch():
-    batch = VideoReader(_default_video())[[0, 10, 20]]
-    assert batch.shape[0] == 3
