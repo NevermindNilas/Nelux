@@ -365,3 +365,92 @@ def test_nvjpeg_batch_decode_encode_and_error_recovery():
     with pytest.raises(RuntimeError):
         nelux.decode_image(encoded[0][:len(encoded[0]) // 2], device="cuda")
     assert nelux.decode_image(encoded[0], device="cuda").shape == expected[0].shape
+
+
+def _textured_jpeg(height, width, quality=95, subsampling="444", channels=3, seed=0):
+    # Noise over the gradients: at these sizes the bitstream passes 128 KiB, so
+    # large images take nvJPEG's GPU Huffman decoder rather than the batched one.
+    generator = torch.Generator().manual_seed(seed)
+    image = _jpeg_test_image(height, width, channels).to(torch.int16)
+    image += torch.randint(-40, 41, image.shape, generator=generator, dtype=torch.int16)
+    image = image.clamp(0, 255).to(torch.uint8)
+    return nelux.encode_image(image, format="jpeg", quality=quality, subsampling=subsampling).numpy().tobytes()
+
+
+def _with_exif_thumbnail(jpeg, thumbnail):
+    payload = b"Exif\x00\x00" + thumbnail
+    return jpeg[:2] + b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload + jpeg[2:]
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA-enabled Nelux and PyTorch")
+def test_nvjpeg_backends_and_regions_match_libjpeg_and_whole_decodes():
+    Image = pytest.importorskip("PIL.Image")
+    small = _textured_jpeg(83, 89)
+    large = _textured_jpeg(1100, 1301)
+    progressive = io.BytesIO()
+    Image.open(io.BytesIO(large)).save(progressive, "JPEG", quality=95, subsampling=0, progressive=True)
+    encoded = [small, large, _textured_jpeg(1440, 2560, subsampling="420", seed=1),
+               progressive.getvalue(), _textured_jpeg(1100, 1301, channels=1, seed=2)]
+    assert len(small) < 128 << 10 and all(len(data) > 128 << 10 for data in encoded[1:])
+    whole = nelux.decode_images(encoded, device="cuda")
+    for index, (data, image) in enumerate(zip(encoded, whole)):
+        # libjpeg upsamples 4:2:0 chroma differently, which on noise is far
+        # beyond IDCT rounding, so only the others are held to its output.
+        if index != 2:
+            reference = torch.from_numpy(np.asarray(Image.open(io.BytesIO(data)).convert("RGB")).copy())
+            difference = (image.cpu().int() - reference.int()).abs()
+            assert difference.float().mean() < 0.25 and difference.max() <= 4
+        assert torch.equal(nelux.decode_image(data, device="cuda"), image)
+        height, width = image.shape[:2]
+        for left, top, w, h in ((0, 0, width, height), (0, 0, 1, 1), (width - 1, height - 1, 1, 1),
+                                (width // 3 + 1, height // 3 + 1, width // 3, height // 4),
+                                (1, height - 2, width - 1, 2), (width - 3, 0, 3, height)):
+            region = nelux.decode_image(data, device="cuda", region=(left, top, w, h))
+            assert torch.equal(region, image[top:top + h, left:left + w])
+    regions = [(5, 7, 64, 32), None, (1000, 600, 300, 200), None, (3, 3, 10, 10)]
+    picked = nelux.decode_images(encoded, device="cuda", region=regions, dimension_order="CHW")
+    for image, region, chw in zip(whole, regions, picked):
+        left, top, w, h = region or (0, 0, image.shape[1], image.shape[0])
+        assert torch.equal(chw, image[top:top + h, left:left + w].permute(2, 0, 1))
+    # Each thread decodes with its own nvJPEG state.
+    region = (17, 33, 301, 257)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: nelux.decode_image(encoded[2], device="cuda", region=region), range(8)))
+    assert all(torch.equal(result, whole[2][33:290, 17:318]) for result in results)
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA-enabled Nelux and PyTorch")
+@pytest.mark.parametrize("height,width", [(83, 89), (1100, 1301)])
+def test_nvjpeg_rejects_truncation_past_a_thumbnail_eoi(height, width):
+    # A cut-off camera file still holds its EXIF thumbnail's EOI. nvJPEG would
+    # fill the missing scan with gray, so the decode must fail instead.
+    thumbnail = nelux.encode_image(_jpeg_test_image(16, 16), format="jpeg").numpy().tobytes()
+    data = _with_exif_thumbnail(_textured_jpeg(height, width), thumbnail)
+    assert nelux.decode_image(data, device="cuda").shape == (height, width, 3)
+    with pytest.raises(RuntimeError, match="complete JPEG"):
+        nelux.decode_image(data[:len(data) * 2 // 3], device="cuda")
+    with pytest.raises(RuntimeError, match="complete JPEG"):
+        nelux.decode_image(data[:len(data) * 2 // 3], device="cuda", region=(0, 0, 8, 8))
+    assert nelux.decode_image(data, device="cuda", region=(1, 2, 3, 4)).shape == (4, 3, 3)
+
+
+def test_decode_region_copies_out_and_rejects_bad_regions():
+    image = _jpeg_test_image(48, 64)
+    for encoded in (nelux.encode_image(image, format="jpeg", quality=90), nelux.encode_image(image)):
+        whole = nelux.decode_image(encoded)
+        part = nelux.decode_image(encoded, region=(3, 5, 20, 10))
+        assert torch.equal(part, whole[5:15, 3:23])
+        assert part.untyped_storage().nbytes() == part.numel()  # Not a view of the whole image.
+        chw = nelux.decode_image(encoded, region=(3, 5, 20, 10), dimension_order="CHW")
+        assert torch.equal(chw, part.permute(2, 0, 1))
+        assert torch.equal(nelux.decode_image(encoded, region=(0, 0, 64, 48)), whole)
+    jpeg = nelux.encode_image(image, format="jpeg")
+    for device in ["cpu"] + (["cuda"] if CUDA_AVAILABLE else []):
+        for region in ((0, 0, 65, 48), (0, 1, 64, 48), (-1, 0, 1, 1), (0, 0, 0, 1),
+                       (0, 0, 1.5, 1), (0, 0, 1), "abcd"):
+            with pytest.raises(ValueError):
+                nelux.decode_image(jpeg, device=device, region=region)
+        with pytest.raises(ValueError, match="2 sources"):
+            nelux.decode_images([jpeg, jpeg], device=device, region=[(0, 0, 1, 1)])
+        both = nelux.decode_images([jpeg, jpeg], device=device, region=[None, (1, 1, 2, 2)])
+        assert both[0].shape == (48, 64, 3) and both[1].shape == (2, 2, 3)

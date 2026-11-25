@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-11-25
+
+### Added
+
+- **Region decoding.** `decode_image` / `decode_images` take
+  `region=(left, top, width, height)`, or one region (or `None`) per source.
+  On CUDA, nvJPEG decodes only that region and stops entropy decoding after
+  its last row; on the CPU the image is decoded whole and the region copied
+  out. A 512x512 crop of a 2560x1440 q95 JPEG to CUDA takes 4.3 ms instead of
+  12.7 ms for decoding the whole image and slicing it (RTX 3090).
+
+### Changed
+
+- **Large JPEGs decode with nvJPEG's GPU Huffman decoder.** Huffman decoding
+  ran on one CPU thread and was most of a large JPEG's CUDA decode time.
+  Images over NVIDIA's 512x512x3-byte size whose bitstream is at least
+  128 KiB now take the GPU-assisted decoder, through NVIDIA's decoupled API,
+  with the output unchanged byte for byte: 2560x1440 q95 decodes 1.9-2.3x
+  faster, 12 MP photos 2.4x. Smaller images keep the batched decoder, so
+  they decode exactly as before, on an idle or a busy GPU.
+
+### Fixed
+
+- **A truncated JPEG could decode to gray on CUDA.** A cut-off camera file
+  still holds its EXIF thumbnail's EOI, which passed the completeness check,
+  and nvJPEG fills a short scan with gray rather than failing (it did so for
+  images below roughly 600x600). The check now walks the marker segments, so
+  such a file raises `RuntimeError` at any size.
+
 ## [0.23.0] - 2026-11-04
 
 ### Changed

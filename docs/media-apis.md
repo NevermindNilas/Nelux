@@ -59,6 +59,7 @@ spooled inputs. Resampling and channel remixing use libswresample.
 ```python
 image = nelux.decode_image("photo.jpg", dimension_order="CHW")
 images = nelux.decode_images(["one.jpg", "two.jpg"], device="cuda")
+crop = nelux.decode_image("photo.jpg", device="cuda", region=(1024, 464, 512, 512))
 png_bytes = nelux.encode_image(image, format="png", dimension_order="CHW")
 jpeg_bytes = nelux.encode_image(images[0], format="jpeg", quality=90)
 ```
@@ -71,10 +72,21 @@ from memory, without a temporary file; other sources take the `VideoReader`
 path with identical results. Animated sources return their first frame; use
 `VideoReader` for all animation frames.
 
+`region=(left, top, width, height)` returns only that part of each image; a
+list gives each source its own region, or `None` for the whole image. A region
+outside the image raises `ValueError`. On CUDA only the region is decoded
+(nvJPEG stops entropy decoding after its last row); on the CPU the image is
+decoded whole and the region copied out, so the result never keeps the whole
+image alive. Either way the pixels equal the whole decode's.
+
 CUDA decoding accepts complete grayscale/RGB JPEG bitstreams and emits RGB
-uint8. It reads encoded input directly into host memory without a temporary
-file, gathers one nvJPEG batch, and writes directly into CUDA output tensors on
-the current PyTorch stream. Handle and state caches are per thread and device.
+uint8; a bitstream whose scans do not reach an EOI raises `RuntimeError`. It
+reads encoded input directly into host memory without a temporary file and
+writes directly into CUDA output tensors on the current PyTorch stream. Images
+larger than 512x512x3 decoded bytes (NVIDIA's rule) with at least 128 KiB of
+bitstream use nvJPEG's GPU Huffman decoder; the rest are gathered into one
+nvJPEG batch with CPU Huffman decoding, which is faster for small bitstreams,
+especially while the GPU is busy. Both give the same pixels. Handle and state caches are per thread and device.
 Calls synchronize before releasing host bitstreams and reusing codec state;
 the API does not promise asynchronous host return. EXIF orientation is not
 applied by the nvJPEG path. Other image formats use the CPU API.

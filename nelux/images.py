@@ -27,28 +27,72 @@ def _clear_image_cache():
 atexit.register(_clear_image_cache)
 
 
+def _region(value):
+    try:
+        left, top, width, height = (operator.index(v) for v in value)
+    except (TypeError, ValueError):
+        raise ValueError("region must be four integers: (left, top, width, height)") from None
+    if left < 0 or top < 0 or width <= 0 or height <= 0:
+        raise ValueError("region needs left, top >= 0 and width, height > 0")
+    return left, top, width, height
+
+
+def _regions(region, count):
+    """One (left, top, width, height) or None per source."""
+    if region is None:
+        return [None] * count
+    items = list(region)
+    # A list of regions (or Nones) gives each source its own; four integers apply to all.
+    if any(item is None or isinstance(item, (tuple, list)) for item in items):
+        if len(items) != count:
+            raise ValueError(f"region lists {len(items)} entries for {count} sources")
+        return [None if item is None else _region(item) for item in items]
+    return [_region(items)] * count
+
+
+def _crop(image, region):
+    """Copy a region out of an HWC image, so the result does not keep the whole image alive."""
+    if region is None:
+        return image
+    left, top, width, height = region
+    if left + width > image.shape[1] or top + height > image.shape[0]:
+        raise ValueError(f"region {region} lies outside the {image.shape[1]}x{image.shape[0]} image")
+    if (width, height) == (image.shape[1], image.shape[0]):
+        return image
+    return image[top:top + height, left:left + width].clone()
+
+
 def decode_images(sources, *, device="cpu", dimension_order="HWC", color_format="rgb",
-                  force_8bit=False) -> list[torch.Tensor]:
-    """Decode first images into owned tensors; CUDA accepts RGB JPEG batches."""
+                  force_8bit=False, region=None) -> list[torch.Tensor]:
+    """Decode first images into owned tensors; CUDA accepts RGB JPEG batches.
+
+    ``region`` is (left, top, width, height) in pixels, applied to every source,
+    or a list with one such tuple (or None for the whole image) per source. A
+    CUDA JPEG decodes only that region; on the CPU the image is decoded whole
+    and the region copied out.
+    """
     if dimension_order not in ("HWC", "CHW"):
         raise ValueError("dimension_order must be 'HWC' or 'CHW'")
     if color_format not in ("rgb", "gray", "rgba"):
         raise ValueError("color_format must be 'rgb', 'gray', or 'rgba'")
     target = torch.device(device)
+    sources = list(sources)
+    regions = _regions(region, len(sources))
     if target.type == "cuda":
         if not _nelux.__cuda_support__ or not torch.cuda.is_available():
             raise RuntimeError("CUDA images require CUDA-enabled Nelux and PyTorch")
         if color_format != "rgb":
             raise ValueError("CUDA JPEG output supports color_format='rgb'")
         index = torch.cuda.current_device() if target.index is None else target.index
-        images = _nelux._decode_jpegs_cuda([read_encoded_source(s) for s in sources], index, _image_cache())
+        images = _nelux._decode_jpegs_cuda([read_encoded_source(s) for s in sources], regions, index,
+                                           _image_cache())
         return [image.permute(2, 0, 1) for image in images] if dimension_order == "CHW" else images
     if target.type != "cpu":
         raise ValueError("device must be CPU or CUDA")
     from . import VideoReader
     channels = {"rgb": 3, "gray": 1, "rgba": 4}[color_format]
     result = []
-    for source in sources:
+    for source, crop in zip(sources, regions):
         # One in-memory decode of a still image; anything else, including every
         # failure, goes through the reader so its behavior and errors still apply.
         if isinstance(source, (str, os.PathLike)):
@@ -57,13 +101,20 @@ def decode_images(sources, *, device="cpu", dimension_order="HWC", color_format=
             source = read_encoded_source(source)  # A stream can be read only once.
             image = _nelux._decode_image_cpu(source, "input.bin", channels, force_8bit)
         if image is not None:
+            image = _crop(image, crop)
             result.append(image.permute(2, 0, 1) if dimension_order == "CHW" else image)
             continue
+        # A region is cut from the reader's HWC frame, then laid out like a still image.
+        order = "HWC" if crop is not None else dimension_order
         with VideoReader(source, num_threads=1, convert_workers=0, force_8bit=force_8bit,
-                         dimension_order=dimension_order, color_format=color_format) as reader:
+                         dimension_order=order, color_format=color_format) as reader:
             image = reader.read_frame()
             if image is None:
                 raise ValueError("Source contains no image")
+            if crop is not None:
+                image = _crop(image, crop)
+                if dimension_order == "CHW":
+                    image = image.permute(2, 0, 1)
             result.append(image)
     return result
 

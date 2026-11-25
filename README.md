@@ -615,7 +615,7 @@ nelux.transcode(source, output_path=None, *, format="mp4", start=0.0, end=None,
                 audio=True, subtitles=True, allow_transcode=True, **encoder_options)
 nelux.encode_video(frames, output_path=None, *, format="mp4", dimension_order="HWC", **options)
 nelux.merge_streams(video_source, audio_source, output)
-nelux.decode_image(source, *, device="cpu") / nelux.decode_images(sources, *, device="cpu")
+nelux.decode_image(source, *, device="cpu", region=None) / nelux.decode_images(sources, *, device="cpu", region=None)
 nelux.encode_image(image, output_path=None, *, format="png", ...)
 nelux.AudioReader(source, *, stream_index=None, sample_rate=None, num_channels=None)
 nelux.samplers.clips_at_indices / clips_at_regular_indices / clips_at_random_indices / clips_at_timestamps

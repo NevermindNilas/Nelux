@@ -1,4 +1,20 @@
 
+### **Version 0.24.0 (2026-11-25)**
+
+- **Region decoding.** `decode_image` / `decode_images` take
+  `region=(left, top, width, height)`, or one region (or `None`) per source.
+  On CUDA, nvJPEG decodes only that region and stops entropy decoding after
+  its last row; on the CPU the image is decoded whole and the region copied
+  out. A 512x512 crop of a 2560x1440 q95 JPEG to CUDA takes 4.3 ms instead of
+  12.7 ms (RTX 3090).
+- **Large JPEGs decode with nvJPEG's GPU Huffman decoder** (NVIDIA's decoupled
+  API) when larger than NVIDIA's 512x512x3-byte size and at least 128 KiB of
+  bitstream: 1.9-2.4x faster for 1440p-12 MP images, output unchanged byte for
+  byte. Smaller images keep the batched CPU-Huffman decoder.
+- Fixed: a truncated JPEG whose EXIF thumbnail kept an EOI could decode to
+  gray on CUDA; the completeness check now walks the marker segments and
+  raises `RuntimeError` at any size.
+
 ### **Version 0.23.0 (2026-11-04)**
 
 - **One wheel for every PyTorch from 2.14 on.** The native module is built on
